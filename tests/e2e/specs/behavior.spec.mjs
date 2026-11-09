@@ -229,3 +229,42 @@ test.describe("responsive layout", () => {
     });
   }
 });
+
+// D-2 regression: at phone width the sidebar is an overlay drawer, not a column that
+// squeezes the content. Desktop behaviour is covered by the "navigation" tests above.
+test.describe("mobile sidebar drawer [D-2]", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+  const mainWidth = (page) => page.locator(".main-content").evaluate((el) => el.getBoundingClientRect().width);
+
+  test("starts closed, so the content uses the full width", async ({ page, mockApi }) => {
+    await openRoute(page, "images");
+    await expect(page.getByRole("navigation", { name: "Main" })).toBeHidden();
+    expect(await mainWidth(page)).toBeGreaterThanOrEqual(380);
+  });
+
+  test("opens as an overlay without moving the content, and closes after navigating", async ({ page, mockApi }) => {
+    await openRoute(page, "images");
+    const before = await mainWidth(page);
+    await page.getByRole("button", { name: "Open sidebar" }).click();
+    await expect(nav(page, "Models")).toBeVisible();
+    expect(await page.locator(".sidebar").evaluate((el) => getComputedStyle(el).position)).toBe("fixed");
+    expect(await mainWidth(page)).toBeGreaterThanOrEqual(before); // never squeezed (the collapsed sidebar keeps a 1px border)
+    await nav(page, "Models").click();
+    await expect(page).toHaveURL(/#\/models$/);
+    await expect(page.getByRole("navigation", { name: "Main" })).toBeHidden();
+  });
+
+  test("does not overwrite the desktop sidebar preference", async ({ page, mockApi }) => {
+    await page.addInitScript(() => { if (!sessionStorage.getItem("seeded")) { localStorage.setItem("sidebarVisible", "true"); sessionStorage.setItem("seeded", "1"); } });
+    await openRoute(page, "chat");
+    await page.getByRole("button", { name: "Open sidebar" }).first().click();
+    await nav(page, "Voice").click();
+    expect(await page.evaluate(() => localStorage.getItem("sidebarVisible"))).toBe("true");
+  });
+});
+
+test("desktop: sidebar stays an in-flow column (unchanged by the D-2 fix)", async ({ page, mockApi }) => {
+  await openRoute(page, "images");
+  expect(await page.locator(".sidebar").evaluate((el) => getComputedStyle(el).position)).toBe("relative");
+  await expect(page.getByRole("navigation", { name: "Main" })).toBeVisible();
+});
