@@ -1,0 +1,101 @@
+# CI: reproducible frontend build, server syntax check, unit + security
+# regression tests (incl. a real serve.cjs boot with no models) on all three
+# desktop OSes. Required check for PRs to main. See docs/ci/CI_GUIDE.md.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same Node version the portable launchers install (scripts/setup/setup.sh NODE_VERSION).
+  NODE_VERSION: "22.12.0"
+
+jobs:
+  build-test:
+    name: build-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+
+      - name: Install frontend dependencies (lockfile enforced)
+        working-directory: app/frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Syntax-check server, search and worker scripts
+        run: |
+          for f in scripts/server/*.cjs scripts/search/*.js scripts/workers/*.mjs scripts/tests/*.cjs; do
+            node --check "$f" || { echo "::error file=$f::syntax check failed"; exit 1; }
+          done
+
+      - name: Build frontend (vite build -> app/dist)
+        working-directory: app/frontend
+        run: npm run build
+
+      - name: Verify build output
+        run: |
+          test -f app/dist/index.html || { echo "::error::app/dist/index.html missing"; exit 1; }
+          grep -Eq 'src="/assets/index-[^"]+\.js"' app/dist/index.html || { echo "::error::entry script missing from index.html"; exit 1; }
+          if find app/dist -name '*.map' | grep -q .; then echo "::error::source maps found in release build"; exit 1; fi
+          { echo "### Build output ($RUNNER_OS)"; echo '```'; ls -l app/dist app/dist/assets | grep -Ev 'KaTeX_|inter-'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Unit, regression and security tests
+        run: |
+          mkdir -p test-results
+          node --test \
+            --test-reporter=spec --test-reporter-destination=stdout \
+            --test-reporter=junit --test-reporter-destination=test-results/junit.xml \
+            "scripts/tests/*.test.cjs"
+
+      - name: Test summary
+        if: always()
+        run: |
+          if [ -f test-results/junit.xml ]; then
+            tests=$(grep -o '<testcase ' test-results/junit.xml | wc -l)
+            fails=$(grep -o '<failure' test-results/junit.xml | wc -l)
+            skips=$(grep -o '<skipped' test-results/junit.xml | wc -l)
+            echo "### Tests ($RUNNER_OS): $tests run, $fails failed, $skips skipped" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-${{ matrix.os }}
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload built frontend (web assets only, not a portable bundle)
+        if: matrix.os == 'ubuntu-24.04'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: frontend-dist
+          path: app/dist/
+          retention-days: 7
+          if-no-files-found: error
