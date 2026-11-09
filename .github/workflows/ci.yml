@@ -76,10 +76,13 @@ jobs:
         if: always()
         run: |
           if [ -f test-results/junit.xml ]; then
-            tests=$(grep -o '<testcase ' test-results/junit.xml | wc -l)
-            fails=$(grep -o '<failure' test-results/junit.xml | wc -l)
-            skips=$(grep -o '<skipped' test-results/junit.xml | wc -l)
-            echo "### Tests ($RUNNER_OS): $tests run, $fails failed, $skips skipped" >> "$GITHUB_STEP_SUMMARY"
+            node -e '
+              const x = require("fs").readFileSync("test-results/junit.xml", "utf8");
+              const n = (re) => (x.match(re) || []).length;
+              console.log(`### Tests (${process.env.RUNNER_OS}): ${n(/<testcase /g)} run, ${n(/<failure/g)} failed, ${n(/<skipped/g)} skipped`);
+            ' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Tests ($RUNNER_OS): no JUnit report produced" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload test report
