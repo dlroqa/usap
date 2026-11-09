@@ -52,7 +52,7 @@ api() { # method path [json-body]
   if [[ $# -ge 3 ]]; then curl -s -m 600 -X "$1" -H 'content-type: application/json' --data "$3" "$BASE$2"; else curl -s -m 600 -X "$1" "$BASE$2"; fi
 }
 
-json_get() { node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);const v=process.argv[1].split(".").reduce((a,k)=>a==null?a:a[k],o);console.log(v===undefined?"":typeof v==="object"?JSON.stringify(v):v)}catch(e){console.log("")}})' "$1"; }
+json_get() { node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);const v=process.argv[1].split(".").reduce((a,k)=>a==null?a:a[k],o);console.log(v==null?"":typeof v==="object"?JSON.stringify(v):v)}catch(e){console.log("")}})' "$1"; }
 
 echo "| Check | Result | Detail |"
 echo "|---|---|---|"
@@ -106,7 +106,10 @@ check_binary "whisper-cli" "$WHISPER_BIN" 1 && {
 for bin in "${SD_BINS[@]}"; do
   label="sd ($(basename "$bin"))"
   check_binary "$label" "$bin" 1 && {
-    "$bin" --help >/dev/null 2>&1; rc=$?
+    # Same library search path the app sets when it spawns the image backend.
+    d="$(dirname "$bin")"
+    LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" DYLD_LIBRARY_PATH="$d${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
+      "$bin" --help >/dev/null 2>&1; rc=$?
     [[ $rc == 0 || $rc == 1 ]] && record "$label startup" PASS "--help ran (exit $rc), libraries resolved" || record "$label startup" FAIL "exit $rc"
   }
 done
