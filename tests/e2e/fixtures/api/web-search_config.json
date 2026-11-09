@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "provider": "duckduckgo",
+  "providers": [
+    {
+      "key": "duckduckgo",
+      "name": "DuckDuckGo",
+      "requiresApiKey": false,
+      "active": true
+    }
+  ],
+  "cachePath": "/studio/app/cache/search",
+  "defaults": {
+    "resultLimit": 5,
+    "fetchLimit": 3,
+    "timeFilter": "any"
+  }
+}

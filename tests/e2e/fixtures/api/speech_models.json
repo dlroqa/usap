@@ -1,0 +1,125 @@
+{
+  "ok": true,
+  "models": [
+    {
+      "id": "tiny.en",
+      "name": "Whisper Tiny English",
+      "filename": "ggml-tiny.en.bin",
+      "size": "75 MB",
+      "language": "English",
+      "recommended": false,
+      "installed": false,
+      "sizeBytes": 0,
+      "localSize": "",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+    },
+    {
+      "id": "tiny.en-q5_1",
+      "name": "Whisper Tiny English Q5",
+      "filename": "ggml-tiny.en-q5_1.bin",
+      "size": "31 MB",
+      "language": "English",
+      "recommended": false,
+      "installed": false,
+      "sizeBytes": 0,
+      "localSize": "",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q5_1.bin"
+    },
+    {
+      "id": "base.en",
+      "name": "Whisper Base English",
+      "filename": "ggml-base.en.bin",
+      "size": "142 MB",
+      "language": "English",
+      "recommended": true,
+      "installed": false,
+      "sizeBytes": 0,
+      "localSize": "",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+    },
+    {
+      "id": "base.en-q5_1",
+      "name": "Whisper Base English Q5",
+      "filename": "ggml-base.en-q5_1.bin",
+      "size": "57 MB",
+      "language": "English",
+      "recommended": true,
+      "installed": false,
+      "sizeBytes": 0,
+      "localSize": "",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin"
+    },
+    {
+      "id": "small.en",
+      "name": "Whisper Small English",
+      "filename": "ggml-small.en.bin",
+      "size": "466 MB",
+      "language": "English",
+      "recommended": false,
+      "installed": false,
+      "sizeBytes": 0,
+      "localSize": "",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
+    },
+    {
+      "id": "small.en-q5_1",
+      "name": "Whisper Small English Q5",
+      "filename": "ggml-small.en-q5_1.bin",
+      "size": "181 MB",
+      "language": "English",
+      "recommended": false,
+      "installed": false,
+      "sizeBytes": 0,
+      "localSize": "",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_1.bin"
+    },
+    {
+      "id": "tiny",
+      "name": "Whisper Tiny Multilingual",
+      "filename": "ggml-tiny.bin",
+      "size": "75 MB",
+      "language": "Multilingual",
+      "recommended": false,
+      "installed": false,
+      "sizeBytes": 0,
+      "localSize": "",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"
+    },
+    {
+      "id": "base",
+      "name": "Whisper Base Multilingual",
+      "filename": "ggml-base.bin",
+      "size": "142 MB",
+      "language": "Multilingual",
+      "recommended": false,
+      "installed": false,
+      "sizeBytes": 0,
+      "localSize": "",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
+    },
+    {
+      "id": "base-q5_1",
+      "name": "Whisper Base Multilingual Q5",
+      "filename": "ggml-base-q5_1.bin",
+      "size": "57 MB",
+      "language": "Multilingual",
+      "recommended": false,
+      "installed": false,
+      "sizeBytes": 0,
+      "localSize": "",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin"
+    },
+    {
+      "id": "small",
+      "name": "Whisper Small Multilingual",
+      "filename": "ggml-small.bin",
+      "size": "466 MB",
+      "language": "Multilingual",
+      "recommended": false,
+      "installed": false,
+      "sizeBytes": 0,
+      "localSize": "",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+    }
+  ]
+}

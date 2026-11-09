@@ -1,0 +1,48 @@
+{
+  "ok": true,
+  "ready": false,
+  "running": false,
+  "port": 10088,
+  "preferredPort": 10088,
+  "backendInstalled": false,
+  "backendPath": "",
+  "serverPath": "",
+  "backendMode": "whisper.cpp CPU",
+  "backendPreference": "auto",
+  "backends": [
+    {
+      "key": "vulkan",
+      "label": "Vulkan GPU",
+      "mode": "whisper.cpp Vulkan GPU",
+      "cli": "",
+      "server": "",
+      "pathHint": "/studio/app/speech-backend/linux/vulkan",
+      "installed": false
+    },
+    {
+      "key": "cpu",
+      "label": "CPU",
+      "mode": "whisper.cpp CPU",
+      "cli": "",
+      "server": "",
+      "pathHint": "/studio/app/speech-backend/linux/cpu",
+      "installed": false
+    }
+  ],
+  "error": null,
+  "settings": {
+    "model": null,
+    "language": "auto",
+    "threads": 4,
+    "backendPreference": "auto",
+    "backendBinary": "",
+    "backendMode": ""
+  },
+  "transcription": {
+    "active": false,
+    "phase": "",
+    "progress": 0,
+    "model": "",
+    "filename": ""
+  }
+}

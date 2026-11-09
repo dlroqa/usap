@@ -1,0 +1,58 @@
+{
+  "ok": true,
+  "generatedAt": "2026-01-01T12:00:00.000Z",
+  "candidates": [
+    {
+      "key": "cuda",
+      "path": "/studio/app/llm-backend/linux/cuda/llama-server",
+      "mode": "Auto (CUDA/CPU)",
+      "portable": true,
+      "installed": false,
+      "detected": false,
+      "devices": [],
+      "error": "Backend binary not installed."
+    },
+    {
+      "key": "rocm",
+      "path": "/studio/app/llm-backend/linux/rocm/llama-server",
+      "mode": "Auto (ROCm/CPU)",
+      "portable": true,
+      "installed": false,
+      "detected": false,
+      "devices": [],
+      "error": "Backend binary not installed."
+    },
+    {
+      "key": "sycl",
+      "path": "/studio/app/llm-backend/linux/sycl/llama-server",
+      "mode": "Auto (SYCL/CPU)",
+      "portable": true,
+      "installed": false,
+      "detected": false,
+      "devices": [],
+      "error": "Backend binary not installed."
+    },
+    {
+      "key": "vulkan",
+      "path": "/studio/app/llm-backend/linux/vulkan/llama-server",
+      "mode": "Auto (Vulkan/CPU)",
+      "portable": true,
+      "installed": false,
+      "detected": false,
+      "devices": [],
+      "error": "Backend binary not installed."
+    },
+    {
+      "key": "cpu",
+      "path": "/studio/app/llm-backend/linux/cpu/llama-server",
+      "mode": "CPU",
+      "portable": true,
+      "installed": false,
+      "detected": false,
+      "devices": [],
+      "error": "Backend binary not installed."
+    }
+  ],
+  "available": [],
+  "selected": null
+}

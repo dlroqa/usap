@@ -1,0 +1,47 @@
+{
+  "os_name": "Linux (fixture)",
+  "cpu_name": "Fixture CPU",
+  "cpu_cores_physical": 8,
+  "cpu_cores_logical": 16,
+  "ram_total_gb": 16,
+  "gpu_name": "Fixture GPU",
+  "gpu_vram_gb": 8,
+  "npu": {
+    "detected": false,
+    "vendor": null,
+    "name": null
+  },
+  "tier": "low",
+  "recommended_models": [
+    {
+      "name": "Qwen 2.5 Coder 0.5B Instruct (Q4_K_M)",
+      "filename": "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
+      "approxSize": "491 MB",
+      "url": "https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
+      "notes": "Extremely fast, lightweight assistant, perfect for low RAM/VRAM machines.",
+      "reason": "GPU with 0 GB VRAM and 7.58 GB RAM."
+    },
+    {
+      "name": "SmolLM2 1.7B Instruct (Q4_K_M)",
+      "filename": "smollm2-1.7b-instruct-q4_k_m.gguf",
+      "approxSize": "1.1 GB",
+      "url": "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf",
+      "notes": "Excellent lightweight assistant with strong logic, reasoning, and prompt expansion capabilities.",
+      "reason": "GPU with 0 GB VRAM and 7.58 GB RAM."
+    }
+  ],
+  "recommended_text_settings": {
+    "contextSize": 2048,
+    "threads": 2,
+    "gpuLayers": 0,
+    "cacheTypeK": "q4_0",
+    "cacheTypeV": "q4_0",
+    "flashAttn": true,
+    "mlock": true,
+    "mmap": true,
+    "cachePrompt": true,
+    "batchSize": 256,
+    "ubatchSize": 256,
+    "performanceProfile": "potato"
+  }
+}

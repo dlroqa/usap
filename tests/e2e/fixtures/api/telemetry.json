@@ -1,0 +1,8 @@
+{
+  "cpu_usage": 12,
+  "ram_used_gb": 6.2,
+  "ram_total_gb": 16,
+  "gpu_name": "Fixture GPU",
+  "vram_used_gb": 0,
+  "vram_total_gb": 8
+}

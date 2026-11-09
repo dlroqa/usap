@@ -1,0 +1,15 @@
+{
+  "name": "usap-e2e",
+  "private": true,
+  "description": "Browser rendering, behaviour and UI-preservation tests for Portable Local Studio. Kept separate from app/frontend so user installs are unaffected.",
+  "type": "module",
+  "scripts": {
+    "record-fixtures": "node scripts/record-fixtures.mjs",
+    "test": "playwright test",
+    "test:visual": "playwright test specs/visual.spec.mjs"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
+    "@playwright/test": "1.65.0"
+  }
+}

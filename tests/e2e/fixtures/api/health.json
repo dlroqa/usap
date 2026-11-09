@@ -1,0 +1,205 @@
+{
+  "ok": false,
+  "build": "text-image-v1",
+  "root": "/studio",
+  "platform": "linux",
+  "checks": [
+    {
+      "label": "Portable Node.js",
+      "path": "/studio/app/tools/node-linux/bin/node",
+      "type": "file",
+      "exists": false,
+      "ok": false
+    },
+    {
+      "label": "Portable npm",
+      "path": "/studio/app/tools/node-linux/bin/npm",
+      "type": "file",
+      "exists": false,
+      "ok": false
+    },
+    {
+      "label": "Frontend build",
+      "path": "/studio/app/dist/index.html",
+      "type": "file",
+      "exists": true,
+      "ok": true
+    },
+    {
+      "label": "Models folder",
+      "path": "/studio/app/models",
+      "type": "directory",
+      "exists": true,
+      "writable": true,
+      "ok": true
+    },
+    {
+      "label": "Outputs folder",
+      "path": "/studio/app/outputs",
+      "type": "directory",
+      "exists": true,
+      "writable": true,
+      "ok": true
+    },
+    {
+      "label": "Chat history folder",
+      "path": "/studio/app/chat-history",
+      "type": "directory",
+      "exists": true,
+      "writable": true,
+      "ok": true
+    },
+    {
+      "label": "Transcriptions folder",
+      "path": "/studio/app/transcriptions",
+      "type": "directory",
+      "exists": true,
+      "writable": true,
+      "ok": true
+    },
+    {
+      "label": "TTS outputs folder",
+      "path": "/studio/app/tts-outputs",
+      "type": "directory",
+      "exists": true,
+      "writable": true,
+      "ok": true
+    },
+    {
+      "label": "Linux CPU backend",
+      "path": "/studio/app/backend/linux/cpu/sd-server-cpu",
+      "type": "file",
+      "exists": false,
+      "ok": false
+    },
+    {
+      "label": "Linux Vulkan backend",
+      "path": "/studio/app/backend/linux/vulkan/sd-server-vulkan",
+      "type": "file",
+      "exists": false,
+      "ok": false
+    },
+    {
+      "label": "Linux ROCm backend",
+      "path": "/studio/app/backend/linux/rocm/sd-server-rocm",
+      "type": "file",
+      "exists": false,
+      "ok": false
+    }
+  ],
+  "ports": {
+    "frontend": {
+      "port": 45015,
+      "available": false,
+      "inUse": true,
+      "expectedInUse": true,
+      "ok": true
+    },
+    "backend": {
+      "port": 8080,
+      "available": true,
+      "inUse": false,
+      "expectedInUse": false,
+      "preferred": 8080,
+      "selected": 8080,
+      "ok": true
+    }
+  },
+  "backend": {
+    "ready": false,
+    "running": false,
+    "error": null,
+    "settings": {
+      "model": null,
+      "steps": 20,
+      "cfgScale": 7,
+      "sampler": "euler_a",
+      "threads": 8,
+      "useGpu": true,
+      "backendType": "auto",
+      "vaeTiling": true,
+      "vaeOnCpu": false,
+      "flashAttn": true,
+      "width": 512,
+      "height": 512
+    },
+    "options": {
+      "options": [],
+      "unavailable": [
+        {
+          "id": "cpu",
+          "label": "CPU",
+          "reason": "Linux CPU backend is not installed. Run setup again to install app/backend/linux/cpu."
+        },
+        {
+          "id": "openvino-npu",
+          "label": "NPU (OpenVINO)",
+          "reason": "OpenVINO GenAI runtime is not installed. Run bash scripts/setup/setup-openvino-npu.sh first."
+        }
+      ],
+      "cudaAvailable": false,
+      "vulkanAvailable": false,
+      "rocmAvailable": false,
+      "metalAvailable": false,
+      "openvinoNpuAvailable": false,
+      "openvinoNpu": {
+        "supported": false,
+        "reason": "OpenVINO GenAI runtime is not installed. Run bash scripts/setup/setup-openvino-npu.sh first."
+      },
+      "openvinoModels": [
+        {
+          "id": "lcm-dreamshaper-v7-fp16",
+          "name": "LCM DreamShaper v7 FP16",
+          "repo": "OpenVINO/LCM_Dreamshaper_v7-fp16-ov",
+          "folder": "LCM_Dreamshaper_v7-fp16-ov",
+          "approxSize": "2.0 GB",
+          "resolution": "512x512",
+          "notes": "OpenVINO LCM image model. Uses CPU text encoder, NPU UNet, and GPU or CPU VAE decoder.",
+          "filename": "lcm-dreamshaper-v7-fp16",
+          "path": "/studio/app/openvino-models/LCM_Dreamshaper_v7-fp16-ov",
+          "installed": false,
+          "sizeBytes": 0,
+          "size": "0 B",
+          "format": "OpenVINO"
+        }
+      ],
+      "coremlNpu": {
+        "supported": false,
+        "reason": "Apple Silicon ANE (NPU) is only available on Apple Silicon macOS devices."
+      },
+      "defaultBackendType": "cpu"
+    }
+  },
+  "models": {
+    "count": 0,
+    "totalBytes": 0,
+    "totalSize": "0 B"
+  },
+  "outputs": {
+    "count": 0,
+    "totalBytes": 0,
+    "totalSize": "0 B"
+  },
+  "chat": {
+    "count": 0,
+    "totalBytes": 0,
+    "totalSize": "0 B"
+  },
+  "speech": {
+    "transcriptions": 0,
+    "totalBytes": 0,
+    "totalSize": "0 B"
+  },
+  "tts": {
+    "models": 0,
+    "outputs": 0,
+    "runtimeInstalled": false,
+    "totalBytes": 0,
+    "totalSize": "0 B"
+  },
+  "issues": [
+    "Portable Node.js is missing or not writable.",
+    "Portable npm is missing or not writable.",
+    "No Linux backend binary is installed."
+  ]
+}

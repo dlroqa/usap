@@ -1,0 +1,4 @@
+node_modules/
+test-results/
+playwright-report/
+specs/__screenshots__/local/

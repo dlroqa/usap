@@ -1,0 +1,7 @@
+{
+  "supported": false,
+  "reason": "OpenVINO GenAI runtime is not installed. Run bash scripts/setup/setup-openvino-npu.sh first.",
+  "npu": null,
+  "python": "",
+  "models": []
+}
