@@ -48,3 +48,10 @@ __pycache__/
 .DS_Store
 ._*
 Thumbs.db
+
+# usap: local-only repository backups must never be committed (see docs/audit/IMPORT_PROVENANCE.md)
+*.bundle
+*.git.tar*
+/backups/
+/Backups/
+*-backup.tar*
