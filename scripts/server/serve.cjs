@@ -3310,9 +3310,10 @@ function getBackendOptions() {
   const rocmInstalled = osPlatform === "linux" && fs.existsSync(BACKEND_PATHS.linuxRocm);
   const rocmAvailable = rocmInstalled && hasAmdGpu() && backendAccepts(BACKEND_PATHS.linuxRocm, "rocm");
   const metalInstalled = osPlatform === "darwin" && fs.existsSync(BACKEND_PATHS.mac);
-  // The macOS sd build also contains ggml's CPU backend. It is the only path where Metal lacks ops
-  // the model needs (e.g. 'NORM' on paravirtual GPUs), and the default on Intel Macs.
-  const macCpuAvailable = metalInstalled && backendAccepts(BACKEND_PATHS.mac, "cpu");
+  // The macOS sd build always contains ggml's CPU backend ("--backend cpu"). It is the fallback
+  // where Metal lacks ops the model needs (e.g. 'NORM' on paravirtual GPUs) and the default on
+  // Intel Macs. Like Metal, it is not probed: a cold first exec on macOS can exceed the 5 s probe.
+  const macCpuAvailable = metalInstalled;
   const cpuInstalled = (osPlatform === "linux" && fs.existsSync(BACKEND_PATHS.linuxCpu)) ||
                         (osPlatform === "win32" && fs.existsSync(BACKEND_PATHS.cpu)) ||
                         macCpuAvailable;
