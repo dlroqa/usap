@@ -102,12 +102,13 @@ jobs:
       matrix:
         include:
           # Pixel baselines are kept for each macOS architecture (required by the dual-arch policy).
-          - { label: macos-arm64,  runner: macos-15,       arch: arm64,  visual: true }
-          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, visual: true }
+          - { label: macos-arm64,  target: macos-arm64, runner: macos-15,       arch: arm64,  visual: true }
+          - { label: macos-x86_64, target: macos-x64,   runner: macos-15-intel, arch: x86_64, visual: true }
           # Windows: behaviour, a11y and live-backend specs; no pixel baselines.
-          - { label: windows-x64,  runner: windows-2025,   arch: x86_64, visual: false }
+          - { label: windows-x64,  target: windows-x64, runner: windows-2025,   arch: x86_64, visual: false }
     env:
-      RENDER_TARGET: ${{ matrix.label }}
+      # Snapshot directory name; must stay filesystem/Playwright-safe (no underscores).
+      RENDER_TARGET: ${{ matrix.target }}
     defaults:
       run:
         shell: bash
@@ -161,7 +162,7 @@ jobs:
         if: env.UPDATE == '1' && matrix.visual
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: proposed-baselines-${{ matrix.label }}
-          path: tests/e2e/specs/__screenshots__/${{ matrix.label }}/
+          name: proposed-baselines-${{ matrix.target }}
+          path: tests/e2e/specs/__screenshots__/${{ matrix.target }}/
           retention-days: 7
           if-no-files-found: error

@@ -24,7 +24,7 @@ The Linux target renders in `mcr.microsoft.com/playwright:v1.65.0-noble`, pinned
 |---|---|---|
 | `render (linux-x64)` | ubuntu-24.04 + pinned container | `specs/__screenshots__/linux-x64/` |
 | `render (macos-arm64)` | macos-15 | `specs/__screenshots__/macos-arm64/` |
-| `render (macos-x86_64)` | macos-15-intel | `specs/__screenshots__/macos-x86_64/` |
+| `render (macos-x86_64)` | macos-15-intel | `specs/__screenshots__/macos-x64/` |
 | `render (windows-x64)` | windows-2025 | none (behaviour, a11y, live backend only) |
 
 ## Changing baselines (owner approval required)

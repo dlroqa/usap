@@ -6,7 +6,7 @@ import { defineConfig, devices } from "@playwright/test";
 const PORT = Number(process.env.E2E_PORT || 14720);
 const CI = !!process.env.CI;
 // Screenshot baselines are stored per render target (font rasterisation differs by
-// OS/CPU): linux-x64 (Playwright container), macos-arm64, macos-x86_64. Local runs use
+// OS/CPU): linux-x64 (Playwright container), macos-arm64, macos-x64. Local runs use
 // "local", which is git-ignored.
 const RENDER_TARGET = process.env.RENDER_TARGET || "local";
 
