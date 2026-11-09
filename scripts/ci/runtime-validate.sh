@@ -61,6 +61,8 @@ OS="$(uname -s)"
 case "$OS" in Darwin) PLAT=mac ;; Linux) PLAT=linux ;; MINGW*|MSYS*|CYGWIN*) PLAT=win ;; *) PLAT=unknown ;; esac
 NODE_ARCH=$([[ "$EXPECTED_ARCH" == arm64 ]] && echo arm64 || echo x64)
 EXE=$([[ "$PLAT" == win ]] && echo .exe || echo "")
+# Hosted Windows runners expose Python as "python", not "python3".
+PY=python3; for c in python3 python; do "$c" -c "import zlib" >/dev/null 2>&1 && { PY="$c"; break; }; done
 
 # ── Hardware / translation ──────────────────────────────────────────────────
 if [[ "$PLAT" == mac ]]; then
@@ -71,7 +73,10 @@ if [[ "$PLAT" == mac ]]; then
     record "native hardware" FAIL "hw.optional.arm64=$hw translated=$tr"
   fi
 else
-  m="$(uname -m)"; [[ "$m" == "$EXPECTED_ARCH" ]] && record "native hardware" PASS "$OS $m" || record "native hardware" FAIL "$OS $m"
+  m="$(uname -m)"; extra=""
+  # Git Bash on Windows: also require a native AMD64 OS (not x64 emulation on Windows on Arm).
+  if [[ "$PLAT" == win ]]; then extra=" PROCESSOR_ARCHITECTURE=${PROCESSOR_ARCHITECTURE:-?}"; [[ "${PROCESSOR_ARCHITECTURE:-}" == AMD64 ]] || m="$m(non-native)"; fi
+  [[ "$m" == "$EXPECTED_ARCH" ]] && record "native hardware" PASS "$OS $m$extra" || record "native hardware" FAIL "$OS $m$extra"
 fi
 
 # ── Binaries: architecture + executable bit + startup ──────────────────────
@@ -196,7 +201,7 @@ if fetch_verified "https://huggingface.co/second-state/stable-diffusion-v1-5-GGU
     t1=$(date +%s)
     gen="$(curl -s -m 1800 -X POST -H 'content-type: application/json' --data '{"prompt":"a red apple on a wooden table","negative_prompt":"","width":256,"height":256,"steps":4,"cfg_scale":7,"seed":42,"sampler_name":"euler_a","batch_size":1}' "$BASE/sdapi/v1/txt2img")"
     echo "$gen" | json_get images.0 | base64 --decode > "$ROOT/ci-image.png" 2>/dev/null
-    stats="$(python3 -c 'import struct,zlib,sys
+    stats="$("$PY" -c 'import struct,zlib,sys
 d=open(sys.argv[1],"rb").read()
 assert d[:8]==b"\x89PNG\r\n\x1a\n"
 w,h=struct.unpack(">II",d[16:24]); i=8; idat=b""
