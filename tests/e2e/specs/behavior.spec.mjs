@@ -174,19 +174,28 @@ test.describe("chat error states", () => {
     await expect.poll(() => JSON.stringify([...mockApi.conversations.values()].map((c) => c.messages))).toContain("Error: Fixture backend exploded");
   });
 
-  // Known pre-existing defects D-1/D-3 (docs/audit/UI_PRESERVATION_BASELINE.md): the
-  // pending requestAnimationFrame token flush in TextChat.jsx is never cancelled, so when it
-  // lands after the stream settles it overwrites the final message. In real use this is a
-  // race; these tests force the late-flush ordering so the outcome is deterministic.
-  // Remove test.fail when the defect is fixed.
+  // Regression tests for D-1/D-3 (docs/audit/UI_PRESERVATION_BASELINE.md): a pending
+  // requestAnimationFrame token flush used to land after the stream settled and overwrite
+  // the final message. In real use that is a race; these tests force the late-flush
+  // ordering so the outcome is deterministic.
   const forceLateTokenFlush = (page) =>
     page.addInitScript(() => {
+      // Delay every animation frame by 150 ms, keeping rAF/cAF semantics (own ids; cancel works).
       const raf = window.requestAnimationFrame.bind(window);
-      window.requestAnimationFrame = (cb) => setTimeout(() => raf(cb), 150);
+      const pending = new Map();
+      let nextId = 0;
+      window.requestAnimationFrame = (cb) => {
+        const id = ++nextId;
+        pending.set(id, setTimeout(() => { pending.delete(id); raf(cb); }, 150));
+        return id;
+      };
+      window.cancelAnimationFrame = (id) => {
+        clearTimeout(pending.get(id));
+        pending.delete(id);
+      };
     });
 
   test("a streamed backend error shows its reason in the conversation [D-1]", async ({ page, mockApi }) => {
-    test.fail(true, "D-1: error reason overwritten by deferred token flush (original UI behaviour)");
     mockApi.chat = partialThenError;
     await forceLateTokenFlush(page);
     await openRoute(page, "chat");
@@ -200,7 +209,6 @@ test.describe("chat error states", () => {
   });
 
   test("a finished reply shows a completed thought process [D-3]", async ({ page, mockApi }) => {
-    test.fail(true, "D-3: final generation stats overwritten by deferred token flush (original UI behaviour)");
     await forceLateTokenFlush(page);
     await openRoute(page, "chat");
     await page.getByRole("textbox", { name: "Message" }).fill("Say hello");

@@ -199,6 +199,17 @@ function TextChat({
   // rAF batching: accumulate token updates and flush once per frame
   const tokenBufferRef = useRef(null);
   const rafRef = useRef(null);
+  // Drop a pending token flush once a stream settles. Otherwise a frame that fires after
+  // the final/error message is set would overwrite it with stale streaming state
+  // (hidden error reason, or a finished reply stuck on "Thinking...").
+  // Returns the dropped buffer so the abort path can keep the last tokens received.
+  const cancelPendingTokenFlush = () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    const pending = tokenBufferRef.current;
+    tokenBufferRef.current = null;
+    return pending;
+  };
   // Debounced stats: only update stats pill every 250ms
   const statsDebounceRef = useRef(null);
 
@@ -804,6 +815,7 @@ function TextChat({
           });
         }
       });
+      cancelPendingTokenFlush();
 
       const completedAt = performance.now();
       let finalThinkingDuration = thinkingDuration;
@@ -860,11 +872,20 @@ function TextChat({
       // Clean up attached files on success
       setAttachments([]);
     } catch (err) {
+      const pendingTokens = cancelPendingTokenFlush();
       if (err.name === "AbortError") {
         setMessages((prev) => {
           const updated = [...prev];
           if (updated.length > 0 && updated[updated.length - 1].role === "assistant") {
-            const lastMsg = updated[updated.length - 1];
+            const lastMsg = {
+              ...updated[updated.length - 1],
+              ...(pendingTokens ? {
+                content: pendingTokens.content,
+                reasoning: pendingTokens.reasoning,
+                thinkingDuration: pendingTokens.thinkingDuration,
+                generationStats: pendingTokens.stats,
+              } : {}),
+            };
             updated[updated.length - 1] = {
               ...lastMsg,
               generationStats: lastMsg.generationStats ? {
