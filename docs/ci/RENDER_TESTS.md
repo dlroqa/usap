@@ -31,7 +31,8 @@ The Linux target renders in `mcr.microsoft.com/playwright:v1.65.0-noble`, pinned
 Baselines are never written in a normal run (`updateSnapshots: "none"` under CI).
 1. Push to `ui-baseline/<topic>`, or run *render-e2e* manually with `update_baselines`. The job **refuses** unless `app/frontend` is byte-identical to `tests/e2e/ORIGINAL_UI_COMMIT`.
 2. Download the `proposed-baselines-*` artifacts, review every image, and commit them in a PR that says why.
-3. After an owner-approved UI change, the same PR must update `ORIGINAL_UI_COMMIT` and explain the change. Never regenerate baselines just to make CI green.
+3. After an owner-approved UI change, the same PR points `ORIGINAL_UI_COMMIT` at the commit that holds the approved frontend (the file means *last owner-approved frontend state*; it started as upstream `a55c42c`). It then commits **only the baselines the change affects**, with the defect, before/after images and the reason in the PR. Unaffected proposals must match the existing baselines and are not committed. Never regenerate baselines just to make CI green.
+   * D-2 (mobile sidebar drawer): `mobile-light-*.png` for each target, approved 2026-11-09.
 
 ## Local debugging
 ```bash

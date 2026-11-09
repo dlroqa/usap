@@ -30,7 +30,7 @@ Evidence: `render-e2e.yml` runs; baselines live in `tests/e2e/specs/__screenshot
 | ID | Defect | Evidence | Test |
 |---|---|---|---|
 | D-1 | When a stream errors after partial output, the error reason is not shown: the pending `requestAnimationFrame` token flush (`TextChat.jsx:784-803`, never cancelled) overwrites the `Error: …` message with the partial text. The saved conversation keeps the error text, so the UI and the stored history disagree. | code; a timing race in real use (seen locally, and also *not* seen in some CI runs) | `behavior.spec.mjs` "[D-1]" forces the late-flush ordering, `test.fail` |
-| D-2 | At phone width (390 px) the 260 px sidebar stays open, leaving the content column unreadably narrow (text wraps per letter). | baseline `mobile-light-*.png` | captured as-is in visual baselines |
+| D-2 | At phone width (390 px) the 260 px sidebar stays open, leaving the content column unreadably narrow (text wraps per letter). | baseline `mobile-light-*.png` | **Fixed** (≤640 px: overlay drawer, starts closed, closes on navigation; desktop unchanged). Only the `mobile-light-*` baselines were updated; regression tests in `behavior.spec.mjs` "[D-2]" |
 | D-3 | Same root cause as D-1 on success: the stale flush can overwrite the final `generationStats`, leaving a finished reply showing "Thinking..." until reload. Timing-dependent (seen in 2 of 4 local runs). | local runs | `behavior.spec.mjs` "[D-3]" (forced ordering, `test.fail`); the visual test captures the deterministic saved state |
 | A-1 | `label-content-name-mismatch` (WCAG 2.5.3): the image-size chip's accessible name "Image size 1024 by 1024" doesn't contain its visible text. | axe | `a11y-baseline.json` (images, both themes) |
 
