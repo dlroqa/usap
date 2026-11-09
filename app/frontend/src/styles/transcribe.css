@@ -1,0 +1,376 @@
+/* Transcribe (speech-to-text) screen. Builds on the shared page classes in App.css. */
+
+.transcribe-page {
+  --page-column: 760px;
+}
+
+.transcribe-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.transcribe-header-actions .chat-model-picker {
+  min-width: 0;
+}
+
+.transcribe-menu-note {
+  padding-bottom: 8px;
+}
+
+.transcribe-options {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.transcribe-options .icon-btn.active {
+  background: var(--sidebar-active, var(--md-sys-color-surface-variant));
+  color: var(--md-sys-color-on-surface);
+}
+
+.transcribe-popover {
+  top: calc(100% + 8px);
+  right: 0;
+  width: 300px;
+}
+
+.transcribe-popover-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.transcribe-input {
+  height: 36px;
+  width: 100%;
+  padding: 0 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--md-sys-color-surface);
+  color: var(--md-sys-color-on-surface);
+  font: inherit;
+  font-size: 0.88rem;
+}
+
+.transcribe-input:focus {
+  border-color: color-mix(in srgb, var(--md-sys-color-on-surface) 30%, transparent);
+}
+
+.transcribe-popover-action {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.transcribe-popover-action + .transcribe-popover-action {
+  margin-top: 8px;
+}
+
+.transcribe-notice {
+  margin-bottom: 12px;
+}
+
+/* Drop zone */
+.transcribe-dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 40px 24px 28px;
+  border: 1.5px dashed var(--border-color);
+  border-radius: 16px;
+  background: var(--md-sys-color-surface);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.transcribe-dropzone.dragging {
+  border-color: var(--md-sys-color-on-surface);
+  background: var(--sidebar-hover, var(--md-sys-color-surface));
+}
+
+.transcribe-record-btn {
+  position: relative;
+  width: 72px;
+  height: 72px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: var(--md-sys-color-on-surface);
+  color: var(--md-sys-color-surface);
+  cursor: pointer;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.transcribe-record-btn:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.transcribe-record-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.transcribe-record-btn.recording::after {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border: 2px solid var(--md-sys-color-on-surface);
+  border-radius: 50%;
+  opacity: 0;
+  pointer-events: none;
+  animation: transcribe-pulse 1.6s ease-out infinite;
+}
+
+@keyframes transcribe-pulse {
+  0% { transform: scale(0.92); opacity: 0.45; }
+  100% { transform: scale(1.25); opacity: 0; }
+}
+
+.transcribe-dropzone-title {
+  margin-top: 16px;
+  font-size: 1rem;
+  font-weight: 500;
+  color: var(--md-sys-color-on-surface);
+}
+
+.transcribe-elapsed {
+  font-variant-numeric: tabular-nums;
+}
+
+.transcribe-dropzone-hint {
+  margin-top: 4px;
+  max-width: 420px;
+  font-size: 0.82rem;
+  color: var(--md-sys-color-outline);
+}
+
+.transcribe-dropzone-actions {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 16px;
+}
+
+.transcribe-upload {
+  position: relative;
+}
+
+.transcribe-upload.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Visually hidden but focusable; the label shows the focus ring. */
+.transcribe-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.transcribe-upload:focus-within,
+.transcribe-select-chip:focus-within {
+  outline: 2px solid var(--md-sys-color-on-surface);
+  outline-offset: 2px;
+}
+
+.transcribe-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.transcribe-select-chip {
+  position: relative;
+}
+
+.transcribe-select-chip svg {
+  color: var(--md-sys-color-outline);
+}
+
+.transcribe-select-chip select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  font: inherit;
+}
+
+.transcribe-select-chip select:disabled {
+  cursor: not-allowed;
+}
+
+/* Ready-to-transcribe row */
+.transcribe-pending {
+  margin-top: 16px;
+}
+
+.transcribe-pending .row-item {
+  align-items: flex-start;
+  padding: 12px 14px;
+}
+
+.transcribe-pending-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--md-sys-color-outline);
+}
+
+.transcribe-pending .row-item-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.transcribe-inline-progress {
+  font-size: 0.8rem;
+}
+
+.transcribe-audio {
+  display: block;
+  width: 100%;
+  height: 32px;
+  margin-top: 8px;
+}
+
+.transcribe-pending .row-item-actions {
+  align-self: center;
+}
+
+/* Transcript card */
+.transcribe-result {
+  margin-top: 24px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: var(--md-sys-color-surface);
+  overflow: hidden;
+}
+
+.transcribe-result-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 10px 12px 10px 16px;
+  border-bottom: 1px solid var(--border-color-muted);
+}
+
+.transcribe-result-title {
+  flex: 1 1 180px;
+  min-width: 0;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--md-sys-color-on-surface);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transcribe-result-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.transcribe-small-chip {
+  height: 34px;
+  padding: 0 12px;
+}
+
+.transcribe-text {
+  display: block;
+  width: 100%;
+  min-height: 200px;
+  field-sizing: content;
+  padding: 16px 18px 20px;
+  border: none;
+  outline: none;
+  resize: vertical;
+  background: transparent;
+  color: var(--md-sys-color-on-surface);
+  font: inherit;
+  font-size: 0.95rem;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.transcribe-text:focus-visible {
+  outline: 2px solid var(--md-sys-color-on-surface);
+  outline-offset: -2px;
+}
+
+.transcribe-segments {
+  list-style: none;
+  margin: 0;
+  padding: 8px 0 12px;
+}
+
+.transcribe-segment {
+  display: grid;
+  grid-template-columns: minmax(0, max-content) 1fr;
+  align-items: baseline;
+  gap: 16px;
+  padding: 6px 18px;
+  line-height: 1.6;
+}
+
+.transcribe-segment-time {
+  font-size: 0.78rem;
+  color: var(--md-sys-color-outline);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.transcribe-segment-text {
+  font-size: 0.95rem;
+  color: var(--md-sys-color-on-surface);
+}
+
+.transcribe-spin {
+  animation: transcribe-spin 0.9s linear infinite;
+}
+
+@keyframes transcribe-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .transcribe-record-btn.recording::after {
+    animation: none;
+    opacity: 0.35;
+    transform: scale(1.08);
+  }
+
+  .transcribe-spin {
+    animation-duration: 2.4s;
+  }
+}
+
+@media (max-width: 560px) {
+  .transcribe-dropzone {
+    padding: 32px 16px 24px;
+  }
+
+  .transcribe-pending .row-item {
+    flex-wrap: wrap;
+  }
+
+  .transcribe-segment {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+}
