@@ -91,4 +91,13 @@ test.describe("mobile 390x844", () => {
       await expect(page).toHaveScreenshot(`mobile-light-${route}.png`);
     });
   }
+
+  // D-2: the open sidebar is an overlay drawer at phone width (approved 2026-11-09).
+  test("sidebar drawer open - light", async ({ page, mockApi }) => {
+    await openRoute(page, "chat", { theme: "light" });
+    await page.getByRole("button", { name: "Open sidebar" }).click();
+    await page.getByRole("navigation", { name: "Main" }).waitFor();
+    await settle(page);
+    await expect(page).toHaveScreenshot("mobile-light-sidebar-open.png");
+  });
 });
