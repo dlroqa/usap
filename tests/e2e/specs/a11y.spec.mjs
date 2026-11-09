@@ -41,3 +41,13 @@ for (const theme of ["light", "dark"]) {
     });
   }
 }
+
+// Regression for A-1 (WCAG 2.5.3 label-in-name): the image-size chip's accessible name
+// must contain its visible text so voice-control users can activate it by what they see.
+test("image size chip: accessible name contains its visible label", async ({ page, mockApi }) => {
+  await openRoute(page, "images", { theme: "light" });
+  const chip = page.locator("button.chat-composer-chip[aria-haspopup='menu']").filter({ hasText: /\d+×\d+/ }).first();
+  const visible = (await chip.innerText()).trim();
+  expect(visible).toMatch(/\d+×\d+/);
+  await expect(chip).toHaveAccessibleName(new RegExp(visible.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});

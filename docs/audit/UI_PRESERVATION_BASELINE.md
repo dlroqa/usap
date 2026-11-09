@@ -26,12 +26,13 @@ Evidence: `render-e2e.yml` runs; baselines live in `tests/e2e/specs/__screenshot
 - [x] Pixel-identical rendering of the captured states per target; no new axe violations; no console errors; no unexpected API calls.
 - [ ] Inference, downloads, recording and playback flows are **unverified** (no models or native engines in CI).
 
-## Pre-existing defects found (characterised, NOT fixed; fixes need an owner-approved spec)
+## Pre-existing defects found
+Owner approved fixing D-1/D-3, D-2 and A-1 (2026-11-09) without redesign.
 | ID | Defect | Evidence | Test |
 |---|---|---|---|
-| D-1 | When a stream errors after partial output, the error reason is not shown: the pending `requestAnimationFrame` token flush (`TextChat.jsx:784-803`, never cancelled) overwrites the `Error: …` message with the partial text. The saved conversation keeps the error text, so the UI and the stored history disagree. | code; a timing race in real use (seen locally, and also *not* seen in some CI runs) | `behavior.spec.mjs` "[D-1]" forces the late-flush ordering, `test.fail` |
+| D-1 | When a stream errors after partial output, the error reason is not shown: the pending `requestAnimationFrame` token flush (`TextChat.jsx:784-803`, never cancelled) overwrites the `Error: …` message with the partial text. The saved conversation keeps the error text, so the UI and the stored history disagree. | code; a timing race in real use (seen locally, and also *not* seen in some CI runs) | **Fixed** (`cancelPendingTokenFlush` in `TextChat.jsx`): `behavior.spec.mjs` "[D-1]" regression test (forced late flush) |
 | D-2 | At phone width (390 px) the 260 px sidebar stays open, leaving the content column unreadably narrow (text wraps per letter). | baseline `mobile-light-*.png` | **Fixed** (≤640 px: overlay drawer, starts closed, closes on navigation; desktop unchanged). Only the `mobile-light-*` baselines were updated; regression tests in `behavior.spec.mjs` "[D-2]" |
-| D-3 | Same root cause as D-1 on success: the stale flush can overwrite the final `generationStats`, leaving a finished reply showing "Thinking..." until reload. Timing-dependent (seen in 2 of 4 local runs). | local runs | `behavior.spec.mjs` "[D-3]" (forced ordering, `test.fail`); the visual test captures the deterministic saved state |
-| A-1 | `label-content-name-mismatch` (WCAG 2.5.3): the image-size chip's accessible name "Image size 1024 by 1024" doesn't contain its visible text. | axe | `a11y-baseline.json` (images, both themes) |
+| D-3 | Same root cause as D-1 on success: the stale flush can overwrite the final `generationStats`, leaving a finished reply showing "Thinking..." until reload. Timing-dependent (seen in 2 of 4 local runs). | local runs | **Fixed** (same change): `behavior.spec.mjs` "[D-3]" regression test |
+| A-1 | `label-content-name-mismatch` (WCAG 2.5.3): the image-size chip's accessible name "Image size 1024 by 1024" doesn't contain its visible text. | axe | **Fixed**: accessible name now starts with the visible label; `a11y-baseline.json` is back to 0 for images, plus the chip test in `a11y.spec.mjs` |
 
-Suggested D-1/D-3 fix (small, no visual change intended): call `cancelAnimationFrame(rafRef.current)` and clear `tokenBufferRef` before the final/error `setMessages`. It needs a spec, plus before/after baselines showing only the intended difference.
+D-1/D-3 fix: the pending flush is cancelled before the final/error `setMessages`. On abort, the last buffered tokens are applied so no received text is lost. The regression tests fail on the original code (10/10) and pass on the fix (20/20 over 10 repeats).
