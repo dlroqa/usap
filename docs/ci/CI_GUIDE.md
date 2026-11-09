@@ -15,7 +15,7 @@ macOS status per architecture: see `MACOS_COMPATIBILITY.md`.
 Artifacts (7-day retention): `test-results-<label>` (JUnit XML) and `frontend-dist` (web assets only; **not** a portable app bundle).
 
 ## What CI does *not* prove
-Inference with real models, GPU/NPU backends, or the full first-run launcher setup (it downloads multi-GB runtimes). See `RUNNER_REQUIREMENTS.md` (PR 03).
+Inference with real models, GPU/NPU backends, or the full first-run launcher setup (it downloads multi-GB runtimes). See [RUNNER_REQUIREMENTS.md](RUNNER_REQUIREMENTS.md) and the `native-runtime` workflow.
 
 ## Running the same commands locally
 ```bash

@@ -198,6 +198,7 @@ api POST /api/tts/stop '{}' >/dev/null
 # recorded as UNAVAILABLE / UNSUPPORTED with the reason (FAIL when REQUIRE_GPU=1).
 SD_MODEL="stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf"
 REQUIRE_GPU="${REQUIRE_GPU:-0}"
+IMAGE_SIZE="${IMAGE_SIZE:-256}"; IMAGE_STEPS="${IMAGE_STEPS:-4}"
 SERVER_LOG="${SERVER_LOG:-}"
 
 png_stats() {
@@ -230,7 +231,7 @@ image_test() { # backend id (cpu|metal|vulkan|cuda|rocm)
     return
   fi
   t0=$(date +%s)
-  start="$(api POST /api/restart-backend "{\"model\":\"$SD_MODEL\",\"width\":256,\"height\":256,\"steps\":4,\"backend_type\":\"$B\",\"use_gpu\":$([[ $B == cpu ]] && echo false || echo true)}")"
+  start="$(api POST /api/restart-backend "{\"model\":\"$SD_MODEL\",\"width\":$IMAGE_SIZE,\"height\":$IMAGE_SIZE,\"steps\":$IMAGE_STEPS,\"backend_type\":\"$B\",\"use_gpu\":$([[ $B == cpu ]] && echo false || echo true)}")"
   for _ in $(seq 1 180); do st="$(api GET /api/backend-status)"; [[ "$(echo "$st" | json_get ready)" == true || -n "$(echo "$st" | json_get error)" ]] && break; sleep 5; done
   if [[ "$(echo "$st" | json_get ready)" != true ]]; then
     gpu_fail "$label load" "start: ${start:0:150} status: ${st:0:250}"; api POST /api/stop-backend '{}' >/dev/null; return
@@ -238,13 +239,13 @@ image_test() { # backend id (cpu|metal|vulkan|cuda|rocm)
   local mode; mode="$(echo "$st" | json_get loading.backendMode)"; [[ -z "$mode" ]] && mode="$(echo "$st" | json_get settings.backendMode)"
   record "$label load" PASS "$(( $(date +%s) - t0 ))s; mode ${mode:-?}"
   t1=$(date +%s)
-  gen="$(curl -s -m 1800 -X POST -H 'content-type: application/json' --data '{"prompt":"a red apple on a wooden table","negative_prompt":"","width":256,"height":256,"steps":4,"cfg_scale":7,"seed":42,"sampler_name":"euler_a","batch_size":1}' "$BASE/sdapi/v1/txt2img")"
+  gen="$(curl -s -m 2700 -X POST -H 'content-type: application/json' --data "{\"prompt\":\"a red apple on a wooden table\",\"negative_prompt\":\"\",\"width\":$IMAGE_SIZE,\"height\":$IMAGE_SIZE,\"steps\":$IMAGE_STEPS,\"cfg_scale\":7,\"seed\":42,\"sampler_name\":\"euler_a\",\"batch_size\":1}" "$BASE/sdapi/v1/txt2img")"
   rm -f "$ROOT/ci-image-$B.png"
   echo "$gen" | json_get images.0 | base64 --decode > "$ROOT/ci-image-$B.png" 2>/dev/null
   stats="$(png_stats "$ROOT/ci-image-$B.png")"
   set -- $stats
-  if [[ "${1:-0}" == 256 && "${2:-0}" == 256 && "${3:-0}" -gt 20 ]]; then
-    record "$label inference" PASS "$(( $(date +%s) - t1 ))s: 256x256 PNG, 4 steps, $3 distinct sampled byte values (not blank)"
+  if [[ "${1:-0}" == "$IMAGE_SIZE" && "${2:-0}" == "$IMAGE_SIZE" && "${3:-0}" -gt 20 ]]; then
+    record "$label inference" PASS "$(( $(date +%s) - t1 ))s: ${IMAGE_SIZE}x${IMAGE_SIZE} PNG, $IMAGE_STEPS steps, $3 distinct sampled byte values (not blank)"
   else
     gpu_fail "$label inference" "stats='$stats' resp=${gen:0:200}"
   fi

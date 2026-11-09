@@ -34,7 +34,7 @@ jobs:
   setup-validate:
     name: native-runtime (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 75
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +42,9 @@ jobs:
           # image: backends exercised for image generation. "cpu" must pass; GPU backends are
           # attempted and recorded as UNSUPPORTED/UNAVAILABLE on hosted runners (no usable GPU).
           - { label: macos-arm64,  runner: macos-15,       arch: arm64,  launcher: ./mac.sh,   image: "cpu metal" }
-          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, launcher: ./mac.sh,   image: "cpu metal" }
+          # Intel: upstream's universal sd has an SSE3-only x86_64 slice (no AVX/AVX2/FMA), so CPU
+          # generation is ~75x slower than Linux x64; a smaller image keeps the proof within the timeout.
+          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, launcher: ./mac.sh,   image: "cpu metal", size: 128, steps: 2 }
           - { label: linux-x64,    runner: ubuntu-24.04,   arch: x86_64, launcher: ./linux.sh, image: "cpu vulkan" }
           # Git Bash drives windows.bat through cmd; piped empty lines answer its "press any key" prompts.
           - { label: windows-x64,  runner: windows-2025,   arch: x86_64, launcher: "cmd //c windows.bat", image: "cpu vulkan" }
@@ -90,10 +92,11 @@ jobs:
           {
             echo "## Native runtime validation (${{ matrix.label }})"
             EXPECTED_ARCH=${{ matrix.arch }} BASE="http://127.0.0.1:$FRONTEND_PORT" RESULTS=ci-logs/runtime-results.jsonl \
-              IMAGE_BACKENDS="${{ matrix.image }}" SERVER_LOG=ci-logs/first-launch.log \
+              IMAGE_BACKENDS="${{ matrix.image }}" IMAGE_SIZE="${{ matrix.size || 256 }}" IMAGE_STEPS="${{ matrix.steps || 4 }}" \
+              SERVER_LOG=ci-logs/first-launch.log \
               bash scripts/ci/runtime-validate.sh
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          for f in ci-image-*.png; do [ -f "$f" ] && cp "$f" "ci-logs/generated-${f#ci-}"; done
+          for f in ci-image-*.png; do [ -s "$f" ] && cp "$f" "ci-logs/generated-${f#ci-}"; done; true
           ! grep -q '"status":"FAIL"' ci-logs/runtime-results.jsonl
 
       - name: Stop first launch

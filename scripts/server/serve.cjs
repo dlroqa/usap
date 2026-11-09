@@ -4991,7 +4991,8 @@ async function startBackend(settings = {}) {
       backendLoadState.backendMode = "ROCm GPU";
       currentSettings.backendMode = "ROCm GPU";
     }
-    if (cleanOutput.includes("ggml_metal")) {
+    // ggml lists the Metal device even when sd runs with --backend cpu; keep the CPU label then.
+    if (cleanOutput.includes("ggml_metal") && requestedBackend !== "cpu") {
       backendLoadState.backendMode = "Metal GPU";
       currentSettings.backendMode = "Metal GPU";
     }
