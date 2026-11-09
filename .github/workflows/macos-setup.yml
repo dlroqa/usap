@@ -77,6 +77,7 @@ jobs:
             EXPECTED_ARCH=${{ matrix.arch }} BASE="http://127.0.0.1:$FRONTEND_PORT" RESULTS=ci-logs/runtime-results.jsonl \
               bash scripts/ci/macos-runtime-validate.sh
           } | tee -a "$GITHUB_STEP_SUMMARY"
+          cp ci-image.png ci-logs/generated-image.png 2>/dev/null || true
           ! grep -q '"status":"FAIL"' ci-logs/runtime-results.jsonl
 
       - name: Stop first launch

@@ -77,16 +77,15 @@ check_binary "llama-server" "$APP/llm-backend/mac/$LLAMA_DIR/llama-server" 1 && 
 check_binary "whisper-cli" "$APP/speech-backend/mac/cpu/whisper-cli" 1 && {
   "$APP/speech-backend/mac/cpu/whisper-cli" --help >/dev/null 2>&1 && record "whisper-cli startup" PASS "--help exits 0" || record "whisper-cli startup" FAIL "--help failed"
 }
-if [[ "$EXPECTED_ARCH" == arm64 ]]; then
-  check_binary "sd (image, Metal)" "$APP/backend/mac/sd" 1 && {
-    "$APP/backend/mac/sd" --help >/dev/null 2>&1; rc=$?
-    [[ $rc == 0 || $rc == 1 ]] && record "sd startup" PASS "--help ran (exit $rc), dylibs resolved" || record "sd startup" FAIL "exit $rc"
-  }
-else
-  [[ ! -e "$APP/backend/mac/sd" ]] && record "no arm64-only image binary on Intel" PASS "app/backend/mac/sd absent" || record "no arm64-only image binary on Intel" FAIL "$(archs_of "$APP/backend/mac/sd")"
-  opts="$(api GET /api/backend-options)"
-  [[ "$opts" == *"not available on Intel Macs"* ]] && record "Intel image message" PASS "backend-options explains image generation is unavailable" || record "Intel image message" FAIL "${opts:0:200}"
-fi
+check_binary "sd (image)" "$APP/backend/mac/sd" 1 && {
+  "$APP/backend/mac/sd" --help >/dev/null 2>&1; rc=$?
+  [[ $rc == 0 || $rc == 1 ]] && record "sd startup" PASS "--help ran (exit $rc), dylibs resolved" || record "sd startup" FAIL "exit $rc"
+}
+for lib in "$APP"/backend/mac/*.dylib; do
+  [[ -e "$lib" ]] || continue
+  a="$(archs_of "$lib")"
+  [[ "$a" == *"$EXPECTED_ARCH"* ]] && record "dylib $(basename "$lib")" PASS "$a" || record "dylib $(basename "$lib")" FAIL "$a"
+done
 # Native Node addons used by Kokoro TTS must load in the portable Node.
 addons="$(cd "$APP/tts-runtime" && "$APP/tools/node-mac/bin/node" -e '
   const o = require("onnxruntime-node"); const s = require("sharp");
@@ -150,8 +149,41 @@ else
 fi
 api POST /api/tts/stop '{}' >/dev/null
 
-if [[ "$EXPECTED_ARCH" == arm64 ]]; then
-  record "Image generation inference" UNVERIFIED "no small, license-clear SD model fits CI; needs provisioned Apple Silicon hardware"
+# Image: Stable Diffusion 1.5 pruned-emaonly Q4_0 GGUF (CreativeML OpenRAIL-M), pinned.
+SD_MODEL="stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf"
+if fetch_verified "https://huggingface.co/second-state/stable-diffusion-v1-5-GGUF/resolve/031b5f5df991f511b3f5fa8fed6d99048ababb69/$SD_MODEL" \
+     b8944e9fe0b69b36ae1b5bb0185b3a7b8ef14347fe0fa9af6c64c4829022261f "$CACHE/$SD_MODEL"; then
+  cp "$CACHE/$SD_MODEL" "$APP/models/$SD_MODEL"
+  t0=$(date +%s)
+  start="$(api POST /api/restart-backend "{\"model\":\"$SD_MODEL\",\"width\":256,\"height\":256,\"steps\":4}")"
+  for _ in $(seq 1 180); do st="$(api GET /api/backend-status)"; [[ "$(echo "$st" | json_get ready)" == true || -n "$(echo "$st" | json_get error)" ]] && break; sleep 5; done
+  if [[ "$(echo "$st" | json_get ready)" == true ]]; then
+    record "Image backend load (app API)" PASS "$(( $(date +%s) - t0 ))s; mode $(echo "$st" | json_get settings.backendMode)"
+    t1=$(date +%s)
+    gen="$(curl -s -m 1800 -X POST -H 'content-type: application/json' --data '{"prompt":"a red apple on a wooden table","negative_prompt":"","width":256,"height":256,"steps":4,"cfg_scale":7,"seed":42,"sampler_name":"euler_a","batch_size":1}' "$BASE/sdapi/v1/txt2img")"
+    echo "$gen" | json_get images.0 | base64 --decode > "$ROOT/ci-image.png" 2>/dev/null
+    stats="$(python3 -c 'import struct,zlib,sys
+d=open(sys.argv[1],"rb").read()
+assert d[:8]==b"\x89PNG\r\n\x1a\n"
+w,h=struct.unpack(">II",d[16:24]); i=8; idat=b""
+while i<len(d):
+    n=struct.unpack(">I",d[i:i+4])[0]; t=d[i+4:i+8]
+    if t==b"IDAT": idat+=d[i+8:i+8+n]
+    i+=12+n
+raw=zlib.decompress(idat); vals=set(raw[::97])
+print(w,h,len(vals))' "$ROOT/ci-image.png" 2>/dev/null)"
+    set -- $stats
+    if [[ "${1:-0}" == 256 && "${2:-0}" == 256 && "${3:-0}" -gt 20 ]]; then
+      record "Image generation inference (app API)" PASS "$(( $(date +%s) - t1 ))s: 256x256 PNG, 4 steps, $3 distinct sampled byte values (not blank)"
+    else
+      record "Image generation inference (app API)" FAIL "stats='$stats' resp=${gen:0:200}"
+    fi
+  else
+    record "Image backend load (app API)" FAIL "start: ${start:0:200} status: ${st:0:300}"
+  fi
+  api POST /api/stop-backend '{}' >/dev/null
+else
+  record "Image model download" FAIL "checksum mismatch or download failed"
 fi
 
 exit $FAILED

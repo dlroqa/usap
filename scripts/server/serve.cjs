@@ -56,9 +56,9 @@ const BACKEND_PATHS = {
   linuxCuda: path.join(ROOT, "app", "backend", "linux", "cuda", "sd-server-cuda"),
 };
 let BACKEND_PATH = "";
-// stable-diffusion.cpp publishes macOS builds for Apple Silicon only (see scripts/setup/setup.sh).
+// On Intel Macs the image backend is only present if setup verified its x86_64 slices (scripts/setup/setup.sh).
 const MAC_INTEL_IMAGE_UNSUPPORTED = osPlatform === "darwin" && process.arch !== "arm64";
-const MAC_INTEL_IMAGE_MESSAGE = "Image generation is not available on Intel Macs yet: stable-diffusion.cpp publishes macOS builds for Apple Silicon only. Text chat, transcription and voice still work.";
+const MAC_INTEL_IMAGE_MESSAGE = "Image generation is not installed on this Intel Mac: setup could not verify an x86_64 stable-diffusion.cpp build. Run setup again; text chat, transcription and voice still work.";
 const backendSupportsFlags = {};
 const backendValidationErrors = {};
 if (osPlatform === "win32") {
