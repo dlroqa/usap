@@ -24,7 +24,7 @@ Runtime rows: `macos-setup.yml` run [42669660908](https://github.com/dlroqa/usap
 | Core ML / ANE | **UNVERIFIED** (skipped in CI via `USAP_SKIP_COREML=1`) | not applicable |
 | Packaged release per architecture | none (no packaging pipeline yet) | none |
 
-Test models are pinned by revision and SHA-256 (see `scripts/ci/macos-runtime-validate.sh`); they're downloaded on the runner only and never uploaded.
+Test models are pinned by revision and SHA-256 (see `scripts/ci/runtime-validate.sh`); they're downloaded on the runner only and never uploaded.
 
 ## Remaining gaps
 * **Intel image generation:** stable-diffusion.cpp's release asset is named arm64, but the `sd` binary inside is **universal** (`x86_64 arm64`). Intel support may be achievable. Its bundled dylibs' architectures and Metal-on-Intel behaviour are not yet examined. Follow-up: inspect the archive on the Intel runner and run a CPU generation smoke test before enabling it.

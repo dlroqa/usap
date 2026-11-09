@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Validate a macOS install produced by first-time setup (mac.sh / setup.sh) against a
+# Validate an install produced by first-time setup (mac.sh / linux.sh / windows.bat) against a
 # RUNNING studio server: native binary architecture, executable bits, engine startup,
 # and real inference through the app's own API with small, pinned, checksum-verified
 # models. Writes one JSON line per check to $RESULTS and prints a Markdown table.
-#   EXPECTED_ARCH=arm64|x86_64 BASE=http://127.0.0.1:14900 RESULTS=out.jsonl scripts/ci/macos-runtime-validate.sh
+#   EXPECTED_ARCH=arm64|x86_64 BASE=http://127.0.0.1:14900 RESULTS=out.jsonl scripts/ci/runtime-validate.sh
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -23,7 +23,7 @@ record() { # name status detail
   return 0
 }
 
-archs_of() { lipo -archs "$1" 2>/dev/null || file -b "$1"; }
+archs_of() { local o; o="$(lipo -archs "$1" 2>/dev/null || file -b "$1")"; echo "${o//x86-64/x86_64}"; }
 
 check_binary() { # name path required(1/0)
   local name="$1" bin="$2" required="$3"
@@ -37,13 +37,15 @@ check_binary() { # name path required(1/0)
   record "$name binary" FAIL "${bin#$ROOT/} is '$a', expected $EXPECTED_ARCH"; return 1
 }
 
+sha256_check() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 -c -; else sha256sum -c -; fi; }
+
 fetch_verified() { # url sha256 dest
   local url="$1" sum="$2" dest="$3"
   mkdir -p "$(dirname "$dest")"
-  if [[ ! -f "$dest" ]] || ! echo "$sum  $dest" | shasum -a 256 -c - >/dev/null 2>&1; then
+  if [[ ! -f "$dest" ]] || ! echo "$sum  $dest" | sha256_check >/dev/null 2>&1; then
     curl -fsSL --retry 3 "$url" -o "$dest.part" && mv "$dest.part" "$dest"
   fi
-  echo "$sum  $dest" | shasum -a 256 -c - >/dev/null 2>&1
+  echo "$sum  $dest" | sha256_check >/dev/null 2>&1
 }
 
 api() { # method path [json-body]
@@ -55,39 +57,68 @@ json_get() { node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{tr
 echo "| Check | Result | Detail |"
 echo "|---|---|---|"
 
+OS="$(uname -s)"
+case "$OS" in Darwin) PLAT=mac ;; Linux) PLAT=linux ;; MINGW*|MSYS*|CYGWIN*) PLAT=win ;; *) PLAT=unknown ;; esac
+NODE_ARCH=$([[ "$EXPECTED_ARCH" == arm64 ]] && echo arm64 || echo x64)
+EXE=$([[ "$PLAT" == win ]] && echo .exe || echo "")
+
 # ── Hardware / translation ──────────────────────────────────────────────────
-hw="$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)"; tr="$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)"
-if [[ "$tr" == 0 && ( ( "$EXPECTED_ARCH" == arm64 && "$hw" == 1 ) || ( "$EXPECTED_ARCH" == x86_64 && "$hw" == 0 ) ) ]]; then
-  record "native hardware" PASS "$(sysctl -n machdep.cpu.brand_string); hw.optional.arm64=$hw; translated=$tr"
+if [[ "$PLAT" == mac ]]; then
+  hw="$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)"; tr="$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)"
+  if [[ "$tr" == 0 && ( ( "$EXPECTED_ARCH" == arm64 && "$hw" == 1 ) || ( "$EXPECTED_ARCH" == x86_64 && "$hw" == 0 ) ) ]]; then
+    record "native hardware" PASS "$(sysctl -n machdep.cpu.brand_string); hw.optional.arm64=$hw; translated=$tr"
+  else
+    record "native hardware" FAIL "hw.optional.arm64=$hw translated=$tr"
+  fi
 else
-  record "native hardware" FAIL "hw.optional.arm64=$hw translated=$tr"
+  m="$(uname -m)"; [[ "$m" == "$EXPECTED_ARCH" ]] && record "native hardware" PASS "$OS $m" || record "native hardware" FAIL "$OS $m"
 fi
 
 # ── Binaries: architecture + executable bit + startup ──────────────────────
-NODE_ARCH=$([[ "$EXPECTED_ARCH" == arm64 ]] && echo arm64 || echo x64)
-LLAMA_DIR=$([[ "$EXPECTED_ARCH" == arm64 ]] && echo arm64 || echo x64)
-check_binary "portable node" "$APP/tools/node-mac/bin/node" 1 && {
-  v="$("$APP/tools/node-mac/bin/node" -p 'process.version+" "+process.arch')"
+case "$PLAT" in
+  mac)   NODE_BIN="$APP/tools/node-mac/bin/node"
+         LLAMA_BINS=("$APP/llm-backend/mac/$([[ "$EXPECTED_ARCH" == arm64 ]] && echo arm64 || echo x64)/llama-server")
+         WHISPER_BIN="$APP/speech-backend/mac/cpu/whisper-cli"
+         SD_BINS=("$APP/backend/mac/sd") ;;
+  linux) NODE_BIN="$APP/tools/node-linux/bin/node"
+         LLAMA_BINS=("$APP/llm-backend/linux/cpu/llama-server" "$APP/llm-backend/linux/vulkan/llama-server")
+         WHISPER_BIN="$APP/speech-backend/linux/cpu/whisper-cli"
+         SD_BINS=("$APP/backend/linux/cpu/sd-server-cpu" "$APP/backend/linux/vulkan/sd-server-vulkan") ;;
+  win)   NODE_BIN="$APP/tools/node-win/node.exe"
+         LLAMA_BINS=("$APP/llm-backend/win/cpu/llama-server.exe" "$APP/llm-backend/win/vulkan/llama-server.exe")
+         WHISPER_BIN="$APP/speech-backend/win/cpu/whisper-cli.exe"
+         SD_BINS=("$APP/backend/win/cpu/sd-cpu.exe" "$APP/backend/win/vulkan/sd-vulkan.exe") ;;
+esac
+check_binary "portable node" "$NODE_BIN" 1 && {
+  v="$("$NODE_BIN" -p 'process.version+" "+process.arch')"
   [[ "$v" == *" $NODE_ARCH" ]] && record "portable node startup" PASS "$v" || record "portable node startup" FAIL "$v"
 }
-check_binary "llama-server" "$APP/llm-backend/mac/$LLAMA_DIR/llama-server" 1 && {
-  out="$("$APP/llm-backend/mac/$LLAMA_DIR/llama-server" --version 2>&1 | head -3)"
-  [[ $? == 0 && "$out" == *version* ]] && record "llama-server startup" PASS "$(echo "$out" | grep -m1 version)" || record "llama-server startup" FAIL "$out"
-}
-check_binary "whisper-cli" "$APP/speech-backend/mac/cpu/whisper-cli" 1 && {
-  "$APP/speech-backend/mac/cpu/whisper-cli" --help >/dev/null 2>&1 && record "whisper-cli startup" PASS "--help exits 0" || record "whisper-cli startup" FAIL "--help failed"
-}
-check_binary "sd (image)" "$APP/backend/mac/sd" 1 && {
-  "$APP/backend/mac/sd" --help >/dev/null 2>&1; rc=$?
-  [[ $rc == 0 || $rc == 1 ]] && record "sd startup" PASS "--help ran (exit $rc), dylibs resolved" || record "sd startup" FAIL "exit $rc"
-}
-for lib in "$APP"/backend/mac/*.dylib; do
-  [[ -e "$lib" ]] || continue
-  a="$(archs_of "$lib")"
-  [[ "$a" == *"$EXPECTED_ARCH"* ]] && record "dylib $(basename "$lib")" PASS "$a" || record "dylib $(basename "$lib")" FAIL "$a"
+for bin in "${LLAMA_BINS[@]}"; do
+  label="llama-server ($(basename "$(dirname "$bin")"))"
+  check_binary "$label" "$bin" 1 && {
+    out="$("$bin" --version 2>&1 | head -5)"
+    [[ "$out" == *version* ]] && record "$label startup" PASS "$(echo "$out" | grep -m1 version)" || record "$label startup" FAIL "$out"
+  }
 done
+check_binary "whisper-cli" "$WHISPER_BIN" 1 && {
+  "$WHISPER_BIN" --help >/dev/null 2>&1 && record "whisper-cli startup" PASS "--help exits 0" || record "whisper-cli startup" FAIL "--help failed"
+}
+for bin in "${SD_BINS[@]}"; do
+  label="sd ($(basename "$bin"))"
+  check_binary "$label" "$bin" 1 && {
+    "$bin" --help >/dev/null 2>&1; rc=$?
+    [[ $rc == 0 || $rc == 1 ]] && record "$label startup" PASS "--help ran (exit $rc), libraries resolved" || record "$label startup" FAIL "exit $rc"
+  }
+done
+if [[ "$PLAT" == mac ]]; then
+  for lib in "$APP"/backend/mac/*.dylib; do
+    [[ -e "$lib" ]] || continue
+    a="$(archs_of "$lib")"
+    [[ "$a" == *"$EXPECTED_ARCH"* ]] && record "dylib $(basename "$lib")" PASS "$a" || record "dylib $(basename "$lib")" FAIL "$a"
+  done
+fi
 # Native Node addons used by Kokoro TTS must load in the portable Node.
-addons="$(cd "$APP/tts-runtime" && "$APP/tools/node-mac/bin/node" -e '
+addons="$(cd "$APP/tts-runtime" && "$NODE_BIN" -e '
   const o = require("onnxruntime-node"); const s = require("sharp");
   console.log("onnxruntime-node", require("onnxruntime-node/package.json").version, "sharp", s.versions?.sharp || "?", process.arch);' 2>&1)"
 [[ $? == 0 && "$addons" == *"$NODE_ARCH"* ]] && record "TTS native addons load" PASS "$addons" || record "TTS native addons load" FAIL "$addons"
