@@ -1,0 +1,31 @@
+{
+  "ok": true,
+  "ready": false,
+  "running": false,
+  "selectedBackend": null,
+  "settings": {
+    "model": null,
+    "threads": 4,
+    "contextSize": 4096,
+    "gpuLayers": -1,
+    "backendMode": "",
+    "backendBinary": "",
+    "supportsVision": false,
+    "visionMode": "none",
+    "visionStatus": "Projector not loaded",
+    "flashAttn": true,
+    "cacheTypeK": "q8_0",
+    "cacheTypeV": "q8_0",
+    "mlock": false,
+    "mmap": true,
+    "cachePrompt": true,
+    "defragThold": 0.1,
+    "batchSize": 512,
+    "ubatchSize": 512,
+    "performanceProfile": "balanced"
+  },
+  "modelSettings": {
+    "models": {}
+  },
+  "benchmarks": []
+}

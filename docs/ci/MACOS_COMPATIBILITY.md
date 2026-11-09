@@ -1,6 +1,6 @@
 # macOS compatibility: Apple Silicon (arm64) and Intel (x86_64)
 
-**Status: macOS support is NOT complete.** Both architectures pass the Node/frontend CI gate. Intel first-time setup is blocked (B-1), and no native engine or inference has been verified on either architecture.
+**Status: macOS support is NOT complete.** Both architectures pass the Node/frontend CI gate and the browser UI gate. Intel first-time setup is blocked (B-1), and no native engine or inference has been verified on either architecture.
 
 ## Evidence by architecture
 
@@ -9,7 +9,7 @@
 | Runner + Node architecture asserted (`uname -m`, `process.arch`) | CI | CI | `ci.yml` step "Verify runner and Node architecture" |
 | `npm ci`, syntax checks, Vite production build | CI | CI | `ci.yml` |
 | Unit + security tests, real `serve.cjs` boot (no models) | CI | CI | `ci.yml` |
-| Headless UI render/screenshot regression | PR 02 (Linux first) | PR 02 (Linux first) | not yet on macOS |
+| Headless UI render + pixel regression (27 states) + behaviour + a11y + live-backend smoke | CI | CI | `render-e2e.yml` `render (macos-arm64)` / `render (macos-x86_64)`, own baselines per arch |
 | Launcher `mac.sh` first-time setup | **unverified** | **fails by design (B-1)** | code: `scripts/setup/setup.sh:429-433` |
 | Native binary arch (`file`/`lipo -info`) of downloaded engines | unverified | unverified | needs setup to run |
 | llama.cpp text inference | unverified (expects Metal) | unverified (x64 CPU build selected, `serve.cjs:1973`) | |

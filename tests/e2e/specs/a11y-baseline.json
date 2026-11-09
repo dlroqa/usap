@@ -1,0 +1,18 @@
+{
+  "chat-dark": {},
+  "chat-light": {},
+  "images-dark": {
+    "label-content-name-mismatch": 1
+  },
+  "images-light": {
+    "label-content-name-mismatch": 1
+  },
+  "models-dark": {},
+  "models-light": {},
+  "settings-dark": {},
+  "settings-light": {},
+  "transcribe-dark": {},
+  "transcribe-light": {},
+  "voice-dark": {},
+  "voice-light": {}
+}

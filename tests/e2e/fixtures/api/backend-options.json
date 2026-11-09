@@ -1,0 +1,46 @@
+{
+  "options": [],
+  "unavailable": [
+    {
+      "id": "cpu",
+      "label": "CPU",
+      "reason": "Linux CPU backend is not installed. Run setup again to install app/backend/linux/cpu."
+    },
+    {
+      "id": "openvino-npu",
+      "label": "NPU (OpenVINO)",
+      "reason": "OpenVINO GenAI runtime is not installed. Run bash scripts/setup/setup-openvino-npu.sh first."
+    }
+  ],
+  "cudaAvailable": false,
+  "vulkanAvailable": false,
+  "rocmAvailable": false,
+  "metalAvailable": false,
+  "openvinoNpuAvailable": false,
+  "openvinoNpu": {
+    "supported": false,
+    "reason": "OpenVINO GenAI runtime is not installed. Run bash scripts/setup/setup-openvino-npu.sh first."
+  },
+  "openvinoModels": [
+    {
+      "id": "lcm-dreamshaper-v7-fp16",
+      "name": "LCM DreamShaper v7 FP16",
+      "repo": "OpenVINO/LCM_Dreamshaper_v7-fp16-ov",
+      "folder": "LCM_Dreamshaper_v7-fp16-ov",
+      "approxSize": "2.0 GB",
+      "resolution": "512x512",
+      "notes": "OpenVINO LCM image model. Uses CPU text encoder, NPU UNet, and GPU or CPU VAE decoder.",
+      "filename": "lcm-dreamshaper-v7-fp16",
+      "path": "/studio/app/openvino-models/LCM_Dreamshaper_v7-fp16-ov",
+      "installed": false,
+      "sizeBytes": 0,
+      "size": "0 B",
+      "format": "OpenVINO"
+    }
+  ],
+  "coremlNpu": {
+    "supported": false,
+    "reason": "Apple Silicon ANE (NPU) is only available on Apple Silicon macOS devices."
+  },
+  "defaultBackendType": "cpu"
+}

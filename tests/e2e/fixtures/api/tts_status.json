@@ -1,0 +1,86 @@
+{
+  "ok": true,
+  "ready": false,
+  "running": false,
+  "port": 10089,
+  "preferredPort": 10089,
+  "runtimeInstalled": false,
+  "runtimePath": "/studio/app/tts-runtime",
+  "workerPath": "/studio/scripts/workers/tts-kokoro-worker.mjs",
+  "cachePath": "/studio/app/tts-cache",
+  "backendMode": "Kokoro ONNX",
+  "error": null,
+  "settings": {
+    "model": null,
+    "voice": "af_heart",
+    "speed": 1,
+    "dtype": "q8",
+    "backendMode": "Kokoro ONNX"
+  },
+  "generation": {
+    "active": false,
+    "phase": "",
+    "progress": 0,
+    "model": "",
+    "voice": "",
+    "output": ""
+  },
+  "voices": [
+    {
+      "id": "af_heart",
+      "name": "Heart",
+      "language": "en-us",
+      "gender": "Female",
+      "recommended": true
+    },
+    {
+      "id": "af_bella",
+      "name": "Bella",
+      "language": "en-us",
+      "gender": "Female",
+      "recommended": false
+    },
+    {
+      "id": "af_nicole",
+      "name": "Nicole",
+      "language": "en-us",
+      "gender": "Female",
+      "recommended": false
+    },
+    {
+      "id": "af_sarah",
+      "name": "Sarah",
+      "language": "en-us",
+      "gender": "Female",
+      "recommended": false
+    },
+    {
+      "id": "am_michael",
+      "name": "Michael",
+      "language": "en-us",
+      "gender": "Male",
+      "recommended": false
+    },
+    {
+      "id": "am_fenrir",
+      "name": "Fenrir",
+      "language": "en-us",
+      "gender": "Male",
+      "recommended": false
+    },
+    {
+      "id": "bf_emma",
+      "name": "Emma",
+      "language": "en-gb",
+      "gender": "Female",
+      "recommended": false
+    },
+    {
+      "id": "bm_george",
+      "name": "George",
+      "language": "en-gb",
+      "gender": "Male",
+      "recommended": false
+    }
+  ]
+}

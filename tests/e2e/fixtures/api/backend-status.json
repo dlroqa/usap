@@ -1,0 +1,39 @@
+{
+  "ready": false,
+  "running": false,
+  "port": 8080,
+  "preferredPort": 8080,
+  "error": null,
+  "loading": {
+    "active": false,
+    "phase": "",
+    "progress": 0,
+    "current": 0,
+    "total": 0,
+    "speed": "",
+    "model": "",
+    "backendMode": "",
+    "backendBinary": "",
+    "device": ""
+  },
+  "unloading": {
+    "active": false,
+    "phase": "",
+    "progress": 0
+  },
+  "settings": {
+    "model": null,
+    "steps": 20,
+    "cfgScale": 7,
+    "sampler": "euler_a",
+    "threads": 8,
+    "useGpu": true,
+    "backendType": "auto",
+    "vaeTiling": true,
+    "vaeOnCpu": false,
+    "flashAttn": true,
+    "width": 512,
+    "height": 512
+  },
+  "build": "text-image-v1"
+}
