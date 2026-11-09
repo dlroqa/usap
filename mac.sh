@@ -155,7 +155,8 @@ if [[ ! -f "$DIST_INDEX" ]]; then
   SETUP_REASON="Frontend build is missing."
 fi
 
-if [[ ! -x "$BACKEND_PATH" ]]; then
+# The image backend is published for Apple Silicon only; Intel Macs run without it.
+if [[ "$ARCH" == "arm64" && ! -x "$BACKEND_PATH" ]]; then
   SETUP_REASON="No macOS Metal backend binary is installed."
 fi
 if [[ ! -x "$LLM_BACKEND_PATH" ]]; then
