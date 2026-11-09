@@ -56,6 +56,19 @@ jobs:
           echo "### ${{ matrix.label }}: uname -m=$actual, node process.arch=$node_arch" >> "$GITHUB_STEP_SUMMARY"
           test "$actual" = "${{ matrix.arch }}" || { echo "::error::runner arch $actual != ${{ matrix.arch }}"; exit 1; }
           test "$node_arch" = "${{ matrix.node_arch }}" || { echo "::error::node arch $node_arch != ${{ matrix.node_arch }} (translated binary?)"; exit 1; }
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # uname/Node report x86_64 under Rosetta 2 too, so assert the hardware and translation state.
+            hw_arm64="$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)"
+            translated="$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)"
+            echo "macOS hw.optional.arm64=$hw_arm64 sysctl.proc_translated=$translated cpu=$(sysctl -n machdep.cpu.brand_string)"
+            echo "macOS hardware: hw.optional.arm64=$hw_arm64, proc_translated=$translated" >> "$GITHUB_STEP_SUMMARY"
+            test "$translated" = "0" || { echo "::error::job is running under Rosetta translation"; exit 1; }
+            if [ "${{ matrix.arch }}" = "x86_64" ]; then
+              test "$hw_arm64" = "0" || { echo "::error::Intel job is on Apple Silicon hardware"; exit 1; }
+            else
+              test "$hw_arm64" = "1" || { echo "::error::arm64 job is not on Apple Silicon hardware"; exit 1; }
+            fi
+          fi
 
       - name: Install frontend dependencies (lockfile enforced)
         working-directory: app/frontend
