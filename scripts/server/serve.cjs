@@ -12,6 +12,7 @@ const path     = require("path");
 const { spawn, spawnSync, execSync, exec, execFile } = require("child_process");
 const { comprehensiveWebSearch } = require("../search/core");
 const { detectModelKindCached } = require("./model-kind.cjs");
+const { createRequestPolicy, withoutCorsHeaders, resolveStaticPath } = require("./request-policy.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -3632,8 +3633,7 @@ function proxyImageBackendRequest(req, res) {
     timeout: 0,
   }, (proxyRes) => {
     res.writeHead(proxyRes.statusCode || 502, {
-      ...proxyRes.headers,
-      "Access-Control-Allow-Origin": "*",
+      ...withoutCorsHeaders(proxyRes.headers),
     });
     proxyRes.pipe(res);
   });
@@ -6133,15 +6133,30 @@ function streamModelUpload(req, filename, targetDir = MODELS, mode = "image") {
 
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+  res.writeHead(code, { "Content-Type": "application/json" });
   res.end(body);
 }
 
 // ── HTTP Server ───────────────────────────────────────────────────────────────
+const LISTEN_HOST = process.env.UAIS_HOST || "127.0.0.1";
+const requestPolicy = createRequestPolicy({ listenHost: LISTEN_HOST });
+
 const server = http.createServer(async (req, res) => {
+  // Refuse DNS-rebound hosts and cross-site origins before any route runs.
+  if (!requestPolicy.isAllowedHost(req)) {
+    return json(res, 403, { ok: false, error: "Host not allowed" });
+  }
+  if (!requestPolicy.isAllowedOrigin(req)) {
+    return json(res, 403, { ok: false, error: "Cross-origin request blocked" });
+  }
+  const corsHeaders = requestPolicy.corsHeadersFor(req);
+  if (corsHeaders) {
+    for (const [key, value] of Object.entries(corsHeaders)) res.setHeader(key, value);
+  }
+
   // CORS preflight
   if (req.method === "OPTIONS") {
-    res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Allow-Methods": "GET,POST" });
+    res.writeHead(204);
     res.end(); return;
   }
 
@@ -7379,7 +7394,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     const ext = path.extname(filePath).toLowerCase();
     fs.readFile(filePath, (err, data) => {
       if (err) return json(res, 500, { error: err.message });
-      res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream", "Access-Control-Allow-Origin": "*" });
+      res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream" });
       res.end(data);
     });
     return;
@@ -7403,7 +7418,6 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
         res.writeHead(416, {
           "Content-Range": `bytes */${stat.size}`,
           "Accept-Ranges": "bytes",
-          "Access-Control-Allow-Origin": "*",
         });
         res.end();
         return;
@@ -7421,7 +7435,6 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
         res.writeHead(416, {
           "Content-Range": `bytes */${stat.size}`,
           "Accept-Ranges": "bytes",
-          "Access-Control-Allow-Origin": "*",
         });
         res.end();
         return;
@@ -7432,7 +7445,6 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
         "Content-Length": end - start + 1,
         "Content-Range": `bytes ${start}-${end}/${stat.size}`,
         "Accept-Ranges": "bytes",
-        "Access-Control-Allow-Origin": "*",
       });
       fs.createReadStream(filePath, { start, end }).pipe(res);
       return;
@@ -7442,7 +7454,6 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       "Content-Type": contentType,
       "Content-Length": stat.size,
       "Accept-Ranges": "bytes",
-      "Access-Control-Allow-Origin": "*",
     });
     fs.createReadStream(filePath).pipe(res);
     return;
@@ -7692,8 +7703,10 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
   }
 
   // ── Static frontend files ─────────────────────────────────────────────────
-  let filePath = path.join(DIST, req.url === "/" ? "index.html" : req.url);
-  filePath = filePath.split("?")[0];
+  let filePath = resolveStaticPath(DIST, req.url);
+  if (!filePath) {
+    res.writeHead(404); res.end("Not found"); return;
+  }
   if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
     filePath = path.join(DIST, "index.html");
   }
@@ -7703,7 +7716,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
 
   fs.readFile(filePath, (err, data) => {
     if (err) { res.writeHead(404); res.end("Not found"); return; }
-    res.writeHead(200, { "Content-Type": mime, "Access-Control-Allow-Origin": "*" });
+    res.writeHead(200, { "Content-Type": mime });
     res.end(data);
   });
 });
@@ -7711,7 +7724,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
 server.timeout = 0; // Disable socket timeout for large model uploads/downloads
 
 // Local-only by default: the UI has no login. Set UAIS_HOST=0.0.0.0 to share it on your network.
-server.listen(PORT_FRONTEND, process.env.UAIS_HOST || "127.0.0.1", () => {
+server.listen(PORT_FRONTEND, LISTEN_HOST, () => {
   console.log("");
   console.log("  ============================================================");
   console.log("   UNCENSORED AI STUDIO      |  Running");

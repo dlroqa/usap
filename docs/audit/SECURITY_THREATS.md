@@ -17,7 +17,7 @@ Local chat history, transcriptions, generated media, model files (multi-GB), loc
 
 | ID | Area | Severity | Status |
 |---|---|---|---|
-| S-1 | Static file serving path confinement | High | Fixed in PR 01 (regression tests in CI) |
+| S-1 | Static file serving path confinement | High | Fixed in PR 01 (`scripts/server/request-policy.cjs`, tests in `scripts/tests/security-regressions.test.cjs`) |
 | S-2 | Cross-origin request policy for the local API | High | Fixed in PR 01 (regression tests in CI) |
 | S-3 | DNS-rebinding protection (Host header validation) | Medium | Fixed in PR 01 |
 | S-4 | Page-fetch SSRF guard: DNS check and connection are separate lookups | Medium | Backlog (PR 04) |
@@ -27,6 +27,7 @@ Local chat history, transcriptions, generated media, model files (multi-GB), loc
 | S-8 | One shell-string `execSync(unzip …)` built from a server-derived path | Low | Backlog (PR 04) |
 | S-9 | Request bodies parsed as JSON regardless of Content-Type | Low (mitigated by S-2 fix) | Backlog |
 | S-10 | Setup uses `npm install`, not `npm ci` (lockfile not enforced) | Low | Backlog |
+| S-11 | Native engine ports (llama-server, sd-server, …) are loopback-bound but directly reachable by local pages; their own CORS policy is not controlled by serve.cjs | Medium | Backlog: needs binaries to verify (U) |
 
 ## Existing controls (verified by code)
 Loopback bind by default; 64 MB JSON body cap; `basename` + `pathInside` checks on model/output/TTS file routes; an SSRF guard on page fetch (scheme + private-range checks).

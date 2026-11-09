@@ -55,3 +55,4 @@ Thumbs.db
 /backups/
 /Backups/
 *-backup.tar*
+test-results/
