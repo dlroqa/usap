@@ -16,4 +16,4 @@ The sequence changed from the original plan: the security fixes moved ahead of t
 ## Proposed follow-ups awaiting owner approval
 * D-1/D-3 chat stream flush race fix (see `docs/audit/UI_PRESERVATION_BASELINE.md`).
 * D-2 mobile sidebar layout (behaviour/layout change, needs a spec).
-* B-1 Intel macOS first-time setup (see `docs/ci/MACOS_COMPATIBILITY.md`).
+* ~~B-1 Intel macOS first-time setup~~ (approved; PR #5).

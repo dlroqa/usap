@@ -56,6 +56,9 @@ const BACKEND_PATHS = {
   linuxCuda: path.join(ROOT, "app", "backend", "linux", "cuda", "sd-server-cuda"),
 };
 let BACKEND_PATH = "";
+// stable-diffusion.cpp publishes macOS builds for Apple Silicon only (see scripts/setup/setup.sh).
+const MAC_INTEL_IMAGE_UNSUPPORTED = osPlatform === "darwin" && process.arch !== "arm64";
+const MAC_INTEL_IMAGE_MESSAGE = "Image generation is not available on Intel Macs yet: stable-diffusion.cpp publishes macOS builds for Apple Silicon only. Text chat, transcription and voice still work.";
 const backendSupportsFlags = {};
 const backendValidationErrors = {};
 if (osPlatform === "win32") {
@@ -3338,6 +3341,9 @@ function getBackendOptions() {
   if (metalInstalled && !metalAvailable) {
     unavailable.push({ id: "metal", label: "Metal GPU", reason: "Installed, but Metal backend validation failed." });
   }
+  if (MAC_INTEL_IMAGE_UNSUPPORTED && !metalInstalled) {
+    unavailable.push({ id: "metal", label: "Metal GPU", reason: MAC_INTEL_IMAGE_MESSAGE });
+  }
   if (coremlNpu.supported && !coremlNpu.ready) {
     unavailable.push({ id: "apple-npu", label: "Apple Neural Engine (NPU)", reason: coremlNpu.reason });
   }
@@ -4731,7 +4737,9 @@ async function startBackend(settings = {}) {
   currentSettings.useGpu = resolvedBackendType !== "cpu";
   const backendPath = selectBackendPath(currentSettings.useGpu, currentSettings.backendType, currentSettings.model);
   if (!backendPath) {
-    const setupHint = resolvedBackendType === "apple-npu"
+    const setupHint = MAC_INTEL_IMAGE_UNSUPPORTED
+      ? MAC_INTEL_IMAGE_MESSAGE
+      : resolvedBackendType === "apple-npu"
       ? "CoreML Python environment is not set up. Run scripts/setup/setup-coreml-npu.sh first."
       : resolvedBackendType === "cpu" && osPlatform === "win32"
         ? "Windows CPU backend is not installed. Run scripts/setup.ps1 again so app/backend/win/cpu is created."

@@ -316,6 +316,24 @@ copy_binaries_from_extracted() {
   find "$extracted_dir" -type f -name "*.so" -exec cp {} "$dest_dir/" \; 2>/dev/null || true
 }
 
+# Verify a Mach-O executable contains the expected CPU architecture (arm64 / x86_64).
+verify_macos_binary_arch() {
+  local bin="$1" expected="$2" archs=""
+  [[ -f "$bin" ]] || { print_fail "Missing binary: $bin"; return 1; }
+  if command -v lipo >/dev/null 2>&1; then
+    archs="$(lipo -archs "$bin" 2>/dev/null || true)"
+  fi
+  if [[ -z "$archs" ]]; then
+    archs="$(file -b "$bin" 2>/dev/null || true)"
+  fi
+  if [[ " $archs " == *" $expected "* || "$archs" == *"$expected"* ]]; then
+    print_ok "$(basename "$bin") architecture: $archs"
+    return 0
+  fi
+  print_fail "$(basename "$bin") is built for '$archs', but this Mac needs $expected."
+  return 1
+}
+
 copy_macos_backend_from_extracted() {
   local extracted_dir="$1" dest_dir="$2"
   local target="$dest_dir/sd"
@@ -425,12 +443,16 @@ fi
 mkdir -p "$BACKEND_DIR"
 
 if [[ "$PLATFORM" == "Darwin" ]]; then
-  print_step 2 $TOTAL_STEPS "Setting up stable-diffusion.cpp Metal backend (app/backend/mac/)"
   if [[ "$ARCH" != "arm64" ]]; then
-    print_fail "The official macOS backend binary is Apple Silicon only (arm64)."
-    print_info "macOS Intel hardware is completely unsupported and has not been tested."
-    exit 1
-  fi
+    # Intel Mac: stable-diffusion.cpp publishes macOS builds for Apple Silicon only, and the
+    # Core ML/ANE path needs Apple Silicon. Skip both (never install arm64-only binaries here)
+    # and continue with the text, speech and voice engines, which have x86_64 builds.
+    print_step 2 $TOTAL_STEPS "Image generation backend (skipped on Intel Mac)"
+    print_warn "Image generation is not available on Intel Macs yet: stable-diffusion.cpp"
+    print_warn "publishes macOS builds for Apple Silicon (arm64) only. Text chat, transcription"
+    print_warn "and voice are set up normally and run on the CPU."
+  else
+  print_step 2 $TOTAL_STEPS "Setting up stable-diffusion.cpp Metal backend (app/backend/mac/)"
 
   MAC_BACKEND="$BACKEND_DIR/sd"
   if [[ -x "$MAC_BACKEND" ]]; then
@@ -444,8 +466,16 @@ if [[ "$PLATFORM" == "Darwin" ]]; then
     rm -rf "$BACKEND_DIR/extracted"
     print_ok "macOS Metal backend installed."
   fi
+  if ! verify_macos_binary_arch "$MAC_BACKEND" "arm64"; then
+    rm -f "$MAC_BACKEND"
+    print_fail "The downloaded image backend is not an arm64 binary; it was removed."
+    exit 1
+  fi
 
   # CoreML NPU Environment setup (macOS Apple Silicon only)
+  if [[ "${USAP_SKIP_COREML:-0}" == "1" ]]; then
+    print_info "Skipping CoreML (ANE) environment setup (USAP_SKIP_COREML=1)."
+  else
   print_info "Setting up CoreML Python virtual environment for Apple Silicon ANE (NPU)..."
   VENV_DIR="$BACKEND_DIR/coreml_venv"
   PYTHON_BIN="$VENV_DIR/bin/python"
@@ -467,6 +497,8 @@ if [[ "$PLATFORM" == "Darwin" ]]; then
       print_warn "CoreML dependencies installation failed. CoreML NPU mode will be unavailable."
     fi
   fi
+  fi # USAP_SKIP_COREML
+  fi # Apple Silicon
 else
   VENDOR="$(detect_gpu_vendor)"
   print_step 2 $TOTAL_STEPS "Detecting GPU vendor: ${VENDOR:-none}"
