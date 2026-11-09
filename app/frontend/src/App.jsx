@@ -20,6 +20,8 @@ const ROUTE_TO_TAB = {
   models: "models",
   settings: "settings",
 };
+// Must match the max-width of the sidebar overlay rule at the end of App.css.
+const NARROW_SCREEN_QUERY = "(max-width: 640px)";
 const TAB_TO_ROUTE = Object.fromEntries(Object.entries(ROUTE_TO_TAB).map(([route, tab]) => [tab, route]));
 
 function readRoute() {
@@ -259,12 +261,17 @@ function App() {
     window.addEventListener("hashchange", handleHashChange);
     return () => window.removeEventListener("hashchange", handleHashChange);
   }, []);
+  // Phone-width screens (D-2): the sidebar is an overlay drawer there, so it starts
+  // closed, closes after navigating, and doesn't overwrite the desktop preference.
+  const isNarrowScreen = () => typeof window !== "undefined" && window.matchMedia?.(NARROW_SCREEN_QUERY).matches;
   const [sidebarVisible, setSidebarVisible] = useState(() => {
+    if (isNarrowScreen()) return false;
     const saved = localStorage.getItem("sidebarVisible");
     return saved !== "false";
   });
 
   useEffect(() => {
+    if (isNarrowScreen()) return;
     localStorage.setItem("sidebarVisible", String(sidebarVisible));
   }, [sidebarVisible]);
 
@@ -725,6 +732,10 @@ function App() {
   }, []);
 
   const toggleSidebar = useCallback(() => setSidebarVisible((visible) => !visible), []);
+
+  useEffect(() => {
+    if (isNarrowScreen()) setSidebarVisible(false);
+  }, [activeTab, activeConversationId]);
 
   // Picking Images in the sidebar always lands on its start screen, even when it is already open
   const [imagesHomeSignal, setImagesHomeSignal] = useState(0);
