@@ -80,10 +80,20 @@ has_linux_gpu_vendor() {
 
 if [[ "$PLATFORM" == "Darwin" ]]; then
   if [[ "$ARCH" == "arm64" ]]; then
-    download_and_extract "llama-$RELEASE-bin-macos-arm64.tar.gz" "$APP_DIR/llm-backend/mac/arm64"
+    MAC_LLAMA_DIR="$APP_DIR/llm-backend/mac/arm64"; MAC_LLAMA_ARCH="arm64"
+    download_and_extract "llama-$RELEASE-bin-macos-arm64.tar.gz" "$MAC_LLAMA_DIR"
   else
-    download_and_extract "llama-$RELEASE-bin-macos-x64.tar.gz" "$APP_DIR/llm-backend/mac/x64"
+    MAC_LLAMA_DIR="$APP_DIR/llm-backend/mac/x64"; MAC_LLAMA_ARCH="x86_64"
+    download_and_extract "llama-$RELEASE-bin-macos-x64.tar.gz" "$MAC_LLAMA_DIR"
   fi
+  # Refuse a backend built for the other CPU architecture (e.g. arm64-only on an Intel Mac).
+  MAC_LLAMA_ARCHS="$(lipo -archs "$MAC_LLAMA_DIR/llama-server" 2>/dev/null || file -b "$MAC_LLAMA_DIR/llama-server")"
+  if [[ "$MAC_LLAMA_ARCHS" != *"$MAC_LLAMA_ARCH"* ]]; then
+    echo "   XX   llama-server is built for '$MAC_LLAMA_ARCHS', but this Mac needs $MAC_LLAMA_ARCH." >&2
+    rm -f "$MAC_LLAMA_DIR/llama-server" "$MAC_LLAMA_DIR/.llama-release"
+    exit 1
+  fi
+  echo "   OK   llama-server architecture: $MAC_LLAMA_ARCHS"
 elif [[ "$PLATFORM" == "Linux" ]]; then
   if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
     download_and_extract "llama-$RELEASE-bin-ubuntu-vulkan-arm64.tar.gz" "$APP_DIR/llm-backend/linux/vulkan"
