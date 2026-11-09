@@ -39,11 +39,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { label: macos-arm64,  runner: macos-15,       arch: arm64,  launcher: ./mac.sh }
-          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, launcher: ./mac.sh }
-          - { label: linux-x64,    runner: ubuntu-24.04,   arch: x86_64, launcher: ./linux.sh }
+          # image: backends exercised for image generation. "cpu" must pass; GPU backends are
+          # attempted and recorded as UNSUPPORTED/UNAVAILABLE on hosted runners (no usable GPU).
+          - { label: macos-arm64,  runner: macos-15,       arch: arm64,  launcher: ./mac.sh,   image: "cpu metal" }
+          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, launcher: ./mac.sh,   image: "cpu metal" }
+          - { label: linux-x64,    runner: ubuntu-24.04,   arch: x86_64, launcher: ./linux.sh, image: "cpu vulkan" }
           # Git Bash drives windows.bat through cmd; piped empty lines answer its "press any key" prompts.
-          - { label: windows-x64,  runner: windows-2025,   arch: x86_64, launcher: "cmd //c windows.bat" }
+          - { label: windows-x64,  runner: windows-2025,   arch: x86_64, launcher: "cmd //c windows.bat", image: "cpu vulkan" }
     env:
       FRONTEND_PORT: "14900"
       # CI skips the optional Core ML (ANE) Python stack; it stays unverified.
@@ -88,9 +90,10 @@ jobs:
           {
             echo "## Native runtime validation (${{ matrix.label }})"
             EXPECTED_ARCH=${{ matrix.arch }} BASE="http://127.0.0.1:$FRONTEND_PORT" RESULTS=ci-logs/runtime-results.jsonl \
+              IMAGE_BACKENDS="${{ matrix.image }}" SERVER_LOG=ci-logs/first-launch.log \
               bash scripts/ci/runtime-validate.sh
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          cp ci-image.png ci-logs/generated-image.png 2>/dev/null || true
+          for f in ci-image-*.png; do [ -f "$f" ] && cp "$f" "ci-logs/generated-${f#ci-}"; done
           ! grep -q '"status":"FAIL"' ci-logs/runtime-results.jsonl
 
       - name: Stop first launch

@@ -15,10 +15,14 @@ CACHE="${MODEL_CACHE:-$ROOT/.ci-model-cache}"
 : > "$RESULTS"
 FAILED=0
 
+# Statuses: PASS, FAIL (fails the job), SKIP (optional component not installed),
+# UNSUPPORTED / UNAVAILABLE (a GPU path that this runner's hardware cannot run; recorded with
+# the reason, never silently skipped; FAIL instead when REQUIRE_GPU=1).
 record() { # name status detail
-  local detail="${3//\"/\'}"
-  printf '{"check":"%s","status":"%s","arch":"%s","detail":"%s"}\n' "$1" "$2" "$EXPECTED_ARCH" "${detail//$'\n'/ }" >> "$RESULTS"
-  printf '| %s | %s | %s |\n' "$1" "$2" "${detail//$'\n'/ }"
+  local detail="${3//$'\n'/ }"; detail="${detail//|/\\|}"
+  node -e 'console.log(JSON.stringify({check:process.argv[1],status:process.argv[2],arch:process.argv[3],detail:process.argv[4]}))' \
+    "$1" "$2" "$EXPECTED_ARCH" "$3" >> "$RESULTS"
+  printf '| %s | %s | %s |\n' "$1" "$2" "$detail"
   [[ "$2" == "FAIL" ]] && FAILED=1
   return 0
 }
@@ -189,19 +193,15 @@ fi
 api POST /api/tts/stop '{}' >/dev/null
 
 # Image: Stable Diffusion 1.5 pruned-emaonly Q4_0 GGUF (CreativeML OpenRAIL-M), pinned.
+# Each backend in IMAGE_BACKENDS (default "cpu") is selected explicitly through the app API.
+# "cpu" must pass. A GPU backend that is not offered, or that the runner's GPU cannot run, is
+# recorded as UNAVAILABLE / UNSUPPORTED with the reason (FAIL when REQUIRE_GPU=1).
 SD_MODEL="stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf"
-if fetch_verified "https://huggingface.co/second-state/stable-diffusion-v1-5-GGUF/resolve/031b5f5df991f511b3f5fa8fed6d99048ababb69/$SD_MODEL" \
-     b8944e9fe0b69b36ae1b5bb0185b3a7b8ef14347fe0fa9af6c64c4829022261f "$CACHE/$SD_MODEL"; then
-  cp "$CACHE/$SD_MODEL" "$APP/models/$SD_MODEL"
-  t0=$(date +%s)
-  start="$(api POST /api/restart-backend "{\"model\":\"$SD_MODEL\",\"width\":256,\"height\":256,\"steps\":4}")"
-  for _ in $(seq 1 180); do st="$(api GET /api/backend-status)"; [[ "$(echo "$st" | json_get ready)" == true || -n "$(echo "$st" | json_get error)" ]] && break; sleep 5; done
-  if [[ "$(echo "$st" | json_get ready)" == true ]]; then
-    record "Image backend load (app API)" PASS "$(( $(date +%s) - t0 ))s; mode $(echo "$st" | json_get settings.backendMode)"
-    t1=$(date +%s)
-    gen="$(curl -s -m 1800 -X POST -H 'content-type: application/json' --data '{"prompt":"a red apple on a wooden table","negative_prompt":"","width":256,"height":256,"steps":4,"cfg_scale":7,"seed":42,"sampler_name":"euler_a","batch_size":1}' "$BASE/sdapi/v1/txt2img")"
-    echo "$gen" | json_get images.0 | base64 --decode > "$ROOT/ci-image.png" 2>/dev/null
-    stats="$("$PY" -c 'import struct,zlib,sys
+REQUIRE_GPU="${REQUIRE_GPU:-0}"
+SERVER_LOG="${SERVER_LOG:-}"
+
+png_stats() {
+  "$PY" -c 'import struct,zlib,sys
 d=open(sys.argv[1],"rb").read()
 assert d[:8]==b"\x89PNG\r\n\x1a\n"
 w,h=struct.unpack(">II",d[16:24]); i=8; idat=b""
@@ -210,17 +210,52 @@ while i<len(d):
     if t==b"IDAT": idat+=d[i+8:i+8+n]
     i+=12+n
 raw=zlib.decompress(idat); vals=set(raw[::97])
-print(w,h,len(vals))' "$ROOT/ci-image.png" 2>/dev/null)"
-    set -- $stats
-    if [[ "${1:-0}" == 256 && "${2:-0}" == 256 && "${3:-0}" -gt 20 ]]; then
-      record "Image generation inference (app API)" PASS "$(( $(date +%s) - t1 ))s: 256x256 PNG, 4 steps, $3 distinct sampled byte values (not blank)"
-    else
-      record "Image generation inference (app API)" FAIL "stats='$stats' resp=${gen:0:200}"
-    fi
+print(w,h,len(vals))' "$1" 2>/dev/null
+}
+
+gpu_fail() { # check detail : FAIL on CPU or when a GPU is required, else UNSUPPORTED with the reason
+  local why=""
+  [[ -n "$SERVER_LOG" && -f "$SERVER_LOG" ]] && why="$(tail -n +"$LOG_START" "$SERVER_LOG" | grep -E 'unsupported op|ggml_abort|failed to|error:' | tail -1 | cut -c1-160)"
+  if [[ "$B" == cpu || "$REQUIRE_GPU" == 1 ]]; then record "$1" FAIL "$2${why:+ | log: $why}"
+  else record "$1" UNSUPPORTED "this runner's GPU cannot run it: $2${why:+ | log: $why}"; fi
+}
+
+image_test() { # backend id (cpu|metal|vulkan|cuda|rocm)
+  B="$1"; local label="Image [$1]" opts t0 t1 start st gen stats
+  LOG_START=1; [[ -n "$SERVER_LOG" && -f "$SERVER_LOG" ]] && LOG_START=$(( $(wc -l < "$SERVER_LOG") + 1 ))
+  opts="$(api GET /api/backend-options)"
+  if [[ "$(echo "$opts" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const o=JSON.parse(s);console.log((o.options||[]).some(x=>x.id===process.argv[1]))})' "$B" 2>/dev/null)" != true ]]; then
+    local reason; reason="$(echo "$opts" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const o=JSON.parse(s);const u=(o.unavailable||[]).find(x=>x.id===process.argv[1]);console.log(u?u.reason:"not offered by the app on this machine")})' "$B" 2>/dev/null)"
+    if [[ "$B" == cpu || "$REQUIRE_GPU" == 1 ]]; then record "$label backend" FAIL "${reason:0:300}"; else record "$label backend" UNAVAILABLE "${reason:0:300}"; fi
+    return
+  fi
+  t0=$(date +%s)
+  start="$(api POST /api/restart-backend "{\"model\":\"$SD_MODEL\",\"width\":256,\"height\":256,\"steps\":4,\"backend_type\":\"$B\",\"use_gpu\":$([[ $B == cpu ]] && echo false || echo true)}")"
+  for _ in $(seq 1 180); do st="$(api GET /api/backend-status)"; [[ "$(echo "$st" | json_get ready)" == true || -n "$(echo "$st" | json_get error)" ]] && break; sleep 5; done
+  if [[ "$(echo "$st" | json_get ready)" != true ]]; then
+    gpu_fail "$label load" "start: ${start:0:150} status: ${st:0:250}"; api POST /api/stop-backend '{}' >/dev/null; return
+  fi
+  local mode; mode="$(echo "$st" | json_get loading.backendMode)"; [[ -z "$mode" ]] && mode="$(echo "$st" | json_get settings.backendMode)"
+  record "$label load" PASS "$(( $(date +%s) - t0 ))s; mode ${mode:-?}"
+  t1=$(date +%s)
+  gen="$(curl -s -m 1800 -X POST -H 'content-type: application/json' --data '{"prompt":"a red apple on a wooden table","negative_prompt":"","width":256,"height":256,"steps":4,"cfg_scale":7,"seed":42,"sampler_name":"euler_a","batch_size":1}' "$BASE/sdapi/v1/txt2img")"
+  rm -f "$ROOT/ci-image-$B.png"
+  echo "$gen" | json_get images.0 | base64 --decode > "$ROOT/ci-image-$B.png" 2>/dev/null
+  stats="$(png_stats "$ROOT/ci-image-$B.png")"
+  set -- $stats
+  if [[ "${1:-0}" == 256 && "${2:-0}" == 256 && "${3:-0}" -gt 20 ]]; then
+    record "$label inference" PASS "$(( $(date +%s) - t1 ))s: 256x256 PNG, 4 steps, $3 distinct sampled byte values (not blank)"
   else
-    record "Image backend load (app API)" FAIL "start: ${start:0:200} status: ${st:0:300}"
+    gpu_fail "$label inference" "stats='$stats' resp=${gen:0:200}"
   fi
   api POST /api/stop-backend '{}' >/dev/null
+  sleep 2
+}
+
+if fetch_verified "https://huggingface.co/second-state/stable-diffusion-v1-5-GGUF/resolve/031b5f5df991f511b3f5fa8fed6d99048ababb69/$SD_MODEL" \
+     b8944e9fe0b69b36ae1b5bb0185b3a7b8ef14347fe0fa9af6c64c4829022261f "$CACHE/$SD_MODEL"; then
+  cp "$CACHE/$SD_MODEL" "$APP/models/$SD_MODEL"
+  for b in ${IMAGE_BACKENDS:-cpu}; do image_test "$b"; done
 else
   record "Image model download" FAIL "checksum mismatch or download failed"
 fi
