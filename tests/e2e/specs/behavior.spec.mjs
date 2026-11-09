@@ -174,16 +174,40 @@ test.describe("chat error states", () => {
     await expect.poll(() => JSON.stringify([...mockApi.conversations.values()].map((c) => c.messages))).toContain("Error: Fixture backend exploded");
   });
 
-  // Known pre-existing defect D-1 (docs/audit/UI_PRESERVATION_BASELINE.md): the pending
-  // requestAnimationFrame token flush in TextChat.jsx is not cancelled on error, so it
-  // overwrites the error text with the partial reply. Remove test.fail when D-1 is fixed.
+  // Known pre-existing defects D-1/D-3 (docs/audit/UI_PRESERVATION_BASELINE.md): the
+  // pending requestAnimationFrame token flush in TextChat.jsx is never cancelled, so when it
+  // lands after the stream settles it overwrites the final message. In real use this is a
+  // race; these tests force the late-flush ordering so the outcome is deterministic.
+  // Remove test.fail when the defect is fixed.
+  const forceLateTokenFlush = (page) =>
+    page.addInitScript(() => {
+      const raf = window.requestAnimationFrame.bind(window);
+      window.requestAnimationFrame = (cb) => setTimeout(() => raf(cb), 150);
+    });
+
   test("a streamed backend error shows its reason in the conversation [D-1]", async ({ page, mockApi }) => {
     test.fail(true, "D-1: error reason overwritten by deferred token flush (original UI behaviour)");
     mockApi.chat = partialThenError;
+    await forceLateTokenFlush(page);
     await openRoute(page, "chat");
     await page.getByRole("textbox", { name: "Message" }).fill("trigger error");
     await page.getByRole("button", { name: "Send message" }).click();
-    await expect(page.locator(".chat-bubble.error")).toContainText("Fixture backend exploded", { timeout: 3000 });
+    await expect(page.locator(".chat-bubble.error")).toHaveCount(1);
+    // Let the deferred flush land, then check the settled state (the reason is briefly
+    // visible before being overwritten).
+    await page.waitForTimeout(500);
+    await expect(page.locator(".chat-bubble.error")).toContainText("Fixture backend exploded", { timeout: 2000 });
+  });
+
+  test("a finished reply shows a completed thought process [D-3]", async ({ page, mockApi }) => {
+    test.fail(true, "D-3: final generation stats overwritten by deferred token flush (original UI behaviour)");
+    await forceLateTokenFlush(page);
+    await openRoute(page, "chat");
+    await page.getByRole("textbox", { name: "Message" }).fill("Say hello");
+    await page.getByRole("button", { name: "Send message" }).click();
+    await expect(page.getByText("Hello from the fixture model.")).toBeVisible();
+    await page.waitForTimeout(500);
+    await expect(page.locator(".chat-thinking-title")).toHaveText(/^Thought process/, { timeout: 2000 });
   });
 
   test("an HTTP error from the chat endpoint is shown", async ({ page, mockApi }) => {
