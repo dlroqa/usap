@@ -18,7 +18,7 @@
 * **One error model for the API** (`scripts/server/errors.cjs`). Error responses keep `{ ok: false, error }` and any route-specific fields, and add a machine-readable `code`. Statuses follow the cause: 400 invalid request, 404 missing item, 409 wrong state, 503 engine not installed, 500 server or engine failure. See `docs/runtime/API_ERRORS.md`.
 * A request that triggers an unexpected error in a route is answered with a generic `500 INTERNAL_ERROR`, and the server keeps running. Wrongly typed request fields get `400 INVALID_REQUEST`. JSON bodies that aren't objects (`null`, arrays, numbers, strings) get `400` instead of no answer.
 * Error messages never include stack traces or internal Node.js text. Absolute paths are shortened (studio-relative, `~` for the home folder).
-### Architecture (Step 9.8, in progress)
+### Architecture (Step 9.8, in progress; 9.8a #36)
 * The server's request handling is split into a pipeline (`scripts/server/http/pipeline.cjs`), a router (`http/router.cjs`) and route modules, starting with the read-only system routes (`routes/system.cjs`). Behaviour, API responses and the interface are unchanged. Plan: `docs/roadmap/STEP9_8_MODULES.md`.
 ### Compatibility
 * **Ten error paths changed status** from 500 to 400, 404, 409 or 503 (Step 9.7; table in `docs/runtime/API_ERRORS.md`). Shapes and messages are unchanged, and the interface is unaffected. Scripts that checked for `500` on these paths should check `ok: false` or the new `code`.
