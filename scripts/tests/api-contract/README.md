@@ -26,7 +26,7 @@ macOS arm64 and macOS Intel.
 | File confinement | traversal attempts against delete/read routes can't delete or read sentinel files outside the data folders |
 | Model management, configuration | model files are listed, deleted by name (only that file), 404 when gone; conversations save → list → delete |
 | Engines unavailable | whisper, Kokoro, image and chat requests fail with an explanation; the server keeps serving |
-| Streaming format | `/api/llm/chat` streams OpenAI-style SSE (`data:` chunks, `finish_reason`, `data: [DONE]`) and non-stream JSON, through a fake `llama-server` (`fake-llama-server.cjs`). Linux and macOS only: Windows needs a real `.exe`, so that test is skipped there with that reason |
+| Streaming format | `/api/llm/chat` streams OpenAI-style SSE (`data:` chunks, `finish_reason`, `data: [DONE]`) and non-stream JSON, through a fake `llama-server` (`fake-llama-server.cjs`). Linux and macOS only: Windows needs a real `.exe`, so that test is **skipped there with that reason**, and Windows streaming coverage is incomplete until [#14](https://github.com/dlroqa/usap/issues/14) |
 
 Not covered here (needs network, native dialogs or real engines): downloads, Hugging Face
 search, `pick-model-file`, real inference. Real inference is covered by `native-runtime.yml`.
