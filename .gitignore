@@ -60,3 +60,4 @@ test-results/
 # CI model cache for runtime validation (never committed)
 /.ci-model-cache/
 /ci-logs/
+/ci-image*.png

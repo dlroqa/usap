@@ -444,13 +444,34 @@ mkdir -p "$BACKEND_DIR"
 
 if [[ "$PLATFORM" == "Darwin" ]]; then
   if [[ "$ARCH" != "arm64" ]]; then
-    # Intel Mac: stable-diffusion.cpp publishes macOS builds for Apple Silicon only, and the
-    # Core ML/ANE path needs Apple Silicon. Skip both (never install arm64-only binaries here)
-    # and continue with the text, speech and voice engines, which have x86_64 builds.
-    print_step 2 $TOTAL_STEPS "Image generation backend (skipped on Intel Mac)"
-    print_warn "Image generation is not available on Intel Macs yet: stable-diffusion.cpp"
-    print_warn "publishes macOS builds for Apple Silicon (arm64) only. Text chat, transcription"
-    print_warn "and voice are set up normally and run on the CPU."
+    # Intel Mac: the pinned stable-diffusion.cpp macOS archive is named "arm64", but its
+    # sd-server, sd-cli and libstable-diffusion.dylib are universal (x86_64 + arm64).
+    # Install it only after every Mach-O file is verified to contain an x86_64 slice;
+    # otherwise remove it and keep image generation unavailable. Core ML/ANE needs Apple
+    # Silicon and stays skipped.
+    print_step 2 $TOTAL_STEPS "Setting up stable-diffusion.cpp image backend for Intel Mac (app/backend/mac/)"
+    MAC_BACKEND="$BACKEND_DIR/sd"
+    if [[ ! -x "$MAC_BACKEND" ]]; then
+      MAC_ZIP="$TOOLS_DIR/sd-mac.zip"
+      download_file "$SD_BASE_URL/sd-master-${SD_SHORT_HASH}-bin-Darwin-macOS-15.7.7-arm64.zip" "$MAC_ZIP" "stable-diffusion.cpp macOS backend (universal binaries)"
+      extract_zip "$MAC_ZIP" "$BACKEND_DIR/extracted" "macOS image backend"
+      rm -f "$MAC_ZIP"
+      copy_macos_backend_from_extracted "$BACKEND_DIR/extracted" "$BACKEND_DIR" || true
+      rm -rf "$BACKEND_DIR/extracted"
+    fi
+    INTEL_SD_OK=1
+    verify_macos_binary_arch "$MAC_BACKEND" "x86_64" || INTEL_SD_OK=0
+    for lib in "$BACKEND_DIR"/*.dylib; do
+      [[ -e "$lib" ]] || continue
+      verify_macos_binary_arch "$lib" "x86_64" || INTEL_SD_OK=0
+    done
+    if [[ "$INTEL_SD_OK" == "1" ]]; then
+      print_ok "Intel Mac image backend installed (runs on the CPU; GPU use is not verified on Intel)."
+    else
+      rm -f "$MAC_BACKEND" "$BACKEND_DIR"/*.dylib "$BACKEND_DIR"/*.metallib
+      print_warn "Image generation is not available on this Intel Mac: the stable-diffusion.cpp"
+      print_warn "build has no x86_64 code. Text chat, transcription and voice are set up normally."
+    fi
   else
   print_step 2 $TOTAL_STEPS "Setting up stable-diffusion.cpp Metal backend (app/backend/mac/)"
 

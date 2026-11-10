@@ -56,9 +56,9 @@ const BACKEND_PATHS = {
   linuxCuda: path.join(ROOT, "app", "backend", "linux", "cuda", "sd-server-cuda"),
 };
 let BACKEND_PATH = "";
-// stable-diffusion.cpp publishes macOS builds for Apple Silicon only (see scripts/setup/setup.sh).
-const MAC_INTEL_IMAGE_UNSUPPORTED = osPlatform === "darwin" && process.arch !== "arm64";
-const MAC_INTEL_IMAGE_MESSAGE = "Image generation is not available on Intel Macs yet: stable-diffusion.cpp publishes macOS builds for Apple Silicon only. Text chat, transcription and voice still work.";
+// On Intel Macs the image backend is only present if setup verified its x86_64 slices (scripts/setup/setup.sh).
+const IS_MAC_INTEL = osPlatform === "darwin" && process.arch !== "arm64";
+const MAC_INTEL_IMAGE_MESSAGE = "Image generation is not installed on this Intel Mac: setup could not verify an x86_64 stable-diffusion.cpp build. Run setup again; text chat, transcription and voice still work.";
 const backendSupportsFlags = {};
 const backendValidationErrors = {};
 if (osPlatform === "win32") {
@@ -3309,9 +3309,14 @@ function getBackendOptions() {
   );
   const rocmInstalled = osPlatform === "linux" && fs.existsSync(BACKEND_PATHS.linuxRocm);
   const rocmAvailable = rocmInstalled && hasAmdGpu() && backendAccepts(BACKEND_PATHS.linuxRocm, "rocm");
-  const cpuInstalled = (osPlatform === "linux" && fs.existsSync(BACKEND_PATHS.linuxCpu)) ||
-                        (osPlatform === "win32" && fs.existsSync(BACKEND_PATHS.cpu));
   const metalInstalled = osPlatform === "darwin" && fs.existsSync(BACKEND_PATHS.mac);
+  // The macOS sd build always contains ggml's CPU backend ("--backend cpu"). It is the fallback
+  // where Metal lacks ops the model needs (e.g. 'NORM' on paravirtual GPUs) and the default on
+  // Intel Macs. Like Metal, it is not probed: a cold first exec on macOS can exceed the 5 s probe.
+  const macCpuAvailable = metalInstalled;
+  const cpuInstalled = (osPlatform === "linux" && fs.existsSync(BACKEND_PATHS.linuxCpu)) ||
+                        (osPlatform === "win32" && fs.existsSync(BACKEND_PATHS.cpu)) ||
+                        macCpuAvailable;
   const metalAvailable = metalInstalled;
   const coremlNpu = getCoreMLNpuInfo();
   const openvinoNpu = getOpenVinoNpuInfo();
@@ -3341,7 +3346,7 @@ function getBackendOptions() {
   if (metalInstalled && !metalAvailable) {
     unavailable.push({ id: "metal", label: "Metal GPU", reason: "Installed, but Metal backend validation failed." });
   }
-  if (MAC_INTEL_IMAGE_UNSUPPORTED && !metalInstalled) {
+  if (IS_MAC_INTEL && !metalInstalled) {
     unavailable.push({ id: "metal", label: "Metal GPU", reason: MAC_INTEL_IMAGE_MESSAGE });
   }
   if (coremlNpu.supported && !coremlNpu.ready) {
@@ -3365,7 +3370,8 @@ function getBackendOptions() {
   let defaultBackend = "cpu";
   if (coremlNpu.supported && coremlNpu.ready) {
     defaultBackend = "apple-npu";
-  } else if (metalAvailable) {
+  } else if (metalAvailable && !(IS_MAC_INTEL && macCpuAvailable)) {
+    // Intel Macs default to CPU: Metal image generation is unverified on Intel/AMD Mac GPUs.
     defaultBackend = "metal";
   } else if (cudaAvailable) {
     const gpuName = String(getGpuInfo().name).toLowerCase();
@@ -4737,7 +4743,7 @@ async function startBackend(settings = {}) {
   currentSettings.useGpu = resolvedBackendType !== "cpu";
   const backendPath = selectBackendPath(currentSettings.useGpu, currentSettings.backendType, currentSettings.model);
   if (!backendPath) {
-    const setupHint = MAC_INTEL_IMAGE_UNSUPPORTED
+    const setupHint = IS_MAC_INTEL
       ? MAC_INTEL_IMAGE_MESSAGE
       : resolvedBackendType === "apple-npu"
       ? "CoreML Python environment is not set up. Run scripts/setup/setup-coreml-npu.sh first."
@@ -4767,6 +4773,9 @@ async function startBackend(settings = {}) {
   if (currentSettings.useGpu) {
     runThreads = Math.min(4, runThreads);
   }
+  // Never run more compute threads than logical CPUs: on a 4-core Mac the default 8 threads made
+  // sd ~5x slower (measured on macos-15-intel: 430 s/it at -t 8 vs 84 s/it at -t 4).
+  runThreads = Math.max(1, Math.min(runThreads, os.cpus().length || runThreads));
 
   let args = [];
   const requestedBackend = resolveBackendType(currentSettings.useGpu, currentSettings.backendType, currentSettings.model);
@@ -4985,7 +4994,8 @@ async function startBackend(settings = {}) {
       backendLoadState.backendMode = "ROCm GPU";
       currentSettings.backendMode = "ROCm GPU";
     }
-    if (cleanOutput.includes("ggml_metal")) {
+    // ggml lists the Metal device even when sd runs with --backend cpu; keep the CPU label then.
+    if (cleanOutput.includes("ggml_metal") && requestedBackend !== "cpu") {
       backendLoadState.backendMode = "Metal GPU";
       currentSettings.backendMode = "Metal GPU";
     }
