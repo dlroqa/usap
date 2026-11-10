@@ -107,6 +107,9 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
 * **Provenance-preserving import** of the upstream repository with full history ([#1](https://github.com/dlroqa/usap/pull/1)).
 * **Security hardening** ([#2](https://github.com/dlroqa/usap/pull/2)): the local server only serves
   its own files and refuses requests from other websites, with regression tests.
+* **Outbound request protection** (Step 9.3): web search, page fetching, model downloads and Hugging Face
+  lookups can only reach public internet addresses. Every redirect is checked, and the address that was
+  checked is the one connected to. Covered by regression tests against local test services.
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
 * **UI regression protection** ([#4](https://github.com/dlroqa/usap/pull/4)): pixel-exact
@@ -158,6 +161,9 @@ Platform notes:
 * **Linux:** the prebuilt engines need glibc 2.38+ (for example Ubuntu 24.04). `./linux.sh --max-perf` adds ROCm, and `--setup-openvino` adds Intel NPU support.
 * **Windows:** 64-bit Windows 10 or 11.
 * **macOS:** whisper.cpp is installed through Homebrew. On Intel Macs, images use the CPU by default.
+* **Model downloads from your own network** (for example a NAS mirror) are refused by default. Set
+  `USAP_ALLOW_LAN_DOWNLOADS=1` to allow private-network hosts. This machine's own addresses and cloud
+  metadata addresses are always refused.
 * **LAN access** is off by default. `UAIS_HOST=0.0.0.0` opens the studio to your network, and it has
   no login, so anyone on that network can use it.
 
@@ -187,7 +193,7 @@ only, no force pushes. Details: [CI_GUIDE.md](docs/ci/CI_GUIDE.md),
 | Intel macOS setup; chat, accessibility and mobile fixes | Done (#5–#8) |
 | **Step 8:** native inference verification | **CPU done** on all 4 platforms (#9); GPU pending real hardware |
 | Desktop installer requirement documented | Done (#10), planning only |
-| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver in review |
+| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection in review |
 
 ## Development Roadmap
 

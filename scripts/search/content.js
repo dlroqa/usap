@@ -1,7 +1,5 @@
 const http = require("http");
 const https = require("https");
-const dns = require("dns").promises;
-const net = require("net");
 const zlib = require("zlib");
 
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LocalAIStudio/1.0";
@@ -18,52 +16,8 @@ function decodeHtml(value) {
     .replace(/&#(\d+);/g, (_, num) => String.fromCodePoint(parseInt(num, 10)));
 }
 
-function isPrivateIpv4(ip) {
-  const parts = String(ip || "").split(".").map((part) => Number(part));
-  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part))) return true;
-  const [a, b] = parts;
-  return a === 0 ||
-    a === 10 ||
-    a === 127 ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    a >= 224;
-}
-
-function isPrivateIpv6(ip) {
-  const value = String(ip || "").toLowerCase();
-  return value === "::1" ||
-    value.startsWith("fc") ||
-    value.startsWith("fd") ||
-    value.startsWith("fe80:") ||
-    value === "::";
-}
-
-function isPrivateIp(ip) {
-  const family = net.isIP(ip);
-  if (family === 4) return isPrivateIpv4(ip);
-  if (family === 6) return isPrivateIpv6(ip);
-  return true;
-}
-
-async function assertPublicUrl(rawUrl) {
-  const parsed = new URL(rawUrl);
-  if (!["http:", "https:"].includes(parsed.protocol)) {
-    throw new Error("Only HTTP and HTTPS URLs can be fetched.");
-  }
-  const host = parsed.hostname.toLowerCase();
-  if (host === "localhost" || host.endsWith(".localhost")) {
-    throw new Error("Localhost URLs are blocked.");
-  }
-  if (net.isIP(host) && isPrivateIp(host)) {
-    throw new Error("Private network URLs are blocked.");
-  }
-  const records = await dns.lookup(host, { all: true, verbatim: false });
-  if (!records.length || records.some((record) => isPrivateIp(record.address))) {
-    throw new Error("Private network addresses are blocked.");
-  }
-}
+// Outbound requests may only reach public internet addresses: shared guard (Step 9.3).
+const { assertSafeUrl, guardedRequestOptions, followRedirect } = require("../server/net-guard.cjs");
 
 function stripHtml(html) {
   const withoutNoise = String(html || "")
@@ -98,8 +52,10 @@ function decodeBody(buffer, encoding) {
   return buffer.toString("utf8");
 }
 
+// options._netPolicy is a test seam (scripts/tests/ssrf.test.cjs); production uses the default policy.
 async function fetchPageContent(rawUrl, options = {}, redirects = 0) {
-  await assertPublicUrl(rawUrl);
+  const policy = { maxRedirects: 3, ...(options._netPolicy || {}) };
+  assertSafeUrl(rawUrl, policy);
   const timeoutMs = Math.max(3000, Math.min(20000, Number(options.timeoutMs) || 10000));
   const maxBytes = Math.max(64 * 1024, Math.min(2 * 1024 * 1024, Number(options.maxBytes) || 768 * 1024));
   const parsed = new URL(rawUrl);
@@ -107,6 +63,7 @@ async function fetchPageContent(rawUrl, options = {}, redirects = 0) {
 
   return new Promise((resolve, reject) => {
     const req = transport.get(parsed, {
+      ...guardedRequestOptions(policy),
       headers: {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.2",
@@ -114,10 +71,10 @@ async function fetchPageContent(rawUrl, options = {}, redirects = 0) {
       },
       timeout: timeoutMs,
     }, async (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects < 3) {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
         try {
-          const nextUrl = new URL(res.headers.location, parsed).toString();
+          const nextUrl = followRedirect(parsed.toString(), res.headers.location, redirects, policy);
           resolve(await fetchPageContent(nextUrl, options, redirects + 1));
         } catch (err) {
           reject(err);

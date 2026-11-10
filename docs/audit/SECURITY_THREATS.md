@@ -20,8 +20,8 @@ Local chat history, transcriptions, generated media, model files (multi-GB), loc
 | S-1 | Static file serving path confinement | High | Fixed in PR 01 (`scripts/server/request-policy.cjs`, tests in `scripts/tests/security-regressions.test.cjs`) |
 | S-2 | Cross-origin request policy for the local API | High | Fixed in PR 01 (regression tests in CI) |
 | S-3 | DNS-rebinding protection (Host header validation) | Medium | Fixed in PR 01 |
-| S-4 | Page-fetch SSRF guard: DNS check and connection are separate lookups | Medium | Backlog (PR 04) |
-| S-5 | Search-provider redirects: unbounded and target unvalidated | Medium | Backlog (PR 04) |
+| S-4 | Page-fetch SSRF guard: DNS check and connection are separate lookups | Medium | Fixed in Step 9.3 (`scripts/server/net-guard.cjs`, tests in `scripts/tests/ssrf.test.cjs`); the guard also covers downloads and Hugging Face lookups |
+| S-5 | Search-provider redirects: unbounded and target unvalidated | Medium | Fixed in Step 9.3 (bounded, every hop validated) |
 | S-6 | No integrity verification (checksum/signature) of downloaded native runtimes | Medium | Backlog (PR 03/04) |
 | S-7 | No authentication when LAN mode (`UAIS_HOST`) is enabled | Medium (opt-in) | Backlog (PR 04) |
 | S-8 | One shell-string `execSync(unzip …)` built from a server-derived path | Low | Backlog (PR 04) |
