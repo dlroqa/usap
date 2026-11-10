@@ -1,367 +1,248 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/logo/mark-on-dark.svg" />
-    <img src="assets/branding/logo/mark.svg" alt="Portable AI Studio logo" width="120" height="120" />
-  </picture>
-</p>
+# USAP
 
-<h1 align="center">Portable AI Studio</h1>
-
-<p align="center">
-  <strong>A premium, zero-configuration local AI studio and offline GUI for Stable Diffusion (Image Generation), LLMs (Chat), Whisper (Speech-to-Text), and Kokoro (Text-to-Speech). Powered by hardware-accelerated GPU and NPU execution on Windows, Linux, and macOS.</strong>
-</p>
+**USAP is a local-first AI studio for chat, image generation, speech-to-text and text-to-speech
+on your own hardware.** It is an actively developed continuation of the open-source
+[Portable Local Studio](https://github.com/techjarves/Portable-Local-Studio) (Portable AI Studio)
+by techjarves. USAP keeps that application and its interface as they are, and works on what's underneath:
+security, testing, platform coverage, reliability and performance.
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Offline-100%25-green?style=for-the-badge&logo=offline" alt="100% Offline" />
-  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue?style=for-the-badge" alt="Platforms" />
-  <img src="https://img.shields.io/badge/License-MIT-orange?style=for-the-badge" alt="License" />
-</p>
-
-<p align="center">
-  🎥 <strong>Watch the Setup & Demo Video:</strong> <a href="https://youtu.be/yeFvP3SWMak">https://youtu.be/yeFvP3SWMak</a>
-</p>
-
-<p align="center">
-  <a href="https://youtu.be/yeFvP3SWMak">
-    <img src="https://img.youtube.com/vi/yeFvP3SWMak/maxresdefault.jpg" alt="Uncensored AI Studio Video Tutorial" width="800" style="border-radius: 8px;" />
-  </a>
-</p>
-
----
-
-## <a id="screenshots"></a>📸 Screenshots
-
-<p align="center">
-  <img src="docs/screenshots/chat.jpg" alt="Offline chat with a local LLM" width="900" />
+  <img src="docs/screenshots/chat.jpg" alt="The studio's chat workspace running a local model" width="860" />
   <br />
-  <sub><strong>Chat</strong> with local LLMs, fully offline</sub>
+  <sub>The original Portable Local Studio interface, preserved unchanged in USAP.</sub>
 </p>
 
-<table>
-  <tr>
-    <td width="50%" align="center">
-      <img src="docs/screenshots/images.jpg" alt="Image generation with Stable Diffusion" />
-      <br /><sub><strong>Images:</strong> Stable Diffusion generation and gallery</sub>
-    </td>
-    <td width="50%" align="center">
-      <img src="docs/screenshots/transcribe.jpg" alt="Speech to text with Whisper" />
-      <br /><sub><strong>Transcribe:</strong> speech to text with Whisper</sub>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" align="center">
-      <img src="docs/screenshots/voice.jpg" alt="Text to speech with Kokoro" />
-      <br /><sub><strong>Voice:</strong> natural text to speech with Kokoro</sub>
-    </td>
-    <td width="50%" align="center">
-      <img src="docs/screenshots/models.jpg" alt="Built-in model manager" />
-      <br /><sub><strong>Models:</strong> browse and download models in one click</sub>
-    </td>
-  </tr>
-</table>
-
----
-
-
-## 📖 Table of Contents
-* [Screenshots](#screenshots)
-* [What is Portable AI Studio?](#what-is-uncensored-ai-studio)
-* [Key Features](#key-features)
-* [Workspace & Engine Architecture](#workspace-architecture)
-* [Supported Models](#supported-models)
-* [Folder Architecture](#folder-architecture)
-* [Getting Started](#getting-started)
-  * [Windows Setup](#windows-setup)
-  * [Linux Setup](#linux-setup)
-  * [macOS Setup](#macos-setup)
-* [Hardware Compatibility & Acceleration](#hardware-compatibility-acceleration)
-* [Troubleshooting & FAQ](#troubleshooting-faq)
-* [Building From Source](#building-from-source)
-* [Licensing](#licensing)
-
----
-
-## <a id="what-is-uncensored-ai-studio"></a>📖 What is Portable AI Studio?
-
-**Portable AI Studio** is a completely offline, zero-setup, self-contained AI studio for Windows, Linux, and macOS. Unlike cloud-based AI systems, it runs entirely on your own hardware with no censorship, tracking, subscriptions, or login requirements.
-
-It unifies four major local AI capabilities into one high-performance desktop interface:
-1. **🎨 Image Generation (Stable Diffusion):** Generate and edit high-quality images offline using `.safetensors`, `.gguf`, or `.ckpt` model weights.
-2. **💬 Text Chat (LLMs):** Converse privately with open-source language models (GGUF format) powered by official, high-performance `llama.cpp` backends.
-3. **🎙️ Speech-to-Text (Whisper):** Transcribe voice recordings and speech to text in real-time with an integrated `whisper.cpp` engine.
-4. **🗣️ Text-to-Speech (Kokoro TTS):** Convert text outputs into highly natural, lifelike vocal audio offline using the `Kokoro-82M` ONNX model.
-
----
-
-## <a id="key-features"></a>🌟 Key Features
-
-*   **100% Offline & Private:** Run inferences locally. No internet, telemetry, cloud logging, or API keys required.
-*   **Zero-Install Portability:** Entire runtime (Node.js, models, GPU backends) is self-contained. Zero global system environment changes.
-*   **Auto-Configured Acceleration:** Auto-detects hardware specs to load CUDA (Nvidia), ROCm (AMD), Vulkan (Intel/AMD/NVIDIA), Metal (macOS), or OpenVINO (Intel NPU) backends.
-*   **Integrated Model Manager:** Paste Hugging Face URLs to download weights directly, or drag-and-drop local weights to import them.
-*   **Live Performance Monitor:** Track CPU, RAM, GPU, and VRAM utilization in real-time directly inside the web UI.
-*   **Local Output Gallery:** Saves generated images side-by-side with prompt parameters and metadata JSON files.
-
----
-
-## <a id="workspace-architecture"></a>⚙️ Workspace & Engine Architecture
-
-To avoid exhausting system RAM or VRAM, text and image engines are mutually exclusive by default. You can switch between workspaces inside the UI:
-
-*   **Image Generation Workspace:** Uses a dedicated `stable-diffusion.cpp` backend node. Model weights are stored in `app/models/`.
-*   **Text Chat Workspace:** Uses a portable `llama.cpp` server backend. Model weights (.gguf) are stored in `app/llm-models/`. A small Qwen2.5 Coder starter model can be downloaded directly from the Text Chat panel.
-*   **Speech Worker (Whisper):** Runs a localized `whisper-cli` process to convert your vocal input to text.
-*   **Audio Output (Kokoro TTS):** Utilizes `kokoro-js` locally on the server side to read responses in natural voices.
-
----
-
-## <a id="supported-models"></a>Supported Models
-
-The app is designed around single-file local models that can be loaded directly by the bundled backend engines.
-
-### Image generation
-
-| Model type | Supported | Put files in | Notes |
-| :--- | :--- | :--- | :--- |
-| Stable Diffusion 1.5 checkpoints | Yes | `app/models/` | Best compatibility. Use `.safetensors` or `.ckpt` files. |
-| SDXL checkpoints | Yes | `app/models/` | Supported as single-file checkpoints. Requires more RAM/VRAM than SD 1.5. |
-| Single-file SD/SDXL GGUF checkpoints | Limited | `app/models/` | Only complete single-file checkpoints are supported. |
-| OpenVINO image model folders | Intel NPU only | `app/openvino-models/` | Download from the Model Manager after running the OpenVINO setup. |
-| CoreML image models | Apple Silicon only | `app/models/` | Requires macOS on Apple Silicon and the CoreML setup path. |
-| Flux, HiDream, Hunyuan, Wan, Qwen Image, Z-Image workflows | No | N/A | These usually require separate diffusion, VAE, and text encoder files and are not one-click checkpoint loads in this app. |
-| LoRA, ControlNet, VAE-only, text-encoder-only, or diffusion-only files | No | N/A | Companion files are not loaded as standalone image models. |
-
-Known-good image models available from the Model Manager:
-
-| Name | Filename | Type | Approx. size | Recommended use |
-| :--- | :--- | :--- | :--- | :--- |
-| Juggernaut XL v9 Lightning | `Juggernaut_RunDiffusionPhoto2_Lightning_4Steps.safetensors` | SDXL | 7.1 GB | High-quality photorealism on mid/high tier machines. |
-| DreamShaper XL Lightning | `DreamShaperXL_Lightning.safetensors` | SDXL | 6.9 GB | General SDXL images, fantasy, renders, and illustration. |
-| DreamShaper 8 | `DreamShaper_8_pruned.safetensors` | SD 1.5 | 2.1 GB | Faster, lower-memory image generation. |
-| CyberRealistic V8 | `CyberRealistic_V8_FP16.safetensors` | SD 1.5 | 2.0 GB | Realistic SD 1.5 images and lower-memory systems. |
-| Rev Animated | `rev-animated-v1-2-2.safetensors` | SD 1.5 | 2.0 GB | Stylized/anime SD 1.5 images. |
-| LCM DreamShaper OpenVINO | `OpenVINO/LCM_Dreamshaper_v7-fp16-ov` | OpenVINO | 2.7 GB | Intel Core Ultra NPU test model. |
-
-### Text, speech, and TTS
-
-| Workspace | Supported model files | Put files in | Notes |
-| :--- | :--- | :--- | :--- |
-| Text Chat | `.gguf` llama.cpp models | `app/llm-models/` | Use single-file GGUF chat/instruct models. Vision models may also require a matching `mmproj` file. |
-| Speech-to-Text | whisper.cpp `.bin` models | `app/speech-models/` | Use Whisper GGML/whisper.cpp model files. |
-| Text-to-Speech | Kokoro `.json` manifests and model assets | `app/tts-models/` / `app/tts-runtime/` | Use the built-in Kokoro setup and Model Manager entries. |
-
-> [!NOTE]
-> Linux release binaries are built for Ubuntu 24.04-era systems and require `glibc 2.38+` plus `GLIBCXX_3.4.32+`. On older Ubuntu/Debian VMs, a model such as CyberRealistic may be valid but the backend can still fail before loading it. Upgrade the VM OS or build the backend from source.
-
----
-
-## <a id="folder-architecture"></a>📁 Folder Architecture
-
-```
-Portable-AI-Studio/
-├── windows.bat                # Windows Launcher (Double-click entrypoint)
-├── linux.sh                   # Linux Launcher (Terminal entrypoint)
-├── mac.sh                     # macOS Launcher (Terminal entrypoint)
-├── LICENSE                    # MIT Open Source License
-├── .gitignore                 # Excludes models and output images from version control
-├── README.md                  # Detailed system documentation
-├── scripts/
-│   ├── setup/                 # Platform setup and backend installers
-│   ├── reset/                 # Clean install & environment repair
-│   ├── server/                # UI web server and backend lifecycle manager
-│   ├── workers/               # Local worker processes
-│   ├── build/                 # Optional source build helpers
-│   └── config/                # Runtime configuration catalogs
-└── app/
-    ├── frontend/              # UI source code (Vite + React)
-    ├── models/                # Place image weights here (.safetensors, .gguf, .ckpt)
-    ├── llm-models/            # Place text GGUF weights here
-    └── outputs/               # Saved images and parameters metadata
-```
-
----
-
-## <a id="getting-started"></a>🚀 Getting Started
-
-Ensure you have a modern web browser installed. Follow the quick guide below for your platform:
-
-### Windows Setup
-
-1. **Launch:** Double-click **`windows.bat`**.
-   > [!NOTE]
-   > On the first run, the script will automatically download a portable Node.js runtime and configure pre-compiled GPU/CPU backend binaries.
-2. **Add Models:** Drop `.safetensors`, `.gguf`, or `.ckpt` weights into `app/models/` (or download them via the **Model Manager** tab in the UI).
-3. **Generate:** Open `http://localhost:1420` in your browser, select your model, and write a prompt.
-
-### Linux Setup
-
-1. **Make executable:** Open a terminal in the project folder and make the script executable:
-   ```bash
-   chmod +x linux.sh
-   ```
-2. **Launch:** Run **`./linux.sh`**.
-   - **NVIDIA GPU Users:** You will be prompted to set up the high-performance **CUDA** backend (downloads prebuilt or automatically compiles from source as a fallback).
-   - **AMD Radeon Performance:** Run with **`./linux.sh --max-perf`** to add the ROCm backend (~1.3 GB download).
-   - **Intel Core Ultra NPU:** Run with **`./linux.sh --setup-openvino`** to configure Intel NPU support (requires Intel Linux NPU driver).
-3. **Add Models:** Drop your weights into `app/models/` or download them via the **Model Manager** tab.
-4. **Generate:** Open `http://localhost:1420` in your browser.
-
-### macOS Setup
-
-1. **Make executable:** Open a terminal in the project folder and make the script executable:
-   ```bash
-   chmod +x mac.sh
-   ```
-2. **Launch:** Run **`./mac.sh`**.
-   > [!IMPORTANT]
-   > The prebuilt macOS backend is optimized for **Apple Silicon (M1 or newer)** and uses **Metal** GPU acceleration. *(macOS Intel hardware is completely unsupported)*.
-3. **Add Models:** Drop your weights into `app/models/` or download them via the **Model Manager** tab.
-4. **Generate:** Open `http://localhost:1420` in your browser.
-
----
-
-## <a id="hardware-compatibility-acceleration"></a>🖥️ Hardware Compatibility & Acceleration
-
-### Windows
-
-| GPU Vendor | Tech | Status | Notes |
-| :--- | :--- | :--- | :--- |
-| **Nvidia** | CUDA | ✅ Native | Maps `sd-cuda.exe` with Nvidia SDK 12 optimizations. |
-| **AMD Radeon** | Vulkan | ✅ Native | Maps `sd-vulkan.exe` with Vulkan API acceleration. |
-| **Intel Arc** | Vulkan | ✅ Native | Maps `sd-vulkan.exe` for Intel hardware. |
-| **Integrated / None** | CPU | ⚠️ Fallback | Runs on logical CPU threads (slow). |
-
-### Linux
-
-| GPU Vendor | Primary | Fallback | Notes |
-| :--- | :--- | :--- | :--- |
-| **NVIDIA** | CUDA / Vulkan | Vulkan / CPU | Auto-detects NVIDIA. Prompt-driven CUDA setup downloads prebuilt or compiles from source. Falls back to Vulkan for GTX. |
-| **AMD Radeon** | ROCm | Vulkan | ROCm provides best AMD performance when host ROCm drivers are available. |
-| **Intel Arc / integrated** | Vulkan | CPU | Cross-vendor Vulkan support. |
-| **Intel Core Ultra NPU** | OpenVINO NPU | CPU | Requires the Intel Linux NPU driver, kernel 6.6+, Python 3, and `./linux.sh --setup-openvino`. |
-| **Integrated / None** | CPU | — | Runs on logical CPU threads (slow). |
-
-### macOS
-
-| Hardware | Primary | Fallback | Notes |
-| :--- | :--- | :--- | :--- |
-| **Apple Silicon (M1 or newer)** | Metal | CPU | Uses the official Darwin arm64 stable-diffusion.cpp backend. |
-
-> [!IMPORTANT]
-> **System Requirements & Notes:**
-> - **64-bit Windows 10 or Windows 11** is required for the portable Node.js 22 runtime used by the Windows launcher.
-> - **glibc 2.38 or newer** is required for the prebuilt Linux backends (Ubuntu 24.04, Fedora 40+, etc.). The setup script will warn you if your glibc is older.
-> - **Linux runtime libraries:** The prebuilt backends require `libgomp.so.1`; Vulkan additionally requires `libvulkan.so.1` and a working GPU driver. The setup script now checks these before installing a backend and prints the exact distro package command when one is missing.
-> - **Linux OpenVINO NPU:** Intel Core Ultra, x86_64 Linux, kernel 6.6+, a working `/dev/accel/accel0` device, Python 3 with `venv`, and the Intel Linux NPU driver are required.
-
----
-
-## <a id="troubleshooting-faq"></a>🛠️ Troubleshooting & FAQ
-
-<details>
-  <summary><strong> Reset Environment: If a build fails or you want to clear dependencies</strong></summary>
-  <p>Run <code>scripts/reset/reset.ps1</code> (Windows) or <code>scripts/reset/reset.sh</code> (Linux/macOS). This will clear temporary compilation and package caches to repair your environment. <em>(Note: This preserves your model weights and generated output images).</em></p>
-</details>
-
-<details>
-  <summary><strong> Linux backends fail to start with <code>GLIBC_2.38 not found</code></strong></summary>
-  <p>The prebuilt binaries require glibc 2.38+ (e.g. Ubuntu 24.04). If your distribution uses an older glibc version, you can upgrade your operating system or compile the backend from source (see the <a href="#building-from-source">Building From Source</a> guide below).</p>
-</details>
-
-<details>
-  <summary><strong> Port Conflicts: Default port address already busy</strong></summary>
-  <p>The web user interface runs on port <code>1420</code> by default. The GPU backend manager attempts to bind to port <code>8080</code> first, then automatically detects and falls back to a free system port if <code>8080</code> is already occupied.</p>
-</details>
-
-<details>
-  <summary><strong> Opening the studio from another device on your network</strong></summary>
-  <p>The web interface only accepts connections from the computer it runs on, because it has no login. To reach it from another device on purpose, start it with <code>UAIS_HOST=0.0.0.0</code> (for example <code>UAIS_HOST=0.0.0.0 ./linux.sh</code>, or <code>set UAIS_HOST=0.0.0.0</code> before running <code>windows.bat</code>). Anyone on that network can then use it.</p>
-</details>
-
-<details>
-  <summary><strong> Linux ROCm not loading for AMD Radeon GPUs</strong></summary>
-  <p>Ensure your AMD GPU hardware and host kernel are fully compatible with ROCm 7.13. If ROCm fails to initialize correctly, the application will automatically fall back to Vulkan acceleration.</p>
-</details>
-
-<details>
-  <summary><strong> Linux uses the integrated GPU instead of the discrete GPU</strong></summary>
-  <p>On dual-GPU Linux systems, Vulkan device order can put the integrated Intel GPU at <code>vulkan0</code> and the discrete AMD/NVIDIA GPU at <code>vulkan1</code>. The launcher now tries to prefer a discrete Vulkan device when <code>vulkaninfo --summary</code> is available. To force a device manually, start the app with <code>SD_VULKAN_DEVICE=vulkan1 ./linux.sh</code> or use another index such as <code>vulkan0</code>/<code>vulkan2</code>.</p>
-</details>
-
-<details>
-  <summary><strong> Windows exits with code <code>3221225781</code> (0xC0000135)</strong></summary>
-  <p>This code means Windows could not locate a required backend DLL:</p>
-  <ul>
-    <li><strong>For AMD/Intel Vulkan:</strong> Rerun <code>scripts/setup/setup.ps1</code>. Setup installs the required Microsoft Visual C++ x64 runtime and replaces stale Vulkan binaries with the compatible pinned build. Approve the Windows administrator prompt when it appears.</li>
-    <li><strong>For NVIDIA CUDA:</strong> Install or update your NVIDIA graphics driver, then rerun the setup script to restore the CUDA runtime DLLs.</li>
-  </ul>
-  <p>If setup cannot install the runtime, install Microsoft's official <a href="https://aka.ms/vc14/vc_redist.x64.exe">Visual C++ Redistributable for x64</a> manually, restart Windows, and rerun setup. A custom Vulkan build is not the first fix for this exit code.</p>
-</details>
-
-<details>
-  <summary><strong> Windows exits with code <code>3221225501</code> (0xC000001D)</strong></summary>
-  <p>This is an illegal CPU instruction from an older machine-specific Windows backend build; it is not evidence that the model or RTX GPU is unsupported. Rerun <code>scripts/setup/setup.ps1</code> to replace the CPU/CUDA binaries with runtime-dispatched builds and install the matching CUDA 12.8 runtime. The corrected CUDA package includes Blackwell targets for RTX 50-series GPUs.</p>
-</details>
-
-<details>
-  <summary><strong> Generation shows "server is not responding or crashed"</strong></summary>
-  <p>This indicates that the local backend engine process terminated. Check your launch terminal (where you executed <code>windows.bat</code>, <code>./linux.sh</code>, or <code>./mac.sh</code>) for the exact console error. Common causes include glibc version mismatches, missing Vulkan drivers, or system out-of-memory (OOM) issues.</p>
-</details>
-
----
-
-## <a id="building-from-source"></a>🔨 Building From Source
-
-The setup script (`scripts/setup/setup.sh`) now automates building and setting up the CUDA backend from source when selected. If you want to manually build all backends (CPU, Vulkan, and CUDA) at once, you can run the included `scripts/build/build_from_source.sh` script.
-
-For macOS, the included `scripts/build/build_from_source.sh` builds the Metal backend and copies it to `app/backend/mac/sd`.
-
-### Requirements
-- `git`, `cmake`, `make` (or `ninja`), and a C++17 compiler (`g++` / `clang++`).
-- For **CUDA**: the NVIDIA CUDA toolkit (`nvcc`) must be on your `PATH`.
-- For **Vulkan**: the Vulkan SDK / loader, a compatible driver, and `glslc` (Ubuntu/Debian package: `glslc`).
-- For **ROCm**: AMD ROCm development libraries.
-- For **macOS Metal**: Apple Command Line Tools or Xcode.
-
-### Build commands
-
-```bash
-# 1. Clone upstream
-git clone https://github.com/leejet/stable-diffusion.cpp.git
-cd stable-diffusion.cpp
-mkdir build && cd build
-
-# 2. Configure for your backend (pick ONE)
-# CPU only
-cmake .. -DSD_BUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
-
-# CUDA
-cmake .. -DSD_CUDA=ON -DSD_BUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
-
-# Vulkan
-cmake .. -DSD_VULKAN=ON -DSD_BUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
-
-# ROCm
-cmake .. -DSD_HIPBLAS=ON -DSD_BUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
-
-# macOS Metal
-cmake .. -DSD_METAL=ON -DSD_BUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
-
-# 3. Build
-cmake --build . --config Release -j$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
-
-# 4. Copy the binaries into this project
-cp bin/sd* /path/to/Portable-AI-Studio/app/backend/linux/<backend>/
-```
-
-After copying, rename the server binary to match what `scripts/server/serve.cjs` expects:
-- Vulkan: `sd` → `sd-vulkan`
-- ROCm: `sd` → `sd-rocm`
-
-Then restart the app with `./linux.sh` (Linux) or `./mac.sh` (macOS).
-
----
-
-## <a id="licensing"></a>📝 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file. Bundles [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (MIT License). Model weights are subject to their respective creators' licenses.
+**Status:** pre-release, under active development. There are no USAP release packages yet; you
+run it from a checkout, as below. See [Development Progress](#development-progress) and
+[Known Limitations](#known-limitations).
+
+## Contents
+1. [Project Overview](#usap--project-overview)
+2. [Project Origins & Credits](#project-origins--credits)
+3. [Current Capabilities](#current-capabilities)
+4. [USAP Enhancements](#usap-enhancements)
+5. [Platform Compatibility](#platform-compatibility)
+6. [Installation & Usage](#installation--usage)
+7. [GitHub Actions and Testing](#github-actions-and-testing)
+8. [Development Progress](#development-progress)
+9. [Development Roadmap](#development-roadmap)
+10. [Known Limitations](#known-limitations)
+11. [Contributing](#contributing)
+12. [License & Acknowledgments](#license--acknowledgments)
+
+## USAP — Project Overview
+
+Everything runs on your machine through a small local web server (`scripts/server/serve.cjs`)
+and native engines: [llama.cpp](https://github.com/ggml-org/llama.cpp) for chat,
+[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) for images,
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) for transcription and
+[Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) for speech. Your models, conversations and
+outputs stay on your disk. The network is used only to download engines at first setup, to download
+models you choose, and for web search if you enable it.
+
+Project goals:
+* Preserve the original application, its interface and its features.
+* Strengthen backend architecture and maintainability.
+* Improve security and reliability.
+* Improve native inference performance.
+* Support Windows x64, Linux x64, macOS Apple Silicon (arm64) and macOS Intel (x86_64).
+* Keep portable/USB operation, and add conventional desktop installers later (planned).
+* Prepare optional cloud inference and model routing (planned, off by default).
+* Build, test and validate everything in GitHub Actions.
+
+Status words used in this README: **Implemented** (in the code), **Verified** (passed a real
+test in CI, with linked evidence), **Experimental**, **Planned** (not built yet) and **Unsupported**.
+
+## Project Origins & Credits
+
+> USAP is based on and developed from the open-source Portable Local Studio (Portable AI Studio)
+> project by techjarves.
+>
+> Original repository: https://github.com/techjarves/Portable-Local-Studio
+>
+> USAP preserves and builds upon the original project's codebase, functionality, and
+> contributions while introducing additional engineering improvements, testing, platform
+> compatibility, and future capabilities.
+>
+> Credit for the original work belongs to its original author and contributors.
+
+* **What upstream built:** the application itself. That includes the interface, the chat, image,
+  transcription, voice and model-management workspaces, the launchers and setup scripts, hardware
+  backend selection, and web search.
+* **What USAP adds:** the items listed under [USAP Enhancements](#usap-enhancements).
+* **History:** USAP imported upstream commit `a55c42c` with its full Git history, all 188 commits
+  with their original authors and dates, via a merge rather than a copy
+  ([import provenance](docs/audit/IMPORT_PROVENANCE.md)).
+* **Contributors:** upstream contributors include techjarves (Tech Jarves) and community
+  contributors. `git log a55c42c` lists every one of them.
+* **License:** the original [MIT license](LICENSE) and its copyright notice
+  (Copyright (c) 2026 Tech Jarves) are kept unchanged.
+
+## Current Capabilities
+
+All of the features below were built by the original project. "Verified" marks what USAP's CI has
+exercised with real models (see [evidence](docs/ci/MACOS_COMPATIBILITY.md#evidence-by-architecture)).
+
+| Capability | Status | Notes |
+|---|---|---|
+| Local LLM chat (llama.cpp, GGUF) | Implemented; **CPU verified** on all 4 platforms | Streaming chat, reasoning display, conversation history |
+| Image generation (stable-diffusion.cpp) | Implemented; **CPU verified** on all 4 platforms | SD 1.5/SDXL single-file checkpoints, gallery with saved parameters |
+| Speech-to-text (whisper.cpp) | Implemented; **CPU verified** on all 4 platforms | |
+| Text-to-speech (Kokoro 82M) | Implemented; **verified** on all 4 platforms | |
+| Model management | Implemented | Download from the built-in catalogue or Hugging Face, or import local files |
+| Hardware acceleration (CUDA, ROCm, Vulkan, Metal, Core ML, OpenVINO NPU) | Implemented upstream; **unverified in USAP** | No GPU has passed a USAP hardware test yet; see [Known Limitations](#known-limitations) |
+| Web search for chat | Implemented | DuckDuckGo provider; uses the network when enabled |
+| Live hardware monitor and local API | Implemented | CPU/RAM/GPU telemetry; the local `/api/*` HTTP API used by the interface; the image engine's `/sdapi/v1/*` and `/v1/*` routes are proxied on the same port |
+
+More screenshots: [images](docs/screenshots/images.jpg) ·
+[transcribe](docs/screenshots/transcribe.jpg) · [voice](docs/screenshots/voice.jpg) ·
+[models](docs/screenshots/models.jpg). Supported model formats are listed in the
+[original guide](docs/USAGE_UPSTREAM.md#supported-models); the feature-by-feature contract is in
+[FEATURE_MATRIX.md](docs/audit/FEATURE_MATRIX.md).
+
+## USAP Enhancements
+
+Changes USAP has made on top of the original project (details in [CHANGELOG.md](CHANGELOG.md)):
+
+* **Provenance-preserving import** of the upstream repository with full history ([#1](https://github.com/dlroqa/usap/pull/1)).
+* **Security hardening** ([#2](https://github.com/dlroqa/usap/pull/2)): the local server only serves
+  its own files and refuses requests from other websites, with regression tests.
+* **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
+  checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
+* **UI regression protection** ([#4](https://github.com/dlroqa/usap/pull/4)): pixel-exact
+  screenshot baselines of the original interface, plus behaviour and accessibility tests, run on 4 targets for every change.
+* **Chat reliability:** a finished or failed reply no longer gets overwritten by a late streaming
+  update ([#6](https://github.com/dlroqa/usap/pull/6)).
+* **Accessibility:** the image-size control's accessible name now matches its visible label ([#7](https://github.com/dlroqa/usap/pull/7)).
+* **Mobile layout:** at phone width, the sidebar becomes a drawer instead of squeezing the content ([#8](https://github.com/dlroqa/usap/pull/8)).
+* **Intel macOS:** first-time setup works on Intel Macs ([#5](https://github.com/dlroqa/usap/pull/5)), and image generation is installed and works there on the CPU ([#9](https://github.com/dlroqa/usap/pull/9)).
+* **Verified native CPU inference** on all 4 platforms through the real launchers ([#9](https://github.com/dlroqa/usap/pull/9)).
+* **Image generation speed:** the engine no longer uses more threads than the machine has CPUs. That was a ~4–5× slowdown on 4-core Macs ([#9](https://github.com/dlroqa/usap/pull/9)).
+
+## Platform Compatibility
+
+CPU results come from the [`native-runtime`](.github/workflows/native-runtime.yml) workflow:
+fresh setup through the real launcher, real inference through the app, then a second launch.
+Latest evidence: [run 42733046302](https://github.com/dlroqa/usap/actions/runs/42733046302).
+
+| Platform | Setup + relaunch | Chat | Speech-to-text | Text-to-speech | Images | GPU acceleration |
+|---|---|---|---|---|---|---|
+| Windows x64 | Verified | Verified (CPU) | Verified (CPU) | Verified | Verified (CPU) | CUDA / Vulkan: implemented, **unverified** |
+| Linux x64 | Verified | Verified (CPU) | Verified (CPU) | Verified | Verified (CPU) | CUDA / ROCm / Vulkan / OpenVINO NPU: implemented, **unverified** |
+| macOS Apple Silicon | Verified | Verified (CPU) | Verified (CPU) | Verified | Verified (CPU) | Metal / Core ML: implemented, **unverified** |
+| macOS Intel | Verified | Verified (CPU) | Verified (CPU) | Verified | Verified (CPU, slow, see limitations) | Metal: **unverified** |
+
+Hosted CI runners have no usable GPU, so a green run proves CPU inference only.
+[RUNNER_REQUIREMENTS.md](docs/ci/RUNNER_REQUIREMENTS.md) describes how GPU backends get verified.
+
+## Installation & Usage
+
+Today USAP runs as the **portable/USB edition**: one folder you can keep on an internal or
+external drive, with no system-wide installation. Desktop installers are **planned**, not
+available (see the [roadmap](#development-roadmap)).
+
+1. Get the code: `git clone https://github.com/dlroqa/usap.git` (or download the ZIP).
+2. Launch:
+   * **Windows:** double-click `windows.bat`.
+   * **Linux:** `chmod +x linux.sh && ./linux.sh`.
+   * **macOS:** `chmod +x mac.sh && ./mac.sh`.
+3. **First launch** runs setup automatically. It downloads a portable Node.js, the engines for
+   your platform and the frontend dependencies into the folder, a few GB depending on platform.
+   Later launches skip it.
+4. Open `http://localhost:1420`.
+5. **Models aren't included.** Download them in the **Models** tab or put files in `app/models/`
+   (images), `app/llm-models/` (chat) or `app/speech-models/` (transcription). Each model has its
+   own license.
+
+Platform notes:
+* **Linux:** the prebuilt engines need glibc 2.38+ (for example Ubuntu 24.04). `./linux.sh --max-perf` adds ROCm, and `--setup-openvino` adds Intel NPU support.
+* **Windows:** 64-bit Windows 10 or 11.
+* **macOS:** whisper.cpp is installed through Homebrew. On Intel Macs, images use the CPU by default.
+* **LAN access** is off by default. `UAIS_HOST=0.0.0.0` opens the studio to your network, and it has
+  no login, so anyone on that network can use it.
+
+For troubleshooting (ports, GPU drivers, Windows error codes, building engines from source), see
+[docs/USAGE_UPSTREAM.md](docs/USAGE_UPSTREAM.md). That's the original project's detailed guide, kept as written.
+
+## GitHub Actions and Testing
+
+| Workflow | What it checks | When |
+|---|---|---|
+| [`ci`](.github/workflows/ci.yml) | Frontend build, server unit tests, security regression tests, backend smoke test, on Windows x64, Linux x64, macOS arm64 and macOS Intel (native hardware asserted) | every PR and push; **required** |
+| [`render-e2e`](.github/workflows/render-e2e.yml) | Real built UI in Playwright: pixel-exact screenshots of the original interface, behaviour tests, accessibility (axe) | every PR and push; **required** |
+| [`native-runtime`](.github/workflows/native-runtime.yml) | Real first-time setup, binary architecture checks, real chat/speech/voice/image inference with small pinned models, second launch | PRs touching setup/server/launchers, weekly, on demand |
+| [`docs`](.github/workflows/docs.yml) | README links resolve, upstream attribution and license notices present, no planned feature described as available | PRs and pushes touching docs |
+
+`main` is protected: 8 required checks (`build-test` and `render` on 4 targets), pull requests
+only, no force pushes. Details: [CI_GUIDE.md](docs/ci/CI_GUIDE.md),
+[RENDER_TESTS.md](docs/ci/RENDER_TESTS.md), [BRANCH_PROTECTION.md](docs/ci/BRANCH_PROTECTION.md).
+
+## Development Progress
+
+| Milestone | Status |
+|---|---|
+| Import with provenance, audit | Done (#1) |
+| Security fixes S-1–S-3 | Done (#2) |
+| 4-platform CI, UI regression gates | Done (#3, #4) |
+| Intel macOS setup; chat, accessibility and mobile fixes | Done (#5–#8) |
+| **Step 8:** native inference verification | **CPU done** on all 4 platforms (#9); GPU pending real hardware |
+| Desktop installer requirement documented | Done (#10), planning only |
+| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11) |
+
+## Development Roadmap
+
+* **Step 9, foundational backend** (current): API contract tests; a paths/config module ready for
+  portable and installed storage; remaining security findings; engine crash supervision and
+  diagnostics; consistent API errors; modular backend; resource scheduling; performance
+  benchmarks; an optimized Intel image engine. [Plan](docs/roadmap/STEP9_BACKEND_PLAN.md).
+* **Step 10, desktop installers** (planned): an installed edition next to the portable one,
+  Windows `.exe`/`.msi`, Linux AppImage/`.deb`, macOS Apple Silicon and Intel `.dmg`, from the same
+  code and interface. [Requirements](docs/roadmap/DESKTOP_INSTALLERS.md).
+* **Step 11, installation and release testing** (planned): install, first launch, upgrade and
+  uninstall tests that preserve user data; signing and notarization.
+* **Step 12, production release** (planned): validated architecture-specific releases.
+* **Later, optional** (planned): cloud inference and model routing, off by default.
+
+USAP is not production-release-ready until both the portable and the installed editions pass their
+validation. Full priorities: [PRIORITIES.md](docs/roadmap/PRIORITIES.md).
+
+## Known Limitations
+
+* **GPU acceleration is unverified in USAP.** No GPU backend (CUDA, ROCm, Vulkan, Metal, Core ML,
+  OpenVINO NPU) has passed a real hardware test yet. The code is upstream's and may work on your
+  machine, but USAP doesn't claim it.
+* **macOS Intel image generation is slow.** The upstream engine's Intel build lacks AVX
+  optimizations. A 256×256 test image takes ~6 minutes on a 4-core CI Mac. An optimized Intel
+  engine is planned ([details](docs/ci/MACOS_COMPATIBILITY.md#intel-performance-limitation)).
+* **Metal image generation fails on virtualized Macs** (the engine stops with an unsupported-operation error). Use the CPU
+  option there. It's unverified on physical Macs.
+* **No release packages or installers yet.** Run from a checkout.
+* **macOS whisper depends on Homebrew.**
+* **Linux engines need glibc 2.38+.**
+
+## Contributing
+
+* Work through pull requests to `main`. All 8 required checks must pass, and merges use merge commits.
+* **Preserve the UI.** No redesigns. Visual baselines change only through the guarded process in
+  [RENDER_TESTS.md](docs/ci/RENDER_TESTS.md), and never to hide a regression.
+* **Keep the README current.** If a PR changes functionality, installation, compatibility, security
+  behaviour, testing or project status, update this README (and [CHANGELOG.md](CHANGELOG.md) for
+  user-facing changes) in the same PR. Otherwise, write "README update not required" in the PR
+  description with a reason. Use the status words Implemented / Verified / Experimental /
+  Planned / Unsupported, and link evidence for "Verified".
+* Report security issues privately (GitHub private vulnerability reporting), not in public issues.
+
+## License & Acknowledgments
+
+* USAP is distributed under the original project's [MIT License](LICENSE), Copyright (c) 2026 Tech Jarves.
+* Thanks to techjarves and all contributors to
+  [Portable Local Studio](https://github.com/techjarves/Portable-Local-Studio), whose work this project is built on.
+* **Third-party components** (downloaded at setup, each under its own license):
+  * llama.cpp, whisper.cpp and stable-diffusion.cpp (MIT)
+  * Node.js (MIT)
+  * React and Vite (MIT)
+  * pdf.js (Apache-2.0)
+  * Inter font (OFL-1.1)
+
+  The full inventory is in [DEPENDENCIES.md](docs/audit/DEPENDENCIES.md).
+* **Models** are not distributed with USAP. Each model you download is under its creator's license.
