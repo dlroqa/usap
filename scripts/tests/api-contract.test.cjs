@@ -13,9 +13,14 @@ const { GET_ROUTES } = require("./api-contract/routes.cjs");
 
 const contract = JSON.parse(fs.readFileSync(path.join(__dirname, "api-contract", "contract.json"), "utf8"));
 
-// Keys that legitimately differ by OS/hardware: present on some platforms only, or null where a
-// device is absent. Each entry needs a reason.
+// Keys that legitimately differ by OS/hardware: missing on some platforms, or null where nothing
+// is installed. Each entry needs a reason.
 const OPTIONAL = {
+  // null when no llama.cpp text backend is installed (the Windows test root has none; Linux and
+  // macOS get the fake llama-server). The frontend does not read these fields.
+  "GET /api/llm/status": ["$.selectedBackend"],
+  "GET /api/llm/stats": ["$.selectedBackend"],
+  "GET /api/llm/backends": ["$.selected"],
 };
 
 let srv;

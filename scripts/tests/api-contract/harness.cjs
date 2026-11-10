@@ -129,6 +129,7 @@ function checkShape(value, shape, where = "$", optional = []) {
   const problems = [];
   if (shape === "any") return problems;
   if (value === null || value === undefined) {
+    if (value === null && optional.includes(where)) return problems; // declared nullable
     problems.push(`${where}: expected ${typeof shape === "string" ? shape : Array.isArray(shape) ? "array" : "object"}, got ${value}`);
     return problems;
   }
