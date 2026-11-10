@@ -6,15 +6,19 @@ page describes how they are started, stopped and watched.
 
 ## The problem this fixes
 
-Before Step 9.6, a stopped engine was cleaned up only when the server shut down normally (Ctrl+C,
-`SIGTERM`). If the server was killed outright, its engines kept running in the background. That
-happens with `SIGKILL`, a crash, the out-of-memory killer, Windows Task Manager's "End task", or closing
-the console window on Windows. The orphaned engine still held its memory (often several GB for a
-model) and its port, and the next start had to find another port.
+Before Step 9.6, on **Linux and macOS**, engines were cleaned up only when the server shut down
+normally (Ctrl+C, `SIGTERM`). If the server was killed outright, its engines kept running in the
+background. That happens with `SIGKILL`, a crash that bypasses the shutdown handlers, the
+out-of-memory killer, or a closed terminal. The orphaned engine still held its memory (often several
+GB for a model) and its port, and the next start had to find another port.
 
-`scripts/tests/engine-supervision.test.cjs` shows both sides on all four platforms. A plainly started
-engine survives its killed parent, which reproduces the original problem. A supervised one stops
-within seconds.
+On **Windows**, Node already places the processes it starts in a job object that Windows ends together
+with the server. A plainly started engine therefore didn't outlive a killed server there. The
+supervisor keeps that behaviour and adds the same graceful stop and diagnostics on every platform.
+
+`scripts/tests/engine-supervision.test.cjs` checks this on all four platforms. On Linux and macOS, a
+plainly started engine survives its killed parent, which reproduces the original problem. On Windows,
+the baseline is that it stops. A supervised engine stops within seconds everywhere.
 
 ## How it works
 

@@ -89,8 +89,13 @@ function parentScript() {
   return file;
 }
 
+// The original problem exists on Linux and macOS. On Windows, Node (libuv) already puts its direct
+// children in a kill-on-close job object, so a plainly spawned engine dies with its parent there.
 for (const mode of ["unsupervised", "supervised"]) {
-  test(`orphans: when the server is killed outright, ${mode === "supervised" ? "a supervised engine stops too (fixed)" : "a plainly spawned engine keeps running (the original problem)"}`, async () => {
+  const title = mode === "supervised" ? "a supervised engine stops too (fixed)"
+    : IS_WIN ? "a plainly spawned engine stops too on Windows (Node's job object), the baseline"
+      : "a plainly spawned engine keeps running (the original problem)";
+  test(`orphans: when the server is killed outright, ${title}`, async () => {
     const port = await freePort();
     const parent = spawn(process.execPath, [parentScript(), mode, engine, String(port)], { stdio: "ignore", env: engineEnv() });
     try {
@@ -98,7 +103,9 @@ for (const mode of ["unsupervised", "supervised"]) {
       const pid = await enginePid(port);
       hardKill(parent.pid);
       await exitOf(parent);
-      if (mode === "unsupervised") {
+      if (mode === "unsupervised" && IS_WIN) {
+        await waitFor(async () => !(await engineUp(port)), 10000, "Windows ends direct children with their parent");
+      } else if (mode === "unsupervised") {
         await sleep(3000);
         assert.equal(await engineUp(port), true, "without supervision the engine survives its parent");
         hardKill(pid);

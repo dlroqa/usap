@@ -121,7 +121,8 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   the default local-only mode. JSON API routes require a JSON content type.
   [How it works](docs/security/LAN_ACCESS.md).
 * **Engine supervision** (Step 9.6, in review): the chat, image, speech and voice engines stop with
-  the studio even if it crashes or is killed, so they no longer keep running in the background. A
+  the studio even if it crashes or is killed, so on Linux and macOS they no longer keep running in the
+  background. A
   text engine that crashes is restarted automatically (up to 3 times in 10 minutes). Stopping during
   a model load cancels it at once. [Details](docs/runtime/ENGINE_SUPERVISION.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
