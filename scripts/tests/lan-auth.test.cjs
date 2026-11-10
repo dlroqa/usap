@@ -107,6 +107,29 @@ test("tokens: 256-bit random, owner-only file, malformed files are ignored", () 
   fs.rmSync(t.dir, { recursive: true, force: true });
 });
 
+test("tokens: the file is readable by this user only (POSIX mode 0600; Windows: one non-inherited ACL entry)", () => {
+  const t = tmpTokenFile();
+  try {
+    assert.equal(auth.rotateToken(t.file), null, "protection applied without a warning");
+    if (IS_WIN) {
+      const { execFileSync } = require("node:child_process");
+      const acl = execFileSync("icacls", [t.file], { encoding: "utf8" });
+      const entries = acl.split(/\r?\n/).map((l) => l.replace(t.file, "").trim()).filter((l) => /:\(/.test(l));
+      assert.equal(entries.length, 1, acl);
+      assert.doesNotMatch(acl, /\(I\)/, "no inherited entries");
+      assert.doesNotMatch(acl, /Everyone|BUILTIN\\Users|Authenticated Users|\bUsers:/i, acl);
+      assert.match(entries[0], /\(F\)/);
+    } else {
+      assert.equal(fs.statSync(t.file).mode & 0o777, 0o600);
+      fs.chmodSync(t.file, 0o644); // a copied or older file is re-protected
+      assert.equal(auth.protectTokenFile(t.file), null);
+      assert.equal(fs.statSync(t.file).mode & 0o777, 0o600);
+    }
+    // Leftover temp files would hold a copy of the token.
+    assert.deepEqual(fs.readdirSync(path.dirname(t.file)), [auth.TOKEN_FILE_NAME]);
+  } finally { fs.rmSync(t.dir, { recursive: true, force: true }); }
+});
+
 test("gate: requests without a valid credential are refused without leaking anything", async () => {
   const s = await gateServer();
   try {
@@ -205,6 +228,39 @@ test("gate: failed attempts are rate limited per client, then the window expires
     clock.t += 15 * 60 * 1000 + 1;
     assert.equal((await s.post("/api/auth/login", jsonBody({ token }))).status, 200);
   } finally { s.close(); }
+});
+
+test("gate: sign-in always issues a new server-generated session id (no session fixation)", async () => {
+  const s = await gateServer();
+  try {
+    const planted = `${auth.COOKIE_NAME}=${"C".repeat(43)}`;
+    const r = await s.post("/api/auth/login", { headers: { "Content-Type": "application/json", Cookie: planted }, body: JSON.stringify({ token: s.token() }) });
+    assert.equal(r.status, 200);
+    const issued = cookieOf(r);
+    assert.notEqual(issued, planted);
+    assert.equal((await s.get("/api/health", { headers: { Cookie: planted } })).status, 401, "a planted id never becomes valid");
+    assert.equal((await s.get("/api/health", { headers: { Cookie: issued } })).status, 200);
+    const again = cookieOf(await s.post("/api/auth/login", { headers: { "Content-Type": "application/json", Cookie: issued }, body: JSON.stringify({ token: s.token() }) }));
+    assert.notEqual(again, issued, "signing in again issues a fresh id");
+  } finally { s.close(); }
+});
+
+test("gate: spoofed forwarding headers neither bypass throttling nor earn the local exemption", async () => {
+  const s = await gateServer();
+  try {
+    for (let i = 0; i < auth.MAX_FAILURES; i++) {
+      await s.post("/api/auth/login", { headers: { "Content-Type": "application/json", "X-Forwarded-For": `203.0.113.${i}`, "X-Real-IP": `198.51.100.${i}`, Forwarded: `for=192.0.2.${i}` }, body: JSON.stringify({ token: "usap_" + "x".repeat(43) }) });
+    }
+    const r = await s.post("/api/auth/login", { headers: { "Content-Type": "application/json", "X-Forwarded-For": "203.0.113.200" }, body: JSON.stringify({ token: s.token() }) });
+    assert.equal(r.status, 429, "the limiter keys on the socket address only");
+  } finally { s.close(); }
+  const a = await gateServer({ listenHost: "0.0.0.0", env: {} });
+  try {
+    assert.equal((await a.get("/api/health")).status, 200, "a direct local request is exempt");
+    for (const [h, v] of [["X-Forwarded-For", "192.168.1.50"], ["Forwarded", "for=192.168.1.50"], ["X-Real-IP", "192.168.1.50"], ["Via", "1.1 proxy"], ["X-Forwarded-Host", "studio.lan"]]) {
+      assert.equal((await a.get("/api/health", { headers: { [h]: v } })).status, 401, `${h}: a proxied request must sign in`);
+    }
+  } finally { a.close(); }
 });
 
 test("gate: sessions expire after 12 hours", async () => {
@@ -330,6 +386,17 @@ test("serve.cjs: with sign-in required, every route is protected, credentials ne
     const cookie = cookieOf(login);
     assert.equal((await get("/api/health", { headers: { Cookie: cookie } })).status, 200);
     assert.equal((await post("/api/cleanup", { headers: { Cookie: cookie, "Content-Type": "application/json" }, body: '{"ids":[]}' })).status, 200);
+
+    // CSRF: a valid session cookie doesn't help a request from another website.
+    const evil = await post("/api/cleanup", { headers: { Cookie: cookie, "Content-Type": "application/json", Origin: "http://evil.example" }, body: '{"ids":[]}' });
+    assert.equal(evil.status, 403);
+    const same = await post("/api/cleanup", { headers: { Cookie: cookie, "Content-Type": "application/json", Origin: `http://127.0.0.1:${srv.port}` }, body: '{"ids":[]}' });
+    assert.equal(same.status, 200);
+    // The token file is never served as a static file, even to a signed-in client.
+    for (const p of ["/../config/lan-access-token", "/%2e%2e/config/lan-access-token", "/..%2fconfig%2flan-access-token", "/config/lan-access-token", "/app/config/lan-access-token"]) {
+      const r = await get(p, { headers: { Cookie: cookie } });
+      assert.ok(!r.text.includes(token), `${p} must not return the token (status ${r.status})`);
+    }
 
     // The image-engine proxy forwards the request without USAP's credentials.
     const r = await get("/v1/models", { headers: { Cookie: cookie } });

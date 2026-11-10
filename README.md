@@ -249,8 +249,9 @@ validation. Full priorities: [PRIORITIES.md](docs/roadmap/PRIORITIES.md).
   each package against the lockfile's integrity hash but doesn't guarantee an exact reproduction. CI
   uses `npm ci`. A staged update that keeps the per-OS dependency folders and offline re-setup is
   planned ([#22](https://github.com/dlroqa/usap/issues/22)).
-* **LAN sharing uses plain HTTP and one shared token**: no built-in HTTPS, no user accounts
-  ([details](docs/security/LAN_ACCESS.md#limitations)).
+* **LAN sharing uses plain HTTP and one shared token**: no built-in HTTPS, no user accounts. Use it
+  only on a trusted network, and never expose the studio directly to the internet
+  ([details](docs/security/LAN_ACCESS.md#limitations); follow-ups [#26](https://github.com/dlroqa/usap/issues/26)–[#28](https://github.com/dlroqa/usap/issues/28)).
 * **Open security-hardening work**, tracked before production release packaging:
   * Windows setup engine staging and rollback ([#19](https://github.com/dlroqa/usap/issues/19), pre-release)
   * Verifying the Visual C++ runtime, portable Python and `get-pip.py` ([#20](https://github.com/dlroqa/usap/issues/20), pre-release)

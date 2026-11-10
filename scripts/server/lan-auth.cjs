@@ -20,6 +20,7 @@
 "use strict";
 
 const crypto = require("crypto");
+const { execFileSync } = require("child_process");
 const fs = require("fs");
 const net = require("net");
 const path = require("path");
@@ -36,6 +37,9 @@ const MAX_FAILURES = 10;
 const MAX_TRACKED_CLIENTS = 10000;
 const MAX_LOGIN_BODY_BYTES = 4096;
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "[::1]", "::1"]);
+// A request carrying any of these came through a proxy, so a loopback peer address says nothing
+// about where it really came from. Such requests never get the "this computer" exemption.
+const PROXY_HEADERS = ["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "via"];
 
 // ── Token file ───────────────────────────────────────────────────────────────
 function generateToken() {
@@ -60,22 +64,50 @@ function readTokenFile(file) {
   }
 }
 
-// Write atomically (temp file + rename), readable only by the owner where the OS supports modes.
+// Windows: replace the inherited ACL with one entry for the current user (by SID, so localized or
+// unusual account names don't matter). Throws where ACLs aren't supported (FAT/exFAT drives).
+function restrictWindowsAcl(file) {
+  const out = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8", windowsHide: true });
+  const sid = (out.match(/"(S-1-[0-9-]+)"/) || [])[1];
+  if (!sid) throw new Error("current user SID not found");
+  execFileSync("icacls", [file, "/inheritance:r", "/grant:r", `*${sid}:F`], { stdio: "ignore", windowsHide: true });
+}
+
+/**
+ * Make the token file readable by the owner only. Returns null when that is in place, otherwise a
+ * reason (for a warning); the token is never part of it.
+ */
+function protectTokenFile(file, platform = process.platform) {
+  if (platform === "win32") {
+    try { restrictWindowsAcl(file); return null; } catch (_) {
+      return "Windows could not restrict the access-token file to your account (for example on a FAT/exFAT drive)";
+    }
+  }
+  try { fs.chmodSync(file, 0o600); } catch (_) { /* checked below */ }
+  try {
+    if ((fs.statSync(file).mode & 0o077) === 0) return null;
+  } catch (_) { /* fall through */ }
+  return "this drive does not support file permissions (for example a FAT/exFAT USB drive)";
+}
+
+// Write atomically (temp file + rename). Permissions are applied to the temp file, so the token is
+// never readable by others under its final name, and again after the rename.
 function writeTokenFile(file, token) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
   fs.writeFileSync(tmp, token + "\n", { mode: 0o600 });
   try {
+    protectTokenFile(tmp);
     fs.renameSync(tmp, file);
   } catch (err) {
     fs.rmSync(tmp, { force: true });
     throw err;
   }
-  try { fs.chmodSync(file, 0o600); } catch (_) { /* Windows: ACLs apply instead */ }
+  return protectTokenFile(file);
 }
 
 function rotateToken(file) {
-  writeTokenFile(file, generateToken());
+  return writeTokenFile(file, generateToken());
 }
 
 function revokeToken(file) {
@@ -256,9 +288,12 @@ function createLanAuth({ tokenFile, listenHost = "127.0.0.1", env = process.env,
     return cache.token ? cache : null;
   }
 
+  // Create the token if needed and (re)apply owner-only permissions on every start, so a copied or
+  // older file is protected too.
   function ensureToken() {
-    if (!mode.required || readTokenFile(tokenFile)) return;
-    rotateToken(tokenFile);
+    if (!mode.required) return;
+    const problem = readTokenFile(tokenFile) ? protectTokenFile(tokenFile) : rotateToken(tokenFile);
+    if (problem) log(`[auth] Warning: ${problem}. Anyone who can read ${tokenFile} can sign in.`);
   }
 
   function retryAfter(key) {
@@ -291,9 +326,12 @@ function createLanAuth({ tokenFile, listenHost = "127.0.0.1", env = process.env,
     return `${COOKIE_NAME}=${id}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSeconds}${secure}`;
   }
 
+  // Rate limiting and this exemption use only the socket's peer address, never client-supplied
+  // forwarding headers.
   function isExempt(req) {
     return !mode.required ||
-      (mode.loopbackExempt && isLoopbackAddress(peerAddress(req)) && isLoopbackHostname(hostnameOf(req.headers.host)));
+      (mode.loopbackExempt && isLoopbackAddress(peerAddress(req)) && isLoopbackHostname(hostnameOf(req.headers.host)) &&
+        !PROXY_HEADERS.some((h) => req.headers[h] !== undefined));
   }
 
   // "ok" | "none" | "invalid" | "limited"
@@ -429,6 +467,7 @@ module.exports = {
   readTokenFile,
   rotateToken,
   revokeToken,
+  protectTokenFile,
   withoutAuthHeaders,
   signInPage,
   TOKEN_FILE_NAME,
@@ -449,7 +488,8 @@ if (require.main === module) {
     if (!token) { console.error(`No access token at ${file}. Create one with: rotate`); process.exit(1); }
     console.log(token);
   } else if (cmd === "rotate") {
-    rotateToken(file);
+    const problem = rotateToken(file);
+    if (problem) console.warn(`Warning: ${problem}. Anyone who can read the file can sign in.`);
     console.log(`New access token written to ${file}. Everyone signed in with the old token is signed out.`);
     console.log("Display it with: node scripts/server/lan-auth.cjs show");
   } else if (cmd === "revoke") {
