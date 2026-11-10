@@ -1,0 +1,56 @@
+# Documentation consistency (narrow rules, see scripts/ci/docs-check.cjs):
+# links resolve, upstream attribution and MIT notice present, no GPU "verified" claim without
+# an Actions run link, planned items labelled as planned, and on PRs: user-facing changes either
+# update README.md or say "README update not required: <reason>" in the description.
+# Advisory (not a branch-protection required check) unless the owner decides otherwise.
+name: docs
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+    paths:
+      - "**.md"
+      - "LICENSE"
+      - "scripts/ci/docs-check.cjs"
+      - ".github/workflows/docs.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.12.0"
+
+      - name: Changed files (pull requests)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git diff --name-only "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/changed.txt" && cat "$RUNNER_TEMP/changed.txt"
+
+      - name: Check documentation
+        env:
+          # Passed as data through the environment, never interpolated into the shell.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            node scripts/ci/docs-check.cjs --changed-files "$RUNNER_TEMP/changed.txt" --pr-body-env PR_BODY
+          else
+            node scripts/ci/docs-check.cjs
+          fi

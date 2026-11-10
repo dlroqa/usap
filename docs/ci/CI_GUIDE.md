@@ -14,6 +14,17 @@ Matrix (job names are required checks): `build-test (linux-x64)` on ubuntu-24.04
 macOS status per architecture: see `MACOS_COMPATIBILITY.md`.
 Artifacts (7-day retention): `test-results-<label>` (JUnit XML) and `frontend-dist` (web assets only; **not** a portable app bundle).
 
+## `docs.yml` (advisory)
+Runs `scripts/ci/docs-check.cjs` on every PR (and on pushes to `main` that touch docs). It checks five things:
+
+* Relative links in `README.md`, `CHANGELOG.md` and `docs/**` resolve, and the README's anchors match its headings.
+* Upstream attribution and the original MIT `LICENSE` notice are present.
+* No GPU backend is described as verified without a linked Actions run.
+* Installers, cloud inference and model routing are only mentioned with a planned/not-yet qualifier.
+* If user-facing code changed (`app/frontend/src`, `scripts/server`, `scripts/setup`, `scripts/workers`, launchers) and `README.md` didn't, the PR description must contain `README update not required: <reason>`.
+
+It's not a required check. Run it locally with `node scripts/ci/docs-check.cjs`.
+
 ## What CI does *not* prove
 Inference with real models, GPU/NPU backends, or the full first-run launcher setup (it downloads multi-GB runtimes). See [RUNNER_REQUIREMENTS.md](RUNNER_REQUIREMENTS.md) and the `native-runtime` workflow.
 
