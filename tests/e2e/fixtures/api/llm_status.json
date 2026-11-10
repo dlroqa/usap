@@ -29,5 +29,14 @@
   "backendMode": "",
   "backendPath": "",
   "selectedBackend": null,
-  "availableBackends": []
+  "availableBackends": [],
+  "engine": {
+    "state": "stopped",
+    "autoRestart": true,
+    "restartsInWindow": 0,
+    "restartLimit": 3,
+    "lastExit": null,
+    "crash": null,
+    "supervised": false
+  }
 }

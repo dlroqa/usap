@@ -14,6 +14,9 @@ const { comprehensiveWebSearch } = require("../search/core");
 const { detectModelKindCached } = require("./model-kind.cjs");
 const { createRequestPolicy, withoutCorsHeaders, resolveStaticPath, jsonBodyType } = require("./request-policy.cjs");
 const { createLanAuth, withoutAuthHeaders, TOKEN_FILE_NAME: LAN_TOKEN_FILE_NAME } = require("./lan-auth.cjs");
+// Step 9.6: engines run under a guard process, so they stop with this server even on a crash or SIGKILL.
+const supervisor = require("./supervisor.cjs");
+const { decideRestart } = require("./restart-policy.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -235,6 +238,19 @@ let llmProc = null;
 let llmProcSeq = 0;
 let llmReady = false;
 let llmError = null;
+// Step 9.6 lifecycle: start cancellation, crash detection and bounded automatic restarts.
+let llmStartToken = 0;       // bumped by a stop request: an in-progress start gives up
+let llmStarting = false;
+let llmLastStartRequest = null;
+let llmLastExit = null;      // { code, signal, at, unexpected }
+let llmCrash = null;         // set when the engine stopped unexpectedly and is not being restarted
+let llmRestartTimer = null;
+let llmRestartAttempts = []; // timestamps of automatic restarts in the current window
+let llmRestarting = false;
+const LLM_RESTART_LIMIT = 3;
+const LLM_RESTART_WINDOW_MS = 10 * 60 * 1000;
+const LLM_AUTO_RESTART = process.env.USAP_ENGINE_AUTO_RESTART !== "0";
+const LLM_READY_TIMEOUT_MS = Number(process.env.USAP_LLM_READY_TIMEOUT_MS) || 0; // 0: built-in limits
 let llmOperationQueue = Promise.resolve();
 let speechReady = false;
 let speechError = null;
@@ -300,6 +316,32 @@ function assertNoOtherActiveRuntime(targetType, targetModel) {
   err.activeRuntime = runtime;
   err.targetRuntime = { type: targetType, model: targetName };
   throw err;
+}
+
+function llmEngineState() {
+  if (llmStarting) return llmRestarting ? "restarting" : "starting";
+  if (llmReady && llmProc) return "ready";
+  if (llmRestartTimer) return "restarting";
+  if (llmCrash) return "crashed";
+  return "stopped";
+}
+
+// Additive diagnostics; no secrets, no paths beyond the model name.
+function llmLifecycleSnapshot() {
+  const now = Date.now();
+  return {
+    state: llmEngineState(),
+    autoRestart: LLM_AUTO_RESTART,
+    restartsInWindow: llmRestartAttempts.filter((t) => now - t < LLM_RESTART_WINDOW_MS).length,
+    restartLimit: LLM_RESTART_LIMIT,
+    lastExit: llmLastExit,
+    crash: llmCrash,
+    supervised: Boolean(llmProc && llmProc.supervised),
+  };
+}
+
+function engineStartCancelledError() {
+  return Object.assign(new Error("Loading the text model was stopped."), { code: "ENGINE_START_CANCELLED", statusCode: 409 });
 }
 
 function jsonErrorStatus(err) {
@@ -2504,7 +2546,7 @@ function synthesizeTts(text, options = {}) {
       voice,
       output: "",
     };
-    const proc = spawn(process.execPath, [TTS_WORKER], {
+    const proc = supervisor.spawnSupervised(process.execPath, [TTS_WORKER], {
       cwd: ROOT,
       stdio: "pipe",
       windowsHide: true,
@@ -2745,7 +2787,7 @@ function transcribeWavBuffer(buffer, options = {}) {
 
     const startedAt = Date.now();
     console.log("  [speech] Starting:", backend.cli, args.join(" "));
-    const proc = spawn(backend.cli, args, {
+    const proc = supervisor.spawnSupervised(backend.cli, args, {
       stdio: "pipe",
       windowsHide: true,
       env: {
@@ -2845,6 +2887,7 @@ function pingLlmReady(expectedModel = "") {
 }
 
 async function waitForLlmReady(maxAttempts = 240, expectedProc = llmProc, expectedModel = "") {
+  if (LLM_READY_TIMEOUT_MS > 0) maxAttempts = Math.max(1, Math.ceil(LLM_READY_TIMEOUT_MS / 500));
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     if (!expectedProc || llmProc !== expectedProc) throw new Error(llmError || "llama.cpp exited during startup.");
     if (await pingLlmReady(expectedModel)) {
@@ -2853,7 +2896,8 @@ async function waitForLlmReady(maxAttempts = 240, expectedProc = llmProc, expect
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  throw new Error(`llama.cpp did not become ready within ${Math.round(maxAttempts / 120)} minutes.`);
+  const seconds = Math.round(maxAttempts / 2);
+  throw Object.assign(new Error(`llama.cpp did not become ready within ${seconds >= 120 ? `${Math.round(seconds / 60)} minutes` : `${seconds} seconds`}.`), { code: "ENGINE_START_TIMEOUT" });
 }
 
 function waitForChildExit(proc, timeoutMs) {
@@ -2877,6 +2921,7 @@ function waitForChildExit(proc, timeoutMs) {
 }
 
 async function killLlm() {
+  cancelLlmRestart();
   llmReady = false;
   llmSettings.supportsVision = false;
   llmSettings.visionMode = "none";
@@ -2890,7 +2935,11 @@ async function killLlm() {
   const proc = llmProc;
   const procPort = PORT_LLM;
   llmProc = null;
+  await terminateLlmProc(proc, procPort);
+}
 
+// Polite stop, then forced, then wait until the port is free again.
+async function terminateLlmProc(proc, procPort) {
   try { proc.kill("SIGTERM"); } catch (_) {}
   const exitedAfterTerm = await waitForChildExit(proc, 2500);
   if (!exitedAfterTerm) {
@@ -2902,6 +2951,76 @@ async function killLlm() {
   if (!released) {
     console.warn(`  [llm] Port ${procPort} is still busy after stopping llama.cpp.`);
   }
+}
+
+function cancelLlmRestart() {
+  if (llmRestartTimer) { clearTimeout(llmRestartTimer); llmRestartTimer = null; }
+}
+
+// Stop requested by the user: end any start in progress right away instead of waiting for it.
+async function stopLlmNow() {
+  llmStartToken += 1;
+  cancelLlmRestart();
+  llmCrash = null;
+  if (llmStarting && llmProc) {
+    const proc = llmProc;
+    const procPort = PORT_LLM;
+    llmProc = null;
+    llmReady = false;
+    await terminateLlmProc(proc, procPort);
+  }
+}
+
+function describeExit(code, signal) {
+  return signal ? `signal ${signal}` : `exit code ${code}`;
+}
+
+// The engine stopped on its own after it was ready: restart it a bounded number of times, with
+// backoff (1 s, 2 s, 4 s), using the settings of the last successful start.
+// Bytes the last model needs to load again (the GGUF plus its vision projector, if any).
+function llmModelBytes() {
+  let total = 0;
+  for (const name of [llmLastStartRequest && llmLastStartRequest.model, llmSettings.mmproj]) {
+    if (!name) continue;
+    try { total += fs.statSync(path.join(LLM_MODELS, path.basename(String(name)))).size; } catch (_) { /* gone */ }
+  }
+  return total;
+}
+
+function handleUnexpectedLlmExit(code, signal, stderrTail = "") {
+  const now = Date.now();
+  llmLastExit = { code, signal: signal || null, at: new Date(now).toISOString(), unexpected: true };
+  llmRestartAttempts = llmRestartAttempts.filter((t) => now - t < LLM_RESTART_WINDOW_MS);
+  const what = `llama.cpp stopped unexpectedly (${describeExit(code, signal)})`;
+  const decision = llmLastStartRequest
+    ? decideRestart({
+      autoRestart: LLM_AUTO_RESTART, attempts: llmRestartAttempts, now, limit: LLM_RESTART_LIMIT,
+      windowMs: LLM_RESTART_WINDOW_MS, code, stderrTail, modelBytes: llmModelBytes(), freeBytes: os.freemem(),
+    })
+    : { restart: false, reason: "no-settings", message: "There are no settings to restart it with." };
+  if (!decision.restart) {
+    llmCrash = { code, signal: signal || null, at: llmLastExit.at, restarts: llmRestartAttempts.length, reason: decision.reason };
+    llmError = `${what}. ${decision.message} Load the model again to retry.${llmError ? `\n${llmError}` : ""}`.slice(0, 1600);
+    console.warn(`  [llm] ${what}; not restarting (${decision.reason}).`);
+    return;
+  }
+  const delay = decision.delayMs;
+  const token = llmStartToken;
+  console.warn(`  [llm] ${what}; restarting in ${delay / 1000} s.`);
+  llmRestartTimer = setTimeout(async () => {
+    llmRestartTimer = null;
+    if (token !== llmStartToken || !llmLastStartRequest) return;
+    llmRestartAttempts.push(Date.now());
+    try {
+      await runExclusiveLlmOperation(() => startLlm(llmLastStartRequest, { restart: true }));
+      console.log(`  [llm] Restarted after an unexpected stop (restart ${llmRestartAttempts.length} of ${LLM_RESTART_LIMIT}).`);
+    } catch (err) {
+      if (err.code === "ENGINE_START_CANCELLED") return;
+      llmCrash = { code, signal: signal || null, at: llmLastExit.at, restarts: llmRestartAttempts.length, reason: "restart-failed" };
+      llmError = `${what}, and restarting it failed: ${err.message || err}`.slice(0, 1600);
+      await runExclusiveLlmOperation(() => killLlm());
+    }
+  }, delay);
 }
 
 function getSetupPaths() {
@@ -4329,7 +4448,24 @@ function readGgufArchitecture(modelPath) {
   return "";
 }
 
-async function startLlm(settings = {}) {
+async function startLlm(settings = {}, { restart = false } = {}) {
+  const token = llmStartToken;
+  if (!restart) cancelLlmRestart();
+  llmStarting = true;
+  llmRestarting = restart;
+  try {
+    await startLlmAttempts(settings, token);
+    const { __loadProfile, ...request } = settings;
+    llmLastStartRequest = request;
+    llmCrash = null;
+    if (!restart) llmRestartAttempts = [];
+  } finally {
+    llmStarting = false;
+    llmRestarting = false;
+  }
+}
+
+async function startLlmAttempts(settings, token) {
   const filename = path.basename(String(settings.model || ""));
   const modelPath = path.join(LLM_MODELS, filename);
   if (!filename || !pathInside(modelPath, LLM_MODELS) || !fs.existsSync(modelPath)) {
@@ -4361,6 +4497,7 @@ async function startLlm(settings = {}) {
   const failures = [];
   for (const backend of sortedCandidates) {
     for (const profile of buildLlmLoadProfiles(settings, backend)) {
+      if (token !== llmStartToken) throw engineStartCancelledError();
       try {
         await startLlmWithBackend({ ...settings, __loadProfile: profile }, backend);
         llmSettings.backendFallbacks = failures;
@@ -4383,6 +4520,11 @@ async function startLlm(settings = {}) {
         });
         return;
       } catch (err) {
+        // A stop request during startup ends the whole start; no other backend or profile is tried.
+        if (token !== llmStartToken || err.code === "ENGINE_START_CANCELLED") {
+          await killLlm();
+          throw engineStartCancelledError();
+        }
         const message = err.message || String(err);
         failures.push({
           backend: backend.mode,
@@ -4640,16 +4782,18 @@ async function startLlmWithBackend(settings = {}, backend) {
   }
 
   console.log("  [llm] Starting:", backend.path, args.join(" "));
-  const proc = spawn(backend.path, args, { stdio: "pipe", env: spawnEnv });
+  const proc = supervisor.spawnSupervised(backend.path, args, { stdio: "pipe", env: spawnEnv }, { label: "llm" });
   const procSeq = ++llmProcSeq;
   llmProc = proc;
   proc.stdout.on("data", (data) => {
     if (llmProc !== proc) return;
     process.stdout.write("  [llm] " + data.toString());
   });
+  proc.usapStderrTail = "";
   proc.stderr.on("data", (data) => {
     if (llmProc !== proc) return;
     const output = data.toString();
+    proc.usapStderrTail = (proc.usapStderrTail + output).slice(-4096); // for out-of-memory detection
     process.stderr.write("  [llm-err] " + output);
     if (/Vulkan\d+\s*:/i.test(output)) llmSettings.backendMode = "Vulkan GPU";
     else if (/CUDA\d+\s*:/i.test(output)) llmSettings.backendMode = "CUDA GPU";
@@ -4665,18 +4809,22 @@ async function startLlmWithBackend(settings = {}, backend) {
       }
     }
   });
-  proc.on("exit", (code) => {
+  proc.on("exit", (code, signal) => {
     if (llmProc !== proc) {
       console.log("  [llm] stale process exited with code", code);
       return;
     }
+    const wasReady = proc.usapReady === true;
     llmReady = false;
     llmProc = null;
     if (code !== 0 && code !== null && !llmError) llmError = `llama.cpp exited with code ${code}`;
-    console.log("  [llm] exited with code", code, `(process ${procSeq})`);
+    console.log("  [llm] exited with code", code, signal ? `(signal ${signal})` : "", `(process ${procSeq})`);
+    if (wasReady) handleUnexpectedLlmExit(code, signal, proc.usapStderrTail);
+    else llmLastExit = { code, signal: signal || null, at: new Date().toISOString(), unexpected: false };
   });
 
   await waitForLlmReady(backend.key === "cpu" ? 720 : 360, proc, filename);
+  proc.usapReady = true;
 }
 
 async function startBackend(settings = {}) {
@@ -4855,7 +5003,7 @@ async function startBackend(settings = {}) {
   backendReady = false;
 
   const procSeq = ++backendProcSeq;
-  const proc = spawn(backendPath, args, { stdio: "pipe", env: spawnEnv });
+  const proc = supervisor.spawnSupervised(backendPath, args, { stdio: "pipe", env: spawnEnv }, { label: "image" });
   backendProc = proc;
   startBackendReadyPoll();
   const coremlLoadHeartbeat = startCoreMLLoadHeartbeat(proc);
@@ -5000,6 +5148,9 @@ async function startBackend(settings = {}) {
       if (!backendError) {
         backendError = describeBackendExitCode(code, currentSettings.backendBinary || BACKEND_PATH);
       }
+    } else if (signal && signal !== "SIGTERM" && signal !== "SIGKILL" && !backendError) {
+      // e.g. SIGABRT from an unsupported Metal operation: say so instead of a later "socket hang up".
+      backendError = `The image engine stopped unexpectedly (signal ${signal}). Try the CPU backend, or a smaller image size.`;
     }
     backendLoadState.active = false;
     generationState.active = false;
@@ -6126,6 +6277,7 @@ const server = http.createServer(async (req, res) => {
       },
       hardware: getHardwareSpecs(),
       telemetry: getTelemetry(),
+      engines: { llm: llmLifecycleSnapshot(), processes: supervisor.snapshot() }, // additive (Step 9.6)
     });
   }
 
@@ -6177,6 +6329,7 @@ const server = http.createServer(async (req, res) => {
       backendPath: backend?.path || "",
       selectedBackend: probe.selected,
       availableBackends: probe.available,
+      engine: llmLifecycleSnapshot(), // additive (Step 9.6)
     });
   }
 
@@ -6278,6 +6431,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.url === "/api/llm/stop" && req.method === "POST") {
+    await stopLlmNow(); // cancels a start in progress immediately
     await runExclusiveLlmOperation(() => killLlm());
     return json(res, 200, { ok: true });
   }
@@ -7039,7 +7193,13 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
   if (req.url === "/api/llm/chat" && req.method === "POST") {
     const body = await readJsonBody(req, res);
     if (!body) return;
-    if (!llmReady) return json(res, 409, { ok: false, error: "Load a text model before sending a message." });
+    if (!llmReady) {
+      const state = llmEngineState();
+      if (state === "restarting") return json(res, 409, { ok: false, error: "The text engine stopped unexpectedly and is restarting. Try again in a moment.", code: "ENGINE_RESTARTING" });
+      if (state === "crashed") return json(res, 409, { ok: false, error: llmError || "The text engine stopped unexpectedly.", code: "ENGINE_CRASHED" });
+      if (state === "starting") return json(res, 409, { ok: false, error: "The text model is still loading. Try again in a moment.", code: "ENGINE_STARTING" });
+      return json(res, 409, { ok: false, error: "Load a text model before sending a message.", code: "ENGINE_NOT_READY" });
+    }
     await doLlmChat(req, res, body);
     return;
   }
@@ -7683,6 +7843,10 @@ server.listen(PORT_FRONTEND, LISTEN_HOST, () => {
   // Do not auto-start backend; wait for selection from the Web UI
   console.log("  [backend] Ready. Waiting for model load request from the webapp...");
 });
+
+// Last line of defence for exits that skip the handlers below (uncaught errors, process.exit):
+// ask every engine to stop now. Hard kills of this server are covered by the engine guards.
+process.on("exit", () => supervisor.stopAllSync());
 
 // Graceful shutdown
 process.on("SIGINT",  async () => { await killBackend(); await killOpenVinoWorker(); await killLlm(); await stopSpeech(); await stopTts(); process.exit(0); });

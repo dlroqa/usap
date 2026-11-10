@@ -355,5 +355,20 @@
     "gpu_name": "Fixture GPU",
     "vram_used_gb": 0,
     "vram_total_gb": 8
+  },
+  "engines": {
+    "llm": {
+      "state": "stopped",
+      "autoRestart": true,
+      "restartsInWindow": 0,
+      "restartLimit": 3,
+      "lastExit": null,
+      "crash": null,
+      "supervised": false
+    },
+    "processes": {
+      "supervised": [],
+      "recentExits": []
+    }
   }
 }
