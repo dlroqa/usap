@@ -1,0 +1,929 @@
+{
+  "recordedWith": "node v22.23.1 on linux-x64",
+  "calls": [
+    {
+      "method": "GET",
+      "path": "/api/health",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "backend": "object",
+        "build": "string",
+        "chat": "object",
+        "checks": [],
+        "issues": [],
+        "models": "object",
+        "ok": "boolean",
+        "outputs": "object",
+        "platform": "string",
+        "ports": "object",
+        "root": "string",
+        "speech": "object",
+        "tts": "object"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/backend-options",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "coremlNpu": "object",
+        "cudaAvailable": "boolean",
+        "defaultBackendType": "string",
+        "metalAvailable": "boolean",
+        "openvinoModels": [],
+        "openvinoNpu": "object",
+        "openvinoNpuAvailable": "boolean",
+        "options": [],
+        "rocmAvailable": "boolean",
+        "unavailable": [],
+        "vulkanAvailable": "boolean"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/backend-status",
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "build": "string",
+        "error": "any",
+        "loading": {
+          "active": "boolean",
+          "backendBinary": "string",
+          "backendMode": "string",
+          "current": "number",
+          "device": "string",
+          "model": "string",
+          "phase": "string",
+          "progress": "number",
+          "speed": "string",
+          "total": "number"
+        },
+        "port": "number",
+        "preferredPort": "number",
+        "ready": "boolean",
+        "running": "boolean",
+        "settings": {
+          "backendType": "string",
+          "cfgScale": "number",
+          "flashAttn": "boolean",
+          "height": "number",
+          "model": "any",
+          "sampler": "string",
+          "steps": "number",
+          "threads": "number",
+          "useGpu": "boolean",
+          "vaeOnCpu": "boolean",
+          "vaeTiling": "boolean",
+          "width": "number"
+        },
+        "unloading": {
+          "active": "boolean",
+          "phase": "string",
+          "progress": "number"
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/diagnostics",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "cleanupCandidates": [],
+        "download": "object",
+        "generatedAt": "string",
+        "generation": "object",
+        "hardware": "object",
+        "health": "object",
+        "llm": "object",
+        "speech": "object",
+        "telemetry": "object"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/hardware-specs",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "cpu_cores_logical": "number",
+        "cpu_cores_physical": "number",
+        "cpu_name": "string",
+        "gpu_name": "string",
+        "gpu_vram_gb": "number",
+        "npu": "object",
+        "os_name": "string",
+        "ram_total_gb": "number",
+        "recommended_models": [],
+        "recommended_text_settings": "object",
+        "tier": "string"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/telemetry",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "cpu_usage": "number",
+        "gpu_name": "string",
+        "ram_total_gb": "number",
+        "ram_used_gb": "number",
+        "vram_total_gb": "number",
+        "vram_used_gb": "number"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/models",
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "models": []
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/outputs",
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "outputs": []
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/llm/models",
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "models": []
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/llm/status",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 2,
+      "shape": {
+        "availableBackends": [
+          "object"
+        ],
+        "backendInstalled": "boolean",
+        "backendMode": "string",
+        "backendPath": "string",
+        "error": "any",
+        "port": "number",
+        "preferredPort": "number",
+        "ready": "boolean",
+        "running": "boolean",
+        "selectedBackend": {
+          "detected": "boolean",
+          "device": "any",
+          "devices": [],
+          "error": "string",
+          "installed": "boolean",
+          "key": "string",
+          "mode": "string",
+          "path": "string",
+          "portable": "boolean"
+        },
+        "settings": {
+          "backendBinary": "string",
+          "backendMode": "string",
+          "batchSize": "number",
+          "cachePrompt": "boolean",
+          "cacheTypeK": "string",
+          "cacheTypeV": "string",
+          "contextSize": "number",
+          "defragThold": "number",
+          "flashAttn": "boolean",
+          "gpuLayers": "number",
+          "mlock": "boolean",
+          "mmap": "boolean",
+          "model": "any",
+          "performanceProfile": "string",
+          "supportsVision": "boolean",
+          "threads": "number",
+          "ubatchSize": "number",
+          "visionMode": "string",
+          "visionStatus": "string"
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/llm/backends",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "available": [],
+        "candidates": [],
+        "generatedAt": "string",
+        "ok": "boolean",
+        "selected": "object"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/llm/conversations",
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "conversations": [],
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/llm/stats",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 2,
+      "shape": {
+        "benchmarks": [],
+        "modelSettings": {
+          "models": "object"
+        },
+        "ok": "boolean",
+        "ready": "boolean",
+        "running": "boolean",
+        "selectedBackend": {
+          "detected": "boolean",
+          "device": "any",
+          "devices": [],
+          "error": "string",
+          "installed": "boolean",
+          "key": "string",
+          "mode": "string",
+          "path": "string",
+          "portable": "boolean"
+        },
+        "settings": {
+          "backendBinary": "string",
+          "backendMode": "string",
+          "batchSize": "number",
+          "cachePrompt": "boolean",
+          "cacheTypeK": "string",
+          "cacheTypeV": "string",
+          "contextSize": "number",
+          "defragThold": "number",
+          "flashAttn": "boolean",
+          "gpuLayers": "number",
+          "mlock": "boolean",
+          "mmap": "boolean",
+          "model": "any",
+          "performanceProfile": "string",
+          "supportsVision": "boolean",
+          "threads": "number",
+          "ubatchSize": "number",
+          "visionMode": "string",
+          "visionStatus": "string"
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/llm/model-settings",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "models": "object",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/llm/recommend",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "ok": "boolean",
+        "recommendations": "any",
+        "source": "string"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/speech/models",
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "models": [
+          {
+            "filename": "string",
+            "id": "string",
+            "installed": "boolean",
+            "language": "string",
+            "localSize": "string",
+            "name": "string",
+            "recommended": "boolean",
+            "size": "string",
+            "sizeBytes": "number",
+            "url": "string"
+          }
+        ],
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/speech/status",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "backendInstalled": "boolean",
+        "backendMode": "string",
+        "backendPath": "string",
+        "backendPreference": "string",
+        "backends": [],
+        "error": "any",
+        "ok": "boolean",
+        "port": "number",
+        "preferredPort": "number",
+        "ready": "boolean",
+        "running": "boolean",
+        "serverPath": "string",
+        "settings": "object",
+        "transcription": "object"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/speech/transcriptions",
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "ok": "boolean",
+        "transcriptions": []
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/tts/models",
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "models": [
+          {
+            "dtype": "string",
+            "filename": "string",
+            "format": "string",
+            "id": "string",
+            "installed": "boolean",
+            "localSize": "string",
+            "modelId": "string",
+            "name": "string",
+            "recommended": "boolean",
+            "size": "string",
+            "sizeBytes": "number",
+            "url": "string"
+          }
+        ],
+        "ok": "boolean",
+        "voices": [
+          {
+            "gender": "string",
+            "id": "string",
+            "language": "string",
+            "name": "string",
+            "recommended": "boolean"
+          }
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/tts/status",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "backendMode": "string",
+        "cachePath": "string",
+        "error": "any",
+        "generation": "object",
+        "ok": "boolean",
+        "port": "number",
+        "preferredPort": "number",
+        "ready": "boolean",
+        "running": "boolean",
+        "runtimeInstalled": "boolean",
+        "runtimePath": "string",
+        "settings": "object",
+        "voices": [],
+        "workerPath": "string"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/tts/outputs",
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "ok": "boolean",
+        "outputs": []
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/web-search/config",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 2,
+      "shape": {
+        "cachePath": "string",
+        "defaults": {
+          "fetchLimit": "number",
+          "resultLimit": "number",
+          "timeFilter": "string"
+        },
+        "ok": "boolean",
+        "provider": "string",
+        "providers": [
+          "object"
+        ]
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/download-progress",
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "active": "boolean",
+        "downloadedBytes": "number",
+        "error": "any",
+        "eta": "number",
+        "filename": "string",
+        "progress": "number",
+        "speed": "string",
+        "totalBytes": "number"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/generation-progress",
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "active": "boolean",
+        "backendDevice": "string",
+        "backendMode": "string",
+        "decoding": "boolean",
+        "speed": "string",
+        "step": "number",
+        "steps": "number"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/cleanup-candidates",
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "candidates": []
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/openvino-models",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "models": [],
+        "npu": "any",
+        "python": "string",
+        "reason": "string",
+        "supported": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/llm/start",
+      "body": {},
+      "status": 500,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "activeRuntime": "any",
+        "code": "string",
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/llm/chat",
+      "body": {},
+      "status": 409,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/llm/delete-conversation",
+      "body": {},
+      "status": 500,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/llm/delete-model",
+      "body": {},
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/llm/download-model",
+      "body": {},
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/llm/import-model",
+      "body": {},
+      "status": 500,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/llm/benchmark",
+      "body": {},
+      "status": 500,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/speech/start",
+      "body": {},
+      "status": 500,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "activeRuntime": "any",
+        "code": "string",
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/speech/delete-model",
+      "body": {},
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/speech/download-model",
+      "body": {},
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/speech/delete-transcription",
+      "body": {},
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/tts/start",
+      "body": {},
+      "status": 500,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "activeRuntime": "any",
+        "code": "string",
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/tts/speak",
+      "body": {},
+      "status": 500,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "activeRuntime": "any",
+        "code": "string",
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/tts/delete-model",
+      "body": {},
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/tts/delete-output",
+      "body": {},
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/delete-model",
+      "body": {},
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/move-model",
+      "body": {},
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/link-model",
+      "body": {},
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/import-model",
+      "body": {},
+      "status": 500,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/save-output",
+      "body": {},
+      "status": 500,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/download-model",
+      "body": {},
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/openvino-generate",
+      "body": {},
+      "status": 500,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/sdapi/v1/txt2img",
+      "body": {},
+      "status": 502,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/does-not-exist",
+      "status": 404,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/does-not-exist",
+      "body": {},
+      "status": 404,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/llm/start",
+      "status": 404,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/llm/start",
+      "body": "{not json",
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/llm/save-conversation",
+      "body": "{not json",
+      "status": 400,
+      "contentType": "application/json",
+      "depth": 1,
+      "shape": {
+        "error": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/llm/stop",
+      "body": {},
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/speech/stop",
+      "body": {},
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/tts/stop",
+      "body": {},
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/stop-backend",
+      "body": {},
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/cancel-download",
+      "body": {},
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "cancelled": "boolean",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/delete-outputs",
+      "body": {},
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "deleted": [],
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/cleanup",
+      "body": {},
+      "status": 200,
+      "contentType": "application/json",
+      "shape": {
+        "deleted": [],
+        "ok": "boolean"
+      }
+    }
+  ]
+}
