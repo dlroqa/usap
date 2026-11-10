@@ -43,6 +43,11 @@ These are the architecture points the installed edition depends on. Each maps to
    Mode detection must be explicit (for example a marker file shipped only in the portable
    layout, or an installer-set flag), never guessed from a path. User-chosen model folders must
    keep working.
+   **Status (Step 9.2):** the resolver exists (`scripts/server/paths.cjs`) and computes both layouts,
+   with the per-OS installed roots above, covered by `scripts/tests/paths.test.cjs` on all 4
+   platforms. Installed mode is reachable only through the internal `USAP_DATA_MODE=installed`
+   variable, which no launcher sets. A tested migration and rollback plan is still required before any
+   installed build uses it.
 2. **Engines are downloaded at first launch into `app/`** (llama.cpp, whisper.cpp,
    stable-diffusion.cpp, Node, Kokoro runtime). For installed builds, decide per engine:
    bundle at build time (CI-built, checksum-pinned), or download into the user data root.

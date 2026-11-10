@@ -23,6 +23,9 @@
 * Added `.github/workflows/native-runtime.yml`: real first-time setup and real inference on 4 platforms (#5, #9).
 * Added API contract tests (`scripts/tests/api-contract.test.cjs`, run by `ci.yml` on all 4 platforms). They pin 61 API calls (status codes, response shapes, errors) and test Origin/Host security, file confinement, model and conversation operations, behaviour without engines and the chat streaming format, against an isolated copy of the server. The streaming test is skipped on Windows (#14) (#13).
 * Added `.github/workflows/docs.yml`: documentation consistency (links, attribution and license notice, evidence for GPU claims, planned items labelled as planned, README review for user-facing PRs).
+### Internal
+* Step 9.2: all user-data folders (models, chats, settings, outputs, caches) now come from one resolver, `scripts/server/paths.cjs`. The portable/USB layout is unchanged byte for byte: same `<root>/app/...` folders, nothing moved or deleted. A per-user installed-edition layout is prepared for the future desktop installers but not enabled.
+
 ### Documentation
 * The README now describes USAP as its own project, with origins, credits and attribution to Portable Local Studio by techjarves. The original README is kept verbatim as `docs/USAGE_UPSTREAM.md`.
 * Roadmap: desktop installers (planning only), Step 9 backend plan (#10, #11).
