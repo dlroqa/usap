@@ -116,7 +116,7 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   passes, so a failed, interrupted or tampered download keeps the previous version. Community models are
   marked **unverified** (or source-checksum only); the publisher is not authenticated.
   [What is covered](docs/security/DOWNLOAD_INTEGRITY.md).
-* **Sign-in for network sharing** (Step 9.5, in review): when the studio is shared on your network,
+* **Sign-in for network sharing** (Step 9.5, [#25](https://github.com/dlroqa/usap/pull/25)): when the studio is shared on your network,
   every other device must sign in with a generated access token. This computer is unaffected, and so is
   the default local-only mode. JSON API routes require a JSON content type.
   [How it works](docs/security/LAN_ACCESS.md).
@@ -210,7 +210,7 @@ only, no force pushes. Details: [CI_GUIDE.md](docs/ci/CI_GUIDE.md),
 | Intel macOS setup; chat, accessibility and mobile fixes | Done (#5–#8) |
 | **Step 8:** native inference verification | **CPU done** on all 4 platforms (#9); GPU pending real hardware |
 | Desktop installer requirement documented | Done (#10), planning only |
-| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection done (#16); Windows streaming tests done (#17); 9.4 download integrity done (#18); 9.5 LAN sign-in in review |
+| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection done (#16); Windows streaming tests done (#17); 9.4 download integrity done (#18); 9.5 LAN sign-in done (#25) |
 
 ## Development Roadmap
 
