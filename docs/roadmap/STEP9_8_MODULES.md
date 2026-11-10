@@ -49,7 +49,7 @@ scripts/server/
 | PR | Scope | Risk |
 |---|---|---|
 | **9.8a** (#36, done) | Pipeline, router, `routes/system.cjs` (6 read-only routes) | Low: read-only routes; pipeline order covered by tests |
-| 9.8b | `routes/tts.cjs` + `services/tts-engine.cjs` | Low: self-contained |
+| **9.8b** (#37, done) | `routes/tts.cjs` + `services/tts-engine.cjs` | Low: self-contained |
 | 9.8c | `routes/speech.cjs` + `services/speech-engine.cjs` (including the binary upload route) | Medium: streaming upload |
 | 9.8d | `routes/search.cjs` | Low |
 | 9.8e | `services/hardware.cjs` (detection used by several routes) | Medium: shared |
