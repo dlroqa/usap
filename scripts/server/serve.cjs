@@ -41,9 +41,15 @@ let PORT_SPEECH = PREFERRED_SPEECH_PORT;
 let PORT_TTS = PREFERRED_TTS_PORT;
 const MAX_JSON_BODY_BYTES = 64 * 1024 * 1024;
 const SERVER_BUILD = "text-image-v1";
-const ROOT    = path.join(__dirname, "..", "..");
-const DIST    = path.join(ROOT, "app", "dist");
-const TOOLS   = path.join(ROOT, "app", "tools");
+// Program and user-data locations come from one resolver (scripts/server/paths.cjs). The default
+// portable layout is byte-identical to the original <root>/app folders.
+const { resolveLayout, ensureDataDirs } = require("./paths.cjs");
+const LAYOUT  = resolveLayout();
+if (LAYOUT.warning) console.warn(`  [paths] ${LAYOUT.warning}`);
+const ROOT    = LAYOUT.root;
+const DIST    = LAYOUT.dist;
+const TOOLS   = LAYOUT.tools;
+ensureDataDirs(LAYOUT);
 const osPlatform = process.platform;
 const BACKEND_PATHS = {
   cuda: path.join(ROOT, "app", "backend", "win", "cuda", "sd-cuda.exe"),
@@ -92,18 +98,9 @@ if (osPlatform === "win32") {
     BACKEND_PATH = BACKEND_PATHS.linuxVulkan;
   }
 }
-const MODELS  = path.join(ROOT, "app", "models");
-if (!fs.existsSync(MODELS)) {
-  fs.mkdirSync(MODELS, { recursive: true });
-}
-const LLM_MODELS = path.join(ROOT, "app", "llm-models");
-if (!fs.existsSync(LLM_MODELS)) {
-  fs.mkdirSync(LLM_MODELS, { recursive: true });
-}
-const CHAT_HISTORY = path.join(ROOT, "app", "chat-history");
-if (!fs.existsSync(CHAT_HISTORY)) {
-  fs.mkdirSync(CHAT_HISTORY, { recursive: true });
-}
+const MODELS = LAYOUT.data.models;
+const LLM_MODELS = LAYOUT.data.llmModels;
+const CHAT_HISTORY = LAYOUT.data.chatHistory;
 const LLM_BACKEND_PATHS = {
   winCuda: path.join(ROOT, "app", "llm-backend", "win", "cuda", "llama-server.exe"),
   winVulkan: path.join(ROOT, "app", "llm-backend", "win", "vulkan", "llama-server.exe"),
@@ -118,36 +115,15 @@ const LLM_BACKEND_PATHS = {
   macArm64: path.join(ROOT, "app", "llm-backend", "mac", "arm64", "llama-server"),
   macX64: path.join(ROOT, "app", "llm-backend", "mac", "x64", "llama-server"),
 };
-const LLM_CONFIG_DIR = path.join(ROOT, "app", "config");
+const LLM_CONFIG_DIR = LAYOUT.data.config;
 const LLM_MODEL_SETTINGS_PATH = path.join(LLM_CONFIG_DIR, "llm-model-settings.json");
 const LLM_BENCHMARK_PATH = path.join(LLM_CONFIG_DIR, "llm-benchmarks.json");
-if (!fs.existsSync(LLM_CONFIG_DIR)) {
-  fs.mkdirSync(LLM_CONFIG_DIR, { recursive: true });
-}
-const SPEECH_MODELS = path.join(ROOT, "app", "speech-models");
-if (!fs.existsSync(SPEECH_MODELS)) {
-  fs.mkdirSync(SPEECH_MODELS, { recursive: true });
-}
-const TRANSCRIPTIONS = path.join(ROOT, "app", "transcriptions");
-if (!fs.existsSync(TRANSCRIPTIONS)) {
-  fs.mkdirSync(TRANSCRIPTIONS, { recursive: true });
-}
-const TTS_MODELS = path.join(ROOT, "app", "tts-models");
-if (!fs.existsSync(TTS_MODELS)) {
-  fs.mkdirSync(TTS_MODELS, { recursive: true });
-}
-const TTS_OUTPUTS = path.join(ROOT, "app", "tts-outputs");
-if (!fs.existsSync(TTS_OUTPUTS)) {
-  fs.mkdirSync(TTS_OUTPUTS, { recursive: true });
-}
-const TTS_CACHE = path.join(ROOT, "app", "tts-cache");
-if (!fs.existsSync(TTS_CACHE)) {
-  fs.mkdirSync(TTS_CACHE, { recursive: true });
-}
-const WEB_SEARCH_CACHE = path.join(ROOT, "app", "cache", "search");
-if (!fs.existsSync(WEB_SEARCH_CACHE)) {
-  fs.mkdirSync(WEB_SEARCH_CACHE, { recursive: true });
-}
+const SPEECH_MODELS = LAYOUT.data.speechModels;
+const TRANSCRIPTIONS = LAYOUT.data.transcriptions;
+const TTS_MODELS = LAYOUT.data.ttsModels;
+const TTS_OUTPUTS = LAYOUT.data.ttsOutputs;
+const TTS_CACHE = LAYOUT.data.ttsCache;
+const WEB_SEARCH_CACHE = LAYOUT.data.webSearchCache;
 const TTS_RUNTIME = path.join(ROOT, "app", "tts-runtime");
 const TTS_WORKER = path.join(ROOT, "scripts", "workers", "tts-kokoro-worker.mjs");
 const SPEECH_BACKEND_ROOT = path.join(ROOT, "app", "speech-backend");
@@ -215,14 +191,8 @@ const TTS_VOICES = [
   { id: "bf_emma", name: "Emma", language: "en-gb", gender: "Female", recommended: false },
   { id: "bm_george", name: "George", language: "en-gb", gender: "Male", recommended: false },
 ];
-const OPENVINO_MODELS = path.join(ROOT, "app", "openvino-models");
-if (!fs.existsSync(OPENVINO_MODELS)) {
-  fs.mkdirSync(OPENVINO_MODELS, { recursive: true });
-}
-const OUTPUTS = path.join(ROOT, "app", "outputs");
-if (!fs.existsSync(OUTPUTS)) {
-  fs.mkdirSync(OUTPUTS, { recursive: true });
-}
+const OPENVINO_MODELS = LAYOUT.data.openvinoModels;
+const OUTPUTS = LAYOUT.data.outputs;
 
 const OPENVINO_NPU_MODELS = [
   {
