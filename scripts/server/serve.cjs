@@ -18,7 +18,12 @@ const { createLanAuth, withoutAuthHeaders, TOKEN_FILE_NAME: LAN_TOKEN_FILE_NAME 
 const supervisor = require("./supervisor.cjs");
 const { decideRestart } = require("./restart-policy.cjs");
 // Step 9.7: one error model (status by cause, machine-readable code, no stacks, no host paths).
-const { ApiError, badRequest, notFound, conflict, notInstalled, errorStatus, errorBody, publicMessage, configurePathRedaction } = require("./errors.cjs");
+const errors = require("./errors.cjs");
+const { ApiError, badRequest, notFound, conflict, notInstalled, errorStatus, errorBody, publicMessage, configurePathRedaction } = errors;
+// Step 9.8: request pipeline (security order + error boundary), router and route modules.
+const { createRouter } = require("./http/router.cjs");
+const { createPipeline } = require("./http/pipeline.cjs");
+const { systemRoutes } = require("./routes/system.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -6237,70 +6242,45 @@ try {
   console.error(`  [auth] Could not create the access token file (${err.code || err.message}). Remote access is refused.`);
 }
 
-async function handleRequest(req, res) {
-  // Refuse DNS-rebound hosts and cross-site origins before any route runs.
-  if (!requestPolicy.isAllowedHost(req)) {
-    return json(res, 403, { ok: false, error: "Host not allowed" });
-  }
-  if (!requestPolicy.isAllowedOrigin(req)) {
-    return json(res, 403, { ok: false, error: "Cross-origin request blocked" });
-  }
-  const corsHeaders = requestPolicy.corsHeadersFor(req);
-  if (corsHeaders) {
-    for (const [key, value] of Object.entries(corsHeaders)) res.setHeader(key, value);
-  }
+// One troubleshooting snapshot (GET /api/diagnostics). No secrets.
+async function getDiagnostics() {
+  return {
+    generatedAt: new Date().toISOString(),
+    health: await getHealth(),
+    cleanupCandidates: getCleanupCandidates(),
+    download: downloadState,
+    generation: generationState,
+    llm: {
+      ready: llmReady,
+      running: llmProc !== null,
+      error: llmError,
+      settings: llmSettings,
+      port: PORT_LLM,
+    },
+    speech: {
+      ready: speechReady,
+      error: speechError,
+      settings: speechSettings,
+      backend: getSpeechBackend(),
+      transcription: speechTranscriptionState,
+    },
+    hardware: getHardwareSpecs(),
+    telemetry: getTelemetry(),
+    engines: { llm: llmLifecycleSnapshot(), processes: supervisor.snapshot() }, // additive (Step 9.6)
+  };
+}
 
-  // CORS preflight
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end(); return;
-  }
+// Routes moved into modules (Step 9.8). They run after the pipeline's security checks and
+// before the routes below that haven't moved yet.
+const router = createRouter();
+router.use(systemRoutes({ json, getHealth, getDiagnostics, getCleanupCandidates, getHardwareSpecs, getBackendOptions, getTelemetry }));
 
-  // Sign-in gate for network-exposed servers (no-op on the default loopback bind).
-  if (await lanAuth.handle(req, res)) return;
-
+// Routes not yet moved into modules, then static files. Only reached through the pipeline.
+async function legacyRoutes(req, res) {
   if ((req.url.startsWith("/v1/") || req.url.startsWith("/sdapi/")) && ["GET", "POST"].includes(req.method)) {
     return proxyImageBackendRequest(req, res);
   }
   // ── Management API ────────────────────────────────────────────────────────
-  // GET /api/health
-  if (req.url === "/api/health" && req.method === "GET") {
-    return json(res, 200, await getHealth());
-  }
-
-  // GET /api/diagnostics
-  if (req.url === "/api/diagnostics" && req.method === "GET") {
-    return json(res, 200, {
-      generatedAt: new Date().toISOString(),
-      health: await getHealth(),
-      cleanupCandidates: getCleanupCandidates(),
-      download: downloadState,
-      generation: generationState,
-      llm: {
-        ready: llmReady,
-        running: llmProc !== null,
-        error: llmError,
-        settings: llmSettings,
-        port: PORT_LLM,
-      },
-      speech: {
-        ready: speechReady,
-        error: speechError,
-        settings: speechSettings,
-        backend: getSpeechBackend(),
-        transcription: speechTranscriptionState,
-      },
-      hardware: getHardwareSpecs(),
-      telemetry: getTelemetry(),
-      engines: { llm: llmLifecycleSnapshot(), processes: supervisor.snapshot() }, // additive (Step 9.6)
-    });
-  }
-
-  // GET /api/cleanup-candidates
-  if (req.url === "/api/cleanup-candidates" && req.method === "GET") {
-    return json(res, 200, { candidates: getCleanupCandidates() });
-  }
-
   // POST /api/cleanup
   if (req.url === "/api/cleanup" && req.method === "POST") {
     try {
@@ -7229,21 +7209,6 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     return json(res, 200, { ok: true, recommendations, source: recommendations ? "llmfit" : "fallback" });
   }
 
-  // GET /api/hardware-specs
-  if (req.url === "/api/hardware-specs" && req.method === "GET") {
-    return json(res, 200, getHardwareSpecs());
-  }
-
-  // GET /api/backend-options
-  if (req.url === "/api/backend-options" && req.method === "GET") {
-    return json(res, 200, getBackendOptions());
-  }
-
-  // GET /api/telemetry
-  if (req.url === "/api/telemetry" && req.method === "GET") {
-    return json(res, 200, getTelemetry());
-  }
-
   // GET /api/models — list available model files
   if (req.url === "/api/models" && req.method === "GET") {
     try {
@@ -7833,16 +7798,9 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
   });
 }
 
-// A route that throws (a bug, or input nobody anticipated) answers 500 with a generic message
-// instead of an unhandled rejection, which would stop the whole server. Details go to the console only.
-const server = http.createServer((req, res) => {
-  handleRequest(req, res).catch((err) => {
-    console.error(`  [api] Unhandled error in ${req.method} ${String(req.url || "").split("?")[0]}:`, err && err.stack ? err.stack : err);
-    if (res.headersSent) { try { res.destroy(); } catch (_) {} return; }
-    const status = errorStatus(err) === 400 ? 400 : 500; // wrong-typed input is the caller's error
-    try { json(res, status, status === 400 ? errorBody(err) : { ok: false, error: "Something went wrong in the local server.", code: "INTERNAL_ERROR" }); } catch (_) {}
-  });
-});
+// Every request: Host → Origin → CORS → preflight → sign-in → module routes → legacy routes,
+// inside one error boundary (scripts/server/http/pipeline.cjs).
+const server = http.createServer(createPipeline({ requestPolicy, lanAuth, router, fallback: legacyRoutes, json, errors }));
 
 server.timeout = 0; // Disable socket timeout for large model uploads/downloads
 
