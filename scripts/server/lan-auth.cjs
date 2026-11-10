@@ -67,10 +67,10 @@ function readTokenFile(file) {
 // Windows: replace the inherited ACL with one entry for the current user (by SID, so localized or
 // unusual account names don't matter). Throws where ACLs aren't supported (FAT/exFAT drives).
 function restrictWindowsAcl(file) {
-  const out = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8", windowsHide: true });
-  const sid = (out.match(/"(S-1-[0-9-]+)"/) || [])[1];
+  const out = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  const sid = (out.match(/S-1-[0-9]+(?:-[0-9]+)+/) || [])[0];
   if (!sid) throw new Error("current user SID not found");
-  execFileSync("icacls", [file, "/inheritance:r", "/grant:r", `*${sid}:F`], { stdio: "ignore", windowsHide: true });
+  execFileSync("icacls", [file, "/inheritance:r", "/grant:r", `*${sid}:(F)`], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
 }
 
 /**
@@ -79,8 +79,10 @@ function restrictWindowsAcl(file) {
  */
 function protectTokenFile(file, platform = process.platform) {
   if (platform === "win32") {
-    try { restrictWindowsAcl(file); return null; } catch (_) {
-      return "Windows could not restrict the access-token file to your account (for example on a FAT/exFAT drive)";
+    try { restrictWindowsAcl(file); return null; } catch (err) {
+      // The reason (a tool's error line) helps support; it never contains the token.
+      const detail = String(err.stderr || err.stdout || err.message || "").trim().split(/\r?\n/)[0].slice(0, 200);
+      return `Windows could not restrict the access-token file to your account (for example on a FAT/exFAT drive)${detail ? `: ${detail}` : ""}`;
     }
   }
   try { fs.chmodSync(file, 0o600); } catch (_) { /* checked below */ }
