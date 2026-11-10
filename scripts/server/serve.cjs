@@ -4773,6 +4773,9 @@ async function startBackend(settings = {}) {
   if (currentSettings.useGpu) {
     runThreads = Math.min(4, runThreads);
   }
+  // Never run more compute threads than logical CPUs: on a 4-core Mac the default 8 threads made
+  // sd ~5x slower (measured on macos-15-intel: 430 s/it at -t 8 vs 84 s/it at -t 4).
+  runThreads = Math.max(1, Math.min(runThreads, os.cpus().length || runThreads));
 
   let args = [];
   const requestedBackend = resolveBackendType(currentSettings.useGpu, currentSettings.backendType, currentSettings.model);

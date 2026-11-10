@@ -42,9 +42,9 @@ jobs:
           # image: backends exercised for image generation. "cpu" must pass; GPU backends are
           # attempted and recorded as UNSUPPORTED/UNAVAILABLE on hosted runners (no usable GPU).
           - { label: macos-arm64,  runner: macos-15,       arch: arm64,  launcher: ./mac.sh,   image: "cpu metal" }
-          # Intel: upstream's universal sd has an SSE3-only x86_64 slice (no AVX/AVX2/FMA), so CPU
-          # generation is ~75x slower than Linux x64; a smaller image keeps the proof within the timeout.
-          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, launcher: ./mac.sh,   image: "cpu metal", size: 128, steps: 2 }
+          # Intel: upstream's universal sd has an SSE3-only x86_64 slice (no AVX/AVX2/FMA); CPU image
+          # generation is slower than on Linux x64 but fits the timeout (docs/ci/MACOS_COMPATIBILITY.md).
+          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, launcher: ./mac.sh,   image: "cpu metal" }
           - { label: linux-x64,    runner: ubuntu-24.04,   arch: x86_64, launcher: ./linux.sh, image: "cpu vulkan" }
           # Git Bash drives windows.bat through cmd; piped empty lines answer its "press any key" prompts.
           - { label: windows-x64,  runner: windows-2025,   arch: x86_64, launcher: "cmd //c windows.bat", image: "cpu vulkan" }
