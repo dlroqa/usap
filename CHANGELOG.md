@@ -6,7 +6,7 @@
 * Static file serving is confined to `app/dist/`.
 * Outbound requests (web search, page fetching, model and engine downloads, Hugging Face lookups) can only reach public internet addresses. Each redirect is validated and the number of redirects is limited. The address checked is the address connected to. Search and normal downloads are unaffected (Step 9.3).
 ### Compatibility
-* **Model downloads from private-network hosts** (e.g. a NAS mirror) are now refused by default. Set `USAP_ALLOW_LAN_DOWNLOADS=1` to allow them. Loopback and cloud-metadata addresses are always refused (Step 9.3).
+* **Model downloads from private-network hosts** (e.g. a NAS mirror) are now refused by default. Set `USAP_ALLOW_LAN_DOWNLOADS=1` to allow them. Loopback, cloud-metadata addresses and this machine's own network addresses are always refused (Step 9.3).
 * **Browser-based third-party tools** on another origin that called the studio API (e.g. `/v1/*`) are now refused. To allow one, set `UAIS_ALLOWED_ORIGINS=https://tool.example` (comma-separated); only those origins receive CORS headers.
 * If you reach a loopback-bound server through a custom hostname, add it with `UAIS_ALLOWED_HOSTS`.
 * Non-browser clients (curl, scripts, SDKs), which send no `Origin`, are unaffected. LAN mode (`UAIS_HOST=0.0.0.0`) still works for same-origin use.

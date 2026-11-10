@@ -8,9 +8,12 @@
 //   * the address that passed the check is the address the socket connects to (custom `lookup`),
 //     so a DNS answer cannot change between the check and the connection
 //   * redirects are followed only through followRedirect(), which re-validates every hop
+//   * any address assigned to one of this machine's network interfaces is refused, so neither the
+//     default policy nor the LAN opt-in can reach this machine through its own LAN or public address
 "use strict";
 const dns = require("node:dns");
 const net = require("node:net");
+const os = require("node:os");
 
 class BlockedRequestError extends Error {
   constructor(message, category) {
@@ -104,12 +107,47 @@ function classifyIpv6(ip) {
   return null;
 }
 
+// ── This machine's own addresses ────────────────────────────────────────────
+// Read on every check (interfaces change with DHCP, VPNs, Wi-Fi). Returns null if they cannot be
+// enumerated. Keys are canonical: dotted IPv4, or 8 hex groups for IPv6.
+let interfaceProvider = () => os.networkInterfaces();
+
+function addressKey(ip) {
+  const family = net.isIP(String(ip || "").split("%")[0]);
+  if (family === 4) return String(ip);
+  if (family !== 6) return null;
+  const g = ipv6Groups(ip);
+  if (g.length !== 8) return null;
+  // IPv4-mapped / IPv4-compatible forms compare as the IPv4 address they carry
+  if (g.slice(0, 5).every((x) => x === 0) && (g[5] === 0xffff || g[5] === 0)) {
+    if (g[5] === 0xffff || g[6] !== 0) return embeddedIpv4(g, 6, 7);
+  }
+  return g.map((x) => x.toString(16)).join(":");
+}
+
+function localAddressKeys() {
+  let ifaces;
+  try { ifaces = interfaceProvider(); } catch (_) { return null; }
+  if (!ifaces || typeof ifaces !== "object") return null;
+  const keys = new Set();
+  for (const list of Object.values(ifaces)) {
+    for (const entry of list || []) {
+      const key = entry && addressKey(entry.address);
+      if (key) keys.add(key);
+    }
+  }
+  return keys;
+}
+
 /** Category name if the address must not be contacted, else null. Non-IP input is blocked. */
 function classifyAddress(ip) {
   const family = net.isIP(String(ip || ""));
-  if (family === 4) return classifyIpv4(ip);
-  if (family === 6) return classifyIpv6(ip);
-  return "not an IP address";
+  if (family !== 4 && family !== 6) return "not an IP address";
+  const category = family === 4 ? classifyIpv4(ip) : classifyIpv6(ip);
+  if (category && !PRIVATE_LAN_CATEGORIES.has(category)) return category;
+  const local = localAddressKeys();
+  if (local && local.has(addressKey(ip))) return "this machine";
+  return category;
 }
 
 // Hostnames that always mean "this machine" or a metadata service, whatever DNS says.
@@ -123,10 +161,21 @@ function normaliseHost(hostname) {
 // Loopback, link-local/metadata and everything else stay blocked regardless.
 const PRIVATE_LAN_CATEGORIES = new Set(["private", "unique local (private)", "shared (CGNAT)"]);
 
-/** Policy that additionally allows private-LAN addresses (still never loopback or metadata). */
+/**
+ * Policy that additionally allows private-LAN addresses. Loopback, metadata and this machine's own
+ * addresses stay blocked. If the local interfaces cannot be enumerated, private addresses stay
+ * blocked too (fail closed), because one of them could be this machine.
+ */
 function privateLanPolicy(base = {}) {
   const inner = base.isBlockedAddress || classifyAddress;
-  return { ...base, isBlockedAddress: (ip) => { const c = inner(ip); return c && PRIVATE_LAN_CATEGORIES.has(c) ? null : c; } };
+  return {
+    ...base,
+    isBlockedAddress: (ip) => {
+      const c = inner(ip);
+      if (!c || !PRIVATE_LAN_CATEGORIES.has(c)) return c;
+      return localAddressKeys() ? null : `${c} (this machine's addresses could not be checked)`;
+    },
+  };
 }
 
 /**
@@ -204,4 +253,6 @@ module.exports = {
   followRedirect,
   normaliseHost,
   privateLanPolicy,
+  // Test seam only: replace the network-interface source (scripts/tests/ssrf.test.cjs).
+  _setInterfaceProviderForTests(fn) { interfaceProvider = fn || (() => os.networkInterfaces()); },
 };

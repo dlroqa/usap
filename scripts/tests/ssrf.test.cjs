@@ -64,11 +64,56 @@ test("urls: ordinary public URLs pass", () => {
   }
 });
 
-test("urls: the LAN opt-in allows private hosts but never loopback or metadata", () => {
+test("urls: the LAN opt-in allows private hosts but never loopback or metadata", (t) => {
+  // Deterministic: the runner's own interface addresses must not coincide with the sample hosts.
+  guard._setInterfaceProviderForTests(() => ({ lo: [{ address: "127.0.0.1", family: "IPv4", internal: true }] }));
+  t.after(() => guard._setInterfaceProviderForTests(null));
   const lan = guard.privateLanPolicy();
   for (const u of ["http://192.168.1.20/m.gguf", "http://10.0.0.5/m.gguf", "http://[fd12:3456::1]/m.gguf"]) guard.assertSafeUrl(u, lan);
   for (const u of ["http://127.0.0.1/", "http://169.254.169.254/", "http://[::1]/", "http://localhost/"]) {
     assert.throws(() => guard.assertSafeUrl(u, lan), guard.BlockedRequestError, u);
+  }
+});
+
+test("urls: this machine's own interface addresses are blocked, with or without the LAN opt-in", (t) => {
+  // Stub: this machine has a LAN address, a public address and a global IPv6 address.
+  guard._setInterfaceProviderForTests(() => ({
+    lo: [{ address: "127.0.0.1", family: "IPv4", internal: true }],
+    eth0: [
+      { address: "192.168.1.50", family: "IPv4", internal: false },
+      { address: "93.184.216.99", family: "IPv4", internal: false },
+      { address: "2606:4700:abcd::50", family: "IPv6", internal: false },
+    ],
+  }));
+  t.after(() => guard._setInterfaceProviderForTests(null));
+  const lan = guard.privateLanPolicy();
+  const own = ["http://192.168.1.50:8080/m.gguf", "http://[::ffff:192.168.1.50]/", "http://93.184.216.99/", "http://[2606:4700:abcd:0::50]/"];
+  for (const u of own) {
+    assert.throws(() => guard.assertSafeUrl(u), guard.BlockedRequestError, `default: ${u}`);
+    assert.throws(() => guard.assertSafeUrl(u, lan), /this machine/, `LAN opt-in: ${u}`);
+  }
+  // Another host on the same LAN is still reachable with the opt-in only.
+  guard.assertSafeUrl("http://192.168.1.20/m.gguf", lan);
+  assert.throws(() => guard.assertSafeUrl("http://192.168.1.20/m.gguf"), guard.BlockedRequestError);
+  // A DNS answer that is this machine is refused at connection time too.
+  const lookup = guard.guardedLookup({ ...lan, resolve: (h, o, cb) => cb(null, [{ address: "192.168.1.50", family: 4 }]) });
+  lookup("nas.example", {}, (err) => assert.match(String(err && err.message), /this machine/));
+});
+
+test("urls: the LAN opt-in fails closed when interfaces cannot be enumerated", (t) => {
+  guard._setInterfaceProviderForTests(() => { throw new Error("uv_interface_addresses failed"); });
+  t.after(() => guard._setInterfaceProviderForTests(null));
+  assert.throws(() => guard.assertSafeUrl("http://192.168.1.20/m.gguf", guard.privateLanPolicy()), guard.BlockedRequestError);
+  assert.equal(guard.assertSafeUrl("https://93.184.216.34/").protocol, "https:");
+});
+
+test("urls: the real non-loopback interface addresses of this runner are blocked under the LAN opt-in", () => {
+  const os = require("node:os");
+  const lan = guard.privateLanPolicy();
+  const addrs = Object.values(os.networkInterfaces()).flat().filter((a) => a && !a.internal && !a.address.startsWith("fe80"));
+  for (const a of addrs) {
+    const host = a.family === "IPv6" || a.family === 6 ? `[${a.address}]` : a.address;
+    assert.throws(() => guard.assertSafeUrl(`http://${host}/`, lan), guard.BlockedRequestError, a.address);
   }
 });
 
