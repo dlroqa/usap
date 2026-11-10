@@ -174,6 +174,25 @@ if fetch_verified "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c
   else
     record "Speech transcription (app API)" FAIL "${res:0:300}"
   fi
+  # Translation request path (Step 9.8c). ggml-tiny.en is English-only: whisper.cpp accepts -tr and
+  # keeps English, so this proves the request is handled end to end, not translation quality.
+  res="$(curl -s -m 600 -X POST -H 'content-type: audio/wav' --data-binary @"$CACHE/jfk.wav" "$BASE/api/speech/transcribe?model=ggml-tiny.en.bin&language=auto&translate=true&save=false&filename=jfk.wav")"
+  lower="$(echo "$res" | tr "[:upper:]" "[:lower:]")"
+  if [[ "$(echo "$res" | json_get ok)" == true && "$lower" == *"your country"* ]]; then
+    record "Speech translation request (app API)" PASS "translate=true, language=auto handled (English-only model keeps English)"
+  else
+    record "Speech translation request (app API)" FAIL "${res:0:300}"
+  fi
+  # Saved transcript: listed, then deleted (transcription history).
+  res="$(curl -s -m 600 -X POST -H 'content-type: audio/wav' --data-binary @"$CACHE/jfk.wav" "$BASE/api/speech/transcribe?model=ggml-tiny.en.bin&language=en&filename=jfk-saved.wav")"
+  saved="$(echo "$res" | json_get transcription.metadata)"
+  listed="$(api GET /api/speech/transcriptions)"
+  if [[ -n "$saved" && "$listed" == *"$saved"* ]] && [[ "$(api POST /api/speech/delete-transcription "{\"filename\":\"$saved\"}" | json_get ok)" == true ]] \
+     && [[ "$(api GET /api/speech/transcriptions)" != *"$saved"* ]]; then
+    record "Speech transcript history (app API)" PASS "saved, listed and deleted $saved"
+  else
+    record "Speech transcript history (app API)" FAIL "saved=$saved res=${res:0:200}"
+  fi
   api POST /api/speech/stop '{}' >/dev/null
 else
   record "Speech model download" FAIL "checksum mismatch or download failed"
