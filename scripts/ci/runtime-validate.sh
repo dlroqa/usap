@@ -179,6 +179,26 @@ else
   record "Speech model download" FAIL "checksum mismatch or download failed"
 fi
 
+# Download integrity (Step 9.4): a catalog model downloaded *through the app* must stream, verify against
+# scripts/config/download-digests.txt ("verified"), and be activated with no partial file left behind.
+APPDL=ggml-tiny.en-q5_1.bin
+APPDL_SHA=c77c5766f1cef09b6b7d47f21b546cbddd4157886b3b5d6d4f709e91e66c7c2b
+rm -f "$APP/speech-models/$APPDL"
+t0=$(date +%s)
+start="$(api POST /api/speech/download-model "{\"model\":\"$APPDL\"}")"
+st=""
+if [[ "$(echo "$start" | json_get ok)" == true ]]; then
+  for _ in $(seq 1 150); do st="$(api GET /api/download-progress)"; [[ "$(echo "$st" | json_get active)" != true ]] && break; sleep 2; done
+fi
+integ="$(echo "$st" | json_get integrity)"; dlerr="$(echo "$st" | json_get error)"
+if [[ "$integ" == verified && -z "$dlerr" ]] && echo "$APPDL_SHA  $APP/speech-models/$APPDL" | sha256_check >/dev/null 2>&1 \
+   && ! ls "$APP/speech-models" | grep -q '\.part$'; then
+  record "In-app download integrity" PASS "$(( $(date +%s) - t0 ))s: $APPDL $integ (sha256 $(echo "$st" | json_get sha256 | cut -c1-12)...)"
+else
+  record "In-app download integrity" FAIL "start=${start:0:120} integrity=$integ error=${dlerr:0:200}"
+fi
+rm -f "$APP/speech-models/$APPDL"
+
 # Voice: Kokoro 82M ONNX q8 through the app's catalog (kokoro-js fetches the model).
 api POST /api/tts/download-model '{"model":"kokoro-onnx-q8"}' >/dev/null
 t0=$(date +%s)

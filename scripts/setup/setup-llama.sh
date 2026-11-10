@@ -12,6 +12,8 @@ ARCH="$(uname -m)"
 if [[ "$PLATFORM" == "Darwin" ]] && [[ "$(sysctl -in hw.optional.arm64 2>/dev/null || true)" == "1" ]]; then
   ARCH="arm64"
 fi
+# shellcheck source=verify-download.sh
+source "$SCRIPT_DIR/verify-download.sh"
 
 download_and_extract() {
   local asset="$1"
@@ -31,22 +33,38 @@ download_and_extract() {
   rm -f "$archive" "$archive.part"
   echo "   >>   Downloading $asset"
   curl -fSL --progress-bar "$url" -o "$archive.part"
-  mv "$archive.part" "$archive"
-  # Clear the previous release only after the new archive downloaded, so a failed update keeps the old backend.
-  find "$dest" -mindepth 1 -delete 2>/dev/null || true
-  if command -v python3 >/dev/null 2>&1; then
-    python3 "$SCRIPT_DIR/extract_tar.py" --archive "$archive" --dest "$dest" --strip-components=1
-  else
-    tar -xzf "$archive" -C "$dest" --strip-components=1
-  fi
-  rm -f "$archive"
-  chmod +x "$dest"/llama-* 2>/dev/null || true
-
-  if [[ ! -x "$dest/llama-server" ]]; then
-    echo "   XX   llama-server was not found after extracting $asset" >&2
+  if ! usap_verify_download "$url" "$archive.part"; then
+    rm -f "$archive.part"
     return 1
   fi
-  echo "$RELEASE" > "$dest/.llama-release"
+  mv "$archive.part" "$archive"
+  # Extract into a staging folder and swap it in only when it is complete, so a failed or corrupt
+  # update always keeps the previous backend (Step 9.4).
+  local staging="$dest.staging"
+  rm -rf "$staging"
+  mkdir -p "$staging"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 "$SCRIPT_DIR/extract_tar.py" --archive "$archive" --dest "$staging" --strip-components=1
+  else
+    tar -xzf "$archive" -C "$staging" --strip-components=1
+  fi
+  rm -f "$archive"
+  chmod +x "$staging"/llama-* 2>/dev/null || true
+
+  if [[ ! -x "$staging/llama-server" ]]; then
+    echo "   XX   llama-server was not found after extracting $asset" >&2
+    rm -rf "$staging"
+    return 1
+  fi
+  echo "$RELEASE" > "$staging/.llama-release"
+  rm -rf "$dest.previous"
+  mv "$dest" "$dest.previous"
+  if ! mv "$staging" "$dest"; then
+    mv "$dest.previous" "$dest"
+    echo "   XX   Could not activate the new llama.cpp backend; the previous one was kept" >&2
+    return 1
+  fi
+  rm -rf "$dest.previous"
 }
 
 download_and_extract_optional() {

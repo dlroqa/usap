@@ -55,6 +55,10 @@ ensureDataDirs(LAYOUT);
 // such as a model mirror on a NAS; loopback and cloud-metadata addresses stay blocked.
 const { assertSafeUrl, guardedRequestOptions, followRedirect, privateLanPolicy } = require("./net-guard.cjs");
 const DOWNLOAD_POLICY = process.env.USAP_ALLOW_LAN_DOWNLOADS === "1" ? privateLanPolicy({ maxRedirects: 10 }) : { maxRedirects: 10 };
+// Downloads are hashed while they stream, checked against scripts/config/download-digests.txt and only
+// then moved into place (Step 9.4; scripts/server/downloader.cjs, scripts/server/integrity.cjs).
+const downloader = require("./downloader.cjs");
+const integrity = require("./integrity.cjs");
 function downloadBlockReason(url) {
   try { assertSafeUrl(url, DOWNLOAD_POLICY); return ""; } catch (err) { return err.message; }
 }
@@ -1638,14 +1642,8 @@ function ensureStorageCapacity(targetDir, requiredBytes) {
 }
 
 function replaceFileWithRetry(tempPath, destPath) {
-  withFileRetrySync(() => {
-    try {
-      fs.unlinkSync(destPath);
-    } catch (err) {
-      if (err?.code !== "ENOENT") throw err;
-    }
-    fs.renameSync(tempPath, destPath);
-  });
+  // Atomic: the previous file stays in place until the new one is fully in position (Step 9.4).
+  withFileRetrySync(() => integrity.atomicReplaceFile(tempPath, destPath));
 }
 
 function getPathInfo(label, targetPath, type = "file") {
@@ -5119,11 +5117,18 @@ function listFilesRecursive(dir) {
 }
 
 function installImageBackendArchive(zipPath, backend, runtimeOnly = false) {
-  const tempDir = path.join(TOOLS, `image-backend-${backend.id}-extract-${Date.now()}`);
+  // Extract into a temporary folder, build the complete new engine folder next to the live one, check
+  // that the executable is built for this CPU, then swap folders in one step. If anything fails, the
+  // installed engine is left exactly as it was (Step 9.4).
+  const stamp = Date.now();
+  const tempDir = path.join(TOOLS, `image-backend-${backend.id}-extract-${stamp}`);
+  const stagingDir = `${backend.destDir}.staging-${stamp}`;
   try {
     fs.rmSync(tempDir, { recursive: true, force: true });
     fs.mkdirSync(tempDir, { recursive: true });
-    fs.mkdirSync(backend.destDir, { recursive: true });
+    fs.rmSync(stagingDir, { recursive: true, force: true });
+    if (fs.existsSync(backend.destDir)) fs.cpSync(backend.destDir, stagingDir, { recursive: true });
+    else fs.mkdirSync(stagingDir, { recursive: true });
 
     const tar = spawnSync("tar.exe", ["-xf", zipPath, "-C", tempDir], { encoding: "utf8" });
     if (tar.status !== 0) {
@@ -5134,37 +5139,86 @@ function installImageBackendArchive(zipPath, backend, runtimeOnly = false) {
     if (runtimeOnly) {
       const dlls = files.filter((file) => path.extname(file).toLowerCase() === ".dll");
       if (dlls.length === 0) throw new Error("CUDA runtime archive did not contain any DLL files.");
-      for (const file of dlls) fs.copyFileSync(file, path.join(backend.destDir, path.basename(file)));
-      cachedBackendOptions = null;
-      return;
-    }
-    const exeSource = files.find((file) => ["sd-server.exe", "sd.exe"].includes(path.basename(file).toLowerCase()));
-    const dllSource = files.find((file) => path.basename(file).toLowerCase() === backend.requiredDll.toLowerCase());
-    if (!exeSource || !dllSource) {
-      throw new Error("Backend archive did not contain the expected stable-diffusion executable and DLL.");
-    }
+      for (const file of dlls) fs.copyFileSync(file, path.join(stagingDir, path.basename(file)));
+    } else {
+      const exeSource = files.find((file) => ["sd-server.exe", "sd.exe"].includes(path.basename(file).toLowerCase()));
+      const dllSource = files.find((file) => path.basename(file).toLowerCase() === backend.requiredDll.toLowerCase());
+      if (!exeSource || !dllSource) {
+        throw new Error("Backend archive did not contain the expected stable-diffusion executable and DLL.");
+      }
 
-    fs.copyFileSync(exeSource, path.join(backend.destDir, backend.exeName));
-    fs.copyFileSync(dllSource, path.join(backend.destDir, backend.requiredDll));
-    for (const file of files) {
-      const ext = path.extname(file).toLowerCase();
-      if (ext !== ".dll" && ext !== ".exe") continue;
-      if (file === exeSource) continue;
-      fs.copyFileSync(file, path.join(backend.destDir, path.basename(file)));
-    }
+      fs.copyFileSync(exeSource, path.join(stagingDir, backend.exeName));
+      fs.copyFileSync(dllSource, path.join(stagingDir, backend.requiredDll));
+      for (const file of files) {
+        const ext = path.extname(file).toLowerCase();
+        if (ext !== ".dll" && ext !== ".exe") continue;
+        if (file === exeSource) continue;
+        fs.copyFileSync(file, path.join(stagingDir, path.basename(file)));
+      }
 
-    if (!fs.existsSync(path.join(backend.destDir, backend.exeName)) || !fs.existsSync(path.join(backend.destDir, backend.requiredDll))) {
-      throw new Error(`Backend install did not create ${backend.exeName} and ${backend.requiredDll}.`);
+      if (!fs.existsSync(path.join(stagingDir, backend.exeName)) || !fs.existsSync(path.join(stagingDir, backend.requiredDll))) {
+        throw new Error(`Backend install did not create ${backend.exeName} and ${backend.requiredDll}.`);
+      }
+      // Windows on Arm runs these x64 builds through its built-in emulation; every other host must match.
+      integrity.assertNativeBinary(path.join(stagingDir, backend.exeName), {
+        accept: process.arch === "arm64" ? ["arm64", "x64"] : [process.arch],
+      });
+    }
+    try {
+      integrity.atomicReplaceDir(stagingDir, backend.destDir);
+    } catch (err) {
+      throw new Error(`${err.message} Stop image generation (the engine may be running) and try again.`);
     }
     cachedBackendOptions = null;
   } finally {
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
+    try { fs.rmSync(stagingDir, { recursive: true, force: true }); } catch (_) {}
   }
 }
 
-function startImageBackendDownload(backendId, redirectCount = 0, redirectUrl = "", stage = "main") {
+// ── Verified downloads (Step 9.4) ───────────────────────────────────────────
+// Bumped on every new download and on cancel, so a superseded transfer never overwrites the status.
+let downloadGeneration = 0;
+const DOWNLOAD_USER_AGENT = "Uncensored-AI-Studio/1.0 (+https://github.com/techjarves/Uncensored-AI-Studio)";
+
+function downloadProgressUpdater() {
+  let lastTime = Date.now();
+  let lastBytes = 0;
+  return ({ bytes, totalBytes }) => {
+    if (bytes < lastBytes) lastBytes = 0; // a retry restarted from byte zero
+    downloadState.downloadedBytes = bytes;
+    downloadState.totalBytes = totalBytes;
+    const now = Date.now();
+    const elapsed = (now - lastTime) / 1000;
+    if (elapsed < 0.5) return;
+    const speed = (bytes - lastBytes) / elapsed; // bytes/sec
+    lastBytes = bytes;
+    lastTime = now;
+    downloadState.speed = `${(speed / (1024 * 1024)).toFixed(1)} MB/s`;
+    if (totalBytes > 0) {
+      downloadState.progress = Math.round((bytes / totalBytes) * 100);
+      downloadState.eta = Math.round((totalBytes - bytes) / Math.max(1, speed));
+    } else {
+      downloadState.progress = -1; // Indeterminate
+      downloadState.eta = -1;
+    }
+  };
+}
+
+function describeDownloadFailure(err, label) {
+  if (!err) return `Download of ${label} failed.`;
+  if (err.name === "BlockedRequestError" || err.name === "IntegrityError" || err.code === "USAP_HTTP") return err.message;
+  if (err.code === "USAP_INTERRUPTED" || err.code === "USAP_STALLED" || downloader.TRANSIENT.has(err.code)) {
+    return `Download interrupted before ${label} finished: ${err.message} Retry the download.`;
+  }
+  if (err.code === "USAP_WRITE") return `Could not write ${label}: ${err.message}`;
+  return err.message || String(err);
+}
+
+// The redirect arguments are unused since Step 9.4 (the downloader follows redirects); the signature is kept.
+function startImageBackendDownload(backendId, _redirectCount = 0, _redirectUrl = "", stage = "main") {
   const isRuntimeStage = stage === "runtime";
-  if (downloadState.active && redirectCount === 0 && !isRuntimeStage) {
+  if (downloadState.active && !isRuntimeStage) {
     throw new Error("Another download is already active.");
   }
   if (osPlatform !== "win32") {
@@ -5178,143 +5232,81 @@ function startImageBackendDownload(backendId, redirectCount = 0, redirectUrl = "
   }
 
   fs.mkdirSync(TOOLS, { recursive: true });
-  const url = redirectUrl || (isRuntimeStage ? backend.runtimeUrl : backend.url);
+  const url = isRuntimeStage ? backend.runtimeUrl : backend.url;
   const filename = isRuntimeStage ? `${backend.id}-runtime.zip` : `${backend.id}-backend.zip`;
   const destPath = path.join(TOOLS, filename);
-  const tempPath = `${destPath}.part`;
-  if (redirectCount === 0) {
-    try { fs.unlinkSync(tempPath); } catch (_) {}
-    downloadState = {
-      active: true,
-      filename: isRuntimeStage ? `${backend.label} runtime` : backend.label,
-      progress: 0,
-      speed: "0 MB/s",
-      eta: 0,
-      totalBytes: 0,
-      downloadedBytes: 0,
-      error: null,
-      kind: "backend",
-      backendId: backend.id,
-    };
-  }
-
-  console.log(`  [backend-download] Downloading ${backend.label} backend from ${url}`);
-  let downloadFinalized = false;
-  const fileStream = fs.createWriteStream(tempPath);
+  const label = `${backend.label} backend`;
+  downloadState = {
+    active: true,
+    filename: isRuntimeStage ? `${backend.label} runtime` : backend.label,
+    progress: 0,
+    speed: "0 MB/s",
+    eta: 0,
+    totalBytes: 0,
+    downloadedBytes: 0,
+    error: null,
+    kind: "backend",
+    backendId: backend.id,
+    integrity: null,
+    sha256: null,
+  };
+  const generation = ++downloadGeneration;
   const failDownload = (message, err = null) => {
-    if (downloadFinalized) return;
-    downloadFinalized = true;
+    if (generation !== downloadGeneration) return;
     downloadState.active = false;
     downloadState.error = message;
-    if (err) console.error("  [backend-download]", message, err);
+    if (err) console.error("  [backend-download]", message, err.code || "");
     else console.error("  [backend-download] Failed:", message);
-    try { fileStream.close(); } catch (_) {}
-    try { fs.unlinkSync(tempPath); } catch (_) {}
     activeDownload = null;
   };
 
-  fileStream.on("error", (err) => failDownload(`Could not write ${filename}: ${err.message}`, err));
   const blockedReason = downloadBlockReason(url);
   if (blockedReason) return failDownload(blockedReason);
-  const client = url.startsWith("https") ? https : http;
-  const request = client.get(url, {
-    ...guardedRequestOptions(DOWNLOAD_POLICY),
-    headers: {
-      "User-Agent": "Uncensored-AI-Studio/1.0 (+https://github.com/techjarves/Uncensored-AI-Studio)",
-      "Accept": "application/zip, application/octet-stream, */*",
+  console.log(`  [backend-download] Downloading ${backend.label} backend from ${url}`);
+  const controller = new AbortController();
+  const progress = downloadProgressUpdater();
+  activeDownload = { abort: () => controller.abort(), destPath, tempPath: `${destPath}.part` };
+  downloader.downloadVerified(url, destPath, {
+    policy: DOWNLOAD_POLICY,
+    signal: controller.signal,
+    label,
+    requirePinned: true, // engines are only installed when they match a reviewed digest
+    headers: { "User-Agent": DOWNLOAD_USER_AGENT, "Accept": "application/zip, application/octet-stream, */*" },
+    checkResponse: (res, current) => (res.statusCode === 200 ? null : describeDownloadHttpError(res.statusCode, current, res.headers)),
+    onRedirect: () => { if (generation === downloadGeneration) downloadState.speed = "Following redirect"; },
+    onProgress: (p) => { if (generation === downloadGeneration) progress(p); },
+    onRetry: ({ attempt, error }) => {
+      console.warn(`  [backend-download] ${label}: ${error.message} Retrying (attempt ${attempt + 1}).`);
+      if (generation === downloadGeneration) downloadState.speed = "Retrying";
     },
-  }, (response) => {
-    activeDownload = { request, fileStream, destPath, tempPath };
-    if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
-      let nextUrl;
-      try {
-        nextUrl = followRedirect(url, response.headers.location, redirectCount, DOWNLOAD_POLICY);
-      } catch (err) {
-        response.resume();
-        return failDownload(err.message);
-      }
-      downloadState.speed = "Following redirect";
-      request.removeAllListeners("error");
-      request.destroy();
-      response.resume();
-      fileStream.close();
-      try { fs.unlinkSync(tempPath); } catch (_) {}
+  }).then((result) => {
+    if (generation !== downloadGeneration) { try { fs.rmSync(destPath, { force: true }); } catch (_) {} return; }
+    downloadState.speed = "Installing";
+    downloadState.progress = 95;
+    try {
+      installImageBackendArchive(destPath, backend, isRuntimeStage);
+    } catch (err) {
+      return failDownload(`Could not install ${backend.label} backend: ${err.message}`, err);
+    } finally {
+      try { fs.unlinkSync(destPath); } catch (_) {}
+    }
+    console.log(`  [backend-download] ${filename}: ${result.status}, sha256 ${result.sha256}`);
+    if (!isRuntimeStage && backend.runtimeUrl) {
       activeDownload = null;
-      startImageBackendDownload(backend.id, redirectCount + 1, nextUrl, stage);
+      console.log(`  [backend-download] Installed ${backend.label} backend, fetching runtime libraries`);
+      startImageBackendDownload(backend.id, 0, "", "runtime");
       return;
     }
-    if (response.statusCode !== 200) {
-      return failDownload(describeDownloadHttpError(response.statusCode, url, response.headers));
-    }
-
-    const totalBytes = parseInt(response.headers["content-length"], 10) || 0;
-    downloadState.totalBytes = totalBytes;
-    let downloadedBytes = 0;
-    let lastTime = Date.now();
-    let lastDownloaded = 0;
-
-    response.on("data", (chunk) => {
-      downloadedBytes += chunk.length;
-      downloadState.downloadedBytes = downloadedBytes;
-      if (!fileStream.write(chunk)) {
-        response.pause();
-        fileStream.once("drain", () => response.resume());
-      }
-      const now = Date.now();
-      const elapsed = (now - lastTime) / 1000;
-      if (elapsed >= 0.5) {
-        const chunkSpeed = (downloadedBytes - lastDownloaded) / elapsed;
-        lastDownloaded = downloadedBytes;
-        lastTime = now;
-        downloadState.speed = `${(chunkSpeed / (1024 * 1024)).toFixed(1)} MB/s`;
-        if (totalBytes > 0) {
-          downloadState.progress = Math.round((downloadedBytes / totalBytes) * 100);
-          downloadState.eta = Math.round((totalBytes - downloadedBytes) / Math.max(1, chunkSpeed));
-        } else {
-          downloadState.progress = -1;
-          downloadState.eta = -1;
-        }
-      }
-    });
-
-    response.on("aborted", () => failDownload(`Download interrupted before ${backend.label} backend finished.`));
-    response.on("error", (err) => failDownload(`Download stream failed before ${backend.label} backend finished.`, err));
-    response.on("end", () => {
-      if (downloadFinalized) return;
-      if (totalBytes > 0 && downloadedBytes !== totalBytes) {
-        failDownload(`Download incomplete for ${backend.label}: received ${formatBytes(downloadedBytes)} of ${formatBytes(totalBytes)}.`);
-        return;
-      }
-      fileStream.end(() => {
-        try {
-          replaceFileWithRetry(tempPath, destPath);
-          downloadState.speed = "Installing";
-          downloadState.progress = 95;
-          installImageBackendArchive(destPath, backend, isRuntimeStage);
-          try { fs.unlinkSync(destPath); } catch (_) {}
-          downloadFinalized = true;
-          if (!isRuntimeStage && backend.runtimeUrl) {
-            activeDownload = null;
-            console.log(`  [backend-download] Installed ${backend.label} backend, fetching runtime libraries`);
-            startImageBackendDownload(backend.id, 0, "", "runtime");
-            return;
-          }
-          downloadState.active = false;
-          downloadState.progress = 100;
-          downloadState.downloadedBytes = downloadedBytes;
-          downloadState.error = null;
-          downloadState.speed = "Complete";
-          activeDownload = null;
-          console.log(`  [backend-download] Installed ${backend.label} backend`);
-        } catch (err) {
-          failDownload(`Could not install ${backend.label} backend: ${err.message}`, err);
-        }
-      });
-    });
-  });
-
-  request.on("error", (err) => failDownload(err.message, err));
-  activeDownload = { request, fileStream, destPath, tempPath };
+    downloadState.active = false;
+    downloadState.progress = 100;
+    downloadState.downloadedBytes = result.bytes;
+    downloadState.error = null;
+    downloadState.speed = "Complete";
+    downloadState.integrity = result.status;
+    downloadState.sha256 = result.sha256;
+    activeDownload = null;
+    console.log(`  [backend-download] Installed ${backend.label} backend`);
+  }, (err) => failDownload(describeDownloadFailure(err, label), err));
 }
 
 // ── Generation State (Real-time progress parser) ─────────────────────────────
@@ -5391,7 +5383,7 @@ function getModelDownloadUrlIssue(url) {
   return "";
 }
 
-function startModelDownload(url, overrideFilename = null, targetDir = MODELS, kind = "image", redirectCount = 0) {
+function startModelDownload(url, overrideFilename = null, targetDir = MODELS, kind = "image") {
   if (downloadState.active && !overrideFilename) {
     console.log("  [download] Already downloading a model");
     return;
@@ -5415,7 +5407,6 @@ function startModelDownload(url, overrideFilename = null, targetDir = MODELS, ki
 
   const destPath = path.join(targetDir, filename);
   const tempPath = `${destPath}.part`;
-  try { fs.unlinkSync(tempPath); } catch (_) {}
   downloadState = {
     active: true,
     filename: filename,
@@ -5426,182 +5417,80 @@ function startModelDownload(url, overrideFilename = null, targetDir = MODELS, ki
     downloadedBytes: 0,
     error: null,
     kind,
+    // Step 9.4 (additive): "verified" | "source-checksum" | "unverified" once finished.
+    integrity: null,
+    sha256: null,
   };
-
-  if (redirectCount > 0) {
-    console.log(`  [download] Continuing redirected download of ${filename}`);
-  } else {
-    console.log(`  [download] Starting download of ${filename} from ${url}`);
-  }
-
-  let downloadFinalized = false;
-  const failDownload = (message, err = null) => {
-    if (downloadFinalized) return;
-    downloadFinalized = true;
-    downloadState.active = false;
-    downloadState.error = message;
-    if (err) {
-      console.error("  [download]", message, err);
-    } else {
-      console.error("  [download] Failed:", message);
-    }
-    try { fileStream.close(); } catch (_) {}
-    try { fs.unlinkSync(tempPath); } catch (_) {}
-    activeDownload = null;
-  };
+  const generation = ++downloadGeneration;
 
   const blockedReason = downloadBlockReason(url);
   if (blockedReason) {
-    downloadFinalized = true;
     downloadState.active = false;
     downloadState.error = blockedReason;
     console.error("  [download] Refused:", blockedReason);
     return;
   }
 
-  const fileStream = fs.createWriteStream(tempPath);
-  fileStream.on("error", (err) => {
-    failDownload(`Could not write ${filename}: ${err.message}`, err);
-  });
-  
-  const client = url.startsWith("https") ? https : http;
-  const request = client.get(url, {
-    ...guardedRequestOptions(DOWNLOAD_POLICY),
+  console.log(`  [download] Starting download of ${filename} from ${url}`);
+  const controller = new AbortController();
+  activeDownload = { abort: () => controller.abort(), destPath, tempPath };
+  const progress = downloadProgressUpdater();
+  downloader.downloadVerified(url, destPath, {
+    tempPath,
+    policy: DOWNLOAD_POLICY,
+    signal: controller.signal,
+    label: filename,
     headers: {
-      "User-Agent": "Uncensored-AI-Studio/1.0 (+https://github.com/techjarves/Uncensored-AI-Studio)",
+      "User-Agent": DOWNLOAD_USER_AGENT,
       "Accept": "application/octet-stream, application/x-safetensors, */*",
       "Referer": "https://huggingface.co/",
     },
-  }, (response) => {
-    activeDownload = { request, fileStream, destPath, tempPath };
-    // Handle redirects (HuggingFace resolve URLs redirect to Cloudfront/S3)
-    if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
-      let redirectUrl;
-      try {
-        redirectUrl = followRedirect(url, response.headers.location, redirectCount, DOWNLOAD_POLICY);
-      } catch (err) {
-        response.resume();
-        failDownload(err.message);
-        return;
+    checkResponse: (res, current) => {
+      if (res.statusCode !== 200) return describeDownloadHttpError(res.statusCode, current, res.headers);
+      // Repository pages, login walls and error pages come back as 200 + text/html.
+      if (String(res.headers["content-type"] || "").toLowerCase().includes("text/html")) {
+        return `That URL returned a web page, not a model file. ${MODEL_FILE_URL_HINT}`;
       }
+      return null;
+    },
+    // Handle redirects (HuggingFace resolve URLs redirect to Cloudfront/S3); each hop is re-validated.
+    onRedirect: () => {
       console.log(`  [download] Following redirect for ${filename}`);
-      downloadState.speed = "Following redirect";
-      
-      // Clean up redirected request to avoid triggering error handlers later
-      request.removeAllListeners("error");
-      request.destroy();
-      response.resume();
-      
-      fileStream.close();
-      try { fs.unlinkSync(tempPath); } catch (_) {}
-      activeDownload = null;
-      startModelDownload(redirectUrl, filename, targetDir, kind, redirectCount + 1);
-      return;
-    }
-
-    if (response.statusCode !== 200) {
-      failDownload(describeDownloadHttpError(response.statusCode, url, response.headers));
-      return;
-    }
-
-    // Repository pages, login walls and error pages come back as 200 + text/html.
-    if (String(response.headers["content-type"] || "").toLowerCase().includes("text/html")) {
-      response.resume();
-      failDownload(`That URL returned a web page, not a model file. ${MODEL_FILE_URL_HINT}`);
-      return;
-    }
-
-    const totalBytes = parseInt(response.headers["content-length"], 10) || 0;
-    downloadState.totalBytes = totalBytes;
-    let downloadedBytes = 0;
-    let startTime = Date.now();
-    let lastTime = startTime;
-    let lastDownloaded = 0;
-
-    response.on("data", (chunk) => {
-      downloadedBytes += chunk.length;
-      downloadState.downloadedBytes = downloadedBytes;
-      // Wait for the disk to catch up so slow drives (USB sticks) don't buffer the whole file in memory
-      if (!fileStream.write(chunk)) {
-        response.pause();
-        fileStream.once("drain", () => response.resume());
+      if (generation === downloadGeneration) downloadState.speed = "Following redirect";
+    },
+    onProgress: (p) => { if (generation === downloadGeneration) progress(p); },
+    onRetry: ({ attempt, error }) => {
+      console.warn(`  [download] ${filename}: ${error.message} Retrying from the start (attempt ${attempt + 1}).`);
+      if (generation === downloadGeneration) downloadState.speed = "Retrying";
+    },
+  }).then((result) => {
+    console.log(`  [download] ${filename}: ${result.status} (${result.message}) sha256 ${result.sha256}`);
+    if (generation !== downloadGeneration) return; // cancelled or superseded; status already set
+    if (destPath.toLowerCase().endsWith(".zip")) {
+      try {
+        // execFile with an argument list: the path is never interpreted by a shell (S-8).
+        const { execFileSync } = require("child_process");
+        execFileSync("unzip", ["-o", destPath, "-d", path.dirname(destPath)], { stdio: "ignore" });
+        fs.unlinkSync(destPath);
+      } catch(err) {
+        console.error("Failed to unzip", err);
       }
-
-      const now = Date.now();
-      const elapsed = (now - lastTime) / 1000;
-      if (elapsed >= 0.5) {
-        const chunkSpeed = (downloadedBytes - lastDownloaded) / elapsed; // bytes/sec
-        lastDownloaded = downloadedBytes;
-        lastTime = now;
-
-        const speedMb = (chunkSpeed / (1024 * 1024)).toFixed(1);
-        downloadState.speed = `${speedMb} MB/s`;
-
-        if (totalBytes > 0) {
-          downloadState.progress = Math.round((downloadedBytes / totalBytes) * 100);
-          const remainingBytes = totalBytes - downloadedBytes;
-          downloadState.eta = Math.round(remainingBytes / chunkSpeed);
-        } else {
-          downloadState.progress = -1; // Indeterminate
-          downloadState.eta = -1;
-        }
-      }
-    });
-
-    response.on("aborted", () => {
-      failDownload(`Download interrupted before ${filename} finished. Delete and retry the model download.`);
-    });
-
-    response.on("error", (err) => {
-      failDownload(`Download stream failed before ${filename} finished. Delete and retry the model download.`, err);
-    });
-
-    response.on("end", () => {
-      if (downloadFinalized) return;
-      if (totalBytes > 0 && downloadedBytes !== totalBytes) {
-        failDownload(`Download incomplete for ${filename}: received ${formatBytes(downloadedBytes)} of ${formatBytes(totalBytes)}. Delete and retry the model download.`);
-        return;
-      }
-
-      fileStream.end(() => {
-        try {
-          if (totalBytes > 0) {
-            const writtenBytes = fs.statSync(tempPath).size;
-            if (writtenBytes !== totalBytes) {
-              failDownload(`Download incomplete for ${filename}: wrote ${formatBytes(writtenBytes)} of ${formatBytes(totalBytes)}. Delete and retry the model download.`);
-              return;
-            }
-          }
-          replaceFileWithRetry(tempPath, destPath);
-
-          if (destPath.toLowerCase().endsWith(".zip")) {
-            try {
-              const { execSync } = require("child_process");
-              execSync(`unzip -o "${destPath}" -d "${path.dirname(destPath)}"`, { stdio: "ignore" });
-              fs.unlinkSync(destPath);
-            } catch(err) {
-              console.error("Failed to unzip", err);
-            }
-          }
-
-          downloadState.active = false;
-          downloadFinalized = true;
-          downloadState.progress = 100;
-          downloadState.downloadedBytes = downloadedBytes;
-          downloadState.error = null;
-          activeDownload = null;
-          console.log(`  [download] Completed download of ${filename}`);
-        } catch (err) {
-          failDownload(`Could not finalize ${filename}: ${err.message}`);
-        }
-      });
-    });
+    }
+    downloadState.active = false;
+    downloadState.progress = 100;
+    downloadState.downloadedBytes = result.bytes;
+    downloadState.error = null;
+    downloadState.integrity = result.status;
+    downloadState.sha256 = result.sha256;
+    activeDownload = null;
+    console.log(`  [download] Completed download of ${filename}`);
+  }, (err) => {
+    if (generation !== downloadGeneration) return;
+    downloadState.active = false;
+    downloadState.error = describeDownloadFailure(err, filename);
+    activeDownload = null;
+    console.error("  [download] Failed:", downloadState.error);
   });
-
-  request.on("error", (err) => {
-    failDownload(err.message, err);
-  });
-  activeDownload = { request, fileStream, destPath, tempPath };
 }
 
 function cancelModelDownload() {
@@ -5613,10 +5502,9 @@ function cancelModelDownload() {
     if (activeDownload.process) {
       try { activeDownload.process.kill("SIGTERM"); } catch (_) {}
       setTimeout(() => { try { activeDownload?.process?.kill("SIGKILL"); } catch (_) {} }, 1000);
-    } else {
-      try { activeDownload.request.destroy(new Error("Download cancelled by user")); } catch (_) {}
-      try { activeDownload.fileStream.destroy(); } catch (_) {}
-      try { fs.unlinkSync(activeDownload.tempPath || activeDownload.destPath); } catch (_) {}
+    } else if (activeDownload.abort) {
+      downloadGeneration++; // the aborted transfer must not overwrite the "cancelled" status
+      try { activeDownload.abort(); } catch (_) {} // the downloader removes its partial file
     }
   } else if (filename) {
     const targetDir = downloadState.kind === "text"

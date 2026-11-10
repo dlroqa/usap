@@ -12,6 +12,7 @@ $npmCmd      = Join-Path $nodeDir  "npm.cmd"
 $distDir     = Join-Path $appDir   "dist"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+. (Join-Path $scriptDir "verify-download.ps1")  # Assert-UsapDownload (Step 9.4)
 function Print-Header {
     Write-Host ""
     Write-Host "  ============================================================" -ForegroundColor Cyan
@@ -132,9 +133,16 @@ function Invoke-RichDownload {
 
             Write-Host "`r  [$("#" * $barWidth)] 100%  $(Format-Bytes $done)  Done!                         " -ForegroundColor Green
             Write-Host ""
+            $out.Close(); $out = $null
+            Assert-UsapDownload -Url $Url -Path $Dest
             return $true
         } catch {
             Write-Host ""
+            if ("$_" -like "USAP_INTEGRITY:*") {
+                # A pinned-digest mismatch is not a network glitch: do not retry it.
+                Print-Fail "$_"
+                break
+            }
             if ($attempt -lt 3) {
                 Print-Warn "Download attempt $attempt failed: $_"
                 Print-Info "Retrying download..."

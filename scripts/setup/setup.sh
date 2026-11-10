@@ -69,6 +69,8 @@ if [[ "${1:-}" == "--max-perf" ]]; then
 fi
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+# shellcheck source=verify-download.sh
+source "$SCRIPT_DIR/verify-download.sh"
 print_header() {
   echo ""
   echo "  ============================================================"
@@ -115,6 +117,11 @@ download_file() {
 
   curl -fSL --progress-bar "$url" -o "$tmp_dest" || {
     print_fail "Download failed: $url"
+    rm -f "$tmp_dest"
+    return 1
+  }
+  # Step 9.4: pinned SHA-256 check before the file is moved into place.
+  usap_verify_download "$url" "$tmp_dest" || {
     rm -f "$tmp_dest"
     return 1
   }
