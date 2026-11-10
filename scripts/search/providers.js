@@ -1,4 +1,5 @@
 const https = require("https");
+const { assertSafeUrl, guardedRequestOptions, followRedirect } = require("../server/net-guard.cjs");
 
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LocalAIStudio/1.0";
 
@@ -17,9 +18,14 @@ function stripTags(value) {
   return decodeHtml(String(value || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim());
 }
 
-function requestText(url, timeoutMs = 12000) {
+// policy is a test seam (scripts/tests/ssrf.test.cjs); production uses the default policy.
+function requestText(url, timeoutMs = 12000, redirects = 0, policy = {}) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, {
+    const effective = { maxRedirects: 3, ...policy };
+    try { assertSafeUrl(url, effective); } catch (err) { reject(err); return; }
+    const transport = url.startsWith("http:") ? require("http") : https;
+    const req = transport.get(url, {
+      ...guardedRequestOptions(effective),
       headers: {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -28,7 +34,12 @@ function requestText(url, timeoutMs = 12000) {
     }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        resolve(requestText(new URL(res.headers.location, url).toString(), timeoutMs));
+        try {
+          const next = followRedirect(url, res.headers.location, redirects, effective);
+          resolve(requestText(next, timeoutMs, redirects + 1, policy));
+        } catch (err) {
+          reject(err);
+        }
         return;
       }
       if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -103,4 +114,5 @@ async function webSearch(query, options = {}) {
 
 module.exports = {
   webSearch,
+  requestText,
 };
