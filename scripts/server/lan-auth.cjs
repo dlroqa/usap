@@ -66,11 +66,16 @@ function readTokenFile(file) {
 
 // Windows: replace the inherited ACL with one entry for the current user (by SID, so localized or
 // unusual account names don't matter). Throws where ACLs aren't supported (FAT/exFAT drives).
+// System tools by absolute path: a "whoami" from Git Bash or another toolset can come first on PATH.
+function windowsTool(name) {
+  return path.join(process.env.SystemRoot || process.env.windir || "C:\\Windows", "System32", name);
+}
+
 function restrictWindowsAcl(file) {
-  const out = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  const out = execFileSync(windowsTool("whoami.exe"), ["/user", "/fo", "csv", "/nh"], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
   const sid = (out.match(/S-1-[0-9]+(?:-[0-9]+)+/) || [])[0];
   if (!sid) throw new Error("current user SID not found");
-  execFileSync("icacls", [file, "/inheritance:r", "/grant:r", `*${sid}:(F)`], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  execFileSync(windowsTool("icacls.exe"), [file, "/inheritance:r", "/grant:r", `*${sid}:(F)`], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
 }
 
 /**
