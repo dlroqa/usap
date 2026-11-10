@@ -4546,3 +4546,17 @@ body {
   font-weight: 500;
   color: var(--md-sys-color-on-surface);
 }
+
+/* D-2: on phone-width screens the open sidebar overlays the content as a drawer instead of
+   squeezing it into an unreadable column. Keep in sync with NARROW_SCREEN_QUERY (App.jsx). */
+@media (max-width: 640px) {
+  .sidebar:not(.collapsed) {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    max-width: 85vw;
+    z-index: 40;
+    box-shadow: var(--glass-shadow);
+  }
+}

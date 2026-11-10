@@ -1331,7 +1331,8 @@ function Generator({
                 disabled={isBusy}
                 aria-haspopup="menu"
                 aria-expanded={openMenu === "size"}
-                aria-label={`Image size ${constraints.width} by ${constraints.height}`}
+                // WCAG 2.5.3: the accessible name starts with the visible label (voice control)
+                aria-label={`${sizeLabel(constraints.width, constraints.height)} image size`}
               >
                 <span>{sizeLabel(constraints.width, constraints.height)}</span>
                 <ChevronDown size={14} aria-hidden="true" />
