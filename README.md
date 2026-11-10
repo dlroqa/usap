@@ -168,7 +168,7 @@ For troubleshooting (ports, GPU drivers, Windows error codes, building engines f
 
 | Workflow | What it checks | When |
 |---|---|---|
-| [`ci`](.github/workflows/ci.yml) | Frontend build, server unit tests, security regression tests, **API contract tests** (61 recorded calls: routes, status codes, response schemas, error format, Origin/Host security, file confinement, model and conversation operations, behaviour without engines, chat streaming format; [details](scripts/tests/api-contract/README.md)), backend smoke test, on Windows x64, Linux x64, macOS arm64 and macOS Intel (native hardware asserted) | every PR and push; **required** |
+| [`ci`](.github/workflows/ci.yml) | Frontend build, server unit tests, security regression tests, **API contract tests** (61 recorded calls: routes, status codes, response schemas, error format, Origin/Host security, file confinement, model and conversation operations, behaviour without engines, chat streaming format, order and failure handling on all 4 platforms; [details](scripts/tests/api-contract/README.md)), backend smoke test, on Windows x64, Linux x64, macOS arm64 and macOS Intel (native hardware asserted) | every PR and push; **required** |
 | [`render-e2e`](.github/workflows/render-e2e.yml) | Real built UI in Playwright: pixel-exact screenshots of the original interface, behaviour tests, accessibility (axe) | every PR and push; **required** |
 | [`native-runtime`](.github/workflows/native-runtime.yml) | Real first-time setup, binary architecture checks, real chat/speech/voice/image inference with small pinned models, second launch | PRs touching setup/server/launchers, weekly, on demand |
 | [`docs`](.github/workflows/docs.yml) | README links resolve, upstream attribution and license notices present, no planned feature described as available | PRs and pushes touching docs |
@@ -219,7 +219,6 @@ validation. Full priorities: [PRIORITIES.md](docs/roadmap/PRIORITIES.md).
 * **No release packages or installers yet.** Run from a checkout.
 * **macOS whisper depends on Homebrew.**
 * **Linux engines need glibc 2.38+.**
-* **Testing gap:** the chat streaming contract test runs on Linux and macOS but is **skipped on Windows** (it needs a Windows stand-in engine). Windows streaming coverage is incomplete until [#14](https://github.com/dlroqa/usap/issues/14) is done.
 
 ## Contributing
 
