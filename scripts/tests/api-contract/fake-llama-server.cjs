@@ -10,7 +10,17 @@
 //   MODE:http-error HTTP 400 with an OpenAI-style error body, before any streaming
 //   MODE:crash-mid  2 chunks, then the connection is destroyed (no finish, no [DONE])
 //   MODE:slow       a chunk every 50 ms for 5 s (client-disconnect checks)
-// GET /fake/stats reports {requests, completed, aborted} so tests can observe aborts.
+// GET /fake/stats reports {requests, completed, aborted, pid} so tests can observe aborts.
+//
+// Lifecycle modes for the engine-supervision tests (Step 9.6), chosen by a marker in the model
+// file name (so they work through the normal /api/llm/start path):
+//   fail-start      exit with code 3 before listening (a failed launch)
+//   slow-start      wait 60 s before listening (an interrupted or cancelled startup)
+//   never-ready     listen, but /v1/models answers 503 forever (a startup timeout)
+// and by flags (used when a test starts the fake directly):
+//   --fake-ignore-sigterm         ignore SIGTERM (forces the forced-termination path)
+//   --fake-exit-after-ms N        exit after N ms with --fake-exit-code (default 3)
+//   --fake-abort-after-ms N       process.abort() after N ms (SIGABRT on POSIX)
 "use strict";
 const http = require("node:http");
 const path = require("node:path");
@@ -20,7 +30,11 @@ if (args.includes("--version")) { console.log("version: 0 (contract-test fake ll
 if (args.includes("--help") || args.includes("--list-devices")) { console.log("contract-test fake llama-server"); process.exit(0); }
 const model = path.basename(arg("--model", "fake.gguf"));
 const WORDS = ["Contract", " test", " reply."];
-const stats = { requests: 0, completed: 0, aborted: 0 };
+const stats = { requests: 0, completed: 0, aborted: 0, pid: process.pid };
+if (model.includes("fail-start")) { console.error("fake engine: failed to load model (fail-start)"); process.exit(3); }
+if (args.includes("--fake-ignore-sigterm")) process.on("SIGTERM", () => { console.error("fake engine: ignoring SIGTERM"); });
+if (args.includes("--fake-exit-after-ms")) setTimeout(() => process.exit(Number(arg("--fake-exit-code", "3"))), Number(arg("--fake-exit-after-ms", "0")));
+if (args.includes("--fake-abort-after-ms")) setTimeout(() => process.abort(), Number(arg("--fake-abort-after-ms", "0")));
 
 const chunk = (content) => `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content } }] })}\n\n`;
 const finish = (n) => `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], timings: { predicted_n: n, predicted_ms: 30 } })}\n\n`;
@@ -32,7 +46,11 @@ function modeOf(body) {
   return m[2] ? { name: "count", n: Math.min(500, Number(m[2])) } : { name: m[1] };
 }
 
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
+  if (req.url.startsWith("/v1/models") && model.includes("never-ready")) {
+    res.writeHead(503, { "content-type": "application/json" });
+    return res.end('{"error":{"message":"Loading model","code":503}}');
+  }
   if (req.url.startsWith("/v1/models")) {
     res.writeHead(200, { "content-type": "application/json" });
     return res.end(JSON.stringify({ object: "list", data: [{ id: model, object: "model" }] }));
@@ -84,4 +102,6 @@ http.createServer((req, res) => {
     return;
   }
   res.writeHead(404); res.end();
-}).listen(Number(arg("--port", "10086")), arg("--host", "127.0.0.1"));
+});
+const listen = () => server.listen(Number(arg("--port", "10086")), arg("--host", "127.0.0.1"));
+if (model.includes("slow-start")) setTimeout(listen, 60000); else listen();
