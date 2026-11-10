@@ -94,6 +94,13 @@ function withoutCorsHeaders(headers) {
   return out;
 }
 
+// S-9: classify a request body's declared type for JSON routes: "json", "missing" or "other".
+function jsonBodyType(req) {
+  const type = String((req.headers && req.headers["content-type"]) || "").split(";")[0].trim().toLowerCase();
+  if (!type) return "missing";
+  return type === "application/json" || /^application\/[a-z0-9.!#$&^_-]+\+json$/.test(type) ? "json" : "other";
+}
+
 // Resolve a request URL to a file inside distDir, or null if it would escape it.
 function resolveStaticPath(distDir, requestUrl) {
   let urlPath = String(requestUrl || "/").split("?")[0].split("#")[0];
@@ -115,4 +122,5 @@ module.exports = {
   withoutCorsHeaders,
   resolveStaticPath,
   isLoopbackBind,
+  jsonBodyType,
 };

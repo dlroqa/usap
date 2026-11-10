@@ -65,7 +65,9 @@ function makeRoot() {
   return root;
 }
 
-async function startServer(root, extraEnv = {}) {
+// readyPath: a route that answers 200 once the server is up (a sign-in-required server answers
+// /api/health with 401, so its tests wait on /api/auth/status instead).
+async function startServer(root, extraEnv = {}, { readyPath = "/api/health" } = {}) {
   const [port, llm, sd, speech, tts] = await Promise.all([freePort(), freePort(), freePort(), freePort(), freePort()]);
   const env = {
     ...process.env,
@@ -84,8 +86,11 @@ async function startServer(root, extraEnv = {}) {
   const deadline = Date.now() + 30000;
   for (;;) {
     if (proc.exitCode !== null) throw new Error(`server exited early (${proc.exitCode}):\n${log}`);
-    try { const r = await request(port, "GET", "/api/health"); if (r.status === 200) break; } catch (_) { /* not up yet */ }
-    if (Date.now() > deadline) throw new Error(`server did not start:\n${log}`);
+    try { const r = await request(port, "GET", readyPath); if (r.status === 200) break; } catch (_) { /* not up yet */ }
+    if (Date.now() > deadline) {
+      stopServer({ proc }); // don't leave a half-started server holding the test process open
+      throw new Error(`server did not start (no 200 from ${readyPath}):\n${log}`);
+    }
     await new Promise((r) => setTimeout(r, 200));
   }
   return { port, llmPort: llm, proc, root, log: () => log };

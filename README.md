@@ -116,6 +116,10 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   passes, so a failed, interrupted or tampered download keeps the previous version. Community models are
   marked **unverified** (or source-checksum only); the publisher is not authenticated.
   [What is covered](docs/security/DOWNLOAD_INTEGRITY.md).
+* **Sign-in for network sharing** (Step 9.5, in review): when the studio is shared on your network,
+  every other device must sign in with a generated access token. This computer is unaffected, and so is
+  the default local-only mode. JSON API routes require a JSON content type.
+  [How it works](docs/security/LAN_ACCESS.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
 * **UI regression protection** ([#4](https://github.com/dlroqa/usap/pull/4)): pixel-exact
@@ -175,8 +179,10 @@ Platform notes:
   checked only for transfer integrity, or not at all
   ([details](docs/security/DOWNLOAD_INTEGRITY.md)). Changing an engine version with `LLAMA_RELEASE` or
   `WHISPER_RELEASE` installs it unverified, with a warning.
-* **LAN access** is off by default. `UAIS_HOST=0.0.0.0` opens the studio to your network, and it has
-  no login, so anyone on that network can use it.
+* **LAN access** is off by default. `UAIS_HOST=0.0.0.0` opens the studio to your network. Other
+  devices then have to sign in with the access token in `app/config/lan-access-token` (shown with
+  `node scripts/server/lan-auth.cjs show`). The connection is plain HTTP, so share it only on a network
+  you trust ([details](docs/security/LAN_ACCESS.md)).
 
 For troubleshooting (ports, GPU drivers, Windows error codes, building engines from source), see
 [docs/USAGE_UPSTREAM.md](docs/USAGE_UPSTREAM.md). That's the original project's detailed guide, kept as written.
@@ -204,7 +210,7 @@ only, no force pushes. Details: [CI_GUIDE.md](docs/ci/CI_GUIDE.md),
 | Intel macOS setup; chat, accessibility and mobile fixes | Done (#5–#8) |
 | **Step 8:** native inference verification | **CPU done** on all 4 platforms (#9); GPU pending real hardware |
 | Desktop installer requirement documented | Done (#10), planning only |
-| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection done (#16); Windows streaming tests done (#17); 9.4 download integrity in review |
+| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection done (#16); Windows streaming tests done (#17); 9.4 download integrity done (#18); 9.5 LAN sign-in in review |
 
 ## Development Roadmap
 
@@ -239,6 +245,19 @@ validation. Full priorities: [PRIORITIES.md](docs/roadmap/PRIORITIES.md).
 * **Not every download is authenticated.** Community models, the Visual C++ runtime, Kokoro voice
   weights, Python/npm packages and source builds don't have pinned digests
   ([list](docs/security/DOWNLOAD_INTEGRITY.md#what-is-covered)). Pinned digests are not code signatures.
+* **Portable setup doesn't enforce the lockfile exactly** (S-10). It uses `npm install`, which checks
+  each package against the lockfile's integrity hash but doesn't guarantee an exact reproduction. CI
+  uses `npm ci`. A staged update that keeps the per-OS dependency folders and offline re-setup is
+  planned ([#22](https://github.com/dlroqa/usap/issues/22)).
+* **LAN sharing uses plain HTTP and one shared token**: no built-in HTTPS, no user accounts
+  ([details](docs/security/LAN_ACCESS.md#limitations)).
+* **Open security-hardening work**, tracked before production release packaging:
+  * Windows setup engine staging and rollback ([#19](https://github.com/dlroqa/usap/issues/19), pre-release)
+  * Verifying the Visual C++ runtime, portable Python and `get-pip.py` ([#20](https://github.com/dlroqa/usap/issues/20), pre-release)
+  * Kokoro weights ([#21](https://github.com/dlroqa/usap/issues/21))
+  * Dependency installs ([#22](https://github.com/dlroqa/usap/issues/22))
+  * Source builds and Python packages ([#23](https://github.com/dlroqa/usap/issues/23))
+  * Unavailable catalog models ([#24](https://github.com/dlroqa/usap/issues/24))
 
 ## Contributing
 

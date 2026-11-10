@@ -12,7 +12,8 @@ const path     = require("path");
 const { spawn, spawnSync, execSync, exec, execFile } = require("child_process");
 const { comprehensiveWebSearch } = require("../search/core");
 const { detectModelKindCached } = require("./model-kind.cjs");
-const { createRequestPolicy, withoutCorsHeaders, resolveStaticPath } = require("./request-policy.cjs");
+const { createRequestPolicy, withoutCorsHeaders, resolveStaticPath, jsonBodyType } = require("./request-policy.cjs");
+const { createLanAuth, withoutAuthHeaders, TOKEN_FILE_NAME: LAN_TOKEN_FILE_NAME } = require("./lan-auth.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -3606,7 +3607,7 @@ function requestJson(url, payload = null, timeoutMs = 120000) {
 }
 
 function proxyImageBackendRequest(req, res) {
-  const headers = { ...req.headers };
+  const headers = withoutAuthHeaders(req.headers); // USAP credentials stay in USAP
   delete headers.host;
   headers.host = `127.0.0.1:${PORT_BACKEND}`;
 
@@ -5720,7 +5721,7 @@ function getModelInfo(filename) {
   };
 }
 
-function readBody(req) {
+function readBody(req, { emptyOnly = false } = {}) {
   return new Promise((resolve, reject) => {
     let data = "";
     let bytes = 0;
@@ -5733,16 +5734,28 @@ function readBody(req) {
       }
       data += chunk;
     });
-    req.on("end",  () => { try { resolve(JSON.parse(data || "{}")); } catch(e) { reject(new Error("Invalid JSON request body")); } });
+    req.on("end",  () => {
+      if (emptyOnly && data.trim()) return reject(Object.assign(new Error(JSON_TYPE_ERROR), { status: 415 }));
+      try { resolve(JSON.parse(data || "{}")); } catch(e) { reject(new Error("Invalid JSON request body")); }
+    });
     req.on("error", reject);
   });
 }
 
+// S-9: a JSON route only accepts a JSON body (Content-Type application/json or */*+json). A request
+// with no body and no Content-Type (e.g. POST /api/llm/stop) is still accepted as {}.
+const JSON_TYPE_ERROR = "Request body must be JSON (Content-Type: application/json).";
 async function readJsonBody(req, res) {
+  const type = jsonBodyType(req);
+  if (type === "other") {
+    req.resume();
+    json(res, 415, { ok: false, error: JSON_TYPE_ERROR });
+    return null;
+  }
   try {
-    return await readBody(req);
+    return await readBody(req, { emptyOnly: type === "missing" });
   } catch (err) {
-    json(res, err.message.includes("too large") ? 413 : 400, { ok: false, error: err.message });
+    json(res, err.status || (err.message.includes("too large") ? 413 : 400), { ok: false, error: err.message });
     return null;
   }
 }
@@ -6044,6 +6057,19 @@ function json(res, code, obj) {
 // ── HTTP Server ───────────────────────────────────────────────────────────────
 const LISTEN_HOST = process.env.UAIS_HOST || "127.0.0.1";
 const requestPolicy = createRequestPolicy({ listenHost: LISTEN_HOST });
+// Step 9.5: sign-in whenever the server is reachable beyond this machine (scripts/server/lan-auth.cjs).
+const lanAuth = createLanAuth({
+  tokenFile: path.join(LAYOUT.data.config, LAN_TOKEN_FILE_NAME),
+  listenHost: LISTEN_HOST,
+  log: (msg) => console.warn("  " + msg),
+});
+if (lanAuth.mode.warning) console.warn(`  [auth] ${lanAuth.mode.warning}`);
+try {
+  lanAuth.ensureToken();
+} catch (err) {
+  // Fail closed: without a token file every remote request is refused.
+  console.error(`  [auth] Could not create the access token file (${err.code || err.message}). Remote access is refused.`);
+}
 
 const server = http.createServer(async (req, res) => {
   // Refuse DNS-rebound hosts and cross-site origins before any route runs.
@@ -6063,6 +6089,9 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(204);
     res.end(); return;
   }
+
+  // Sign-in gate for network-exposed servers (no-op on the default loopback bind).
+  if (await lanAuth.handle(req, res)) return;
 
   if ((req.url.startsWith("/v1/") || req.url.startsWith("/sdapi/")) && ["GET", "POST"].includes(req.method)) {
     return proxyImageBackendRequest(req, res);
@@ -7631,7 +7660,8 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
 
 server.timeout = 0; // Disable socket timeout for large model uploads/downloads
 
-// Local-only by default: the UI has no login. Set UAIS_HOST=0.0.0.0 to share it on your network.
+// Local-only by default (no sign-in). UAIS_HOST=0.0.0.0 shares it on your network; sign-in is then
+// required for every other device (see docs/security/LAN_ACCESS.md).
 server.listen(PORT_FRONTEND, LISTEN_HOST, () => {
   console.log("");
   console.log("  ============================================================");
@@ -7642,6 +7672,11 @@ server.listen(PORT_FRONTEND, LISTEN_HOST, () => {
   console.log("   Text API : starts on http://127.0.0.1:" + PREFERRED_LLM_PORT);
   console.log("   Speech   : managed locally, API on frontend port");
   console.log("   TTS      : Kokoro ONNX managed locally, API on frontend port");
+  if (lanAuth.mode.required) {
+    // The token itself is never printed; only where to find it.
+    console.log("   Sign-in  : required" + (lanAuth.mode.loopbackExempt ? " for other devices (this computer is exempt)" : " for every request"));
+    console.log("   Token    : " + lanAuth.tokenFile);
+  }
   console.log("  ============================================================");
   console.log("");
 
