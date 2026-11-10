@@ -22,7 +22,8 @@ token itself.
 
 The first network-shared start creates a random token (256 bits) in `app/config/lan-access-token`. The
 file is readable only by your user account: mode `0600` on macOS and Linux, and on Windows an access
-list with a single entry for your account (no inherited entries). Permissions are re-applied on every
+list with your account only (no inherited entries; Windows also keeps `SYSTEM` and, for administrator
+accounts, `Administrators`, which can read every file anyway). Permissions are re-applied on every
 network-shared start. FAT/exFAT drives (common for USB sticks) can't store permissions; the studio then
 warns at startup that anyone who can read the drive can sign in. The file is stored with the portable
 copy, so a USB drive keeps the same token.

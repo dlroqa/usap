@@ -64,7 +64,7 @@ function readTokenFile(file) {
   }
 }
 
-// Windows: replace the inherited ACL with one entry for the current user (by SID, so localized or
+// Windows: replace the inherited ACL with an entry for the current user (SYSTEM/Administrators may remain) (by SID, so localized or
 // unusual account names don't matter). Throws where ACLs aren't supported (FAT/exFAT drives).
 // System tools by absolute path: a "whoami" from Git Bash or another toolset can come first on PATH.
 function windowsTool(name) {

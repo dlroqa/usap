@@ -107,7 +107,7 @@ test("tokens: 256-bit random, owner-only file, malformed files are ignored", () 
   fs.rmSync(t.dir, { recursive: true, force: true });
 });
 
-test("tokens: the file is readable by this user only (POSIX mode 0600; Windows: one non-inherited ACL entry)", () => {
+test("tokens: the file is readable by this user only (POSIX mode 0600; Windows: this account, SYSTEM and Administrators only)", () => {
   const t = tmpTokenFile();
   try {
     assert.equal(auth.rotateToken(t.file), null, "protection applied without a warning");
@@ -115,10 +115,17 @@ test("tokens: the file is readable by this user only (POSIX mode 0600; Windows: 
       const { execFileSync } = require("node:child_process");
       const acl = execFileSync("icacls", [t.file], { encoding: "utf8" });
       const entries = acl.split(/\r?\n/).map((l) => l.replace(t.file, "").trim()).filter((l) => /:\(/.test(l));
-      assert.equal(entries.length, 1, acl);
+      // Only this account, plus SYSTEM and Administrators (which Windows keeps for admin-created
+      // files and which can read every file anyway). No inherited entries, no Users/Everyone.
+      const me = os.userInfo().username.toLowerCase();
+      assert.ok(entries.length >= 1, acl);
+      for (const e of entries) {
+        const who = e.split(":(")[0].toLowerCase();
+        assert.ok(who === "nt authority\\system" || who === "builtin\\administrators" || who.endsWith(`\\${me}`) || who === me, `unexpected ACL entry: ${e}`);
+      }
+      assert.ok(entries.some((e) => e.split(":(")[0].toLowerCase().endsWith(me)), "this account has access");
       assert.doesNotMatch(acl, /\(I\)/, "no inherited entries");
-      assert.doesNotMatch(acl, /Everyone|BUILTIN\\Users|Authenticated Users|\bUsers:/i, acl);
-      assert.match(entries[0], /\(F\)/);
+      assert.doesNotMatch(acl, /Everyone|BUILTIN\\Users|Authenticated Users/i, acl);
     } else {
       assert.equal(fs.statSync(t.file).mode & 0o777, 0o600);
       fs.chmodSync(t.file, 0o644); // a copied or older file is re-protected
