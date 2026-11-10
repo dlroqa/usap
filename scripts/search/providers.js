@@ -115,4 +115,7 @@ async function webSearch(query, options = {}) {
 module.exports = {
   webSearch,
   requestText,
+  // Exported for the Step 9.8d tests (deterministic HTML fixtures); not used elsewhere.
+  parseDuckDuckGoHtml,
+  extractDuckDuckGoUrl,
 };

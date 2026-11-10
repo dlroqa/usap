@@ -28,6 +28,8 @@ const { createTtsService } = require("./services/tts-engine.cjs");
 const { ttsRoutes } = require("./routes/tts.cjs");
 const { createSpeechService } = require("./services/speech-engine.cjs");
 const { speechRoutes } = require("./routes/speech.cjs");
+const { createWebSearchService } = require("./services/web-search.cjs");
+const { searchRoutes } = require("./routes/search.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -5490,10 +5492,39 @@ async function getDiagnostics() {
 
 // Routes moved into modules (Step 9.8). They run after the pipeline's security checks and
 // before the routes below that haven't moved yet.
+// Text of a chat message (string or multi-part content). Moved to module scope for the web-search
+// service; it was declared inside the legacy request handler.
+function getMessageText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((item) => {
+      if (typeof item === "string") return item;
+      if (typeof item?.text === "string") return item.text;
+      if (typeof item?.content === "string") return item.content;
+      return "";
+    }).join("\n");
+  }
+  if (content && typeof content === "object") {
+    if (typeof content.text === "string") return content.text;
+    if (typeof content.content === "string") return content.content;
+  }
+  return "";
+}
+
+// Web search and retrieval for chat lives in services/web-search.cjs (Step 9.8d).
+const webSearch = createWebSearchService({
+  search: comprehensiveWebSearch,
+  cacheDir: WEB_SEARCH_CACHE,
+  completeChat: (payload, timeoutMs) => requestJson(`http://127.0.0.1:${PORT_LLM}/v1/chat/completions`, { model: llmSettings.model || "local-model", ...payload }, timeoutMs),
+  isLlmReady: () => llmReady,
+  getMessageText,
+});
+
 const router = createRouter();
 router.use(systemRoutes({ json, getHealth, getDiagnostics, getCleanupCandidates, getHardwareSpecs, getBackendOptions, getTelemetry }));
 router.use(ttsRoutes({ tts, json, readJsonBody, jsonErrorStatus, errorStatus, errorBody, streamModelUpload, pathInside, fs, path, MIME, TTS_MODELS, TTS_OUTPUTS }));
 router.use(speechRoutes({ speech, SPEECH_MODELS, TRANSCRIPTIONS, downloadBlockReason, getDownloadState: () => downloadState, errorBody, errorStatus, fs, json, jsonErrorStatus, path, pathInside, readBinaryBody, readJsonBody, startModelDownload, streamModelUpload }));
+router.use(searchRoutes({ webSearch, json, readJsonBody, errorStatus, errorBody }));
 
 // Routes not yet moved into modules, then static files. Only reached through the pipeline.
 async function legacyRoutes(req, res) {
@@ -5697,115 +5728,11 @@ async function retryLowerContext() {
   await runExclusiveLlmOperation(() => startLlm(newSettings));
 }
 
-function getMessageText(content) {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content.map((item) => {
-      if (typeof item === "string") return item;
-      if (typeof item?.text === "string") return item.text;
-      if (typeof item?.content === "string") return item.content;
-      return "";
-    }).join("\n");
-  }
-  if (content && typeof content === "object") {
-    if (typeof content.text === "string") return content.text;
-    if (typeof content.content === "string") return content.content;
-  }
-  return "";
-}
-
-function getLastUserQuery(messages) {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i]?.role === "user") {
-      return getMessageText(messages[i].content).trim();
-    }
-  }
-  return "";
-}
-
-// Asks the loaded model whether the latest message needs a web search and, if so, for a
-// standalone query that resolves references to earlier turns ("what about its price?").
-// Returns "" when the model decides no search is needed, or null if planning failed.
-async function planWebSearchQuery(messages) {
-  const recent = messages
-    .filter((message) => message?.role === "user" || message?.role === "assistant")
-    .slice(-6)
-    .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${getMessageText(message.content).replace(/<think>[\s\S]*?<\/think>/g, "").trim().slice(0, 600)}`)
-    .join("\n");
-  if (!recent) return null;
-  try {
-    const result = await requestJson(`http://127.0.0.1:${PORT_LLM}/v1/chat/completions`, {
-      model: llmSettings.model || "local-model",
-      messages: [
-        {
-          role: "system",
-          content: "You decide whether answering the user's latest message needs a web search. " +
-            "If it does, reply with ONLY a short standalone search query (max 12 words) that includes any names or topics the message refers to from earlier in the conversation. " +
-            "If it does not (greetings, chit-chat, rewriting or explaining text already in the chat, math, coding with no recent facts), reply with ONLY the word NONE.",
-        },
-        { role: "user", content: `Conversation:\n${recent}\n\nSearch query for the latest user message (or NONE):` },
-      ],
-      temperature: 0,
-      max_tokens: 48,
-      stream: false,
-      chat_template_kwargs: { enable_thinking: false },
-    }, 30000);
-    const raw = String(result?.choices?.[0]?.message?.content || "")
-      .replace(/<think>[\s\S]*?<\/think>/g, "")
-      .split("\n").map((line) => line.trim()).find(Boolean) || "";
-    const query = raw.replace(/^(search query|query)\s*:\s*/i, "").replace(/^["'`]+|["'`]+$/g, "").trim();
-    if (!query) return null;
-    if (/^none\.?$/i.test(query)) return "";
-    return query.slice(0, 200);
-  } catch (err) {
-    console.warn("  [web-search] Query planning failed, using the last message:", err.message || err);
-    return null;
-  }
-}
-
-async function augmentMessagesWithWebSearch(messages, body) {
-  if (body.useWeb !== true && body.use_web !== true) {
-    return { messages, webSources: [], webContext: "" };
-  }
-  let query = String(body.webQuery || body.query || "").trim();
-  if (!query) {
-    const planned = llmReady ? await planWebSearchQuery(messages) : null;
-    if (planned === "") return { messages, webSources: [], webContext: "", webSkipped: true };
-    query = String(planned || getLastUserQuery(messages) || "").trim();
-  }
-  if (!query) return { messages, webSources: [], webContext: "" };
-  console.log(`  [web-search] Query: ${query}`);
-
-  const result = await comprehensiveWebSearch(query, {
-    timeFilter: body.timeFilter || body.time_filter || "any",
-    resultLimit: body.webResultLimit || 5,
-    fetchLimit: body.webFetchLimit || 3,
-    cacheDir: WEB_SEARCH_CACHE,
-  });
-  if (!result.context || !result.sources.length) {
-    return { messages, webSources: [], webContext: "" };
-  }
-  let insertAt = 0;
-  while (insertAt < messages.length && messages[insertAt]?.role === "system") {
-    insertAt += 1;
-  }
-  const augmentedMessages = [
-    ...messages.slice(0, insertAt),
-    { role: "user", content: result.context },
-    ...messages.slice(insertAt),
-  ];
-  return {
-    messages: augmentedMessages,
-    webSources: result.sources,
-    webContext: result.context,
-  };
-}
-
 async function doLlmChat(req, res, body, retryCount = 0) {
   try {
     const isStream = body.stream === true;
     const rawMessages = Array.isArray(body.messages) ? body.messages : [];
-    const webAugmentation = await augmentMessagesWithWebSearch(rawMessages, body);
+    const webAugmentation = await webSearch.augmentMessagesWithWebSearch(rawMessages, body);
     const requestData = JSON.stringify({
       model: llmSettings.model || "local-model",
       messages: webAugmentation.messages,
@@ -6106,32 +6033,6 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     return null;
   }
 }
-
-  if (req.url === "/api/web-search/config" && req.method === "GET") {
-    return json(res, 200, {
-      ok: true,
-      provider: "duckduckgo",
-      providers: [{ key: "duckduckgo", name: "DuckDuckGo", requiresApiKey: false, active: true }],
-      cachePath: WEB_SEARCH_CACHE,
-      defaults: { resultLimit: 5, fetchLimit: 3, timeFilter: "any" },
-    });
-  }
-
-  if (req.url === "/api/web-search" && req.method === "POST") {
-    const body = await readJsonBody(req, res);
-    if (!body) return;
-    try {
-      const result = await comprehensiveWebSearch(body.query || body.q || "", {
-        timeFilter: body.timeFilter || body.time_filter || "any",
-        resultLimit: body.resultLimit || 5,
-        fetchLimit: body.fetchLimit || 3,
-        cacheDir: WEB_SEARCH_CACHE,
-      });
-      return json(res, 200, { ok: true, ...result });
-    } catch (err) {
-      return json(res, errorStatus(err), errorBody(err));
-    }
-  }
 
   if (req.url === "/api/llm/chat" && req.method === "POST") {
     const body = await readJsonBody(req, res);

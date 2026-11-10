@@ -292,8 +292,9 @@ test("issue 85: chat shows reasoning, scrolls only the message list, renders tab
   assert.match(chat, /type: "table"/);
   assert.match(chat, /katex\.renderToString/);
   assert.match(chat, /extractPdfText/);
-  const server = read("scripts/server/serve.cjs");
-  assert.match(server, /async function planWebSearchQuery/);
+  // The web-search query planner moved to services/web-search.cjs in Step 9.8d; the server still uses it.
+  assert.match(read("scripts/server/services/web-search.cjs"), /async function planWebSearchQuery/);
+  assert.match(read("scripts/server/serve.cjs"), /webSearch\.augmentMessagesWithWebSearch\(/);
 });
 
 test("issue 82: speech upload converts any browser-decodable audio to 16 kHz WAV", () => {
