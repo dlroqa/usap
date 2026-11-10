@@ -53,8 +53,10 @@ These are the architecture points the installed edition depends on. Each maps to
    Homebrew; whisper.cpp must be bundled (built in CI) for both architectures.
 4. **The macOS image engine.** Upstream publishes one universal archive whose x86_64 slice is
    SSE3-only (no AVX/AVX2). A native x86_64 build of the same pinned tag samples about 3–4×
-   faster (see [MACOS_COMPATIBILITY.md](../ci/MACOS_COMPATIBILITY.md)). Installer builds should
-   ship CI-built, per-arch engines with recorded provenance.
+   faster (see [MACOS_COMPATIBILITY.md](../ci/MACOS_COMPATIBILITY.md)). **Decided (Option A):**
+   the Intel portable and desktop packages ship a GitHub Actions-built, optimized x86_64 engine with a
+   baseline-ISA fallback and recorded provenance. Its build spec and tests come in Step 9; integration
+   in Step 10. Packaged apps must never require Xcode, CMake or other developer tools.
 5. **Node runtime.** The portable edition downloads Node 22.12.0. Installed builds either bundle
    the same Node runtime (plain bundled runtime, or a wrapper like Electron/Tauri only if it adds
    no UI change) or package it. The choice is a Step 10 design decision.

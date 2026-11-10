@@ -19,8 +19,8 @@ The sequence changed from the original plan: the security fixes moved ahead of t
 
 | Step | Scope | Gate to start | Status |
 |---|---|---|---|
-| 8 | **Native inference verification:** real LLM, Whisper, Kokoro and image inference on Windows x64, Linux x64, macOS arm64, macOS x86_64 (`native-runtime.yml`); GPU paths recorded as UNSUPPORTED/UNVERIFIED with reasons | — | in progress (draft PR #9) |
-| 9 | **Foundational backend:** modular services, model/engine lifecycle, API reliability, security backlog (S-4..S-10), benchmarks; **data-root resolver and storage safety** needed for packaging; then optional cloud/routing (off by default) | Step 8 complete | not started |
+| 8 | **Native inference verification:** real LLM, Whisper, Kokoro and image inference on Windows x64, Linux x64, macOS arm64, macOS x86_64 (`native-runtime.yml`); GPU paths recorded as UNSUPPORTED/UNVERIFIED with reasons | — | CPU inference verified on all 4 targets (PR #9). GPU (Metal, Vulkan, CUDA, ROCm, Core ML) **unverified**: needs physical GPU runners |
+| 9 | **Foundational backend:** modular services, model/engine lifecycle, API reliability, security backlog (S-4..S-10), benchmarks; **data-root resolver and storage safety** needed for packaging; build spec and compatibility tests for the optimized Intel image engine; then optional cloud/routing (off by default) | Step 8 CPU verification complete | authorized 2026-11-09; small incremental PRs |
 | 10 | **Desktop installers** (mandatory for production release): portable/USB plus installed editions from one codebase and UI | Steps 8 and 9 complete and validated | **planning only**, see [DESKTOP_INSTALLERS.md](DESKTOP_INSTALLERS.md) |
 | 11 | Installation and release testing in GitHub Actions: install, first launch, upgrade, uninstall, data preservation, signing/notarization | Step 10 | not started |
 | 12 | Production release validation: architecture-specific artifacts; documented platforms and capabilities | Step 11; explicit owner authorization to publish | not started |
@@ -38,4 +38,5 @@ verified local machine only.
 * ~~D-1/D-3 chat stream flush race fix~~ (approved; merged #6).
 * ~~D-2 mobile sidebar layout~~ (approved; merged #8).
 * ~~B-1 Intel macOS first-time setup~~ (approved; merged #5).
-* Intel macOS image speed: ship a native x86_64 stable-diffusion.cpp build (see [MACOS_COMPATIBILITY.md](../ci/MACOS_COMPATIBILITY.md) once #9 lands).
+## Decided
+* **Intel macOS image engine: Option A** (owner, 2026-11-09). A GitHub Actions-built, optimized x86_64 stable-diffusion.cpp from the pinned, verified source, with a baseline-ISA fallback (no AVX2 assumption), recorded provenance (revision, compiler, flags, dependencies, SHA-256), and benchmarks against the universal binary with identical models and parameters. Build spec and compatibility tests come in Step 9; integration into the Intel portable and desktop packages in Step 10. The universal binary stays until the optimized engine is proven. Users never need Xcode, CMake or developer tools. Background: [MACOS_COMPATIBILITY.md](../ci/MACOS_COMPATIBILITY.md).
