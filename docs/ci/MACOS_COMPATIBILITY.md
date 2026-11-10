@@ -1,35 +1,87 @@
 # macOS compatibility: Apple Silicon (arm64) and Intel (x86_64)
 
-**Status: macOS support is NOT complete.** Text, speech and voice run with real inference on both native architectures (CPU). Image generation works on neither in CI: it is unsupported on Intel, and unverified on Apple Silicon. Metal/GPU acceleration is unverified.
+**Status: macOS support is NOT complete.** On both native architectures, the hosted runners
+complete real first-time setup, a repeat launch, and real inference for text, speech, voice
+and image generation on the **CPU**. Two things are still missing: **Metal GPU** inference is
+unverified (the runners' GPU is a paravirtual device that can't run it), and Intel image
+generation works but is slow with the upstream binary (see below).
 
 ## Evidence by architecture
-Runtime rows: `macos-setup.yml` run [42669660908](https://github.com/dlroqa/usap/actions/runs/42669660908) on PR #5 (`7e7e324`): fresh checkout → `mac.sh` first launch (real setup) → validation → second launch.
 
-| Gate | macOS arm64 (`macos-15`, Apple M1 VM) | macOS x86_64 (`macos-15-intel`, Core i7-8700B) |
+Runtime rows come from `native-runtime.yml` run
+[42728508137](https://github.com/dlroqa/usap/actions/runs/42728508137) on PR #9 (`9dd6a94`).
+Each run starts from a fresh checkout, does the `mac.sh` first launch (real setup), runs
+`scripts/ci/runtime-validate.sh`, then does a second launch.
+
+| Gate | macOS arm64 (`macos-15`, Apple M1 VM) | macOS x86_64 (`macos-15-intel`, Core i7-8700B, 4 vCPU) |
 |---|---|---|
 | Native hardware, no Rosetta (`hw.optional.arm64`, `proc_translated`) | PASS | PASS |
-| Node build/tests, browser UI gate (`ci.yml`, `render-e2e.yml`) | PASS | PASS |
-| First-time setup via `mac.sh` | PASS | PASS (was `exit 1`, blocker B-1, fixed in #5) |
-| Second launch without re-running setup | PASS | PASS |
-| Portable Node 22.12.0 binary arch + startup | arm64 PASS | x86_64 PASS |
-| llama-server (b11418) arch + startup | arm64 PASS | x86_64 PASS |
-| whisper-cli (Homebrew) arch + startup | arm64 PASS | x86_64 PASS |
-| Kokoro native addons (onnxruntime-node 1.21.0, sharp 0.34.5) load | arm64 PASS | x64 PASS |
-| **LLM inference** via app API (Qwen2.5-0.5B-Instruct Q4_K_M, `gpuLayers: 0`) | PASS (CPU) | PASS (CPU) |
-| **Speech inference** via app API (whisper tiny.en, JFK sample) | PASS | PASS |
-| **TTS inference** via app API (Kokoro 82M q8 → WAV) | PASS | PASS |
-| Image backend `sd` binary | present, starts (`lipo`: `x86_64 arm64`) | intentionally not installed; the UI/API explain why |
-| Image generation inference | **UNVERIFIED** (no small license-clear SD model in CI) | **UNSUPPORTED** |
-| Metal GPU offload (LLM/whisper/SD) | **UNVERIFIED** (CI VM, CPU-only test) | not applicable / unverified |
+| First-time setup via `mac.sh` / second launch without setup | PASS / PASS | PASS / PASS |
+| Portable Node 22.12.0, llama-server b11418, whisper-cli: arch + startup | arm64 PASS | x86_64 PASS |
+| Image backend `sd` + `libstable-diffusion.dylib`: arch + startup | universal (`x86_64 arm64`) PASS | universal PASS, now installed on Intel (#9) |
+| Kokoro native addons (onnxruntime-node 1.21.0, sharp 0.34.5) | PASS | PASS |
+| **LLM** via app API (Qwen2.5-0.5B-Instruct Q4_K_M, `gpuLayers: 0`) | PASS (CPU compute) | PASS (CPU) |
+| **Speech** via app API (whisper tiny.en, JFK sample) | PASS | PASS |
+| **TTS** via app API (Kokoro 82M q8 → WAV) | PASS | PASS |
+| **Image** via app API, CPU backend (SD 1.5 Q4_0) | PASS: 256×256, 4 steps, 43 s | PASS: 256×256, 4 steps, 355 s (see below) |
+| Image via app API, Metal backend | UNSUPPORTED on the runner: ggml-metal aborts with `unsupported op 'NORM'` on "Apple Paravirtual device" | UNSUPPORTED on the runner (same) |
+| Metal GPU inference on real hardware | **UNVERIFIED** (needs a physical Apple Silicon Mac, see [RUNNER_REQUIREMENTS.md](RUNNER_REQUIREMENTS.md)) | **UNVERIFIED** |
 | Core ML / ANE | **UNVERIFIED** (skipped in CI via `USAP_SKIP_COREML=1`) | not applicable |
 | Packaged release per architecture | none (no packaging pipeline yet) | none |
 
-Test models are pinned by revision and SHA-256 (see `scripts/ci/runtime-validate.sh`); they're downloaded on the runner only and never uploaded.
+What the image check proves: the app API loaded the model, generated, and returned a PNG of
+the requested size with non-trivial content. It doesn't judge quality. SD 1.5 at 256 px
+and 4 steps gives a rough image by design. With the same seed and CPU RNG, Linux x64,
+Windows x64 and macOS arm64 produced the same composition (mean abs. pixel difference ≈9–14/255,
+normal float divergence across CPUs), which is consistent with the same model really running.
+
+Test models are pinned by revision and SHA-256 (see `scripts/ci/runtime-validate.sh`). They
+are downloaded on the runner only and never uploaded.
+
+## Image generation on macOS: what changed in #9
+
+* **Intel install:** stable-diffusion.cpp publishes one macOS archive (named arm64). Its `sd`,
+  `sd-cli` and `libstable-diffusion.dylib` are universal. Setup now installs it on Intel too,
+  and keeps it only if `lipo` shows `x86_64` in the binary **and every dylib**. Otherwise it
+  removes it, and the UI/API explain why image generation is unavailable.
+* **CPU image backend on macOS:** the same binary always contains ggml's CPU backend.
+  macOS now offers **CPU** next to **Metal GPU** (`--backend cpu --params-backend cpu`).
+  CPU is the default on Intel Macs, where Metal image generation is unverified. Apple Silicon
+  keeps Metal as the default.
+
+## Intel performance limitation
+
+The x86_64 slice of the upstream universal `libstable-diffusion.dylib` is built for baseline
+x86-64: `ggml_cpu_has_avx`, `_avx2`, `_fma` and `_f16c` return 0, and the code has no YMM
+instructions (checked by disassembling the slice of the pinned, SHA-verified archive).
+Measured on `macos-15-intel` (i7-8700B, 4 vCPU) with the pinned model, 256×256, 4 steps, CPU
+(experiment runs [42716998780](https://github.com/dlroqa/usap/actions/runs/42716998780) and
+[42723239546](https://github.com/dlroqa/usap/actions/runs/42723239546)):
+
+| Binary | Threads | Sampling | Wall time |
+|---|---|---|---|
+| Upstream universal (SSE3 x86_64 slice) | 8 (the app's old default) | ~430 s/it | >600 s (capped) |
+| Upstream universal | 4 | ~84 s/it, 147 s | 239 s |
+| Native build of the same pinned tag (`build_from_source.sh`, `GGML_NATIVE=ON`, 354 s build) | 4 | 43.6 s | 67 s |
+
+Two fixes follow from this:
+* **Thread oversubscription (fixed in #9):** the app passed `--threads 8` to the image engine regardless
+  of the machine, which made generation ~5× slower on 4-core Macs. The spawned thread count is now capped
+  at the logical CPU count. Inside the app this took Intel from a >30 min timeout to 355 s, and Apple Silicon from
+  162 s to 43 s.
+* **SSE3-only binary (open, owner decision):** a native x86_64 build is a further 3–4× faster. Options:
+  (a) ship a CI-built, provenance-recorded x86_64 build (fits Step 10 packaging), or (b) offer an
+  opt-in local build on Intel Macs via the existing `build_from_source.sh` (needs Xcode Command Line
+  Tools and CMake; ~6 min). Neither is implemented.
 
 ## Remaining gaps
-* **Intel image generation:** stable-diffusion.cpp's release asset is named arm64, but the `sd` binary inside is **universal** (`x86_64 arm64`). Intel support may be achievable. Its bundled dylibs' architectures and Metal-on-Intel behaviour are not yet examined. Follow-up: inspect the archive on the Intel runner and run a CPU generation smoke test before enabling it.
-* **Metal / GPU:** needs provisioned Apple Silicon hardware (self-hosted runner) to validate GPU offload and image inference.
-* **Packaging:** no signed per-arch release artifacts yet (release pipeline, PR 03).
+* **Metal / GPU:** needs a physical Apple Silicon Mac (self-hosted runner) to verify GPU
+  offload for the LLM (`gpuLayers > 0`), whisper and SD.
+* **Intel image speed:** the native x86_64 build (see above) is an owner decision.
+* **Packaging:** no signed per-arch release artifacts yet.
 
 ## Runner lifecycle
-The owner's plan states that `macos-15-intel` remains available only until about August 2027. Before then: re-check GitHub's runner-images announcements, and plan a self-hosted Intel Mac runner (or drop Intel support by explicit owner decision). Don't silently remove the `macos-x86_64` required check.
+The owner's plan states that `macos-15-intel` remains available only until about August 2027. Before then,
+re-check GitHub's runner-images announcements, and plan a self-hosted Intel Mac runner (or
+drop Intel support by explicit owner decision). Don't silently remove the `macos-x86_64`
+required check.
