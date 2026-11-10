@@ -50,6 +50,14 @@ const ROOT    = LAYOUT.root;
 const DIST    = LAYOUT.dist;
 const TOOLS   = LAYOUT.tools;
 ensureDataDirs(LAYOUT);
+// Outbound requests (downloads, Hugging Face API) may only reach public internet addresses
+// (scripts/server/net-guard.cjs). USAP_ALLOW_LAN_DOWNLOADS=1 additionally allows private-LAN hosts
+// such as a model mirror on a NAS; loopback and cloud-metadata addresses stay blocked.
+const { assertSafeUrl, guardedRequestOptions, followRedirect, privateLanPolicy } = require("./net-guard.cjs");
+const DOWNLOAD_POLICY = process.env.USAP_ALLOW_LAN_DOWNLOADS === "1" ? privateLanPolicy({ maxRedirects: 10 }) : { maxRedirects: 10 };
+function downloadBlockReason(url) {
+  try { assertSafeUrl(url, DOWNLOAD_POLICY); return ""; } catch (err) { return err.message; }
+}
 const osPlatform = process.platform;
 const BACKEND_PATHS = {
   cuda: path.join(ROOT, "app", "backend", "win", "cuda", "sd-cuda.exe"),
@@ -3632,7 +3640,9 @@ function proxyImageBackendRequest(req, res) {
 
 function requestHttpsJson(url, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
+    try { assertSafeUrl(url, DOWNLOAD_POLICY); } catch (err) { reject(err); return; }
     const req = https.get(url, {
+      ...guardedRequestOptions(DOWNLOAD_POLICY),
       headers: {
         "Accept": "application/json",
         "User-Agent": "Uncensored-AI-Studio/1.0",
@@ -5204,8 +5214,11 @@ function startImageBackendDownload(backendId, redirectCount = 0, redirectUrl = "
   };
 
   fileStream.on("error", (err) => failDownload(`Could not write ${filename}: ${err.message}`, err));
+  const blockedReason = downloadBlockReason(url);
+  if (blockedReason) return failDownload(blockedReason);
   const client = url.startsWith("https") ? https : http;
   const request = client.get(url, {
+    ...guardedRequestOptions(DOWNLOAD_POLICY),
     headers: {
       "User-Agent": "Uncensored-AI-Studio/1.0 (+https://github.com/techjarves/Uncensored-AI-Studio)",
       "Accept": "application/zip, application/octet-stream, */*",
@@ -5213,9 +5226,13 @@ function startImageBackendDownload(backendId, redirectCount = 0, redirectUrl = "
   }, (response) => {
     activeDownload = { request, fileStream, destPath, tempPath };
     if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
-      const nextUrl = response.headers.location ? new URL(response.headers.location, url).toString() : "";
-      if (!nextUrl) return failDownload("Redirect response did not include a Location header.");
-      if (redirectCount > 10) return failDownload("Too many redirects.");
+      let nextUrl;
+      try {
+        nextUrl = followRedirect(url, response.headers.location, redirectCount, DOWNLOAD_POLICY);
+      } catch (err) {
+        response.resume();
+        return failDownload(err.message);
+      }
       downloadState.speed = "Following redirect";
       request.removeAllListeners("error");
       request.destroy();
@@ -5361,6 +5378,8 @@ function getModelDownloadUrlIssue(url) {
     return "That is not a valid URL.";
   }
   if (!/^https?:$/.test(parsed.protocol)) return "Only http(s) download URLs are supported.";
+  const blocked = downloadBlockReason(parsed.toString());
+  if (blocked) return blocked;
   if (/(^|\.)huggingface\.co$/i.test(parsed.hostname)) {
     const parts = parsed.pathname.split("/").filter(Boolean);
     const isFileUrl = parts.includes("resolve") || parts.includes("blob");
@@ -5431,6 +5450,15 @@ function startModelDownload(url, overrideFilename = null, targetDir = MODELS, ki
     activeDownload = null;
   };
 
+  const blockedReason = downloadBlockReason(url);
+  if (blockedReason) {
+    downloadFinalized = true;
+    downloadState.active = false;
+    downloadState.error = blockedReason;
+    console.error("  [download] Refused:", blockedReason);
+    return;
+  }
+
   const fileStream = fs.createWriteStream(tempPath);
   fileStream.on("error", (err) => {
     failDownload(`Could not write ${filename}: ${err.message}`, err);
@@ -5438,6 +5466,7 @@ function startModelDownload(url, overrideFilename = null, targetDir = MODELS, ki
   
   const client = url.startsWith("https") ? https : http;
   const request = client.get(url, {
+    ...guardedRequestOptions(DOWNLOAD_POLICY),
     headers: {
       "User-Agent": "Uncensored-AI-Studio/1.0 (+https://github.com/techjarves/Uncensored-AI-Studio)",
       "Accept": "application/octet-stream, application/x-safetensors, */*",
@@ -5447,13 +5476,12 @@ function startModelDownload(url, overrideFilename = null, targetDir = MODELS, ki
     activeDownload = { request, fileStream, destPath, tempPath };
     // Handle redirects (HuggingFace resolve URLs redirect to Cloudfront/S3)
     if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
-      const redirectUrl = response.headers.location ? new URL(response.headers.location, url).toString() : "";
-      if (!redirectUrl) {
-        failDownload("Redirect response did not include a Location header");
-        return;
-      }
-      if (redirectCount > 10) {
-        failDownload("Too many redirects");
+      let redirectUrl;
+      try {
+        redirectUrl = followRedirect(url, response.headers.location, redirectCount, DOWNLOAD_POLICY);
+      } catch (err) {
+        response.resume();
+        failDownload(err.message);
         return;
       }
       console.log(`  [download] Following redirect for ${filename}`);
@@ -6420,6 +6448,8 @@ const server = http.createServer(async (req, res) => {
     if (!url || !filename || !filename.toLowerCase().endsWith(".bin")) {
       return json(res, 400, { ok: false, error: "A speech model .bin URL or catalog model id is required." });
     }
+    const blocked = downloadBlockReason(url);
+    if (blocked) return json(res, 400, { ok: false, error: blocked });
     startModelDownload(url, filename, SPEECH_MODELS, "speech");
     return json(res, 200, { ok: true, message: "Speech model download started", filename });
   }
@@ -7265,7 +7295,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       return json(res, 400, { ok: false, error: "Image model filename must end in .safetensors, .gguf or .ckpt." });
     }
     const urlIssue = overrideFilename
-      ? (/^https?:\/\//i.test(String(url)) ? "" : "Only http(s) download URLs are supported.")
+      ? (/^https?:\/\//i.test(String(url)) ? downloadBlockReason(url) : "Only http(s) download URLs are supported.")
       : getModelDownloadUrlIssue(url);
     if (urlIssue) return json(res, 400, { ok: false, error: urlIssue });
     // startModelDownload only guards against concurrent downloads when no filename is passed.
@@ -7283,6 +7313,8 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     if (downloadState.active) return json(res, 409, { ok: false, error: "Another model download is already active." });
     try {
       const directUrl = url.includes("huggingface.co") ? url.replace("/blob/", "/resolve/") : url;
+      const blocked = downloadBlockReason(directUrl);
+      if (blocked) return json(res, 400, { ok: false, error: blocked });
       const overrideFilename = body.filename ? path.basename(String(body.filename)) : null;
       const filename = overrideFilename || path.basename(new URL(directUrl).pathname);
       if (!filename.toLowerCase().endsWith(".gguf")) {
