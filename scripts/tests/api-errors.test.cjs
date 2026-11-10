@@ -121,6 +121,29 @@ test("server: wrongly typed fields never crash the server (they get 400), on any
   assert.equal((await request(srv.port, "GET", "/api/health")).status, 200);
 });
 
+test("server: a loaded engine keeps running through malformed requests, and failures stay diagnosable", async () => {
+  fs.writeFileSync(path.join(root, "app", "llm-models", "live.gguf"), Buffer.from("GGUF\x03\x00\x00\x00"));
+  assert.equal((await post("/api/llm/start", { model: "live.gguf", contextSize: 512, gpuLayers: 0 })).status, 200, srv.log().slice(-1500));
+  const before = (await request(srv.port, "GET", "/api/llm/status")).json;
+  assert.equal(before.ready, true);
+  const logStart = srv.log().length;
+  for (let i = 0; i < 3; i++) {
+    expectError(await post("/api/delete-model", { filename: [] }), 400, "INVALID_REQUEST", "malformed request");
+    expectError(await post("/api/cleanup", "null"), 400, "INVALID_REQUEST", "non-object body");
+  }
+  const after = (await request(srv.port, "GET", "/api/llm/status")).json;
+  assert.equal(after.ready, true, "the engine was not stopped");
+  assert.equal(after.engine.lastExit, null, "no engine exit at all");
+  const chat = await post("/api/llm/chat", { messages: [{ role: "user", content: "hi" }], stream: false });
+  assert.equal(chat.status, 200, "chat still works");
+  // The console keeps what an operator needs: the route and the real error (never sent to clients).
+  const log = srv.log().slice(logStart);
+  assert.match(log, /\[api\] Unhandled error in POST \/api\/delete-model:/);
+  assert.match(log, /TypeError|ERR_INVALID_ARG_TYPE/);
+  assert.doesNotMatch(log, /usap_[A-Za-z0-9_-]{43}|authorization:|cookie:/i, "no credentials in logs");
+  assert.equal((await request(srv.port, "POST", "/api/llm/stop")).status, 200);
+});
+
 test("server: no error leaks the host's paths or a stack trace", async () => {
   const r = await post("/api/speech/start", {});
   assert.ok(!r.text.includes(root), r.text);
