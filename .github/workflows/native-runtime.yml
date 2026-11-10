@@ -1,21 +1,24 @@
-# Real macOS first-time setup + runtime validation on NATIVE Apple Silicon and Intel
-# runners: mac.sh first launch (downloads the real engines), native-architecture checks of
-# every binary, engine startup, and real inference through the app API with small pinned
-# models; then a second launch that must start without re-running setup.
-# Heavy (≈1 GB downloads), so it runs when setup/launcher/server code changes, weekly,
-# and on demand. It is path-filtered, so it is NOT a branch-protection required check
-# (a required check that does not run would block unrelated PRs).
-name: macos-setup
+# Real first-time setup + native runtime validation per OS/arch: launcher first launch
+# (downloads the real engines), architecture/startup checks of every binary, real inference
+# through the app API (chat, transcription, voice, image) with small pinned models, then a
+# second launch that must start without re-running setup. Hosted runners have no GPU, so
+# inference runs on the CPU; GPU results need a self-hosted runner (docs/ci/RUNNER_REQUIREMENTS.md).
+# Heavy (~3 GB downloads), so it runs when setup/launcher/server code changes, weekly and on
+# demand. It is path-filtered, so it is NOT a branch-protection required check.
+name: native-runtime
 
 on:
   pull_request:
     paths:
       - "mac.sh"
+      - "linux.sh"
+      - "windows.bat"
       - "scripts/setup/**"
       - "scripts/server/**"
       - "scripts/workers/**"
-      - "scripts/ci/macos-runtime-validate.sh"
-      - ".github/workflows/macos-setup.yml"
+      - "scripts/ci/runtime-validate.sh"
+      - "scripts/ci/stop-app.sh"
+      - ".github/workflows/native-runtime.yml"
   schedule:
     - cron: "17 4 * * 1"
   workflow_dispatch:
@@ -24,20 +27,27 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-setup-${{ github.event.pull_request.number || github.ref }}
+  group: native-runtime-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   setup-validate:
-    name: macos-setup (${{ matrix.label }})
+    name: native-runtime (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 75
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { label: macos-arm64,  runner: macos-15,       arch: arm64 }
-          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64 }
+          # image: backends exercised for image generation. "cpu" must pass; GPU backends are
+          # attempted and recorded as UNSUPPORTED/UNAVAILABLE on hosted runners (no usable GPU).
+          - { label: macos-arm64,  runner: macos-15,       arch: arm64,  launcher: ./mac.sh,   image: "cpu metal" }
+          # Intel: upstream's universal sd has an SSE3-only x86_64 slice (no AVX/AVX2/FMA); CPU image
+          # generation is slower than on Linux x64 but fits the timeout (docs/ci/MACOS_COMPATIBILITY.md).
+          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, launcher: ./mac.sh,   image: "cpu metal" }
+          - { label: linux-x64,    runner: ubuntu-24.04,   arch: x86_64, launcher: ./linux.sh, image: "cpu vulkan" }
+          # Git Bash drives windows.bat through cmd; piped empty lines answer its "press any key" prompts.
+          - { label: windows-x64,  runner: windows-2025,   arch: x86_64, launcher: "cmd //c windows.bat", image: "cpu vulkan" }
     env:
       FRONTEND_PORT: "14900"
       # CI skips the optional Core ML (ANE) Python stack; it stays unverified.
@@ -51,16 +61,23 @@ jobs:
           persist-credentials: false
 
       - name: Assert native hardware (no Rosetta)
+        if: runner.os == 'macOS'
         run: |
           hw="$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)"; tr="$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)"
           echo "uname -m=$(uname -m) hw.optional.arm64=$hw translated=$tr cpu=$(sysctl -n machdep.cpu.brand_string)"
           test "$(uname -m)" = "${{ matrix.arch }}" && test "$tr" = 0
           if [ "${{ matrix.arch }}" = x86_64 ]; then test "$hw" = 0; else test "$hw" = 1; fi
 
-      - name: First launch via mac.sh (runs first-time setup)
+      - name: Assert native hardware (Windows x64)
+        if: runner.os == 'Windows'
+        run: |
+          echo "PROCESSOR_ARCHITECTURE=$PROCESSOR_ARCHITECTURE uname -m=$(uname -m)"
+          test "$PROCESSOR_ARCHITECTURE" = AMD64 && test "$(uname -m)" = x86_64
+
+      - name: First launch via the launcher (runs first-time setup)
         run: |
           mkdir -p ci-logs
-          ( yes '' | ./mac.sh > ci-logs/first-launch.log 2>&1 & )
+          ( yes '' | ${{ matrix.launcher }} > ci-logs/first-launch.log 2>&1 & )
           for i in $(seq 1 270); do
             if curl -fs "http://127.0.0.1:$FRONTEND_PORT/api/health" >/dev/null; then echo "server up after $((i*10))s"; break; fi
             if grep -q "Setup failed" ci-logs/first-launch.log; then break; fi
@@ -73,36 +90,35 @@ jobs:
       - name: Validate binaries, startup and real inference
         run: |
           {
-            echo "## macOS runtime validation (${{ matrix.label }})"
+            echo "## Native runtime validation (${{ matrix.label }})"
             EXPECTED_ARCH=${{ matrix.arch }} BASE="http://127.0.0.1:$FRONTEND_PORT" RESULTS=ci-logs/runtime-results.jsonl \
-              bash scripts/ci/macos-runtime-validate.sh
+              IMAGE_BACKENDS="${{ matrix.image }}" IMAGE_SIZE="${{ matrix.size || 256 }}" IMAGE_STEPS="${{ matrix.steps || 4 }}" \
+              SERVER_LOG=ci-logs/first-launch.log \
+              bash scripts/ci/runtime-validate.sh
           } | tee -a "$GITHUB_STEP_SUMMARY"
+          for f in ci-image-*.png; do [ -s "$f" ] && cp "$f" "ci-logs/generated-${f#ci-}"; done; true
           ! grep -q '"status":"FAIL"' ci-logs/runtime-results.jsonl
 
       - name: Stop first launch
         if: always()
-        run: |
-          lsof -ti "tcp:$FRONTEND_PORT" | xargs kill 2>/dev/null || true
-          pkill -f "scripts/server/serve.cjs" || true
-          pkill -f "llama-server|whisper-server|tts-kokoro-worker" || true
-          sleep 3
+        run: bash scripts/ci/stop-app.sh
 
       - name: Second launch must not re-run setup
         run: |
-          ( yes '' | ./mac.sh > ci-logs/second-launch.log 2>&1 & )
+          ( yes '' | ${{ matrix.launcher }} > ci-logs/second-launch.log 2>&1 & )
           for i in $(seq 1 60); do curl -fs "http://127.0.0.1:$FRONTEND_PORT/api/health" >/dev/null && break; sleep 5; done
           curl -fs "http://127.0.0.1:$FRONTEND_PORT/api/health" >/dev/null || { tail -40 ci-logs/second-launch.log; echo "::error::second launch did not start"; exit 1; }
           if grep -qE "First-Time Setup|Reason:" ci-logs/second-launch.log; then
             grep -E "Reason:" ci-logs/second-launch.log; echo "::error::launcher re-entered setup on an installed system"; exit 1
           fi
           echo "Second launch started without setup." | tee -a "$GITHUB_STEP_SUMMARY"
-          lsof -ti "tcp:$FRONTEND_PORT" | xargs kill 2>/dev/null || true
+          bash scripts/ci/stop-app.sh
 
       - name: Upload logs and results (no models)
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-setup-${{ matrix.label }}
+          name: native-runtime-${{ matrix.label }}
           path: ci-logs/
           retention-days: 7
           if-no-files-found: warn
