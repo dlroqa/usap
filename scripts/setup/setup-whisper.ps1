@@ -8,6 +8,7 @@ $toolsDir = Join-Path $appDir "tools"
 $speechWinRoot = Join-Path $appDir "speech-backend\win"
 $speechRoot = Join-Path $speechWinRoot "cpu"
 $speechVulkanRoot = Join-Path $speechWinRoot "vulkan"
+. (Join-Path $scriptDir "verify-download.ps1")  # Assert-UsapDownload (Step 9.4)
 
 function Enable-Tls12 {
     try {
@@ -30,6 +31,7 @@ function Download-File {
     } finally {
         $client.Dispose()
     }
+    Assert-UsapDownload -Url $Url -Path $DestPath
 }
 
 function Find-FirstFile {

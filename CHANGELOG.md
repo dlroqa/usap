@@ -5,7 +5,11 @@
 * The local server now refuses requests that carry a foreign `Origin`, and (when bound to loopback) a non-loopback `Host`. Wildcard CORS headers are removed. The built-in UI is same-origin and is unaffected.
 * Static file serving is confined to `app/dist/`.
 * Outbound requests (web search, page fetching, model and engine downloads, Hugging Face lookups) can only reach public internet addresses. Each redirect is validated and the number of redirects is limited. The address checked is the address connected to. Search and normal downloads are unaffected (Step 9.3).
+* Downloads are verified (Step 9.4). Engines, the portable Node.js and catalog models must match SHA-256 digests and sizes pinned in `scripts/config/download-digests.txt`; Node.js digests come from its GPG-signed checksum list. Other downloads are labelled `source-checksum` (transfer integrity only) or `unverified`. Files stream to a temporary file and replace the old one atomically only after verification, so a failed, interrupted or tampered download keeps the last-known-good file. Engine installs are staged, checked for the right CPU architecture and swapped in whole. Interrupted transfers are retried from the start, never resumed. See `docs/security/DOWNLOAD_INTEGRITY.md`.
+* The in-app model download no longer builds a shell command for unzipping (S-8).
 ### Compatibility
+* **Download status** (`GET /api/download-progress`) gains two additive fields, `integrity` (`verified`, `source-checksum` or `unverified`) and `sha256`. Existing fields are unchanged. Failed downloads now delete their partial file, so the "Delete and retry" hint became "Retry the download".
+* A download whose pinned digest doesn't match is refused. Setup stops with an integrity error instead of installing the file.
 * **Model downloads from private-network hosts** (e.g. a NAS mirror) are now refused by default. Set `USAP_ALLOW_LAN_DOWNLOADS=1` to allow them. Loopback, cloud-metadata addresses and this machine's own network addresses are always refused (Step 9.3).
 * **Browser-based third-party tools** on another origin that called the studio API (e.g. `/v1/*`) are now refused. To allow one, set `UAIS_ALLOWED_ORIGINS=https://tool.example` (comma-separated); only those origins receive CORS headers.
 * If you reach a loopback-bound server through a custom hostname, add it with `UAIS_ALLOWED_HOSTS`.

@@ -1,0 +1,113 @@
+# USAP pinned download digests (Step 9.4). Format: <sha256> <size-bytes> <url> [trust]
+# trust "signed": the publisher's signed checksum list was verified when the line was added.
+# trust "pinned" (default): the digest was recorded at review time from the publisher's release
+#   metadata; it detects later substitution and corruption but is not a publisher signature.
+# Only exact URLs match. A URL that is not listed downloads as "unverified" (its SHA-256 is still
+# computed and logged). To update: see docs/security/DOWNLOAD_INTEGRITY.md. Pinned 2026-11-09.
+#
+# Node.js 22.12.0: nodejs.org/dist/v22.12.0/SHASUMS256.txt.asc, signature verified with release key
+# 108F52B48DB57BB0CC439B2997B01419BD92F80A (from github.com/nodejs/release-keys).
+293dcc6c2408da21562d135b0412525e381bb6fe150d688edb58fe850d0f3e13 48568612 https://nodejs.org/dist/v22.12.0/node-v22.12.0-darwin-arm64.tar.gz signed
+52bc25dd026db7247c3c00439afdb83e95087248267f02d6c1a7250d1f896173 49317806 https://nodejs.org/dist/v22.12.0/node-v22.12.0-darwin-x64.tar.gz signed
+22982235e1b71fa8850f82edd09cdae7e3f32df1764a9ec298c72d25ef2c164f 29734248 https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz signed
+2b8f2256382f97ad51e29ff71f702961af466c4616393f767455501e6aece9b8 34872043 https://nodejs.org/dist/v22.12.0/node-v22.12.0-win-x64.zip signed
+#
+# github.com/ggml-org/llama.cpp release b11418: GitHub release asset digests
+a6c268ec2ec3d829082cca6b28d33404abf3b74f3e371bc3e5c613c14754282c 594377569 https://github.com/ggml-org/llama.cpp/releases/download/b11418/cudart-llama-b11418-bin-ubuntu-cuda-12.8-x64.tar.gz
+66adebf9e8ba0b677bd1a451a7b196757862f8af0f169602b5691039763a7389 552521500 https://github.com/ggml-org/llama.cpp/releases/download/b11418/cudart-llama-b11418-bin-ubuntu-cuda-13.4-arm64.tar.gz
+2c43a796a6d0f28a022ca2bc058542c1b2d96bb61e99f840e469367ec069294a 440236544 https://github.com/ggml-org/llama.cpp/releases/download/b11418/cudart-llama-b11418-bin-ubuntu-cuda-13.4-x64.tar.gz
+8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6 391443627 https://github.com/ggml-org/llama.cpp/releases/download/b11418/cudart-llama-bin-win-cuda-12.4-x64.zip
+642dcde8805b3e3165ca710a5443b3b4044b27d96bd3ee3132473988c9bcb774 153262407 https://github.com/ggml-org/llama.cpp/releases/download/b11418/cudart-llama-bin-win-cuda-13.4-arm64.zip
+738f8c251ac22b70c3ae6f83a10cf222725df0395246a2cf58f32bdb85fbe668 423535356 https://github.com/ggml-org/llama.cpp/releases/download/b11418/cudart-llama-bin-win-cuda-13.4-x64.zip
+ff3af4ee8ed224da3990bb7634a1a65eb14ffcb95fdfdce1773fe0a055d52792 11966458 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-macos-arm64.tar.gz
+c7aeedcae8c003296e36c680589c23c609a6e9cc40e0e012a3e2c9df48d3df70 11486947 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-macos-x64.tar.gz
+b1b08cfdd51409347cd3d40c03b163f689a6ed3b6cb740adfa7624d8fac1329f 13679288 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-ubuntu-arm64.tar.gz
+daddebf5602ce3fbdfc8744200a7f81a7ead5b33278cb5065fc2df1a8013a86e 171644391 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-ubuntu-cuda-12.8-x64.tar.gz
+f3e608ab0d05554a00453badb3fff42958b2e84e0f3a3efbd5319a59350cd8c1 147637585 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-ubuntu-cuda-13.4-arm64.tar.gz
+c536ed420db77fcb3a72bed7fc4662938a28be991e1c4b2b992a086284c8159b 152509788 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-ubuntu-cuda-13.4-x64.tar.gz
+d3bd76380ae3255c9aaae53670284aad63fc40241d09384d8a24bb2dba45a13e 110524860 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-ubuntu-openvino-2026.4.1-x64.tar.gz
+6258645b754f0085e19944ebbe4c7819d4239c3a1d8da5b206205087f78d8237 243890933 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-ubuntu-rocm-10.0-x64.tar.gz
+cb777ede271fc69144d21b3fe03066eca1f3f023ee9a89e7e7a8c1f9c953d2c9 54288686 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-ubuntu-sycl-fp16-x64.tar.gz
+67b2be8612c99cff79eb80e01693cf933c5520332cc0771c9d3a29fec2807ca7 54196874 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-ubuntu-sycl-fp32-x64.tar.gz
+8876383d896ccb73908a2bb6a6f344e1c934f74bf886add7996948b211175ede 24839311 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-ubuntu-vulkan-arm64.tar.gz
+559ce9bbddd74f2cf99d81a24fc3746b26765e82391fa2d60751a12abc02fd71 31627269 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-ubuntu-vulkan-x64.tar.gz
+828f21de3c50f47bf7af0a667f535a486360000fc2f592de40936f1278c1e6d4 17683761 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-ubuntu-x64.tar.gz
+e60e33cfb2964464f4111467df014e07c078c993e678f1f23cad1b7b84b20591 12224204 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-win-cpu-arm64.zip
+19e10fed024c3c173e67141dcaf8fd595264d6e626d7b11f959a79df96a1fe03 19395471 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-win-cpu-x64.zip
+fc6df285aaeabb0d70ed87cad763d0bae0c1d1242bcc9f8dec1f4caf09f84de0 264469652 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-win-cuda-12.4-x64.zip
+d178b548f27ea212c09786821248ddd7bafe54faac073c780781146bcb85bae3 145263487 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-win-cuda-13.4-arm64.zip
+fc77c5b08aee1937b09c17e933e15d8c8753cf82015d117d5ab602f49c1c1def 153084102 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-win-cuda-13.4-x64.zip
+8042cc1b61d0eae5826b074af58cf1d5dcf4ffef70b3fb73e961cbce1be452fb 89464996 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-win-openvino-2026.4.1-x64.zip
+14e6c34ae11c45e508bff5fba8c070d9c9b5ffdc98e6bb9e717666e5b721b0a3 256952244 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-win-rocm-10.0-x64.zip
+1cdb23a01b80910449ea8fefd33848f13a0d6ec1eac0453e685ac1f8052f08dc 147957571 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-win-sycl-x64.zip
+4c649fc053e4f39494f11dcce0d5510f2a11b54728ff024468135d18a912f2fa 25870186 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-win-vulkan-arm64.zip
+645ca54610294ba3c8db94a110afe71bdafdf4ecab5b18c50fbd7fdfbda94ed8 33317108 https://github.com/ggml-org/llama.cpp/releases/download/b11418/llama-b11418-bin-win-vulkan-x64.zip
+#
+# github.com/ggml-org/whisper.cpp release v1.9.1: GitHub release asset digests
+e0b66cd551ff6f2a28fabe3c6e89691eea037bb76833493abb9a71ca788994b3 4555819 https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1/whisper-bin-ubuntu-arm64.tar.gz
+f3bf3b4369a99b54665b0f19b88483b30de27f25963b0414235dea03198515c5 9379235 https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1/whisper-bin-ubuntu-x64.tar.gz
+7d8be46ecd31828e1eb7a2ecdd0d6b314feafd82163038ab6092594b0a063539 7982101 https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1/whisper-bin-x64.zip
+3c319eab3e87f85883e1ff3d14426c0a1986c661c5eb5985e8af431ed9c4f71f 20769031 https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1/whisper-blas-bin-x64.zip
+aecdce0e4d4bb758a7c72a31f3f9f19a7b6d861405fd2da743cd86398633c963 278557654 https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1/whisper-cublas-11.8.0-bin-x64.zip
+106a2030eff8998e4ef320fe72e263a78449e9040386ee27c41ea80b001b601b 677887125 https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1/whisper-cublas-12.4.0-bin-x64.zip
+#
+# github.com/leejet/stable-diffusion.cpp release master-685-19bdfe2: GitHub release asset digests
+fe20366827d357c00797eebb58244dddab7fd9a348d70090c3871004c320f38d 563452046 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/cudart-sd-bin-win-cu12-x64.zip
+f6ce49cb17a2b81cf0fd5b2a1a54ba7a2cb24f932ecc54a0eac3f2e5b291a627 48533882 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-Darwin-macOS-15.7.7-arm64.zip
+71825db98299be2f1be78a8f141b2470e9c16f46a769738166e22a2878ff8487 239496512 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.13.0.zip
+bba02dc16301d1865a8d24f44766069bf6722bd5aec6e502d94e7e154f9fdc38 158479936 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.2.1.zip
+721e2d12106889c381d6d015e90debc5b209f2ca92b37c9a4bd53778ad599cf2 38841892 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip
+179759f4d1d181c85e1cc71739345328e7a747d960b8f6edde028daec96ea5c1 25098874 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-Linux-Ubuntu-24.04-x86_64.zip
+d673de8d442bd08c9e1f31806ebe5c3dc053b244bab99acbe7e5e9b4d73eeead 21156860 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-win-avx-x64.zip
+b30652509add75cb50532b0e46106a2e749d4ff5974bf9c7e47f2c0b004b093f 21166840 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-win-avx2-x64.zip
+a90fdcb13d9a311e488d307a2577da8487d244d5c8ef0fea00c3a44faf7b1cbf 21188274 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-win-avx512-x64.zip
+f15ac43cb32b4a084bc92124a002872e17bffacb51a2567a2ecea7415715ae92 351013798 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-win-cuda12-x64.zip
+760c18a10fcbabb822f0c1bb64edc329fbadd163868ef8bf32aeef28d2e9062e 21151977 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-win-noavx-x64.zip
+80abd900d21d94a58fa53802786671dd40df76a04adfd7a55970126ed6fc55e5 327060978 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-win-rocm-7.1.1-x64.zip
+4b44b7d898832498a25317ac155336ee5ff6c1c0e12a47c3c2b9c41d8c779b37 255882611 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-win-rocm-7.13.0-x64.zip
+7a0c0a9c3f5a23079174e6f18965177077faeaa7745fcf03c1fc81ae995c14be 37325804 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-win-vulkan-x64.zip
+#
+# github.com/leejet/stable-diffusion.cpp release master-782-b290693: GitHub release asset digests
+fe20366827d357c00797eebb58244dddab7fd9a348d70090c3871004c320f38d 563452046 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/cudart-sd-bin-win-cu12-x64.zip
+61620d31fa787d318ca1ec67ba73ef77b3236bc3a2dc891d66c161c7b075e45c 49381624 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-Darwin-macOS-26.4-arm64.zip
+f3915030ca2a70f9503baaa42ffc459fb11f237fbdfbb3747e03709122e190c7 248614731 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.13.0.zip
+79a561548fac13f5f2e13bde58ade6a2dbb6ba3fe47bcfcf6abfcb4675c4e3c8 166883140 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.2.1.zip
+e49466d0c0c5f985d9ca9f82c18bb55e8e02885c654210f918ca0c0098ea2829 44910016 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip
+16547f8ffb35547f9058e2ea831a2eb36cfcb99594043fc97ad2895c6c485aaf 32351865 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-Linux-Ubuntu-24.04-x86_64.zip
+38da3539d3af6918f4c218fd198ac6e26cd71249e54feb3a491d184d3ca94ea0 23752890 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-win-cpu-x64.zip
+bc7aa2f6d471b324bfbc76f108a5cb3b76de29cb892d12609647e11b041f8a02 361929826 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-win-cuda12-x64.zip
+5389d4ba955e2ebfdedd31b3cf3a85f4dc0f3581a80147a99e8a94844d8bbdf3 328423284 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-win-rocm-7.1.1-x64.zip
+58d1428f913505f99ad11f268d98bb2ae0c11594892db40f2113d9df4404c21a 256533054 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-win-rocm-7.13.0-x64.zip
+431dd14e12cc5fb1abdc20ab213bbfdf390f18766ed7f54ecfd61d6b467a7915 37747777 https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-win-vulkan-x64.zip
+#
+# github.com/leaxer-ai/leaxer-stable-diffusion release v0.1.0: GitHub release asset digests
+e40202fe4223c1cd2d2dce7beec59e1ed61c7801bd827309183be9b50e358f4c 100033536 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/cublas64_12.dll
+2a896460bef60ed57ef32b0875812f355a6984e671d638bb632f5e8c1d7a831f 473551360 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/cublasLt64_12.dll
+d28e42265da7462162a54da6b7a99ea4fa2caf8139d862bb500db875d0b32dfc 553984 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/cudart64_12.dll
+ed4840adb44000786463811719e92ecbc2488efc488911af178f37960e201aa8 24682520 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/sd-aarch64-apple-darwin-metal
+6416760f66f387c32ba1af6816dcd7282be4fbcc420489340d6d18c718c25b12 25194968 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/sd-server-aarch64-apple-darwin-metal
+a4a23bc84820e8cdfe670dd73106dfa241a26d69d5b9e64ef79561b9ee17ed63 24214792 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/sd-server-x86_64-apple-darwin
+31a7fc4e63bfe705ee7c4e208dfb50af6bcedace4f7f350bf01bc725cab1d509 117604352 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/sd-server-x86_64-pc-windows-msvc-cuda.exe
+b41a78de8d80fd9eef8a9b6d944c024bd70c3f4d9d372aacfc30e1ecc0277425 23014912 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/sd-server-x86_64-pc-windows-msvc.exe
+eadf09f5b2a08e3b16795cb87c6384d0079db291f12494ce1145d3793ff6da73 24598000 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/sd-server-x86_64-unknown-linux-gnu
+13097a3885732bc8c0571f0c3d22d4d133acdb76f7a7ba16d491b0f4f04d2db5 120238872 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/sd-server-x86_64-unknown-linux-gnu-cuda
+89d0904c8631620d6ecd7a64e2af54a44bb442d0e7955e070082e17bf62d48d5 23800248 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/sd-x86_64-apple-darwin
+f281ed00b2e3d64bf14603f5e35fbc863603a6f0bda12b444bc18fdedfe7ed5d 117433856 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/sd-x86_64-pc-windows-msvc-cuda.exe
+b4e5c853a724f4addf62ba20efe9fa7fd973f4510565ea7bb352b620214dfe95 22843904 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/sd-x86_64-pc-windows-msvc.exe
+1ffffe6b04324f5c2d68892813c9b3dca060fc0056ee22c1d4f7dc5b52d8a99e 24251720 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/sd-x86_64-unknown-linux-gnu
+1409e5d285c874aef362824adb5f28f9c5a68d1a65a1333c093eb81bafb70a44 119901016 https://github.com/leaxer-ai/leaxer-stable-diffusion/releases/download/v0.1.0/sd-x86_64-unknown-linux-gnu-cuda
+#
+# Hugging Face catalog files: LFS SHA-256 recorded from the repository at pin time
+8a83c7fb9049a9b2e92266fa7ad04933bb53aa1e85136b7b30f1b8000ff2edef 2393231072 https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf
+1d9614638d18024d0fbb36575a15f1302a3adf044df10345688ec4f6e1c4ff32 491400064 https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf
+decd2598bc2c8ed08c19adc3c8fdd461ee19ed5708679d1c54ef54a5a30d4f33 1055609536 https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf
+921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f 77704715 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+c77c5766f1cef09b6b7d47f21b546cbddd4157886b3b5d6d4f709e91e66c7c2b 32166155 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q5_1.bin
+a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002 147964211 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f 59721011 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin
+c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d 487614201 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin
+bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30 190098681 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_1.bin
+be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21 77691713 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin
+60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe 147951465 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898 59707625 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin
+1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b 487601967 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin

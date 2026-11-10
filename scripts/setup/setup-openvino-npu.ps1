@@ -11,6 +11,7 @@ $pythonDir = Join-Path $toolsDir "python-win"
 $pythonExe = Join-Path $pythonDir "python.exe"
 $pythonZip = Join-Path $toolsDir "python-win.zip"
 $getPip = Join-Path $toolsDir "get-pip.py"
+. (Join-Path $scriptDir "verify-download.ps1")  # Assert-UsapDownload (Step 9.4)
 
 $pythonVersion = "3.11.9"
 $pythonZipUrl = "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-embed-amd64.zip"
@@ -32,6 +33,7 @@ function Download-File {
   $client = New-Object System.Net.WebClient
   $client.Headers.Add("User-Agent", "Uncensored-AI-Studio-Setup")
   $client.DownloadFile($Url, $Dest)
+  Assert-UsapDownload -Url $Url -Path $Dest
 }
 
 function Expand-Zip {

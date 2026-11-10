@@ -6,6 +6,7 @@ $rootDir = Split-Path -Parent (Split-Path -Parent $scriptDir)
 $appDir = Join-Path $rootDir "app"
 $toolsDir = Join-Path $appDir "tools"
 $llmRoot = Join-Path $appDir "llm-backend\win"
+. (Join-Path $scriptDir "verify-download.ps1")  # Assert-UsapDownload (Step 9.4)
 
 function Enable-Tls12 {
     try {
@@ -93,9 +94,12 @@ function Download-File {
 
             Write-Host "`r      [$("#" * $barWidth)] 100%  $(Format-Bytes $done)  Done!                         " -ForegroundColor Green
             Write-Host ""
+            $out.Close(); $out = $null
+            Assert-UsapDownload -Url $Url -Path $DestPath
             return
         } catch {
             Write-Host ""
+            if ("$_" -like "USAP_INTEGRITY:*") { throw }  # pinned-digest mismatch: never retried
             if ($attempt -lt 3) {
                 Write-Host "   !!  Download attempt $attempt failed: $_" -ForegroundColor Yellow
                 Write-Host "   >>  Retrying download..." -ForegroundColor Cyan

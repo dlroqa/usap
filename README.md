@@ -110,6 +110,12 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
 * **Outbound request protection** (Step 9.3): web search, page fetching, model downloads and Hugging Face
   lookups can only reach public internet addresses. Every redirect is checked, and the address that was
   checked is the one connected to. Covered by regression tests against local test services.
+* **Download integrity** (Step 9.4): engines, the portable Node.js and catalog models are checked against
+  SHA-256 digests pinned in this repository before they are used (Node.js digests come from its signed
+  checksum list). Downloads stream to a temporary file and only replace an existing file once every check
+  passes, so a failed, interrupted or tampered download keeps the previous version. Community models are
+  marked **unverified** (or source-checksum only); the publisher is not authenticated.
+  [What is covered](docs/security/DOWNLOAD_INTEGRITY.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
 * **UI regression protection** ([#4](https://github.com/dlroqa/usap/pull/4)): pixel-exact
@@ -164,6 +170,11 @@ Platform notes:
 * **Model downloads from your own network** (for example a NAS mirror) are refused by default. Set
   `USAP_ALLOW_LAN_DOWNLOADS=1` to allow private-network hosts. This machine's own addresses and cloud
   metadata addresses are always refused.
+* **Downloads are verified** where USAP has a pinned digest. If a download fails verification it is
+  discarded and the previous file or engine is kept. Models from Hugging Face search or pasted URLs are
+  checked only for transfer integrity, or not at all
+  ([details](docs/security/DOWNLOAD_INTEGRITY.md)). Changing an engine version with `LLAMA_RELEASE` or
+  `WHISPER_RELEASE` installs it unverified, with a warning.
 * **LAN access** is off by default. `UAIS_HOST=0.0.0.0` opens the studio to your network, and it has
   no login, so anyone on that network can use it.
 
@@ -193,7 +204,7 @@ only, no force pushes. Details: [CI_GUIDE.md](docs/ci/CI_GUIDE.md),
 | Intel macOS setup; chat, accessibility and mobile fixes | Done (#5–#8) |
 | **Step 8:** native inference verification | **CPU done** on all 4 platforms (#9); GPU pending real hardware |
 | Desktop installer requirement documented | Done (#10), planning only |
-| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection done (#16) |
+| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection done (#16); Windows streaming tests done (#17); 9.4 download integrity in review |
 
 ## Development Roadmap
 
@@ -225,6 +236,9 @@ validation. Full priorities: [PRIORITIES.md](docs/roadmap/PRIORITIES.md).
 * **No release packages or installers yet.** Run from a checkout.
 * **macOS whisper depends on Homebrew.**
 * **Linux engines need glibc 2.38+.**
+* **Not every download is authenticated.** Community models, the Visual C++ runtime, Kokoro voice
+  weights, Python/npm packages and source builds don't have pinned digests
+  ([list](docs/security/DOWNLOAD_INTEGRITY.md#what-is-covered)). Pinned digests are not code signatures.
 
 ## Contributing
 
