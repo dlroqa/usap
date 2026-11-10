@@ -92,7 +92,7 @@ exercised with real models (see [evidence](docs/ci/MACOS_COMPATIBILITY.md#eviden
 | Model management | Implemented | Download from the built-in catalogue or Hugging Face, or import local files |
 | Hardware acceleration (CUDA, ROCm, Vulkan, Metal, Core ML, OpenVINO NPU) | Implemented upstream; **unverified in USAP** | No GPU has passed a USAP hardware test yet; see [Known Limitations](#known-limitations) |
 | Web search for chat | Implemented | DuckDuckGo provider; uses the network when enabled |
-| Live hardware monitor and local APIs | Implemented | CPU/RAM/GPU telemetry, `/api/*` routes and an OpenAI-style `/v1/chat/completions` |
+| Live hardware monitor and local API | Implemented | CPU/RAM/GPU telemetry; the local `/api/*` HTTP API used by the interface; the image engine's `/sdapi/v1/*` and `/v1/*` routes are proxied on the same port |
 
 More screenshots: [images](docs/screenshots/images.jpg) ·
 [transcribe](docs/screenshots/transcribe.jpg) · [voice](docs/screenshots/voice.jpg) ·
