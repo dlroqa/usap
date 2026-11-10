@@ -20,7 +20,7 @@
 * Error messages never include stack traces or internal Node.js text. Absolute paths are shortened (studio-relative, `~` for the home folder).
 ### Architecture (Step 9.8, in progress; 9.8a #36)
 * The server's request handling is split into a pipeline (`scripts/server/http/pipeline.cjs`), a router (`http/router.cjs`) and route modules, starting with the read-only system routes (`routes/system.cjs`). Behaviour, API responses and the interface are unchanged. Plan: `docs/roadmap/STEP9_8_MODULES.md`.
-* Text-to-speech moves into `services/tts-engine.cjs` (Kokoro state, models, synthesis, outputs) and `routes/tts.cjs` (its 11 routes, including the `/tts-outputs/` audio files), unchanged (Step 9.8b).
+* Text-to-speech moves into `services/tts-engine.cjs` (Kokoro state, models, synthesis, outputs) and `routes/tts.cjs` (its 11 routes, including the `/tts-outputs/` audio files), unchanged (Step 9.8b, #37).
 ### Compatibility
 * **Ten error paths changed status** from 500 to 400, 404, 409 or 503 (Step 9.7; table in `docs/runtime/API_ERRORS.md`). Shapes and messages are unchanged, and the interface is unaffected. Scripts that checked for `500` on these paths should check `ok: false` or the new `code`.
 * Additive API fields (Step 9.6): `GET /api/llm/status` → `engine` (state, restarts, last exit); `GET /api/diagnostics` → `engines`; chat `409` responses gain a `code` (`ENGINE_NOT_READY`, `ENGINE_STARTING`, `ENGINE_RESTARTING`, `ENGINE_CRASHED`); a cancelled load answers `409` with `code: "ENGINE_START_CANCELLED"`. Existing fields and messages are unchanged.
