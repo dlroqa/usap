@@ -48,6 +48,8 @@ serve.cjs ──IPC channel──▶ engine-guard.cjs ──▶ llama-server / s
 | Engine fails to start | Reported as before. Recorded in diagnostics (`lastExit`, `unexpected: false`). Not restarted |
 | Engine never becomes ready | Times out (built-in limits: 6 min GPU, 12 min CPU; `USAP_LLM_READY_TIMEOUT_MS` overrides them). The engine is stopped and its port released |
 | Engine stops on its own after loading (a crash) | Detected and restarted with the same settings after 1 s, 2 s, then 4 s. After 3 restarts within 10 minutes it isn't restarted again. Chat then answers `409` with `code: "ENGINE_CRASHED"` and an error explaining what happened. Loading the model again by hand resets the count. `USAP_ENGINE_AUTO_RESTART=0` turns restarts off |
+| Engine ran out of memory | **Never restarted**: reloading the same model would fail again and keep the machine under memory pressure. Detected from llama.cpp/ggml/GPU allocation errors and the Windows `STATUS_NO_MEMORY` exit code. A restart is also refused when free RAM is below the model's size, which covers a silent Linux out-of-memory kill. `crash.reason` says why (`out-of-memory`, `low-memory`, `limit`, `disabled`, `restart-failed`) |
+| Engine stopped on purpose (stop, unload, switching models or engines) | Never restarted |
 | Chat while not ready | `409`, as before, with an additive `code`: `ENGINE_NOT_READY`, `ENGINE_STARTING`, `ENGINE_RESTARTING` or `ENGINE_CRASHED`. The message for a model that isn't loaded is unchanged |
 | Concurrent start/stop requests | Serialized as before. Never more than one engine, and the reported state matches the processes |
 
@@ -75,11 +77,14 @@ No other field changed; the API contract tests pass unchanged.
 ## Limitations
 
 * **Not supervised yet:**
-  * The optional Intel NPU (OpenVINO) worker, which can't be tested on hosted CI.
+  * The optional Intel NPU (OpenVINO) worker, which can't be tested on hosted CI ([#30](https://github.com/dlroqa/usap/issues/30)).
   * The short one-off helper commands (version and `--help` probes, OpenVINO model conversion).
 * **Only the text engine restarts automatically.** The image, speech and voice processes report
-  failures but aren't restarted.
+  failures but aren't restarted ([#32](https://github.com/dlroqa/usap/issues/32)).
+* **Memory awareness is basic.** The check uses the model's file size and free RAM. GPU memory, the
+  context's KV cache, and an explicit memory check before a manual load aren't covered, and none of it
+  has been validated on low-memory or GPU hardware ([#33](https://github.com/dlroqa/usap/issues/33)).
 * If something kills **only a guard process** with `SIGKILL` (not the server), its engine isn't
-  stopped. Normal tools that end the server, or the whole process tree, are covered.
+  stopped. Normal tools that end the server, or the whole process tree, are covered ([#31](https://github.com/dlroqa/usap/issues/31)).
 * On Windows, stopping an engine is always forced: console programs can't be asked to stop politely.
   Before Step 9.6 it was also forced.

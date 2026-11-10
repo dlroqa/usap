@@ -13,6 +13,7 @@ const { spawn, spawnSync } = require("node:child_process");
 
 const { makeRoot, startServer, stopServer, request, fakeLlamaPath } = require("./api-contract/harness.cjs");
 const supervisor = require("../server/supervisor.cjs");
+const { decideRestart, isOutOfMemory } = require("../server/restart-policy.cjs");
 
 const IS_WIN = process.platform === "win32";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -198,6 +199,32 @@ test("supervisor: repeated start/stop cycles leave no process behind and always 
   assert.equal(supervisor.snapshot().supervised.length, before);
 });
 
+// ── Restart policy (pure) ────────────────────────────────────────────────────
+test("restart policy: bounded, backed off, and never after running out of memory or without free memory", () => {
+  const now = 1_000_000_000;
+  const GB = 1073741824;
+  assert.deepEqual(decideRestart({ now }), { restart: true, delayMs: 1000 });
+  assert.deepEqual(decideRestart({ now, attempts: [now - 1000] }), { restart: true, delayMs: 2000 });
+  assert.deepEqual(decideRestart({ now, attempts: [now - 2000, now - 1000] }), { restart: true, delayMs: 4000 });
+  assert.equal(decideRestart({ now, attempts: [now - 3000, now - 2000, now - 1000] }).reason, "limit");
+  assert.equal(decideRestart({ now, attempts: [now - 11 * 60000, now - 11 * 60000, now - 11 * 60000] }).restart, true, "old restarts age out of the window");
+  assert.equal(decideRestart({ now, autoRestart: false }).reason, "disabled");
+  for (const line of [
+    "ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 4294967296",
+    "CUDA error: out of memory", "cudaMalloc failed: out of memory", "terminate called after throwing an instance of 'std::bad_alloc'",
+    "vk::Device::allocateMemory: ErrorOutOfDeviceMemory", "llama_model_load: error loading model: unable to allocate CPU buffer",
+  ]) {
+    assert.equal(isOutOfMemory({ stderrTail: line }), true, line);
+    assert.equal(decideRestart({ now, stderrTail: `load ok\n${line}` }).reason, "out-of-memory", line);
+  }
+  assert.equal(decideRestart({ now, code: 3221225495 }).reason, "out-of-memory", "Windows STATUS_NO_MEMORY");
+  assert.equal(decideRestart({ now, code: -1073741801 }).reason, "out-of-memory");
+  assert.equal(isOutOfMemory({ code: 1, stderrTail: "srv  update_slots: all slots are idle" }), false);
+  assert.equal(decideRestart({ now, modelBytes: 8 * GB, freeBytes: 2 * GB }).reason, "low-memory", "e.g. after a Linux OOM-killer SIGKILL");
+  assert.match(decideRestart({ now, modelBytes: 8 * GB, freeBytes: 2 * GB }).message, /2\.0 GB.*\(8\.0 GB\)/);
+  assert.equal(decideRestart({ now, modelBytes: 2 * GB, freeBytes: 8 * GB }).restart, true);
+});
+
 // ── Through the real server ──────────────────────────────────────────────────
 const GGUF = Buffer.from("GGUF\x03\x00\x00\x00");
 function model(name) { fs.writeFileSync(path.join(root, "app", "llm-models", name), GGUF); return name; }
@@ -270,6 +297,39 @@ test("server: an engine crash after loading is detected and restarted with backo
   } finally { stopServer(srv); }
 });
 
+test("server: an engine that runs out of memory is not restarted, and says why", async () => {
+  const srv = await startServer(root);
+  try {
+    assert.equal((await startLlm(srv, model("oom-after-ready.gguf"))).status, 200, srv.log().slice(-1500));
+    const st = await waitFor(async () => { const s = await llmStatus(srv); return s.engine.state === "crashed" ? s : null; }, 15000, "crash recorded");
+    assert.equal(st.engine.crash.reason, "out-of-memory");
+    assert.equal(st.engine.restartsInWindow, 0, "no restart attempt");
+    assert.match(st.error, /ran out of memory/);
+    await sleep(2500); // longer than the first backoff: still nothing restarted
+    assert.equal((await llmStatus(srv)).engine.state, "crashed");
+    assert.deepEqual(await supervisedLlm(srv), []);
+    const chat = await request(srv.port, "POST", "/api/llm/chat", { body: { messages: [{ role: "user", content: "hi" }] } });
+    assert.equal(chat.json.code, "ENGINE_CRASHED");
+  } finally { stopServer(srv); }
+});
+
+test("server: an intentional stop never triggers an automatic restart", async () => {
+  const srv = await startServer(root);
+  try {
+    assert.equal((await startLlm(srv, model("plain.gguf"))).status, 200);
+    const { port } = await llmStatus(srv);
+    assert.equal((await request(srv.port, "POST", "/api/llm/stop")).status, 200);
+    await sleep(3000); // past the first restart backoff
+    const st = await llmStatus(srv);
+    assert.equal(st.engine.state, "stopped");
+    assert.equal(st.running, false);
+    assert.equal(st.engine.restartsInWindow, 0);
+    assert.equal(await engineUp(port), false);
+    assert.deepEqual(await supervisedLlm(srv), []);
+    assert.doesNotMatch(srv.log(), /restarting in/);
+  } finally { stopServer(srv); }
+});
+
 test("server: stopping during a slow startup cancels it at once, without trying other profiles", async () => {
   const srv = await startServer(root);
   try {
@@ -335,9 +395,22 @@ test("server: a startup that never becomes ready times out and its engine is sto
 });
 
 test("server: diagnostics describe engines additively, without secrets", async () => {
-  const srv = await startServer(root);
+  const srv = await startServer(root, { UAIS_AUTH: "on" }, { readyPath: "/api/auth/status" });
   try {
-    const d = (await request(srv.port, "GET", "/api/diagnostics")).json;
+    const token = fs.readFileSync(path.join(root, "app", "config", "lan-access-token"), "utf8").trim();
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    model("plain.gguf");
+    assert.equal((await request(srv.port, "POST", "/api/llm/start", { ...auth, body: { model: "plain.gguf", contextSize: 512, gpuLayers: 0 } })).status, 200);
+    const raw = await request(srv.port, "GET", "/api/diagnostics", auth);
+    const status = await request(srv.port, "GET", "/api/llm/status", auth);
+    for (const r of [raw, status]) {
+      assert.ok(!r.text.includes(token), "no access token in diagnostics");
+      assert.doesNotMatch(r.text, /usap_[A-Za-z0-9_-]{43}/);
+      assert.doesNotMatch(r.text, /authorization|cookie|password|secret/i);
+    }
+    const d = raw.json;
+    assert.equal(d.engines.processes.supervised.length, 1);
+    assert.deepEqual(Object.keys(d.engines.processes.supervised[0]).sort(), ["enginePid", "guardPid", "label", "startedAt"], "no command lines, arguments or environment");
     assert.equal(typeof d.engines.llm.state, "string");
     assert.equal(d.engines.llm.restartLimit, 3);
     assert.ok(Array.isArray(d.engines.processes.supervised));

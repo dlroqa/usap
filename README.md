@@ -123,7 +123,8 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
 * **Engine supervision** (Step 9.6, in review): the chat, image, speech and voice engines stop with
   the studio even if it crashes or is killed, so on Linux and macOS they no longer keep running in the
   background. A
-  text engine that crashes is restarted automatically (up to 3 times in 10 minutes). Stopping during
+  text engine that crashes is restarted automatically (up to 3 times in 10 minutes), but not when it
+  ran out of memory. Stopping during
   a model load cancels it at once. [Details](docs/runtime/ENGINE_SUPERVISION.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
@@ -255,8 +256,8 @@ validation. Full priorities: [PRIORITIES.md](docs/roadmap/PRIORITIES.md).
   uses `npm ci`. A staged update that keeps the per-OS dependency folders and offline re-setup is
   planned ([#22](https://github.com/dlroqa/usap/issues/22)).
 * **Only the text engine restarts by itself after a crash.** The image, speech and voice engines
-  report the failure; the optional Intel NPU worker isn't supervised yet
-  ([details](docs/runtime/ENGINE_SUPERVISION.md#limitations)).
+  report the failure; the optional Intel NPU worker isn't supervised yet, and memory awareness is basic
+  ([details](docs/runtime/ENGINE_SUPERVISION.md#limitations); [#30](https://github.com/dlroqa/usap/issues/30)–[#33](https://github.com/dlroqa/usap/issues/33)).
 * **LAN sharing uses plain HTTP and one shared token**: no built-in HTTPS, no user accounts. Use it
   only on a trusted network, and never expose the studio directly to the internet
   ([details](docs/security/LAN_ACCESS.md#limitations); follow-ups [#26](https://github.com/dlroqa/usap/issues/26)–[#28](https://github.com/dlroqa/usap/issues/28)).

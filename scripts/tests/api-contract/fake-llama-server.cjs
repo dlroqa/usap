@@ -17,6 +17,7 @@
 //   fail-start      exit with code 3 before listening (a failed launch)
 //   slow-start      wait 60 s before listening (an interrupted or cancelled startup)
 //   never-ready     listen, but /v1/models answers 503 forever (a startup timeout)
+//   oom-after-ready become ready, then after 3 s print a llama.cpp-style allocation failure and exit 1
 // and by flags (used when a test starts the fake directly):
 //   --fake-ignore-sigterm         ignore SIGTERM (forces the forced-termination path)
 //   --fake-exit-after-ms N        exit after N ms with --fake-exit-code (default 3)
@@ -31,6 +32,7 @@ if (args.includes("--help") || args.includes("--list-devices")) { console.log("c
 const model = path.basename(arg("--model", "fake.gguf"));
 const WORDS = ["Contract", " test", " reply."];
 const stats = { requests: 0, completed: 0, aborted: 0, pid: process.pid };
+if (model.includes("oom-after-ready")) setTimeout(() => { console.error("ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 4294967296"); process.exit(1); }, 3000);
 if (model.includes("fail-start")) { console.error("fake engine: failed to load model (fail-start)"); process.exit(3); }
 if (args.includes("--fake-ignore-sigterm")) process.on("SIGTERM", () => { console.error("fake engine: ignoring SIGTERM"); });
 if (args.includes("--fake-exit-after-ms")) setTimeout(() => process.exit(Number(arg("--fake-exit-code", "3"))), Number(arg("--fake-exit-after-ms", "0")));

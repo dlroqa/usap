@@ -11,7 +11,7 @@
 * JSON API routes require `Content-Type: application/json` (S-9). Other declared types and untyped bodies get `415`; a `POST` without a body still works.
 ### Reliability
 * **Engine supervision** (Step 9.6). Every chat, image, speech and voice engine runs under a small guard process (`scripts/server/engine-guard.cjs`) that stops it when the studio server goes away for any reason. On Linux and macOS, a crash or `SIGKILL` used to leave the engine running with its memory and port. Windows already ended engines with the server, through Node's job object. Stops are polite first, then forced after 3 s (`USAP_ENGINE_STOP_GRACE_MS`), and wait for the port to be free. Exit codes and crash signals (e.g. Metal `SIGABRT`) still reach the server.
-* A text engine that crashes after loading is restarted with the same settings after 1 s, 2 s and 4 s, at most 3 times in 10 minutes (`USAP_ENGINE_AUTO_RESTART=0` turns this off). After that, chat explains what happened.
+* A text engine that crashes after loading is restarted with the same settings after 1 s, 2 s and 4 s, at most 3 times in 10 minutes (`USAP_ENGINE_AUTO_RESTART=0` turns this off). After that, chat explains what happened. An engine that ran out of memory is never restarted (allocation errors, Windows `STATUS_NO_MEMORY`, or less free RAM than the model needs), and neither is one stopped on purpose.
 * Stopping the text engine during a model load cancels it at once, instead of waiting for the load to finish, and no fallback backend is tried afterwards. `USAP_LLM_READY_TIMEOUT_MS` overrides the load timeout.
 * An unexpected image-engine crash signal is reported as a clear error.
 ### Compatibility
