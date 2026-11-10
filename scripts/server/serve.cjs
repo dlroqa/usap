@@ -17,6 +17,8 @@ const { createLanAuth, withoutAuthHeaders, TOKEN_FILE_NAME: LAN_TOKEN_FILE_NAME 
 // Step 9.6: engines run under a guard process, so they stop with this server even on a crash or SIGKILL.
 const supervisor = require("./supervisor.cjs");
 const { decideRestart } = require("./restart-policy.cjs");
+// Step 9.7: one error model (status by cause, machine-readable code, no stacks, no host paths).
+const { ApiError, badRequest, notFound, conflict, notInstalled, errorStatus, errorBody, publicMessage, configurePathRedaction } = require("./errors.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -51,6 +53,7 @@ const { resolveLayout, ensureDataDirs } = require("./paths.cjs");
 const LAYOUT  = resolveLayout();
 if (LAYOUT.warning) console.warn(`  [paths] ${LAYOUT.warning}`);
 const ROOT    = LAYOUT.root;
+configurePathRedaction({ root: ROOT });
 const DIST    = LAYOUT.dist;
 const TOOLS   = LAYOUT.tools;
 ensureDataDirs(LAYOUT);
@@ -345,7 +348,7 @@ function engineStartCancelledError() {
 }
 
 function jsonErrorStatus(err) {
-  return Number(err?.statusCode) || (err?.code === "MODEL_ALREADY_ACTIVE" ? 409 : 500);
+  return errorStatus(err);
 }
 let llmSettings = {
   model: null,
@@ -2228,10 +2231,10 @@ function resolveSpeechModel(value) {
   const raw = String(value || "").trim();
   const model = getSpeechModels().find((item) => item.id === raw || item.filename === raw) ||
     getSpeechModels().find((item) => item.installed);
-  if (!model) throw new Error("Download or import a Whisper model first.");
+  if (!model) throw notFound("MODEL_NOT_FOUND", "Download or import a Whisper model first.");
   const modelPath = path.join(SPEECH_MODELS, path.basename(model.filename));
   if (!pathInside(modelPath, SPEECH_MODELS) || !fs.existsSync(modelPath)) {
-    throw new Error(`Speech model is not installed: ${model.filename}`);
+    throw notFound("MODEL_NOT_FOUND", `Speech model is not installed: ${model.filename}`);
   }
   return { ...model, path: modelPath };
 }
@@ -2313,10 +2316,10 @@ function resolveTtsModel(value) {
   const raw = String(value || "").trim();
   const model = getTtsModels().find((item) => item.id === raw || item.filename === raw) ||
     getTtsModels().find((item) => item.installed);
-  if (!model) throw new Error("Download or import a Kokoro TTS model from Model Manager first.");
+  if (!model) throw notFound("MODEL_NOT_FOUND", "Download or import a Kokoro TTS model from Model Manager first.");
   const manifestPath = getTtsManifestPath(model.filename);
   if (!manifestPath || !fs.existsSync(manifestPath)) {
-    throw new Error(`TTS model is not installed: ${model.filename}`);
+    throw notFound("MODEL_NOT_FOUND", `TTS model is not installed: ${model.filename}`);
   }
   return { ...model, path: manifestPath };
 }
@@ -2342,7 +2345,7 @@ function runExclusiveTtsOperation(operation) {
 async function startTts(settings = {}) {
   const runtime = getTtsRuntimeStatus();
   if (!runtime.installed) {
-    throw new Error("Kokoro TTS runtime is not installed. Run scripts/setup/setup-tts for this platform.");
+    throw notInstalled("Kokoro TTS runtime is not installed. Run scripts/setup/setup-tts for this platform.");
   }
   const model = resolveTtsModel(settings.model || ttsSettings.model);
   PORT_TTS = PREFERRED_TTS_PORT;
@@ -2506,16 +2509,16 @@ function synthesizeTts(text, options = {}) {
   return new Promise((resolve, reject) => {
     const cleanedText = String(text || "").trim();
     if (!cleanedText) {
-      reject(new Error("Enter text to synthesize."));
+      reject(badRequest("INVALID_REQUEST", "Enter text to synthesize."));
       return;
     }
     if (cleanedText.length > 5000) {
-      reject(new Error("TTS text is too long. Limit is 5000 characters for V1."));
+      reject(badRequest("TEXT_TOO_LONG", "TTS text is too long. Limit is 5000 characters for V1."));
       return;
     }
     const runtime = getTtsRuntimeStatus();
     if (!runtime.installed) {
-      reject(new Error("Kokoro TTS runtime is not installed."));
+      reject(notInstalled("Kokoro TTS runtime is not installed."));
       return;
     }
     const model = resolveTtsModel(options.model || ttsSettings.model);
@@ -2642,7 +2645,7 @@ async function startSpeech(settings = {}) {
   const backendPreference = normalizeSpeechBackendPreference(settings.backendPreference || speechSettings.backendPreference);
   const backend = getSpeechBackend(backendPreference);
   if (!backend.cli) {
-    throw new Error(`${backend.label || "Selected"} whisper.cpp backend is not installed. Run setup or copy a compatible binary to ${backend.pathHint || "app/speech-backend"}.`);
+    throw notInstalled(`${backend.label || "Selected"} whisper.cpp backend is not installed. Run setup or copy a compatible binary to ${backend.pathHint || "app/speech-backend"}.`);
   }
   const model = resolveSpeechModel(settings.model);
   PORT_SPEECH = await findAvailableSpeechPort();
@@ -4190,7 +4193,7 @@ async function startOpenVinoWorker(settings = {}) {
 }
 
 async function generateWithOpenVino(body) {
-  if (!openvinoReady || !openvinoPort) throw new Error("OpenVINO NPU worker is not ready. Load an OpenVINO NPU model first.");
+  if (!openvinoReady || !openvinoPort) throw conflict("ENGINE_NOT_READY", "OpenVINO NPU worker is not ready. Load an OpenVINO NPU model first.");
   const steps = Math.max(1, Math.min(8, Number(body.steps) || 4));
   generationState = { active: true, step: 0, steps, speed: "", decoding: false };
   try {
@@ -4468,21 +4471,22 @@ async function startLlm(settings = {}, { restart = false } = {}) {
 async function startLlmAttempts(settings, token) {
   const filename = path.basename(String(settings.model || ""));
   const modelPath = path.join(LLM_MODELS, filename);
-  if (!filename || !pathInside(modelPath, LLM_MODELS) || !fs.existsSync(modelPath)) {
-    throw new Error("Select a downloaded GGUF text model first.");
+  if (!filename) throw badRequest("MODEL_REQUIRED", "Select a downloaded GGUF text model first.");
+  if (!pathInside(modelPath, LLM_MODELS) || !fs.existsSync(modelPath)) {
+    throw notFound("MODEL_NOT_FOUND", "Select a downloaded GGUF text model first.");
   }
   if (!filename.toLowerCase().endsWith(".gguf")) {
-    throw new Error("Text generation requires a .gguf model.");
+    throw badRequest("MODEL_UNSUPPORTED", "Text generation requires a .gguf model.");
   }
 
   const architecture = readGgufArchitecture(modelPath).toLowerCase();
   if (LLAMA_CPP_UNSUPPORTED_ARCHITECTURES[architecture]) {
-    throw new Error(`${filename}: ${LLAMA_CPP_UNSUPPORTED_ARCHITECTURES[architecture]}`);
+    throw badRequest("MODEL_UNSUPPORTED", `${filename}: ${LLAMA_CPP_UNSUPPORTED_ARCHITECTURES[architecture]}`);
   }
 
   const candidates = getLlmBackendCandidates();
   if (candidates.length === 0) {
-    throw new Error("llama.cpp is not installed. Run the platform setup script to install the text backend.");
+    throw notInstalled("llama.cpp is not installed. Run the platform setup script to install the text backend.");
   }
   const persistedSettings = getLlmModelSettings(filename);
   const preferredBackend = String(settings.preferredBackend || persistedSettings.preferredBackend || "").toLowerCase();
@@ -4540,7 +4544,7 @@ async function startLlmAttempts(settings, token) {
 
   const last = failures[failures.length - 1];
   llmSettings.backendFallbacks = failures;
-  throw new Error(`Text model failed on all available llama.cpp backends. Last failure: ${last?.error || "unknown error"}`);
+  throw new ApiError(500, "ENGINE_START_FAILED", `Text model failed on all available llama.cpp backends. Last failure: ${last?.error || "unknown error"}`);
 }
 
 // Older llama.cpp builds take --mmap/--mlock; newer ones only --load-mode. Read the
@@ -4566,15 +4570,16 @@ function llamaServerSupportsFlag(binaryPath, flag) {
 async function startLlmWithBackend(settings = {}, backend) {
   const filename = path.basename(String(settings.model || ""));
   const modelPath = path.join(LLM_MODELS, filename);
-  if (!filename || !pathInside(modelPath, LLM_MODELS) || !fs.existsSync(modelPath)) {
-    throw new Error("Select a downloaded GGUF text model first.");
+  if (!filename) throw badRequest("MODEL_REQUIRED", "Select a downloaded GGUF text model first.");
+  if (!pathInside(modelPath, LLM_MODELS) || !fs.existsSync(modelPath)) {
+    throw notFound("MODEL_NOT_FOUND", "Select a downloaded GGUF text model first.");
   }
   if (!filename.toLowerCase().endsWith(".gguf")) {
-    throw new Error("Text generation requires a .gguf model.");
+    throw badRequest("MODEL_UNSUPPORTED", "Text generation requires a .gguf model.");
   }
 
   if (!backend) {
-    throw new Error("llama.cpp is not installed. Run the platform setup script to install the text backend.");
+    throw notInstalled("llama.cpp is not installed. Run the platform setup script to install the text backend.");
   }
 
   assertNoOtherActiveRuntime("text", filename);
@@ -5900,15 +5905,25 @@ async function readJsonBody(req, res) {
   const type = jsonBodyType(req);
   if (type === "other") {
     req.resume();
-    json(res, 415, { ok: false, error: JSON_TYPE_ERROR });
+    json(res, 415, { ok: false, error: JSON_TYPE_ERROR, code: "UNSUPPORTED_MEDIA_TYPE" });
     return null;
   }
+  let body;
   try {
-    return await readBody(req, { emptyOnly: type === "missing" });
+    body = await readBody(req, { emptyOnly: type === "missing" });
   } catch (err) {
-    json(res, err.status || (err.message.includes("too large") ? 413 : 400), { ok: false, error: err.message });
+    const status = err.status || (err.message.includes("too large") ? 413 : 400);
+    const code = status === 415 ? "UNSUPPORTED_MEDIA_TYPE" : status === 413 ? "BODY_TOO_LARGE" : "INVALID_JSON";
+    json(res, status, { ok: false, error: err.message, code });
     return null;
   }
+  // Every JSON route expects an object. `null`, numbers, strings and arrays used to slip through as
+  // a falsy/odd body, leaving the request unanswered or failing later with a 500.
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    json(res, 400, { ok: false, error: "Request body must be a JSON object.", code: "INVALID_REQUEST" });
+    return null;
+  }
+  return body;
 }
 
 function safeOutputName(value) {
@@ -5961,7 +5976,7 @@ function sanitizeChatConversationForStorage(conversation = {}) {
 
 function getChatConversationPath(id) {
   const safeId = safeOutputName(id);
-  if (!safeId) throw new Error("A chat id is required.");
+  if (!safeId) throw badRequest("INVALID_REQUEST", "A chat id is required.");
   const filePath = path.join(CHAT_HISTORY, `${safeId}.json`);
   if (!pathInside(filePath, CHAT_HISTORY)) {
     throw new Error("Invalid chat id.");
@@ -6016,7 +6031,7 @@ function deleteChatConversation(id) {
 function saveGeneratedOutput(imageDataUrl, metadata = {}) {
   const match = String(imageDataUrl || "").match(/^data:(image\/(?:png|jpeg|jpg|webp));base64,(.+)$/);
   if (!match) {
-    throw new Error("Expected a real base64 PNG, JPEG, or WebP image data URL");
+    throw badRequest("INVALID_IMAGE", "Expected a real base64 PNG, JPEG, or WebP image data URL");
   }
 
   const mime = match[1];
@@ -6127,7 +6142,7 @@ function streamModelUpload(req, filename, targetDir = MODELS, mode = "image") {
           ? lowerName.endsWith(".json")
         : isModelFile(lowerName);
     if (!safeFilename || !valid) {
-      reject(new Error(mode === "text"
+      reject(badRequest("INVALID_FILENAME", mode === "text"
         ? "Filename must end with .gguf"
         : mode === "speech"
           ? "Filename must end with .bin"
@@ -6222,7 +6237,7 @@ try {
   console.error(`  [auth] Could not create the access token file (${err.code || err.message}). Remote access is refused.`);
 }
 
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   // Refuse DNS-rebound hosts and cross-site origins before any route runs.
   if (!requestPolicy.isAllowedHost(req)) {
     return json(res, 403, { ok: false, error: "Host not allowed" });
@@ -6295,7 +6310,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, deleted });
     } catch (err) {
       console.error("  [api] Cleanup failed:", err);
-      return json(res, 500, { ok: false, error: err.message });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -6369,7 +6384,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, conversation });
     } catch (err) {
       console.error("  [api] Failed to save chat conversation:", err);
-      return json(res, 500, { ok: false, error: err.message || String(err) });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -6381,7 +6396,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, deleted });
     } catch (err) {
       console.error("  [api] Failed to delete chat conversation:", err);
-      return json(res, 500, { ok: false, error: err.message || String(err) });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -6426,7 +6441,7 @@ const server = http.createServer(async (req, res) => {
       if (err.code !== "MODEL_ALREADY_ACTIVE") {
         await runExclusiveLlmOperation(() => killLlm());
       }
-      return json(res, jsonErrorStatus(err), { ok: false, error: llmError, code: err.code || "", activeRuntime: err.activeRuntime || null });
+      return json(res, jsonErrorStatus(err), errorBody(err, { error: llmError, code: err.code || "", activeRuntime: err.activeRuntime || null }));
     }
   }
 
@@ -6443,7 +6458,7 @@ const server = http.createServer(async (req, res) => {
       const result = await runExclusiveLlmOperation(() => benchmarkLlmModel(body));
       return json(res, 200, result);
     } catch (err) {
-      return json(res, 500, { ok: false, error: err.message || String(err) });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -6479,7 +6494,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, ready: speechReady, settings: speechSettings, port: PORT_SPEECH });
     } catch (err) {
       speechError = err.message || String(err);
-      return json(res, jsonErrorStatus(err), { ok: false, error: speechError, code: err.code || "", activeRuntime: err.activeRuntime || null });
+      return json(res, jsonErrorStatus(err), errorBody(err, { error: speechError, code: err.code || "", activeRuntime: err.activeRuntime || null }));
     }
   }
 
@@ -6532,7 +6547,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, message: `Imported ${result.filename}`, model: result });
     } catch (err) {
       console.error("  [api] Failed to import speech model:", err);
-      return json(res, 500, { ok: false, error: err.message });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -6588,7 +6603,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     } catch (err) {
       console.error("  [api] Failed to delete transcription:", err);
-      return json(res, 500, { ok: false, error: err.message });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -6624,7 +6639,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, ready: ttsReady, settings: ttsSettings, port: PORT_TTS });
     } catch (err) {
       ttsError = err.message || String(err);
-      return json(res, jsonErrorStatus(err), { ok: false, error: ttsError, code: err.code || "", activeRuntime: err.activeRuntime || null });
+      return json(res, jsonErrorStatus(err), errorBody(err, { error: ttsError, code: err.code || "", activeRuntime: err.activeRuntime || null }));
     }
   }
 
@@ -6644,7 +6659,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, output });
     } catch (err) {
       ttsError = err.message || String(err);
-      return json(res, jsonErrorStatus(err), { ok: false, error: ttsError, code: err.code || "", activeRuntime: err.activeRuntime || null });
+      return json(res, jsonErrorStatus(err), errorBody(err, { error: ttsError, code: err.code || "", activeRuntime: err.activeRuntime || null }));
     }
   }
 
@@ -6655,7 +6670,7 @@ const server = http.createServer(async (req, res) => {
       const model = installTtsCatalogModel(body.modelId || body.model_id || body.model || body.filename);
       return json(res, 200, { ok: true, message: "TTS model manifest installed", filename: model.filename, model });
     } catch (err) {
-      return json(res, 500, { ok: false, error: err.message || String(err) });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -6666,7 +6681,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, message: `Imported ${result.filename}`, model: result });
     } catch (err) {
       console.error("  [api] Failed to import TTS model:", err);
-      return json(res, 500, { ok: false, error: err.message });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -6718,7 +6733,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     } catch (err) {
       console.error("  [api] Failed to delete TTS output:", err);
-      return json(res, 500, { ok: false, error: err.message });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -6977,7 +6992,7 @@ async function doLlmChat(req, res, body, retryCount = 0) {
       }
     }
   } catch (err) {
-    return json(res, 500, { ok: false, error: err.message || String(err) });
+    return json(res, errorStatus(err), errorBody(err));
   }
 }
 
@@ -7035,8 +7050,9 @@ async function benchmarkLlmBackend(model, backend, baseSettings = {}) {
 async function benchmarkLlmModel(settings = {}) {
   const filename = path.basename(String(settings.model || llmSettings.model || ""));
   const modelPath = path.join(LLM_MODELS, filename);
-  if (!filename || !pathInside(modelPath, LLM_MODELS) || !fs.existsSync(modelPath)) {
-    throw new Error("Select a downloaded GGUF text model before benchmarking.");
+  if (!filename) throw badRequest("MODEL_REQUIRED", "Select a downloaded GGUF text model before benchmarking.");
+  if (!pathInside(modelPath, LLM_MODELS) || !fs.existsSync(modelPath)) {
+    throw notFound("MODEL_NOT_FOUND", "Select a downloaded GGUF text model before benchmarking.");
   }
 
   const previous = {
@@ -7186,7 +7202,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       });
       return json(res, 200, { ok: true, ...result });
     } catch (err) {
-      return json(res, 500, { ok: false, error: err.message || String(err) });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -7335,7 +7351,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       return json(res, 200, { ok: true, message: "Backend restarting...", settings: currentSettings, port: PORT_BACKEND });
     } catch (err) {
       backendError = err.message || String(err);
-      return json(res, jsonErrorStatus(err), { ok: false, error: backendError, code: err.code || "", activeRuntime: err.activeRuntime || null, port: PORT_BACKEND });
+      return json(res, jsonErrorStatus(err), errorBody(err, { error: backendError, code: err.code || "", activeRuntime: err.activeRuntime || null, port: PORT_BACKEND }));
     }
   }
 
@@ -7422,7 +7438,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       startOpenVinoModelDownload(modelId);
       return json(res, 200, { ok: true, message: "OpenVINO model download started" });
     } catch (err) {
-      return json(res, 500, { ok: false, error: err.message || String(err) });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -7471,7 +7487,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     try {
       return json(res, 200, await generateWithOpenVino(body));
     } catch (err) {
-      return json(res, 500, { ok: false, error: err.message || String(err) });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -7490,7 +7506,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     }
     const ext = path.extname(filePath).toLowerCase();
     fs.readFile(filePath, (err, data) => {
-      if (err) return json(res, 500, { error: err.message });
+      if (err) return json(res, errorStatus(err), errorBody(err));
       res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream" });
       res.end(data);
     });
@@ -7565,7 +7581,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       return json(res, 200, { ok: true, output: { ...saved, url: `/api/output-file?filename=${encodeURIComponent(saved.image)}` } });
     } catch (err) {
       console.error("  [api] Failed to save output:", err);
-      return json(res, 500, { ok: false, error: err.message });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -7578,7 +7594,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       return json(res, 200, { ok: true, deleted });
     } catch (err) {
       console.error("  [api] Failed to delete outputs:", err);
-      return json(res, 500, { ok: false, error: err.message });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -7590,7 +7606,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       return json(res, 200, { ok: true, message: `Imported ${result.filename}`, model: result, filename: result.filename });
     } catch (err) {
       console.error("  [api] Failed to import model:", err);
-      return json(res, 500, { ok: false, error: err.message });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -7601,7 +7617,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       return json(res, 200, { ok: true, message: `Imported ${result.filename}`, model: result });
     } catch (err) {
       console.error("  [api] Failed to import text model:", err);
-      return json(res, 500, { ok: false, error: err.message });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -7655,7 +7671,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       console.log(`  [api] Moved model ${filename} from ${body.from} to ${body.to}`);
       return json(res, 200, { ok: true, filename });
     } catch (err) {
-      return json(res, 500, { ok: false, error: `Couldn't move the model: ${err.message}` });
+      return json(res, errorStatus(err), errorBody(err, { error: `Couldn't move the model: ${publicMessage(err)}` }));
     }
   }
 
@@ -7755,12 +7771,11 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       return json(res, 200, { ok: true, filename, linkedFrom: source, kind, detail: detected.detail || "" });
     } catch (err) {
       const crossDrive = err.code === "EXDEV";
-      return json(res, 500, {
-        ok: false,
+      return json(res, errorStatus(err), errorBody(err, {
         error: crossDrive
           ? "This system can't link to a file on another drive. Use Import a copy instead."
-          : `Couldn't link the file: ${err.message}`,
-      });
+          : `Couldn't link the file: ${publicMessage(err)}`,
+      }));
     }
   }
 
@@ -7791,7 +7806,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
       }
     } catch (err) {
       console.error(`  [api] Failed to delete model ${safeFilename}:`, err);
-      return json(res, 500, { error: err.message });
+      return json(res, errorStatus(err), errorBody(err));
     }
   }
 
@@ -7815,6 +7830,17 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     if (err) { res.writeHead(404); res.end("Not found"); return; }
     res.writeHead(200, { "Content-Type": mime });
     res.end(data);
+  });
+}
+
+// A route that throws (a bug, or input nobody anticipated) answers 500 with a generic message
+// instead of an unhandled rejection, which would stop the whole server. Details go to the console only.
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((err) => {
+    console.error(`  [api] Unhandled error in ${req.method} ${String(req.url || "").split("?")[0]}:`, err && err.stack ? err.stack : err);
+    if (res.headersSent) { try { res.destroy(); } catch (_) {} return; }
+    const status = errorStatus(err) === 400 ? 400 : 500; // wrong-typed input is the caller's error
+    try { json(res, status, status === 400 ? errorBody(err) : { ok: false, error: "Something went wrong in the local server.", code: "INTERNAL_ERROR" }); } catch (_) {}
   });
 });
 

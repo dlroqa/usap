@@ -126,6 +126,10 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   text engine that crashes is restarted automatically (up to 3 times in 10 minutes), but not when it
   ran out of memory. Stopping during
   a model load cancels it at once. [Details](docs/runtime/ENGINE_SUPERVISION.md).
+* **Consistent API errors** (Step 9.7, in review): every error keeps its `error` message and gains a
+  machine-readable `code`. Invalid requests answer 400 instead of 500, and a missing engine answers 503.
+  A malformed request can no longer stop the server. Messages never include stack traces or the host's
+  folder paths. [Reference](docs/runtime/API_ERRORS.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
 * **UI regression protection** ([#4](https://github.com/dlroqa/usap/pull/4)): pixel-exact
@@ -216,7 +220,7 @@ only, no force pushes. Details: [CI_GUIDE.md](docs/ci/CI_GUIDE.md),
 | Intel macOS setup; chat, accessibility and mobile fixes | Done (#5–#8) |
 | **Step 8:** native inference verification | **CPU done** on all 4 platforms (#9); GPU pending real hardware |
 | Desktop installer requirement documented | Done (#10), planning only |
-| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection done (#16); Windows streaming tests done (#17); 9.4 download integrity done (#18); 9.5 LAN sign-in done (#25); 9.6 engine supervision done (#29); 9.7 API error consistency in development |
+| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection done (#16); Windows streaming tests done (#17); 9.4 download integrity done (#18); 9.5 LAN sign-in done (#25); 9.6 engine supervision done (#29); 9.7 API error consistency in review |
 
 ## Development Roadmap
 

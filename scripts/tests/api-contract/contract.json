@@ -516,7 +516,7 @@
       "method": "POST",
       "path": "/api/llm/start",
       "body": {},
-      "status": 500,
+      "status": 400,
       "contentType": "application/json",
       "depth": 1,
       "shape": {
@@ -542,7 +542,7 @@
       "method": "POST",
       "path": "/api/llm/delete-conversation",
       "body": {},
-      "status": 500,
+      "status": 400,
       "contentType": "application/json",
       "depth": 1,
       "shape": {
@@ -578,7 +578,7 @@
       "method": "POST",
       "path": "/api/llm/import-model",
       "body": {},
-      "status": 500,
+      "status": 400,
       "contentType": "application/json",
       "depth": 1,
       "shape": {
@@ -590,7 +590,7 @@
       "method": "POST",
       "path": "/api/llm/benchmark",
       "body": {},
-      "status": 500,
+      "status": 400,
       "contentType": "application/json",
       "depth": 1,
       "shape": {
@@ -602,7 +602,7 @@
       "method": "POST",
       "path": "/api/speech/start",
       "body": {},
-      "status": 500,
+      "status": 503,
       "contentType": "application/json",
       "depth": 1,
       "shape": {
@@ -652,7 +652,7 @@
       "method": "POST",
       "path": "/api/tts/start",
       "body": {},
-      "status": 500,
+      "status": 503,
       "contentType": "application/json",
       "depth": 1,
       "shape": {
@@ -666,7 +666,7 @@
       "method": "POST",
       "path": "/api/tts/speak",
       "body": {},
-      "status": 500,
+      "status": 503,
       "contentType": "application/json",
       "depth": 1,
       "shape": {
@@ -739,7 +739,7 @@
       "method": "POST",
       "path": "/api/import-model",
       "body": {},
-      "status": 500,
+      "status": 400,
       "contentType": "application/json",
       "depth": 1,
       "shape": {
@@ -751,7 +751,7 @@
       "method": "POST",
       "path": "/api/save-output",
       "body": {},
-      "status": 500,
+      "status": 400,
       "contentType": "application/json",
       "depth": 1,
       "shape": {
@@ -774,7 +774,7 @@
       "method": "POST",
       "path": "/api/openvino-generate",
       "body": {},
-      "status": 500,
+      "status": 409,
       "contentType": "application/json",
       "depth": 1,
       "shape": {
