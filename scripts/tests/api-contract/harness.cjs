@@ -25,7 +25,18 @@ function freePort() {
 function fakeLlamaPath(root) {
   if (process.platform === "linux") return path.join(root, "app", "llm-backend", "linux", "cpu", "llama-server");
   if (process.platform === "darwin") return path.join(root, "app", "llm-backend", "mac", process.arch === "arm64" ? "arm64" : "x64", "llama-server");
-  return null; // Windows needs a real .exe; the streaming test is skipped there with a reason.
+  return path.join(root, "app", "llm-backend", "win", "cpu", "llama-server.exe");
+}
+
+// Windows: compile fake-llama-launcher.cs with the .NET Framework compiler that ships with Windows.
+// Fails loudly if it is missing; the streaming tests must not be skipped (issue #14).
+function compileWindowsLauncher(outExe) {
+  const windir = process.env.WINDIR || process.env.SystemRoot || "C:\\Windows";
+  const candidates = ["Framework64", "Framework"].map((f) => path.join(windir, "Microsoft.NET", f, "v4.0.30319", "csc.exe"));
+  const csc = candidates.find((c) => fs.existsSync(c));
+  if (!csc) throw new Error(`csc.exe not found (looked in ${candidates.join(", ")}); cannot build the Windows fake llama-server`);
+  const r = spawnSync(csc, ["/nologo", "/target:exe", "/optimize+", `/out:${outExe}`, path.join(__dirname, "fake-llama-launcher.cs")], { encoding: "utf8" });
+  if (r.status !== 0) throw new Error(`csc.exe failed (${r.status}):\n${r.stdout}\n${r.stderr}`);
 }
 
 // Build an isolated root: scripts/ copied from the checkout, empty app/ data folders, sentinel files
@@ -43,8 +54,11 @@ function makeRoot() {
   fs.writeFileSync(path.join(root, "app", "SENTINEL.png"), "outside outputs/");
   fs.writeFileSync(path.join(root, "app", "SENTINEL.txt"), "outside transcriptions/");
   const fake = fakeLlamaPath(root);
-  if (fake) {
-    fs.mkdirSync(path.dirname(fake), { recursive: true });
+  fs.mkdirSync(path.dirname(fake), { recursive: true });
+  if (IS_WIN) {
+    fs.copyFileSync(path.join(__dirname, "fake-llama-server.cjs"), path.join(path.dirname(fake), "fake-llama-server.cjs"));
+    compileWindowsLauncher(fake);
+  } else {
     fs.copyFileSync(path.join(__dirname, "fake-llama-server.cjs"), fake);
     fs.chmodSync(fake, 0o755);
   }
@@ -58,6 +72,7 @@ async function startServer(root, extraEnv = {}) {
     PORT: String(port), FRONTEND_PORT: String(port), LLM_PORT: String(llm), BACKEND_PORT: String(sd),
     SD_BACKEND_PORT: String(sd), SPEECH_PORT: String(speech), TTS_PORT: String(tts),
     UAIS_HOST: "", UAIS_ALLOWED_ORIGINS: "", UAIS_ALLOWED_HOSTS: "",
+    USAP_TEST_NODE: process.execPath, // used by the Windows fake llama-server launcher
     ...extraEnv,
   };
   const proc = spawn(process.execPath, [path.join(root, "scripts", "server", "serve.cjs")], {
@@ -73,7 +88,7 @@ async function startServer(root, extraEnv = {}) {
     if (Date.now() > deadline) throw new Error(`server did not start:\n${log}`);
     await new Promise((r) => setTimeout(r, 200));
   }
-  return { port, proc, root, log: () => log };
+  return { port, llmPort: llm, proc, root, log: () => log };
 }
 
 // Stop the server and anything it spawned (engines), so no test leaves processes behind.
@@ -91,6 +106,9 @@ function request(port, method, urlPath, { body, headers = {}, raw = false } = {}
     if (data !== null) h["Content-Length"] = Buffer.byteLength(data);
     const req = http.request({ host: "127.0.0.1", port, method, path: urlPath, headers: h, timeout: 30000 }, (res) => {
       const chunks = [];
+      // A connection cut after the headers is reported on the response, not the request.
+      res.on("aborted", () => reject(Object.assign(new Error(`response aborted: ${method} ${urlPath}`), { partial: Buffer.concat(chunks).toString("utf8") })));
+      res.on("error", (err) => reject(Object.assign(err, { partial: Buffer.concat(chunks).toString("utf8") })));
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
         const text = Buffer.concat(chunks).toString("utf8");

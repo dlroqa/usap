@@ -8,7 +8,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
-const { IS_WIN, makeRoot, startServer, stopServer, request, checkShape, fakeLlamaPath } = require("./api-contract/harness.cjs");
+const { makeRoot, startServer, stopServer, request, checkShape, fakeLlamaPath } = require("./api-contract/harness.cjs");
 const { GET_ROUTES } = require("./api-contract/routes.cjs");
 
 const contract = JSON.parse(fs.readFileSync(path.join(__dirname, "api-contract", "contract.json"), "utf8"));
@@ -175,36 +175,112 @@ test("engines unavailable: requests fail with an explanation and the server keep
   assert.equal(health.status, 200);
 });
 
-// ── 6. Streaming chat format (through a fake llama-server) ──────────────────
-test("streaming: /api/llm/chat streams OpenAI-style SSE chunks ending in [DONE]; non-stream returns JSON", {
-  skip: IS_WIN ? "Windows needs a real llama-server.exe; streaming is covered on Linux and macOS" : false,
-}, async () => {
-  assert.ok(fs.existsSync(fakeLlamaPath(root)), "fake llama-server installed");
+// ── 6. Streaming chat (through a fake llama-server; a compiled stand-in .exe on Windows) ──
+const net = require("node:net");
+const http = require("node:http");
+
+function sseEvents(text) {
+  return text.split("\n\n").map((e) => e.trim()).filter(Boolean);
+}
+function deltas(events) {
+  return events.filter((e) => e.startsWith("data: {")).map((e) => JSON.parse(e.slice(6)).choices?.[0]?.delta?.content || "").join("");
+}
+const chat = (content, stream = true, raw = true) =>
+  request(srv.port, "POST", "/api/llm/chat", { body: { messages: [{ role: "user", content }], stream }, raw });
+const engineStats = async () => JSON.parse((await request(srv.llmPort, "GET", "/fake/stats", { raw: true })).text);
+const portOpen = (port) => new Promise((resolve) => {
+  const s = net.connect({ host: "127.0.0.1", port }, () => { s.destroy(); resolve(true); });
+  s.on("error", () => resolve(false));
+});
+
+test("streaming: the fake engine starts through the normal backend path on this OS", async () => {
+  assert.ok(fs.existsSync(fakeLlamaPath(root)), `fake llama-server installed at ${fakeLlamaPath(root)}`);
   fs.writeFileSync(path.join(root, "app", "llm-models", "contract-stream.gguf"), Buffer.from("GGUF\x03\x00\x00\x00"));
   const start = await request(srv.port, "POST", "/api/llm/start", { body: { model: "contract-stream.gguf", contextSize: 512, gpuLayers: 0 } });
   assert.equal(start.status, 200, `llm/start: ${start.text}\n${srv.log().slice(-2000)}`);
   assert.equal(start.json.ok, true);
   let ready = false;
-  for (let i = 0; i < 50 && !ready; i++) {
+  for (let i = 0; i < 100 && !ready; i++) {
     ready = (await request(srv.port, "GET", "/api/llm/status")).json.ready === true;
     if (!ready) await new Promise((r) => setTimeout(r, 200));
   }
-  assert.ok(ready, "LLM reports ready");
+  assert.ok(ready, `LLM reports ready\n${srv.log().slice(-2000)}`);
+  srv.llmPort = (await request(srv.port, "GET", "/api/llm/status")).json.port;
+});
 
-  const s = await request(srv.port, "POST", "/api/llm/chat", { body: { messages: [{ role: "user", content: "hi" }], stream: true }, raw: true });
+test("streaming: OpenAI-style SSE chunks end with finish_reason and [DONE]; non-stream returns JSON", async () => {
+  const s = await chat("hi");
   assert.equal(s.status, 200);
   assert.match(String(s.headers["content-type"]), /^text\/event-stream/);
-  const events = s.text.split("\n\n").map((e) => e.trim()).filter(Boolean);
+  const events = sseEvents(s.text);
   assert.ok(events.every((e) => e.startsWith("data: ")), "every SSE event is a data: line");
   assert.equal(events.at(-1), "data: [DONE]");
-  const chunks = events.slice(0, -1).map((e) => JSON.parse(e.slice(6)));
-  assert.equal(chunks.map((c) => c.choices?.[0]?.delta?.content || "").join(""), "Contract test reply.");
-  assert.equal(chunks.at(-1).choices[0].finish_reason, "stop");
+  assert.equal(deltas(events), "Contract test reply.");
+  assert.equal(JSON.parse(events.at(-2).slice(6)).choices[0].finish_reason, "stop");
 
-  const n = await request(srv.port, "POST", "/api/llm/chat", { body: { messages: [{ role: "user", content: "hi" }], stream: false } });
+  const n = await chat("hi", false, false);
   assert.equal(n.status, 200);
   assert.equal(n.json.choices[0].message.content, "Contract test reply.");
+});
 
+test("streaming: many chunks arrive complete and in order", async () => {
+  const s = await chat("MODE:count=200");
+  assert.equal(s.status, 200);
+  const events = sseEvents(s.text);
+  assert.equal(events.at(-1), "data: [DONE]");
+  assert.equal(deltas(events), Array.from({ length: 200 }, (_, i) => `${i} `).join(""));
+});
+
+test("streaming: an engine error before streaming becomes a JSON error with the engine's status and message", async () => {
+  const s = await chat("MODE:http-error", true, false);
+  assert.equal(s.status, 400);
+  assert.equal(s.json.ok, false);
+  assert.equal(s.json.error, "fake engine rejected the request");
+});
+
+test("streaming: an engine failure mid-stream cuts the client's stream promptly (no [DONE]); the next request works", async () => {
+  const t0 = Date.now();
+  const outcome = await chat("MODE:crash-mid").then((r) => ({ completed: true, text: r.text }), (err) => ({ completed: false, text: err.partial || "" }));
+  assert.equal(outcome.completed, false, "a stream whose engine died must not end as a normal response");
+  assert.ok(Date.now() - t0 < 10000, "the client is released promptly, not left waiting");
+  assert.ok(!outcome.text.includes("[DONE]"), "a broken stream must not look complete");
+  assert.ok(deltas(sseEvents(outcome.text)).startsWith("partial-1 partial-2"), "chunks sent before the failure arrive in order");
+  const ok = await chat("hi");
+  assert.equal(ok.status, 200);
+  assert.equal(sseEvents(ok.text).at(-1), "data: [DONE]");
+});
+
+test("streaming: when the client disconnects, the request to the engine is aborted", async () => {
+  const before = await engineStats();
+  await new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port: srv.port, method: "POST", path: "/api/llm/chat", headers: { "Content-Type": "application/json" } }, (res) => {
+      let got = 0;
+      res.on("data", () => { if (++got === 3) { req.destroy(); resolve(); } });
+    });
+    req.on("error", () => {});
+    req.on("timeout", () => reject(new Error("timeout")));
+    req.end(JSON.stringify({ messages: [{ role: "user", content: "MODE:slow" }], stream: true }));
+  });
+  let after = before;
+  for (let i = 0; i < 50 && after.aborted === before.aborted; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    after = await engineStats();
+  }
+  assert.equal(after.aborted, before.aborted + 1, "the engine saw the abort");
+  assert.equal(after.completed, before.completed, "the aborted generation did not run to completion");
+});
+
+test("cleanup: stopping the text model stops the engine process and releases its port", async () => {
+  const port = srv.llmPort;
+  assert.equal(await portOpen(port), true, "engine is listening before stop");
   const stop = await request(srv.port, "POST", "/api/llm/stop", { body: {} });
   assert.equal(stop.json.ok, true);
+  let open = true;
+  for (let i = 0; i < 50 && open; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    open = await portOpen(port);
+  }
+  assert.equal(open, false, "engine port still open after stop (orphaned engine process)");
+  const status = await request(srv.port, "GET", "/api/llm/status");
+  assert.equal(status.json.running, false);
 });
