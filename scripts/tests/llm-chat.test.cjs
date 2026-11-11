@@ -345,14 +345,31 @@ test("out of memory: a streaming request that runs out of memory is retried once
   assert.equal((await status()).settings.contextSize, 2048, "no further restarts");
 });
 
-test("out of memory: a non-streaming request is not retried (existing behaviour: the engine's error object is not read, #67)", async () => {
+test("out of memory: a non-streaming request is retried once with a smaller context too, never in a loop (#67)", async () => {
   await load("chat-q4_k_m.gguf");
   const before = await engine("/fake/stats");
   const r = await chat("MODE:oom", { stream: false });
   assert.equal(r.status, 500);
-  assert.equal(JSON.parse(r.text).code, "INTERNAL_ERROR");
-  assert.equal((await status()).settings.contextSize, 4096);
-  assert.equal((await engine("/fake/stats")).pid, before.pid, "no restart");
+  assert.deepEqual(JSON.parse(r.text), { ok: false, error: "ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer" });
+  const s = await waitFor(async () => { const x = await status(); return x.ready ? x : null; });
+  assert.equal(s.settings.contextSize, 2048, "restarted once with the next smaller context");
+  const stats = await engine("/fake/stats");
+  assert.ok(stats.pid !== before.pid);
+  assert.equal(stats.requests, 1, "the restarted engine received exactly one retry");
+  await sleep(1500);
+  assert.equal((await status()).settings.contextSize, 2048, "no further restarts");
+});
+
+test("errors: non-streaming engine errors answer like streaming ones: the engine's status and message, never [object Object] (#67)", async () => {
+  await load("chat-q4_k_m.gguf");
+  const streamed = await chat("MODE:http-error");
+  const plain = await chat("MODE:http-error", { stream: false });
+  assert.equal(plain.status, 400);
+  assert.equal(plain.status, streamed.status);
+  assert.deepEqual(JSON.parse(plain.text), JSON.parse(streamed.text));
+  assert.deepEqual(JSON.parse(plain.text), { ok: false, error: "fake engine rejected the request" });
+  assert.doesNotMatch(plain.text, /\[object Object\]/);
+  assert.equal((await status()).settings.contextSize, 4096, "a client error is not retried");
 });
 
 // ── Conversations ────────────────────────────────────────────────────────────
@@ -442,7 +459,7 @@ test("trust boundary: web results enter as one user message after the system pro
     getMessageText: (c) => (typeof c === "string" ? c : ""),
   });
   const state = Object.freeze({ get PORT_LLM() { return fake.port; }, get llmSettings() { return { model: "unit.gguf", contextSize: 4096 }; } });
-  const chatService = createChatService({ state, errorBody: errors.errorBody, errorStatus: errors.errorStatus, http, json, requestJson,
+  const chatService = createChatService({ state, errorBody: errors.errorBody, errorStatus: errors.errorStatus, http, json, redactPaths: errors.redactPaths, requestJson,
     runExclusiveLlmOperation: async (fn) => fn(), startLlm: async () => { throw new Error("no restart in this test"); }, webSearch });
   const app = http.createServer((req, res) => { let b = ""; req.on("data", (c) => { b += c; }); req.on("end", () => chatService.doLlmChat(req, res, JSON.parse(b))); });
   await new Promise((r) => app.listen(0, "127.0.0.1", r));
