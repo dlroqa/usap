@@ -1028,7 +1028,14 @@ function requestJson(url, payload = null, timeoutMs = 120000) {
         try {
           const jsonBody = JSON.parse(body || "{}");
           if (res.statusCode < 200 || res.statusCode >= 300 || jsonBody.ok === false) {
-            reject(new Error(jsonBody.error || `HTTP ${res.statusCode}`));
+            // #67: llama-server (OpenAI style) reports { error: { message, code, type } }; reading the object as
+            // a string gave "[object Object]". The engine's status is kept for callers that pass it on.
+            const engineError = jsonBody.error;
+            const message = typeof engineError === "string" ? engineError
+              : (engineError && typeof engineError.message === "string" && engineError.message) || `HTTP ${res.statusCode}`;
+            const err = new Error(message);
+            if (res.statusCode < 200 || res.statusCode >= 300) err.upstreamStatus = res.statusCode;
+            reject(err);
             return;
           }
           resolve(jsonBody);
@@ -1620,7 +1627,7 @@ router.use(modelRoutes({
   searchHuggingFaceModels, speech, startImageBackendDownload, startModelDownload, startOpenVinoModelDownload, streamModelUpload,
 }));
 // Chat requests and saved conversations (Step 9.8h): services/chat.cjs and services/conversations.cjs.
-const chatService = createChatService({ state: llmEngine.state, errorBody, errorStatus, http, json, requestJson, runExclusiveLlmOperation, startLlm, webSearch });
+const chatService = createChatService({ state: llmEngine.state, errorBody, errorStatus, http, json, redactPaths: errors.redactPaths, requestJson, runExclusiveLlmOperation, startLlm, webSearch });
 const conversations = createConversationStore({ CHAT_HISTORY, badRequest, formatBytes, fs, path, pathInside, readdirVisible, safeOutputName });
 router.use(llmRoutes({
   state: llmEngine.routeState, PREFERRED_LLM_PORT, benchmarkLlmModel, deleteChatConversation: conversations.deleteChatConversation, doLlmChat: chatService.doLlmChat, errorBody, errorStatus, getLlmBackend, getLlmBackendProbe, getLlmRuntimeStats, getLlmfitRecommendations: (...args) => createLlmfitLookup({ ROOT, fs, getGpuInfo, os, osPlatform, path, spawnSync }).getLlmfitRecommendations(...args), getPersistedLlmModelSettings, json, jsonErrorStatus, killLlm, listChatConversations: conversations.listChatConversations, llmEngineState, llmLifecycleSnapshot, path, publicPaths, readJsonBody, runExclusiveLlmOperation, saveChatConversation: conversations.saveChatConversation, startLlm, stopLlmNow, updateLlmModelSettings,
