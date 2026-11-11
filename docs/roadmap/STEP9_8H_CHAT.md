@@ -1,6 +1,6 @@
 # Step 9.8h: text engine, chat and streaming
 
-Status: **in review** (not merged). Part of the modular backend plan in [STEP9_8_MODULES.md](STEP9_8_MODULES.md).
+Status: **done** (#70, merged). Part of the modular backend plan in [STEP9_8_MODULES.md](STEP9_8_MODULES.md).
 This is the last 9.8 extraction.
 
 This step moves the text engine (llama.cpp), chat requests, streaming and saved conversations out of
@@ -32,7 +32,7 @@ doLlmChat                                  ← web-search.cjs augmentMessagesWit
 
 Out of memory: a streaming request whose engine answer looks like an allocation failure restarts the engine once
 with the next smaller context (`retryLowerContext`, through the engine lock) and is sent again; a second failure is
-returned. The non-streaming path never detects it (existing bug, #67).
+returned. Before #67 was fixed, the non-streaming path never detected it; it now retries the same way.
 
 Engine lifecycle (`POST /api/llm/start`, `/api/llm/stop`, automatic restarts):
 
@@ -134,7 +134,7 @@ Changes to these boundaries belong in separate security PRs (the planned prompt-
   requests and nothing runs on; stopping during a stream ends it without `[DONE]`, frees the port and does not
   restart; chat refused while loading; overlapping loads leave one engine;
 * an engine killed mid-stream: the stream is cut, the engine is restarted once (limit 3), and chat works again;
-* out of memory while streaming: one retry with a smaller context, no loop; not streaming: no retry (#67);
+* out of memory: one retry with a smaller context, no loop, streaming or not (the non-streaming retry since #67);
 * conversations: file format, order, dropped roles, omitted images, newest first, kept across a server restart;
   hostile ids never reach outside the folder;
 * web results as one user message after the system prompt, the client's messages unchanged, control tokens
@@ -156,7 +156,7 @@ leaving mid-stream does not break the next request. GPU and NPU backends are unv
   with no queue limit. Resource scheduling is Step 9.9.
 * A streaming request to the engine has no timeout; a non-streaming one times out after 5 minutes. A client that
   leaves always ends its engine request.
-* A non-streaming engine error answers `500 "[object Object]"` and is never retried after running out of memory (#67).
+* Fixed since: a non-streaming engine error answered `500 "[object Object]"` and was never retried after running out of memory (#67).
 * A text engine that cannot be started (for example not executable) stops the whole server (#68).
 * Some validation errors still answer `500` (for example an invalid conversation id), as noted in Step 9.7.
 * llmfit recommendations are looked up again on every request (#69).

@@ -10,6 +10,8 @@
 // routes may set the four values they set before the move (`routeState`).
 "use strict";
 
+const { describeSpawnError, isLaunchFailure } = require("../spawn-error.cjs");
+
 const REQUIRED = ["BACKEND_PATHS","IS_MAC_INTEL","MAC_INTEL_IMAGE_MESSAGE","MODELS","OUTPUTS","PREFERRED_BACKEND_PORT","ROOT","assertNoOtherActiveRuntime","backendValidationErrors","badRequest","checkPort","conflict","describeLinuxRuntimeLinkerError","findOpenVinoModel","fs","getBackendOptions","getBackendPath","getDefaultModel","getModelLoadIssue","getOpenVinoModelInfo","getOpenVinoNpuInfo","getPreferredVulkanBackendName","http","json","killLlm","os","osPlatform","path","pollNvidiaVram","readdirVisible","requestJson","safeOutputName","spawn","spawnSync","stripAnsi","supervisor","withoutAuthHeaders","withoutCorsHeaders"];
 
 function createImageEngine(deps) {
@@ -1001,6 +1003,18 @@ function createImageEngine(deps) {
           backendError = nextError;
         }
       }
+    });
+    // #68: a launch failure (EACCES and the like) is an "error" event, not an exit; without a listener it
+    // stopped the whole server. Now the start fails with a clear message and the server keeps running.
+    proc.on("error", (err) => {
+      if (!isLaunchFailure(proc)) { console.warn("  [backend] engine process error:", err.message); return; }
+      if (coremlLoadHeartbeat) clearInterval(coremlLoadHeartbeat);
+      console.error("  [backend] Could not start", backendPath, "-", err.code || "", err.message);
+      if (backendProc !== proc) return;
+      backendError = describeSpawnError(err, "image engine (stable-diffusion.cpp)");
+      backendReady = false;
+      backendProc = null;
+      backendLoadState.active = false;
     });
     proc.on("exit", (code, signal) => {
       if (coremlLoadHeartbeat) clearInterval(coremlLoadHeartbeat);
