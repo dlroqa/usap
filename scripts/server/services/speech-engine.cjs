@@ -7,6 +7,8 @@
 // its free variables now come from `deps`. No HTTP here (see routes/speech.cjs).
 "use strict";
 
+const { describeSpawnError, isLaunchFailure } = require("../spawn-error.cjs");
+
 const os = require("os");
 
 const SPEECH_MODEL_CATALOG = [
@@ -342,6 +344,16 @@ function createSpeechService(deps) {
       proc.stderr.on("data", (data) => {
         stderr += data.toString();
         process.stderr.write("  [speech-err] " + data.toString());
+      });
+      // #68: a launch failure (EACCES and the like) is an "error" event, not an exit; without a listener it
+      // stopped the whole server. Now the transcription fails with a clear message.
+      proc.on("error", (err) => {
+        if (!isLaunchFailure(proc)) { console.warn("  [speech] engine process error:", err.message); return; }
+        console.error("  [speech] Could not start", backend.cli, "-", err.code || "", err.message);
+        try { fs.unlinkSync(wavPath); } catch (_) {}
+        speechTranscriptionState = { active: false, phase: "Failed", progress: 0, model: model.filename, filename: sourceFilename };
+        speechError = describeSpawnError(err, "speech engine (whisper.cpp)");
+        reject(new Error(speechError));
       });
       proc.on("exit", (code) => {
         try { fs.unlinkSync(wavPath); } catch (_) {}
