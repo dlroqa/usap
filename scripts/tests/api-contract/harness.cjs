@@ -42,8 +42,22 @@ function compileWindowsLauncher(outExe) {
 // Build an isolated root: scripts/ copied from the checkout, empty app/ data folders, sentinel files
 // OUTSIDE every data folder (to prove traversal attempts can't read or delete them), and a fake
 // llama-server where the OS allows a script executable.
+// Every temp root and server made here is remembered. When the test process exits, servers that are
+// still running are stopped and roots that are still there are removed, so a failed or forgetful test
+// never leaves folders in the temp directory. Only paths this harness created are touched.
+const liveRoots = new Set();
+const liveServers = new Set();
+process.on("exit", () => {
+  for (const srv of liveServers) { try { stopServer(srv); } catch (_) { /* already gone */ } }
+  for (const root of liveRoots) {
+    if (!path.basename(root).startsWith("usap-contract-") || path.dirname(root) !== path.resolve(os.tmpdir())) continue;
+    try { fs.rmSync(root, { recursive: true, force: true, maxRetries: 3 }); } catch (_) { /* Windows may hold files briefly */ }
+  }
+});
+
 function makeRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "usap-contract-"));
+  liveRoots.add(path.resolve(root));
   fs.cpSync(path.join(REPO, "scripts"), path.join(root, "scripts"), { recursive: true });
   for (const d of ["models", "llm-models", "outputs", "chat-history", "speech-models", "transcriptions", "tts-models", "tts-outputs"]) {
     fs.mkdirSync(path.join(root, "app", d), { recursive: true });
@@ -93,7 +107,10 @@ async function startServer(root, extraEnv = {}, { readyPath = "/api/health" } = 
     }
     await new Promise((r) => setTimeout(r, 200));
   }
-  return { port, llmPort: llm, proc, root, log: () => log };
+  const srv = { port, llmPort: llm, proc, root, log: () => log };
+  liveServers.add(srv);
+  proc.on("exit", () => liveServers.delete(srv));
+  return srv;
 }
 
 // Stop the server and anything it spawned (engines), so no test leaves processes behind.

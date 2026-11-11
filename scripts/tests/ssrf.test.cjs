@@ -5,6 +5,7 @@
 "use strict";
 const assert = require("node:assert/strict");
 const http = require("node:http");
+const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 
@@ -262,5 +263,6 @@ test("downloads: model download endpoints refuse internal destinations with a cl
     assert.equal(progress.json.active, false, "no download was started");
   } finally {
     stopServer(srv);
+    try { fs.rmSync(root, { recursive: true, force: true }); } catch (_) { /* Windows may hold files briefly */ }
   }
 });
