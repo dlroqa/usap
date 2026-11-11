@@ -47,13 +47,21 @@ function compileWindowsLauncher(outExe) {
 // never leaves folders in the temp directory. Only paths this harness created are touched.
 const liveRoots = new Set();
 const liveServers = new Set();
-process.on("exit", () => {
+function cleanUpLeftovers() {
   for (const srv of liveServers) { try { stopServer(srv); } catch (_) { /* already gone */ } }
+  liveServers.clear();
   for (const root of liveRoots) {
     if (!path.basename(root).startsWith("usap-contract-") || path.dirname(root) !== path.resolve(os.tmpdir())) continue;
     try { fs.rmSync(root, { recursive: true, force: true, maxRetries: 3 }); } catch (_) { /* Windows may hold files briefly */ }
   }
-});
+  liveRoots.clear();
+}
+process.on("exit", cleanUpLeftovers);
+// An interrupted run (Ctrl+C, or the test runner stopping a file) skips "exit" handlers unless the signal is
+// handled. A hard kill (SIGKILL, Windows TerminateProcess) can't run any clean-up; those roots stay behind.
+for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
+  process.once(signal, () => { cleanUpLeftovers(); process.exit(code); });
+}
 
 function makeRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "usap-contract-"));
