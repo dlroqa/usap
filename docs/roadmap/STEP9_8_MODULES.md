@@ -52,7 +52,7 @@ scripts/server/
 | **9.8b** (#37, done) | `routes/tts.cjs` + `services/tts-engine.cjs` | Low: self-contained |
 | **9.8c** (#40, done) | `routes/speech.cjs` + `services/speech-engine.cjs` (including the binary upload route) | Medium: streaming upload |
 | **9.8d** (#46, done) | `routes/search.cjs` + `services/web-search.cjs`, trust boundary documented | Low |
-| 9.8e | `services/hardware.cjs` (detection used by several routes) | Medium: shared |
+| 9.8e (planned: [plan](STEP9_8E_PLAN.md)) | `services/hardware.cjs` (detection used by several routes) | Medium: shared |
 | 9.8f | `routes/models.cjs` + `services/model-store.cjs` + `services/downloads.cjs` | Medium: file operations; traversal tests already exist |
 | 9.8g | `routes/image.cjs` + `services/image-engine.cjs` (proxy included) | Medium |
 | 9.8h | `routes/llm.cjs` + `services/llm-engine.cjs` (chat streaming last) | Highest: streaming contract tests on all 4 OS |
