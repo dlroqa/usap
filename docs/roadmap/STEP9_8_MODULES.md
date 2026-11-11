@@ -69,8 +69,9 @@ Each PR is reviewed and merged separately, with owner approval.
 Step 9.8 moved code without changing behaviour, so issues found along the way are tracked separately. Open
 when 9.8 finished:
 
-* **Reliability:** an engine file that can't be started stops the server (#68; fix in review). Non-streaming
-  chat errors read `[object Object]` and skip the out-of-memory retry (#67; fix in review). Image generation
+* **Fixed after 9.8:** an engine file that can't be started no longer stops the server (#68, PR #72), and
+  non-streaming chat reports the engine's error and retries once after running out of memory (#67, PR #73).
+* **Reliability:** image generation
   can't be cancelled (#64), nor can transcription (#41). The llmfit cache is never reused (#69). Concurrent
   requests have no queue limits or shared CPU and memory budget (Step 9.9). Crash recovery exists for the text
   engine only (#32, #33). An engine can be orphaned if only its guard is force-killed (#31).
