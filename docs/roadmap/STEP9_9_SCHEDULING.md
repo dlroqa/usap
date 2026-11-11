@@ -100,7 +100,7 @@ separate UI change is approved.
 | Stage | PR | Behaviour change | Rollback |
 |---|---|---|---|
 | 9.9a (done) | Fix #68 (unstartable engine stops the server; PR #72) and #67 (non-streaming chat errors; PR #73), both merged | Bug fixes only | Revert the PR |
-| 9.9b | `services/scheduler.cjs` with read-only accounting; `GET /api/resources`; tests | None: it only records and reports | `USAP_SCHEDULER=off` hides the route |
+| 9.9b (in review) | `services/scheduler.cjs` with read-only accounting; `GET /api/resources`; tests | None: it only records and reports | `USAP_SCHEDULER=off` (or `"scheduler": "off"` in `app/config/scheduler.json`) leaves the route out |
 | 9.9c | Memory check before loading a model, **warn only** (a field in the start response and a log line) | None for users; adds a field | Setting `memoryCheck: off` |
 | 9.9d | Chat queue limit and disconnect-aware queue | Requests past the limit get `429` | `chatQueue: off` restores the unbounded queue |
 | 9.9e | Thread budget shared between engines | Thread counts change only when engines overlap | `threads: off` |
@@ -108,6 +108,20 @@ separate UI change is approved.
 
 Each stage lands only after its tests pass on all 4 OS and the native-runtime timings (Step 9.10) don't regress.
 Stages 9.9c–f change behaviour and each needs a separate owner approval.
+
+### Stage 9.9b as built
+
+* `services/scheduler.cjs` builds a snapshot from accessors the engines already have, plus counters added to the
+  existing operation queues (text engine, speech, voice) and to chat requests (active, and streaming requests
+  waiting for the one engine connection). The counters only count: order, timing and limits are unchanged.
+* `GET /api/resources` (`routes/resources.cjs`) returns `{ ok, scheduler: { mode: "observe", decisions: false },
+  cpu, memory, heavyModel, engines, limits }`. Every number is `{ value, known }`; unknown memory is
+  `{ value: null, known: false }`, and a VRAM total of 0 counts as unknown. It names no model, path, prompt,
+  conversation, client or credential; `heavyModel` is only `{ type }`. Every limit reads `off`.
+* The image engine has no studio-side queue, so its queue is reported as unknown.
+* Rollback: `USAP_SCHEDULER=off` or `app/config/scheduler.json` `{ "scheduler": "off" }`. The environment wins.
+* Evidence: `scripts/tests/scheduler.test.cjs` (8 tests), and the 9.8h 60-request golden comparison against
+  `main` is identical with the scheduler on and off.
 
 ## 4. Tests (GitHub Actions)
 

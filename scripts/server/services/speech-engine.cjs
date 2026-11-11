@@ -196,9 +196,13 @@ function createSpeechService(deps) {
     return { ...model, path: modelPath };
   }
 
+  let pendingOperations = 0;
   function runExclusiveSpeechOperation(operation) {
     const run = speechOperationQueue.catch(() => {}).then(operation);
     speechOperationQueue = run.catch(() => {});
+    // Step 9.9b: counted for GET /api/resources only (running + waiting); order and timing are unchanged.
+    pendingOperations += 1;
+    speechOperationQueue.then(() => { pendingOperations -= 1; });
     return run;
   }
 
@@ -408,6 +412,7 @@ function createSpeechService(deps) {
     catalog: SPEECH_MODEL_CATALOG,
     // operations
     getSpeechBackendCandidates, normalizeSpeechBackendPreference, getSpeechBackend, getSpeechModels, resolveSpeechModel,
+    getPendingOperations: () => pendingOperations,
     runExclusiveSpeechOperation, startSpeech, stopSpeech, saveTranscript, listTranscriptions, transcribeWavBuffer,
   };
 }
