@@ -20,6 +20,7 @@ const { decideRestart } = require("./restart-policy.cjs");
 // Step 9.7: one error model (status by cause, machine-readable code, no stacks, no host paths).
 const errors = require("./errors.cjs");
 const { ApiError, badRequest, notFound, conflict, notInstalled, errorStatus, errorBody, publicMessage, configurePathRedaction } = errors;
+const { publicPaths } = require("./public-paths.cjs");
 // Step 9.8: request pipeline (security order + error boundary), router and route modules.
 const { createRouter } = require("./http/router.cjs");
 const { createPipeline } = require("./http/pipeline.cjs");
@@ -5522,7 +5523,8 @@ const webSearch = createWebSearchService({
 });
 
 const router = createRouter();
-router.use(systemRoutes({ json, getHealth, getDiagnostics, getCleanupCandidates, getHardwareSpecs, getBackendOptions, getTelemetry }));
+// Status responses carry shortened paths for every client (issue #52); internal callers keep absolute ones.
+router.use(systemRoutes({ json, getHealth: async () => publicPaths(await getHealth()), getDiagnostics: async () => publicPaths(await getDiagnostics()), getCleanupCandidates, getHardwareSpecs, getBackendOptions: () => publicPaths(getBackendOptions()), getTelemetry }));
 router.use(ttsRoutes({ tts, json, readJsonBody, jsonErrorStatus, errorStatus, errorBody, streamModelUpload, pathInside, fs, path, MIME, TTS_MODELS, TTS_OUTPUTS }));
 router.use(speechRoutes({ speech, SPEECH_MODELS, TRANSCRIPTIONS, downloadBlockReason, getDownloadState: () => downloadState, errorBody, errorStatus, fs, json, jsonErrorStatus, path, pathInside, readBinaryBody, readJsonBody, startModelDownload, streamModelUpload }));
 router.use(searchRoutes({ webSearch, json, readJsonBody, errorStatus, errorBody }));
@@ -5564,7 +5566,7 @@ async function legacyRoutes(req, res) {
   if (req.url === "/api/llm/status" && req.method === "GET") {
     const backend = getLlmBackend();
     const probe = getLlmBackendProbe();
-    return json(res, 200, {
+    return json(res, 200, publicPaths({
       ready: llmReady,
       running: llmProc !== null,
       port: PORT_LLM,
@@ -5577,16 +5579,16 @@ async function legacyRoutes(req, res) {
       selectedBackend: probe.selected,
       availableBackends: probe.available,
       engine: llmLifecycleSnapshot(), // additive (Step 9.6)
-    });
+    }));
   }
 
   if (req.url.startsWith("/api/llm/backends") && req.method === "GET") {
     const parsed = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-    return json(res, 200, { ok: true, ...getLlmBackendProbe(parsed.searchParams.get("refresh") === "1") });
+    return json(res, 200, publicPaths({ ok: true, ...getLlmBackendProbe(parsed.searchParams.get("refresh") === "1") }));
   }
 
   if (req.url === "/api/llm/stats" && req.method === "GET") {
-    return json(res, 200, getLlmRuntimeStats());
+    return json(res, 200, publicPaths(getLlmRuntimeStats()));
   }
 
   if (req.url === "/api/llm/model-settings" && req.method === "GET") {
