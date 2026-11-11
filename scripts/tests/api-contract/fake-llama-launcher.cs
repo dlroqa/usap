@@ -1,4 +1,4 @@
-// Windows stand-in for llama-server.exe, used ONLY by the API contract tests (issue #14).
+// Windows stand-in for llama-server.exe (and, since Step 9.8g, sd-cpu.exe), used ONLY by the tests (issue #14).
 // Compiled at test time with the .NET Framework compiler that ships with Windows (csc.exe) into a
 // temp test root; never shipped. It runs `node fake-llama-server.cjs <same arguments>` and relays the
 // exit code. The child is placed in a Job Object with KILL_ON_JOB_CLOSE, so when the studio server
@@ -70,7 +70,9 @@ static class FakeLlamaLauncher
     static int Main(string[] args)
     {
         string dir = AppDomain.CurrentDomain.BaseDirectory;
-        string script = Path.Combine(dir, "fake-llama-server.cjs");
+        // <exe name>.cjs next to the exe if present (sd-cpu.exe -> sd-cpu.cjs, the fake sd-server); else the fake llama-server.
+        string own = Path.Combine(dir, Path.GetFileNameWithoutExtension(System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName) + ".cjs");
+        string script = File.Exists(own) ? own : Path.Combine(dir, "fake-llama-server.cjs");
         string node = Environment.GetEnvironmentVariable("USAP_TEST_NODE");
         if (string.IsNullOrEmpty(node)) node = "node";
 

@@ -140,9 +140,11 @@ test("chat streams preserve fragmented content, reasoning, sources and metadata"
 });
 
 test("slow image generation has no fixed proxy timeout and blocks destructive restarts", () => {
-  const server = read("scripts/server/serve.cjs");
+  // The image engine and its routes moved to services/image-engine.cjs and routes/image.cjs in Step 9.8g
+  // (engine state is read as state.X in the routes).
+  const server = read("scripts/server/services/image-engine.cjs");
   assert.match(server, /function proxyImageBackendRequest[\s\S]*?timeout:\s*0/);
-  assert.match(server, /if \(generationState\.active\)[\s\S]*?Image generation is in progress/);
+  assert.match(read("scripts/server/routes/image.cjs"), /if \(state\.generationState\.active\)[\s\S]*?Image generation is in progress/);
 });
 
 test("Windows OpenVINO setup only accepts Intel NPUs and remains optional", () => {
@@ -184,7 +186,8 @@ test("Windows launcher remains ASCII-safe for cmd.exe", () => {
 
 test("Windows Vulkan setup repairs issue 10 runtime and RX 580 backend failures", () => {
   const setup = read("scripts/setup/setup.ps1");
-  const server = read("scripts/server/serve.cjs");
+  // Backend start-up and its error messages moved to services/image-engine.cjs in Step 9.8g.
+  const server = read("scripts/server/services/image-engine.cjs");
 
   assert.match(setup, /https:\/\/aka\.ms\/vc14\/vc_redist\.x64\.exe/);
   assert.match(setup, /VCOMP140\.dll/);
@@ -198,7 +201,8 @@ test("Windows Vulkan setup repairs issue 10 runtime and RX 580 backend failures"
 
 test("Windows setup repairs issue 44 illegal instructions and RTX 50 CUDA runtime", () => {
   const setup = read("scripts/setup/setup.ps1");
-  const server = read("scripts/server/serve.cjs");
+  // Backend start-up and its error messages moved to services/image-engine.cjs in Step 9.8g.
+  const server = read("scripts/server/services/image-engine.cjs");
 
   assert.match(setup, /master-782-b290693\/sd-master-b290693-bin-win-cuda12-x64\.zip/);
   assert.match(setup, /master-782-b290693\/cudart-sd-bin-win-cu12-x64\.zip/);
@@ -318,10 +322,12 @@ test("issue 87: vision catalog models ship matching projectors and never borrow 
 });
 
 test("issue 86: image backend validation keeps the real failure reason", () => {
-  const server = read("scripts/server/serve.cjs");
+  // Backend validation moved to services/image-engine.cjs in Step 9.8g; the removed message must not be anywhere.
+  const server = read("scripts/server/services/image-engine.cjs");
+  const allServer = ["serve.cjs", "services/image-engine.cjs", "routes/image.cjs", "services/downloads.cjs"].map((f) => read(`scripts/server/${f}`)).join("\n");
   assert.match(server, /amdgpu\.si_support=1/);
   assert.match(server, /build_from_source\.sh/);
-  assert.doesNotMatch(server, /In-app backend downloads are currently available for Windows image backends\./);
+  assert.doesNotMatch(allServer, /In-app backend downloads are currently available for Windows image backends\./);
 });
 
 test("launchers update a stale llama.cpp backend so existing installs get backend fixes", () => {

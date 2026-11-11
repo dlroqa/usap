@@ -175,4 +175,24 @@ function checkShape(value, shape, where = "$", optional = []) {
   return problems;
 }
 
-module.exports = { REPO, IS_WIN, makeRoot, startServer, stopServer, request, shapeOf, checkShape, fakeLlamaPath };
+// Step 9.8g: a fake stable-diffusion.cpp sd-server at the path the studio uses for the CPU image engine on
+// this OS (fake-sd-server.cjs; on Windows through the same compiled launcher, as sd-cpu.exe + sd-cpu.cjs).
+function fakeSdPath(root) {
+  if (process.platform === "linux") return path.join(root, "app", "backend", "linux", "cpu", "sd-server-cpu");
+  if (process.platform === "darwin") return path.join(root, "app", "backend", "mac", "sd");
+  return path.join(root, "app", "backend", "win", "cpu", "sd-cpu.exe");
+}
+function installFakeSdServer(root) {
+  const fake = fakeSdPath(root);
+  fs.mkdirSync(path.dirname(fake), { recursive: true });
+  if (IS_WIN) {
+    fs.copyFileSync(path.join(__dirname, "fake-sd-server.cjs"), path.join(path.dirname(fake), "sd-cpu.cjs"));
+    compileWindowsLauncher(fake);
+  } else {
+    fs.copyFileSync(path.join(__dirname, "fake-sd-server.cjs"), fake);
+    fs.chmodSync(fake, 0o755);
+  }
+  return fake;
+}
+
+module.exports = { REPO, IS_WIN, makeRoot, startServer, stopServer, request, shapeOf, checkShape, fakeLlamaPath, fakeSdPath, installFakeSdServer };

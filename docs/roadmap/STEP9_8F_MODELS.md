@@ -1,6 +1,6 @@
 # Step 9.8f: model management and downloads
 
-Status: **in review** (not merged). Part of the modular backend plan in [STEP9_8_MODULES.md](STEP9_8_MODULES.md).
+Status: **done** (#59, #60, #63). Part of the modular backend plan in [STEP9_8_MODULES.md](STEP9_8_MODULES.md).
 
 This step moves model management and downloads out of `scripts/server/serve.cjs` into three modules. The code is
 moved, not rewritten. API responses, model folders, file names and the interface are unchanged.
