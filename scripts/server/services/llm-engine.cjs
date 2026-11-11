@@ -11,6 +11,8 @@
 // set llmError, which POST /api/llm/start set before the move (`routeState`).
 "use strict";
 
+const { describeSpawnError, isLaunchFailure } = require("../spawn-error.cjs");
+
 const REQUIRED = ["ApiError","LLM_BACKEND_PATHS","LLM_BENCHMARK_PATH","LLM_MODELS","LLM_MODEL_SETTINGS_PATH","PREFERRED_LLM_PORT","assertNoOtherActiveRuntime","badRequest","checkPort","decideRestart","fs","getGpuInfo","getStableSyclGpuLayers","http","isVisionModelFilename","killBackend","killOpenVinoWorker","notFound","notInstalled","os","osPlatform","path","pathInside","readJsonFile","readdirVisible","requestJson","spawnSync","supervisor","waitForChildExit","waitForPortAvailable","writeJsonFile"];
 
 function createLlmEngine(deps) {
@@ -995,6 +997,18 @@ function createLlmEngine(deps) {
           llmError = `${LLAMA_CPP_UNSUPPORTED_ARCHITECTURES[unknownArch[1].toLowerCase()] || `This llama.cpp build does not support the '${unknownArch[1]}' architecture. Re-run setup to update the backend, or pick a different model.`}\n${llmError}`.slice(-1400);
         }
       }
+    });
+    // #68: a launch failure (EACCES and the like) is an "error" event, not an exit. Without a listener it
+    // stopped the whole server. Now it fails this start like a failed launch: waitForLlmReady sees that the
+    // engine is gone and throws llmError, and the next backend or profile is tried.
+    proc.on("error", (err) => {
+      if (!isLaunchFailure(proc)) { console.warn("  [llm] engine process error:", err.message); return; }
+      console.error("  [llm] Could not start", backend.path, "-", err.code || "", err.message);
+      if (llmProc !== proc) return;
+      llmError = describeSpawnError(err, "text engine (llama.cpp)");
+      llmReady = false;
+      llmProc = null;
+      llmLastExit = { code: null, signal: null, at: new Date().toISOString(), unexpected: false };
     });
     proc.on("exit", (code, signal) => {
       if (llmProc !== proc) {
