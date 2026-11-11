@@ -235,15 +235,18 @@ only, no force pushes. Details: [CI_GUIDE.md](docs/ci/CI_GUIDE.md),
 
 * **Step 9, foundational backend** (current): API contract tests; a paths/config module ready for
   portable and installed storage; remaining security findings; engine crash supervision and
-  diagnostics; consistent API errors; modular backend; resource scheduling; performance
-  benchmarks; an optimized Intel image engine. [Plan](docs/roadmap/STEP9_BACKEND_PLAN.md).
+  diagnostics; consistent API errors; modular backend (9.8; 9.8g image generation and 9.8h chat and
+  streaming remain); 9.9 resource scheduling; 9.10 performance benchmarks; 9.11 an optimized Intel
+  image engine; 9.12 installed-mode storage preparation. [Plan](docs/roadmap/STEP9_BACKEND_PLAN.md).
 * **Step 10, desktop installers** (planned): an installed edition next to the portable one,
   Windows `.exe`/`.msi`, Linux AppImage/`.deb`, macOS Apple Silicon and Intel `.dmg`, from the same
   code and interface. [Requirements](docs/roadmap/DESKTOP_INSTALLERS.md).
 * **Step 11, installation and release testing** (planned): install, first launch, upgrade and
   uninstall tests that preserve user data; signing and notarization.
 * **Step 12, production release** (planned): validated architecture-specific releases.
-* **Later, optional** (planned): cloud inference and model routing, off by default.
+* **Later, as separate modules** (planned, none implemented): multi-user accounts and API keys
+  ([#28](https://github.com/dlroqa/usap/issues/28)), Cloudflare-backed user data with offline/online
+  sync, a dedicated prompt-injection defence layer, and optional cloud inference and model routing, off by default.
 
 USAP is not production-release-ready until both the portable and the installed editions pass their
 validation. Full priorities: [PRIORITIES.md](docs/roadmap/PRIORITIES.md).
