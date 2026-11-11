@@ -11,10 +11,9 @@ const guard = require("../server/net-guard.cjs");
 
 const html = fs.readFileSync(path.join(__dirname, "fixtures", "duckduckgo-results.html"), "utf8");
 
-test("#45: snippets are captured on the real page structure, each with its own result", () => {
+test("#45: snippets are captured on the real page structure, each with its own result (the sponsored block is skipped, #50)", () => {
   const results = parseDuckDuckGoHtml(html, 10);
   assert.deepEqual(results.map((r) => [r.title, r.url, r.snippet]), [
-    ["Sponsored: Shop Example", "https://duckduckgo.com/y.js?ad_domain=shop.example&u3=https%3A%2F%2Fshop.example%2Fpromo", "Ad snippet text"],
     ["Tower & History - Example Encyclopedia", "https://en.example.org/wiki/Tower", "The tower is 330 metres tall and was completed in 1889."],
     ["Visiting the Tower | Travel Example", "https://travel.example.com/visit", ""],
     ["Tower lights up for anniversary", "https://news.example.net/2026/tower-lights", "Thousands gathered as the tower was lit \"like never before\"."],
@@ -33,7 +32,7 @@ test("#45: ordering, de-duplication, scheme filtering and the limit are unchange
   assert.equal(results.filter((r) => r.url === "https://en.example.org/wiki/Tower").length, 1, "the first occurrence wins");
   assert.equal(results.find((r) => r.url === "https://en.example.org/wiki/Tower").title, "Tower & History - Example Encyclopedia");
   assert.ok(!results.some((r) => /^javascript:/i.test(r.url)));
-  assert.deepEqual(parseDuckDuckGoHtml(html, 2).map((r) => r.title), ["Sponsored: Shop Example", "Tower & History - Example Encyclopedia"]);
+  assert.deepEqual(parseDuckDuckGoHtml(html, 2).map((r) => r.title), ["Tower & History - Example Encyclopedia", "Visiting the Tower | Travel Example"], "the limit counts organic results only (#50)");
   assert.deepEqual(parseDuckDuckGoHtml("", 5), []);
   assert.deepEqual(parseDuckDuckGoHtml("<a class=\"result__a\" href=\"https://x.example\">unclosed", 5), []);
 });

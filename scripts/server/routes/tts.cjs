@@ -6,6 +6,7 @@
 //        /api/tts/import-model (prefix), /api/tts/delete-model, /api/tts/delete-output
 //   GET  /tts-outputs/<file> (prefix; audio with range requests)
 "use strict";
+const { publicPaths } = require("../public-paths.cjs"); // issue #52: no absolute host paths in status
 
 const REQUIRED = ["tts", "json", "readJsonBody", "jsonErrorStatus", "errorStatus", "errorBody", "streamModelUpload", "pathInside", "fs", "path", "MIME", "TTS_MODELS", "TTS_OUTPUTS"];
 
@@ -17,7 +18,7 @@ function ttsRoutes(deps) {
   return (r) => {
     r.get("/api/tts/status", async (req, res) => {
     const runtime = tts.getTtsRuntimeStatus();
-    return json(res, 200, {
+    return json(res, 200, publicPaths({
       ok: true,
       ready: tts.isReady(),
       running: tts.isReady(),
@@ -32,7 +33,7 @@ function ttsRoutes(deps) {
       settings: tts.getSettings(),
       generation: tts.getGenerationState(),
       voices: tts.voices,
-    });
+    }));
     });
 
     r.get("/api/tts/models", async (req, res) => {

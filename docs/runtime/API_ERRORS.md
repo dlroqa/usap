@@ -64,6 +64,10 @@ The interface treats every non-2xx response the same way (it shows `error`), so 
   and the user's home folder becomes `~`. A device on the network doesn't learn the host's user name or
   folder layout.
 * No tokens or credentials appear in errors (Step 9.5 tests check logs and responses).
+* The same shortening applies to the path fields of the status and diagnostics routes (`/api/health`,
+  `/api/diagnostics`, `/api/backend-options`, `/api/llm/status|backends|stats`, `/api/speech/status`,
+  `/api/tts/status`) for every client, including localhost (#52, `scripts/server/public-paths.cjs`).
+  The studio folder itself is reported as `.`.
 
 ## Streaming
 

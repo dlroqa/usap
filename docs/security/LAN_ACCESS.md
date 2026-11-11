@@ -114,6 +114,12 @@ Any other `UAIS_AUTH` value is treated as `auto` with a warning. There is no "of
 * **One shared token, no user accounts.** Everyone who signs in has the same access, and there's no
   per-device revocation. `rotate` signs everyone out. Optional multi-user accounts:
   [#28](https://github.com/dlroqa/usap/issues/28).
+* **A signed-in device can see where linked models are stored.** Status and diagnostics routes shorten
+  host paths for every client (#52), but model lists and the "Link a file" response include the full
+  location (`linkedFrom`) of each model linked in place, because Model Manager shows it. That can reveal
+  folder names and your user name. Values under `settings` in status responses are not shortened; today
+  they hold only file names and model IDs. Opaque identifiers are tracked in
+  [#57](https://github.com/dlroqa/usap/issues/57).
 * **Sessions are kept in memory.** Restarting the studio signs every device out.
 * **A device whose session expires** sees errors in the open interface until the page is reloaded,
   which then shows the sign-in page. The interface itself is unchanged and has no sign-out button;

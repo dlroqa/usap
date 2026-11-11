@@ -119,6 +119,10 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
 * **Sign-in for network sharing** (Step 9.5, [#25](https://github.com/dlroqa/usap/pull/25)): when the studio is shared on your network,
   every other device must sign in with a generated access token. This computer is unaffected, and so is
   the default local-only mode. JSON API routes require a JSON content type.
+  Status and diagnostics responses report studio-relative or `~/…` paths, so a signed-in device doesn't
+  learn the host's user name or folder layout from them ([#52](https://github.com/dlroqa/usap/issues/52)).
+  Model lists still show the full location of models you linked in place
+  ([#57](https://github.com/dlroqa/usap/issues/57)).
   [How it works](docs/security/LAN_ACCESS.md).
 * **Engine supervision** (Step 9.6, [#29](https://github.com/dlroqa/usap/pull/29)): the chat, image, speech and voice engines stop with
   the studio even if it crashes or is killed, so on Linux and macOS they no longer keep running in the
@@ -265,8 +269,9 @@ validation. Full priorities: [PRIORITIES.md](docs/roadmap/PRIORITIES.md).
 * **Web search content is untrusted and USAP is not prompt-injection-safe.** Web results are added as
   untrusted user-role context and can't trigger any operation, but no adversarial defence exists yet.
   Automatically planned search queries use only your own recent messages, and a query that copies
-  other conversation text is refused (#43)
-  ([trust boundary](docs/security/WEB_CONTENT_TRUST.md); [#42](https://github.com/dlroqa/usap/issues/42), [#43](https://github.com/dlroqa/usap/issues/43)).
+  other conversation text is refused (#43). Results marked as sponsored, and ad-click redirects, are
+  never used as sources or opened (#50)
+  ([trust boundary](docs/security/WEB_CONTENT_TRUST.md); [#42](https://github.com/dlroqa/usap/issues/42), [#43](https://github.com/dlroqa/usap/issues/43), [#50](https://github.com/dlroqa/usap/issues/50)).
 * **LAN sharing uses plain HTTP and one shared token**: no built-in HTTPS, no user accounts. Use it
   only on a trusted network, and never expose the studio directly to the internet
   ([details](docs/security/LAN_ACCESS.md#limitations); follow-ups [#26](https://github.com/dlroqa/usap/issues/26)–[#28](https://github.com/dlroqa/usap/issues/28)).
