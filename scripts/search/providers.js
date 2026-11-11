@@ -71,14 +71,25 @@ function extractDuckDuckGoUrl(rawHref) {
   return "";
 }
 
+// Issue #45: each result is parsed on its own, from its title link up to the next result's title
+// link, and its snippet is looked for inside that span only. (The former single regex made the
+// snippet optional after a lazy gap, so it was dropped whenever any markup sat in between, which
+// is always the case on the real results page.) Order, URL handling, de-duplication and the
+// limit are unchanged.
 function parseDuckDuckGoHtml(html, limit) {
+  const source = String(html || "");
   const results = [];
-  const resultRegex = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>|<div[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/div>)?/gi;
-  let match;
-  while ((match = resultRegex.exec(html)) && results.length < limit) {
+  const anchorRegex = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const snippetRegex = /<(a|div)[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/\1>/i;
+  const anchors = [...source.matchAll(anchorRegex)];
+  for (let i = 0; i < anchors.length && results.length < limit; i += 1) {
+    const match = anchors[i];
+    const spanEnd = i + 1 < anchors.length ? anchors[i + 1].index : source.length;
+    const span = source.slice(match.index + match[0].length, spanEnd);
+    const snippetMatch = snippetRegex.exec(span);
     const url = extractDuckDuckGoUrl(match[1]);
     const title = stripTags(match[2]);
-    const snippet = stripTags(match[3] || match[4] || "");
+    const snippet = snippetMatch ? stripTags(snippetMatch[2]) : "";
     if (!url || !title || results.some((item) => item.url === url)) continue;
     results.push({ title, url, snippet, provider: "duckduckgo" });
   }
