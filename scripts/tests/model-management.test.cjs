@@ -19,7 +19,9 @@ const { badRequest } = require("../server/errors.cjs");
 const { detectModelKind } = require("../server/model-kind.cjs");
 const { makeRoot, startServer, stopServer, request } = require("./api-contract/harness.cjs");
 
-const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `usap-98f-${name}-`));
+const made = [];
+const tmp = (name) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), `usap-98f-${name}-`)); made.push(d); return d; };
+test.after(() => { for (const d of made) try { fs.rmSync(d, { recursive: true, force: true }); } catch (_) { /* Windows may hold files briefly */ } });
 const GGUF = () => { const b = Buffer.alloc(64); b.write("GGUF"); return b; };
 
 // ── services/downloads.cjs with a fake downloader (no network) ────────────────────────────────────
