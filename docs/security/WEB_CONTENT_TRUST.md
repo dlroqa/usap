@@ -58,8 +58,14 @@ pins DNS, checks every redirect and limits the number of hops. Pages are capped 
   only the assistant said now fall back to the user's message.
 * [#44](https://github.com/dlroqa/usap/issues/44) `/api/web-search/config` returned the absolute cache
   path (fixed: now relative, e.g. `app/cache/search`).
-* [#45](https://github.com/dlroqa/usap/issues/45) Search snippets are usually dropped by the result
-  parser. That's a quality problem, not a security one.
+* [#45](https://github.com/dlroqa/usap/issues/45) Search snippets were usually dropped by the result
+  parser (fixed: each result is parsed separately). Restored snippets are untrusted text and get the
+  same #42 protections as page text (control tokens removed, quoted lines, size cap).
+* [#50](https://github.com/dlroqa/usap/issues/50) Sponsored results were treated as normal results, so an
+  ad-click redirect could be fetched as a source (fixed: `scripts/search/providers.js` skips result
+  blocks marked as ads and known ad-click redirects, so they are never sources and never fetched).
+  Ads that a provider doesn't mark, or that use an unknown redirect, can still get through; the
+  outbound guard applies to every fetch either way.
 * The search cache (`app/cache/search`, 30 minutes) stores results as received. A poisoned result stays
   until the cache entry expires.
 
