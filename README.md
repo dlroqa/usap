@@ -120,7 +120,9 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   every other device must sign in with a generated access token. This computer is unaffected, and so is
   the default local-only mode. JSON API routes require a JSON content type.
   Status and diagnostics responses report studio-relative or `~/…` paths, so a signed-in device doesn't
-  learn the host's user name or folder layout ([#52](https://github.com/dlroqa/usap/issues/52)).
+  learn the host's user name or folder layout from them ([#52](https://github.com/dlroqa/usap/issues/52)).
+  Model lists still show the full location of models you linked in place
+  ([#57](https://github.com/dlroqa/usap/issues/57)).
   [How it works](docs/security/LAN_ACCESS.md).
 * **Engine supervision** (Step 9.6, [#29](https://github.com/dlroqa/usap/pull/29)): the chat, image, speech and voice engines stop with
   the studio even if it crashes or is killed, so on Linux and macOS they no longer keep running in the
