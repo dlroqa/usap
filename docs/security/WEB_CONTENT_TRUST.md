@@ -71,6 +71,10 @@ pins DNS, checks every redirect and limits the number of hops. Pages are capped 
 
 ## Integration point for a future defence
 
+A staged proposal for a server-side prompt trust-boundary module, covering web text repeated in history,
+documents, client-supplied roles and future multi-user permissions, is in
+[PROMPT_INJECTION_PROPOSAL.md](PROMPT_INJECTION_PROPOSAL.md) (proposal only).
+
 `createWebSearchService({ onUntrustedContent })` receives every search result, for both chat and the
 API, together with its query, before it is used. It returns the result unchanged by default. A future
 prompt-injection module can plug in there, for example to:
