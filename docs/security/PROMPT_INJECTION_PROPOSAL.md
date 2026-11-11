@@ -61,7 +61,7 @@ passing client messages through unchanged.
 | Stage | Change | Compatibility |
 |---|---|---|
 | P1 | Adversarial test suite (no behaviour change): fixtures for each concern above, run against the real server with the fake engine (`/fake/last` shows exactly what the model would see) | None |
-| P2 | Typed segments inside the server; output byte-identical to today (proved by the 9.8h golden comparison) | None |
+| P2 (in review) | Typed segments inside the server (`services/prompt-boundary.cjs`); output byte-identical to today (proved by the 9.8h golden comparison) | None |
 | P3 | Control-token removal and markers for assistant turns with `webSources` (#1, #5) | Prompts change for those turns only; setting to turn it off |
 | P4 | `attachments` field and document marking (#2), with the UI change | Old clients unchanged |
 | P5 | Role policy for API keys and multi-user (#3, #6), with #28 | Single-user default unchanged |
