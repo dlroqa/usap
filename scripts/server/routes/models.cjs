@@ -10,7 +10,10 @@
 //        /api/download-backend, /api/cancel-download, /api/delete-model, /api/llm/delete-model,
 //        /api/move-model, /api/link-model, /api/pick-model-file,
 //        /api/import-model, /api/llm/import-model (prefix; streamed upload)
+//   GET  /api/model-inspect?type=image|text|speech&filename=… (prefix; added after the move, read-only)
 "use strict";
+
+const { inspectModel } = require("../model-metadata.cjs");
 
 const REQUIRED = ["IMAGE_BACKEND_DOWNLOADS","LLM_MODELS","MODELS","OPENVINO_MODELS","SPEECH_MODELS","addHuggingFaceFileSize","cancelModelDownload","describeLinkedModel","detectModelKindCached","downloadBlockReason","errorBody","errorStatus","execFile","findOpenVinoModel","fs","getBackendProc","getCurrentSettings","getDownloadProgress","getDownloadState","getLlmModels","getLlmProc","getLlmSettings","getModelDownloadUrlIssue","getModelInfo","getOpenVinoModelInfo","getOpenVinoNpuInfo","invalidateBackendOptions","isModelFile","json","killLlm","modelFolderFor","os","path","pathInside","publicMessage","readJsonBody","readdirVisible","resolveHuggingFaceProjector","searchHuggingFaceModels","speech","startImageBackendDownload","startModelDownload","startOpenVinoModelDownload","streamModelUpload"];
 
@@ -373,6 +376,26 @@ function modelRoutes(deps) {
       console.error(`  [api] Failed to delete model ${safeFilename}:`, err);
       return json(res, errorStatus(err), errorBody(err));
     }
+    });
+
+    // Added after the move (Step 9.8f): read-only facts from a model's header (format, quantization,
+    // architecture, engine, size, rough memory need). Nothing is loaded or changed, and no path is returned.
+    r.getPrefix("/api/model-inspect", async (req, res) => {
+      const parsed = new URL(req.url, "http://localhost");
+      if (parsed.pathname !== "/api/model-inspect") return json(res, 404, { ok: false, error: "Unknown API endpoint" });
+      const type = String(parsed.searchParams.get("type") || "");
+      const dir = modelFolderFor(type);
+      const filename = path.basename(String(parsed.searchParams.get("filename") || ""));
+      if (!dir || !filename) {
+        return json(res, 400, { ok: false, error: "Choose a model type (image, text or speech) and a file name.", code: "INVALID_REQUEST" });
+      }
+      const fullPath = path.join(dir, filename);
+      if (!pathInside(fullPath, dir) || fullPath === dir || !fs.existsSync(fullPath)) {
+        return json(res, 404, { ok: false, error: "Model not found.", code: "MODEL_NOT_FOUND" });
+      }
+      const context = Number(parsed.searchParams.get("context"));
+      const contextSize = Number.isInteger(context) && context >= 512 && context <= 1048576 ? context : 4096;
+      return json(res, 200, { ok: true, type, filename, ...inspectModel(fullPath, { contextSize }) });
     });
   };
 }

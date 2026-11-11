@@ -48,6 +48,12 @@ inside the error boundary.
   (`getModelLoadIssue`): they belong to the engines (9.8g image, 9.8h text).
 * Cleanup candidates (`/api/cleanup`), which also cover non-model files.
 
+## Model metadata (added after the move)
+
+`scripts/server/model-metadata.cjs` and `GET /api/model-inspect` report a model's format, quantization, architecture,
+engine, size and a rough memory estimate. They are read-only, additive and not used by the interface or the loaders.
+Model formats and quantization per engine: [QUANTIZED_MODELS.md](../runtime/QUANTIZED_MODELS.md).
+
 ## Tests
 
 `scripts/tests/model-management.test.cjs` (24 tests, deterministic, no network):

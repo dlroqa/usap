@@ -245,10 +245,11 @@ function routesWith(over = {}) {
   return { call, router, s, dir, log };
 }
 
-test("9.8f routes: the 17 model routes are registered with the original matching rules", () => {
+test("9.8f routes: the 17 moved routes keep their matching rules, plus the read-only inspect route", () => {
   const { router } = routesWith();
   const list = router.routes().map((r) => `${r.method} ${r.match} ${r.path}`);
-  assert.equal(list.length, 17);
+  assert.equal(list.length, 18);
+  assert.ok(list.includes("GET prefix /api/model-inspect"));
   for (const p of ["/api/huggingface/models", "/api/import-model", "/api/llm/import-model"]) assert.ok(list.some((l) => l.endsWith(` prefix ${p}`)), p);
   assert.ok(list.includes("GET exact /api/download-progress"));
   assert.ok(list.includes("POST exact /api/delete-model"));

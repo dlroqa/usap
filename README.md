@@ -134,6 +134,11 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   machine-readable `code`. Invalid requests answer 400 instead of 500, and a missing engine answers 503.
   A malformed request can no longer stop the server. Messages never include stack traces or the host's
   folder paths. [Reference](docs/runtime/API_ERRORS.md).
+* **Model formats and quantization** (Step 9.8f): which formats and quantized variants each engine reads, and
+  which were verified in CI, are documented in [Model formats](docs/runtime/QUANTIZED_MODELS.md). A read-only
+  `GET /api/model-inspect` reports a model's format, quantization, architecture, engine and a rough memory
+  estimate from its header (**Implemented**; the interface doesn't use it yet). Not every quantized model
+  runs: only what the shipped engine versions read.
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
 * **UI regression protection** ([#4](https://github.com/dlroqa/usap/pull/4)): pixel-exact
