@@ -12,6 +12,8 @@
 // returns the search result unchanged.
 "use strict";
 
+const { plannerMessages, checkPlannedQuery } = require("./query-policy.cjs");
+
 /**
  * @param {object} deps
  * @param {(query: string, options: object) => Promise<{context: string, sources: object[]}>} deps.search  scripts/search/core comprehensiveWebSearch
@@ -61,14 +63,11 @@ function createWebSearchService(deps) {
   }
 
   // Asks the loaded model whether the latest message needs a web search and, if so, for a
-  // standalone query that resolves references to earlier turns ("what about its price?").
+  // standalone query that resolves references to the user's earlier messages ("what about its price?").
   // Returns "" when the model decides no search is needed, or null if planning failed.
+  // The planner sees only the user's own recent messages (query-policy.cjs, issue #43).
   async function planWebSearchQuery(messages) {
-    const recent = messages
-      .filter((message) => message?.role === "user" || message?.role === "assistant")
-      .slice(-6)
-      .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${getMessageText(message.content).replace(/<think>[\s\S]*?<\/think>/g, "").trim().slice(0, 600)}`)
-      .join("\n");
+    const recent = plannerMessages(messages, getMessageText).map((text) => `User: ${text}`).join("\n");
     if (!recent) return null;
     try {
       const result = await completeChat({
@@ -76,7 +75,7 @@ function createWebSearchService(deps) {
           {
             role: "system",
             content: "You decide whether answering the user's latest message needs a web search. " +
-              "If it does, reply with ONLY a short standalone search query (max 12 words) that includes any names or topics the message refers to from earlier in the conversation. " +
+              "If it does, reply with ONLY a short standalone search query (max 12 words) that includes any names or topics the message refers to from the user's earlier messages. " +
               "If it does not (greetings, chit-chat, rewriting or explaining text already in the chat, math, coding with no recent facts), reply with ONLY the word NONE.",
           },
           { role: "user", content: `Conversation:\n${recent}\n\nSearch query for the latest user message (or NONE):` },
@@ -104,10 +103,23 @@ function createWebSearchService(deps) {
       return { messages, webSources: [], webContext: "" };
     }
     let query = String(body.webQuery || body.query || "").trim();
+    let queryPolicy = "explicit";
     if (!query) {
       const planned = isLlmReady() ? await planWebSearchQuery(messages) : null;
       if (planned === "") return { messages, webSources: [], webContext: "", webSkipped: true };
-      query = String(planned || getLastUserQuery(messages) || "").trim();
+      queryPolicy = planned ? "planned" : "fallback";
+      // Issue #43: an automatically planned query may only use the user's own recent words (plus
+      // new ones); anything copied from elsewhere in the conversation sends the latest message instead.
+      if (planned) {
+        const check = checkPlannedQuery(planned, plannerMessages(messages, getMessageText),
+          (Array.isArray(messages) ? messages : []).map((m) => getMessageText(m && m.content)));
+        if (!check.ok) {
+          // The query itself is not logged: it may contain the very text that was refused.
+          console.warn(`  [web-search] Planned query refused (${check.copied.length} word(s) from outside the user's recent messages); searching with the latest message instead.`);
+          queryPolicy = "fallback-refused";
+        }
+      }
+      query = String((queryPolicy === "planned" ? planned : "") || getLastUserQuery(messages) || "").trim();
     }
     if (!query) return { messages, webSources: [], webContext: "" };
     console.log(`  [web-search] Query: ${query}`);
