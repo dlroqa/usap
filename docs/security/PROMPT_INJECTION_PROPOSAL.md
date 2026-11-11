@@ -1,6 +1,6 @@
 # Proposal: a prompt trust-boundary module
 
-Status: **proposal**. Nothing here is implemented, and current prompt behaviour is unchanged. Each stage below is a
+Status: **proposal** (owner decisions below). Nothing here is implemented, and current prompt behaviour is unchanged. Each stage below is a
 separate, independently reviewed security PR that needs the owner's approval.
 
 **No design makes a language model immune to prompt injection.** The aim is narrower: the server decides what each
@@ -70,7 +70,28 @@ Each stage has an `off` setting, a CHANGELOG entry, and native tests on all 4 OS
 prompt changes. The tests check structure (roles, markers, order) and never claim that a model ignores injected
 instructions.
 
-## Open questions for the owner
+## Owner decisions (2026-11-11)
 
-1. Should P3 (marking assistant turns that cited web pages) be on by default once tested?
-2. Is a small UI change for document attachments (P4) acceptable, given that the interface is otherwise frozen?
+Merging this proposal turns nothing on. Each stage is still a separate PR with its own approval.
+
+**P3, history-web marking: on by default, once implemented and validated in its own reviewed PR.** That PR must
+keep each segment's source, keep web-derived text untrusted on every later turn, keep message order and the
+conversation history, never raise any text to an application-controlled role, test against malicious fixtures and
+representative real models, include a rollback setting and compatibility behaviour, and document the remaining
+prompt-injection limits.
+
+**P4, document attachments: the concept of a minimal internal UI change is approved.** It sends extracted document
+text separately from the user's own text. The visual interface and PDF and document attachment behaviour stay as
+they are. Older API clients keep working. Extracted text is labelled untrusted, processing is bounded and
+validated, and document text can never become privileged instructions. Implementation and merge each need
+separate approval.
+
+**P1 and P2: to be prepared next as separate, focused PRs.** P1 (adversarial regression tests) changes no
+production behaviour. P2 (typed segments) produces byte-identical prompts while no protection is enabled.
+
+**Multi-user role policy.** Current single-user local behaviour stays until multi-user sign-in exists. Then:
+per-user and API-key permissions are enforced in server code; client-supplied `system` messages don't
+automatically get application-level authority; and model output never authorizes access to another user's data or
+a privileged action without an independent server-side check.
+
+None of this prevents prompt injection fully, and no USAP document should claim it does.
