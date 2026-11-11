@@ -11,6 +11,8 @@
 // are one extra "user" message after the leading system messages (see docs/security/WEB_CONTENT_TRUST.md).
 "use strict";
 
+const promptBoundary = require("./prompt-boundary.cjs");
+
 const REQUIRED = ["state","errorBody","errorStatus","http","json","redactPaths","requestJson","runExclusiveLlmOperation","startLlm","webSearch"];
 
 function createChatService(deps) {
@@ -67,7 +69,8 @@ function createChatService(deps) {
       const webAugmentation = await webSearch.augmentMessagesWithWebSearch(rawMessages, body);
       const requestData = JSON.stringify({
         model: state.llmSettings.model || "local-model",
-        messages: webAugmentation.messages,
+        // P2: built from typed segments; byte-identical to webAugmentation.messages while no protection is on.
+        messages: promptBoundary.engineMessages(rawMessages, webAugmentation),
         temperature: Number.isFinite(Number(body.temperature)) ? Number(body.temperature) : 0.7,
         max_tokens: Math.max(1, Math.min(4096, Number(body.max_tokens) || Number(body.maxTokens) || 1024)),
         stream: isStream,
