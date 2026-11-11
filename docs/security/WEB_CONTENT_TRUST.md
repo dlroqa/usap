@@ -56,8 +56,8 @@ pins DNS, checks every redirect and limits the number of hops. Pages are capped 
   Remaining risk: the user's own recent messages can still shape the query, and a refused or failed plan
   sends the latest message, which is the request the user turned web search on for. References to text
   only the assistant said now fall back to the user's message.
-* [#44](https://github.com/dlroqa/usap/issues/44) `/api/web-search/config` returns the absolute cache
-  path.
+* [#44](https://github.com/dlroqa/usap/issues/44) `/api/web-search/config` returned the absolute cache
+  path (fixed: now relative, e.g. `app/cache/search`).
 * [#45](https://github.com/dlroqa/usap/issues/45) Search snippets are usually dropped by the result
   parser. That's a quality problem, not a security one.
 * The search cache (`app/cache/search`, 30 minutes) stores results as received. A poisoned result stays

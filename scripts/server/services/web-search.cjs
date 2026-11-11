@@ -18,6 +18,7 @@ const { plannerMessages, checkPlannedQuery } = require("./query-policy.cjs");
  * @param {object} deps
  * @param {(query: string, options: object) => Promise<{context: string, sources: object[]}>} deps.search  scripts/search/core comprehensiveWebSearch
  * @param {string} deps.cacheDir
+ * @param {string} [deps.publicCachePath]  what /api/web-search/config shows (never an absolute host path, #44)
  * @param {(payload: object, timeoutMs: number) => Promise<object>} deps.completeChat  one non-streaming call to the local model
  * @param {() => boolean} deps.isLlmReady
  * @param {(content: unknown) => string} deps.getMessageText
@@ -37,7 +38,8 @@ function createWebSearchService(deps) {
       ok: true,
       provider: "duckduckgo",
       providers: [{ key: "duckduckgo", name: "DuckDuckGo", requiresApiKey: false, active: true }],
-      cachePath: cacheDir,
+      // #44: a display path relative to the studio folder (or ~), never the absolute host path.
+      cachePath: deps.publicCachePath || "app/cache/search",
       defaults: { resultLimit: 5, fetchLimit: 3, timeFilter: "any" },
     };
   }

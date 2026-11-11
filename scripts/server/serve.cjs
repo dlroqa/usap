@@ -5515,6 +5515,7 @@ function getMessageText(content) {
 const webSearch = createWebSearchService({
   search: comprehensiveWebSearch,
   cacheDir: WEB_SEARCH_CACHE,
+  publicCachePath: errors.redactPaths(WEB_SEARCH_CACHE).replace(/\\/g, "/"),
   completeChat: (payload, timeoutMs) => requestJson(`http://127.0.0.1:${PORT_LLM}/v1/chat/completions`, { model: llmSettings.model || "local-model", ...payload }, timeoutMs),
   isLlmReady: () => llmReady,
   getMessageText,
