@@ -7,6 +7,7 @@
 //        /api/speech/delete-transcription
 //   POST /api/speech/transcribe (prefix; raw WAV body), /api/speech/import-model (prefix; upload)
 "use strict";
+const { publicPaths } = require("../public-paths.cjs"); // issue #52: no absolute host paths in status
 
 const REQUIRED = ["speech", "SPEECH_MODELS", "TRANSCRIPTIONS", "downloadBlockReason", "getDownloadState", "errorBody", "errorStatus", "fs", "json", "jsonErrorStatus", "path", "pathInside", "readBinaryBody", "readJsonBody", "startModelDownload", "streamModelUpload"];
 
@@ -18,7 +19,7 @@ function speechRoutes(deps) {
   return (r) => {
     r.get("/api/speech/status", async (req, res) => {
     const backend = speech.getSpeechBackend();
-    return json(res, 200, {
+    return json(res, 200, publicPaths({
       ok: true,
       ready: speech.isReady(),
       running: speech.isReady(),
@@ -33,7 +34,7 @@ function speechRoutes(deps) {
       error: speech.getError(),
       settings: speech.getSettings(),
       transcription: speech.getTranscriptionState(),
-    });
+    }));
     });
 
     r.get("/api/speech/models", async (req, res) => {
