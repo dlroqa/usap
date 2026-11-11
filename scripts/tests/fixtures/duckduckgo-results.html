@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<!-- Synthetic fixture with the structure of DuckDuckGo's HTML results page (html.duckduckgo.com/html/).
+     Content is invented; used by the issue #45 parser tests. No live request is made. -->
+<html><head><title>example query at DuckDuckGo</title></head><body>
+<div class="serp__results"><div id="links" class="results">
+
+  <div class="result results_links results_links_deep result--ad">
+    <div class="links_main links_deep result__body">
+      <h2 class="result__title">
+        <a rel="nofollow" class="result__a" href="//duckduckgo.com/y.js?ad_domain=shop.example&amp;u3=https%3A%2F%2Fshop.example%2Fpromo">Sponsored: Shop Example</a>
+      </h2>
+      <div class="result__extras"><div class="result__extras__url"><a class="result__url" href="#">shop.example</a></div></div>
+      <a class="result__snippet" href="#">Ad snippet text</a>
+    </div>
+  </div>
+
+  <div class="result results_links results_links_deep web-result ">
+    <div class="links_main links_deep result__body">
+      <h2 class="result__title">
+        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.example.org%2Fwiki%2FTower&amp;rut=abc123">Tower &amp; History - Example Encyclopedia</a>
+      </h2>
+      <div class="result__extras">
+        <div class="result__extras__url">
+          <span class="result__icon"><img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/en.example.org.ico" /></span>
+          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.example.org%2Fwiki%2FTower">en.example.org/wiki/Tower</a>
+        </div>
+      </div>
+      <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.example.org%2Fwiki%2FTower">The <b>tower</b> is 330 metres tall and was completed in 1889.</a>
+      <div class="clear"></div>
+    </div>
+  </div>
+
+  <div class="result results_links results_links_deep web-result ">
+    <div class="links_main links_deep result__body">
+      <h2 class="result__title">
+        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftravel.example.com%2Fvisit&amp;rut=def456">Visiting the Tower | Travel Example</a>
+      </h2>
+      <div class="result__extras"><div class="result__extras__url"><a class="result__url" href="#">travel.example.com/visit</a></div></div>
+      <div class="clear"></div>
+    </div>
+  </div>
+
+  <div class="result results_links results_links_deep web-result ">
+    <div class="links_main links_deep result__body">
+      <h2 class="result__title">
+        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fnews.example.net%2F2026%2Ftower-lights&amp;rut=ghi789">Tower lights up for anniversary</a>
+      </h2>
+      <div class="result__extras"><div class="result__extras__url"><a class="result__url" href="#">news.example.net</a></div></div>
+      <a class="result__snippet" href="#">Thousands gathered as the <b>tower</b> was lit &quot;like never before&quot;.</a>
+    </div>
+  </div>
+
+  <div class="result results_links results_links_deep web-result ">
+    <div class="links_main links_deep result__body">
+      <h2 class="result__title"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.example.org%2Fwiki%2FTower">Tower (duplicate)</a></h2>
+      <a class="result__snippet" href="#">Duplicate snippet</a>
+    </div>
+  </div>
+
+  <div class="result results_links results_links_deep web-result ">
+    <div class="links_main links_deep result__body">
+      <h2 class="result__title"><a rel="nofollow" class="result__a" href="javascript:alert(1)">Not a web link</a></h2>
+      <a class="result__snippet" href="#">Should be dropped</a>
+    </div>
+  </div>
+
+  <div class="result results_links results_links_deep web-result ">
+    <div class="links_main links_deep result__body">
+      <h2 class="result__title"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fblog.example.io%2Ftower">A blog about towers</a></h2>
+      <div class="result__extras"></div>
+      <div class="result__snippet">A <b>div</b>-style snippet.</div>
+    </div>
+  </div>
+
+</div></div></body></html>

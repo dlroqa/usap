@@ -179,9 +179,9 @@ test("provider parsing: real-shaped results, malformed HTML and internal targets
   // An internal address can appear in a result list, but it is never fetched: the outbound guard refuses it.
   assert.ok(results.some((r) => r.url === "http://169.254.169.254/"));
   assert.throws(() => guard.assertSafeUrl("http://169.254.169.254/"), guard.BlockedRequestError);
-  // Existing limitation (#45): a snippet is only captured when it directly follows the title link.
+  // #45 fixed: the snippet is found even when other markup sits between it and the title link.
   const spaced = parseDuckDuckGoHtml('<a class="result__a" href="https://e.org/x">T</a>\n<div></div><a class="result__snippet" href="#">S</a>', 5);
-  assert.equal(spaced[0].snippet, "", "pins current behaviour; update when #45 is fixed");
+  assert.equal(spaced[0].snippet, "S");
   assert.deepEqual(parseDuckDuckGoHtml("<html>not a results page</html>", 5), []);
   assert.deepEqual(parseDuckDuckGoHtml("", 5), []);
   assert.equal(extractDuckDuckGoUrl("javascript:alert(1)"), "", "non-http(s) targets are dropped");
