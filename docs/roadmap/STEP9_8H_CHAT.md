@@ -1,6 +1,6 @@
 # Step 9.8h: text engine, chat and streaming
 
-Status: **in review** (not merged). Part of the modular backend plan in [STEP9_8_MODULES.md](STEP9_8_MODULES.md).
+Status: **done** (#70, merged). Part of the modular backend plan in [STEP9_8_MODULES.md](STEP9_8_MODULES.md).
 This is the last 9.8 extraction.
 
 This step moves the text engine (llama.cpp), chat requests, streaming and saved conversations out of
