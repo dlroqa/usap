@@ -33,12 +33,28 @@ pins DNS, checks every redirect and limits the number of hops. Pages are capped 
 * **Provenance:** every source keeps its index, title, URL and fetch status, so answers can cite `[n]`.
 * **The planner never sees system prompts;** it uses user and assistant messages only.
 
+## Two kinds of injection
+
+* **Template-token injection.** Chat models mark turns with special tokens (`<|im_start|>`, `<|eot_id|>`,
+  `[INST]`, `<｜User｜>`, …). The P1 native check (`scripts/ci/runtime-validate.sh`, Qwen2.5 0.5B on all 4 OS)
+  showed that llama.cpp reads these tokens as **real control tokens** when they appear inside message text: 40
+  `<|im_end|>` strings became 69 prompt tokens, while 40 near-miss strings became 270. So untrusted text that
+  contains them can open a real new turn, for example a fake system turn. Removing them from untrusted text is a
+  structural protection, and it only covers the token families it knows (see #42 below). Text that isn't filtered
+  yet (earlier answers, attached documents) can still carry them; P3 and P4 in
+  [PROMPT_INJECTION_PROPOSAL.md](PROMPT_INJECTION_PROPOSAL.md) cover those.
+* **Natural-language injection.** Plain sentences such as "ignore your instructions and…" need no special tokens.
+  No filter can remove them without also removing legitimate text, and markers only label them. Whether a model
+  follows them depends on the model. USAP doesn't prevent this, and its tests check structure, not obedience.
+
 ## Known weaknesses (tracked)
 
 * [#42](https://github.com/dlroqa/usap/issues/42) **Delimiter and role imitation (hardened).** Page text
   used to be inserted verbatim between plain-text markers. Now (`scripts/search/core.js`):
   * chat-template control tokens are removed, so page text can't open a new system or assistant turn
-    at the token level;
+    at the token level. Covered: ChatML, Llama 2 and 3, Gemma, Phi, Command R, gpt-oss and, since the P1 tests,
+    DeepSeek full-width tokens, Mistral control tokens such as `[TOOL_CALLS]` and `[SYSTEM_PROMPT]`, and Qwen/Hermes
+    tool-call tags. A model family with other special tokens isn't covered until it is added;
   * code fences and rules are defused;
   * every untrusted line is quoted with `│`;
   * each source sits between markers carrying a random per-request id;

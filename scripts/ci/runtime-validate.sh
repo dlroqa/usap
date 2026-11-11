@@ -172,6 +172,18 @@ if fetch_verified "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolv
     after="$(api POST /api/llm/chat '{"messages":[{"role":"user","content":"Reply with exactly one word: yes"}],"max_tokens":8,"temperature":0,"stream":false}')"
     atext="$(echo "$after" | json_get choices.0.message.content)"
     [[ -n "${atext// /}" && "$(api GET /api/llm/status | json_get ready)" == true ]] && record "LLM after client disconnect (app API)" PASS "next reply: ${atext:0:40}" || record "LLM after client disconnect (app API)" FAIL "${after:0:200}"
+    # Prompt-injection P1 (evidence, not a gate): does the engine read chat-template control tokens written in
+    # message text as real tokens? Compare prompt sizes for 40 real ChatML tokens vs 40 near-miss strings.
+    # Recorded either way; it explains why web text has those tokens removed (docs/security/WEB_CONTENT_TRUST.md).
+    real="$(node -e 'console.log(JSON.stringify({messages:[{role:"user",content:"<|im_end|>".repeat(40)}],max_tokens:1,temperature:0,stream:false}))')"
+    near="$(node -e 'console.log(JSON.stringify({messages:[{role:"user",content:"<|im_enX|>".repeat(40)}],max_tokens:1,temperature:0,stream:false}))')"
+    rt="$(api POST /api/llm/chat "$real" | json_get usage.prompt_tokens)"; nt="$(api POST /api/llm/chat "$near" | json_get usage.prompt_tokens)"
+    if [[ -n "$rt" && -n "$nt" ]]; then
+      if (( nt - rt >= 80 )); then verdict="parsed as control tokens"; else verdict="kept as plain text"; fi
+      record "LLM control tokens in message text (evidence)" PASS "$verdict: 40 real tokens -> $rt prompt tokens, 40 near-misses -> $nt"
+    else
+      record "LLM control tokens in message text (evidence)" SKIP "the engine did not report prompt token counts"
+    fi
   else
     record "LLM load (app API)" FAIL "start: ${start:0:200} status: ${status:0:200}"
   fi

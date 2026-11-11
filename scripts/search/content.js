@@ -113,4 +113,5 @@ async function fetchPageContent(rawUrl, options = {}, redirects = 0) {
 
 module.exports = {
   fetchPageContent,
+  stripHtml, // exported for the prompt-injection tests (entity decoding happens before the token filter)
 };

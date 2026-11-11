@@ -26,6 +26,9 @@ const CONTROL_TOKENS = [
   /<\/?(?:start_of_turn|end_of_turn|bos|eos|pad)>/gi,  // Gemma and generic special tokens
   /\[\/?INST\]|<<\/?SYS>>/gi,                          // Mistral / Llama 2
   /<\/?s>/gi,
+  /<｜[^｜<>\n]{1,40}｜>/g,                               // DeepSeek (full-width bars): <｜User｜>, <｜end▁of▁sentence｜>, ...
+  /\[\/?(?:SYSTEM_PROMPT|AVAILABLE_TOOLS|TOOL_CALLS|TOOL_RESULTS|TOOL_CONTENT)\]/g, // Mistral control tokens
+  /<\/?(?:tool_call|tool_response)>/gi,                  // Qwen / Hermes tool-call tags
 ];
 
 function neutralizeUntrusted(value, maxChars) {
