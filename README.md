@@ -230,14 +230,14 @@ only, no force pushes. Details: [CI_GUIDE.md](docs/ci/CI_GUIDE.md),
 | Intel macOS setup; chat, accessibility and mobile fixes | Done (#5–#8) |
 | **Step 8:** native inference verification | **CPU done** on all 4 platforms (#9); GPU pending real hardware |
 | Desktop installer requirement documented | Done (#10), planning only |
-| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection done (#16); Windows streaming tests done (#17); 9.4 download integrity done (#18); 9.5 LAN sign-in done (#25); 9.6 engine supervision done (#29); 9.7 API error consistency done (#35); 9.8 modular backend in development ([plan](docs/roadmap/STEP9_8_MODULES.md); 9.8a request pipeline and system routes done (#36); 9.8b text-to-speech module done (#37); 9.8c speech recognition module done (#40); 9.8d web search module done (#46); 9.8e hardware and diagnostics module done (#56); 9.8f model management, downloads and model metadata done (#59, #60, #63); 9.8g image generation module done (#65); 9.8h text engine, chat and streaming in review) |
+| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection done (#16); Windows streaming tests done (#17); 9.4 download integrity done (#18); 9.5 LAN sign-in done (#25); 9.6 engine supervision done (#29); 9.7 API error consistency done (#35); 9.8 modular backend done ([plan](docs/roadmap/STEP9_8_MODULES.md); 9.8a request pipeline and system routes done (#36); 9.8b text-to-speech module done (#37); 9.8c speech recognition module done (#40); 9.8d web search module done (#46); 9.8e hardware and diagnostics module done (#56); 9.8f model management, downloads and model metadata done (#59, #60, #63); 9.8g image generation module done (#65); 9.8h text engine, chat and streaming done (#70)) |
 
 ## Development Roadmap
 
 * **Step 9, foundational backend** (current): API contract tests; a paths/config module ready for
   portable and installed storage; remaining security findings; engine crash supervision and
-  diagnostics; consistent API errors; modular backend (9.8; 9.8h chat and
-  streaming remains); 9.9 resource scheduling; 9.10 performance benchmarks; 9.11 an optimized Intel
+  diagnostics; consistent API errors; modular backend (9.8, done;
+  remaining limitations in its plan); 9.9 resource scheduling (planned); 9.10 performance benchmarks; 9.11 an optimized Intel
   image engine; 9.12 installed-mode storage preparation. [Plan](docs/roadmap/STEP9_BACKEND_PLAN.md).
 * **Step 10, desktop installers** (planned): an installed edition next to the portable one,
   Windows `.exe`/`.msi`, Linux AppImage/`.deb`, macOS Apple Silicon and Intel `.dmg`, from the same

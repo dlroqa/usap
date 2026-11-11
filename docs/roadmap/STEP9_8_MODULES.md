@@ -1,5 +1,10 @@
 # Step 9.8: modular backend (design and PR sequence)
 
+Status: **done**. All eight extractions (9.8a–9.8h) are merged: #36, #37, #40, #46, #56, #59/#60/#63, #65, #70.
+`serve.cjs` went from about 7,800 lines to about 1,700 (configuration, wiring, start-up and the few routes left).
+The external API and the interface are unchanged. See [Remaining limitations](#remaining-limitations) for what 9.8
+did not fix.
+
 Goal: split `scripts/server/serve.cjs` (≈7,800 lines, 59 routes in one if-chain) into maintainable
 modules **without changing the interface or the external API**. It stays one Node.js process on one
 port, with no new services, ports or background processes.
@@ -55,9 +60,28 @@ scripts/server/
 | **9.8e** (#56, done: [plan](STEP9_8E_PLAN.md)) | `services/hardware.cjs` (detection used by several routes) | Medium: shared |
 | **9.8f** (#59, #60, #63, done: [notes](STEP9_8F_MODELS.md)) | `routes/models.cjs` + `services/model-store.cjs` + `services/downloads.cjs` | Medium: file operations; traversal tests already exist |
 | **9.8g** (#65, done: [notes](STEP9_8G_IMAGE.md)) | `routes/image.cjs` + `services/image-engine.cjs` (proxy included) | Medium |
-| 9.8h (in review: [notes](STEP9_8H_CHAT.md)) | `routes/llm.cjs` + `services/llm-engine.cjs` + `services/chat.cjs` + `services/conversations.cjs` (chat streaming last) | Highest: streaming contract tests on all 4 OS |
+| **9.8h** (#70, done: [notes](STEP9_8H_CHAT.md)) | `routes/llm.cjs` + `services/llm-engine.cjs` + `services/chat.cjs` + `services/conversations.cjs` (chat streaming last) | Highest: streaming contract tests on all 4 OS |
 
 Each PR is reviewed and merged separately, with owner approval.
+
+## Remaining limitations
+
+Step 9.8 moved code without changing behaviour, so issues found along the way are tracked separately. Open
+when 9.8 finished:
+
+* **Reliability:** an engine file that can't be started stops the server (#68; fix in review). Non-streaming
+  chat errors read `[object Object]` and skip the out-of-memory retry (#67; fix in review). Image generation
+  can't be cancelled (#64), nor can transcription (#41). The llmfit cache is never reused (#69). Concurrent
+  requests have no queue limits or shared CPU and memory budget (Step 9.9). Crash recovery exists for the text
+  engine only (#32, #33). An engine can be orphaned if only its guard is force-killed (#31).
+* **Error responses:** some validation errors still answer `500` (Step 9.7 notes, #38, #39).
+* **Privacy:** model lists show absolute paths of linked models (#57). The `/api/restart-backend` response
+  includes the image model's absolute path.
+* **Model files:** same-name replacement, partial downloads and the host file dialog (#58).
+* **Prompt injection:** reduced, not prevented. Untrusted text that enters prompts without marking is listed in
+  [STEP9_8H_CHAT.md](STEP9_8H_CHAT.md#where-untrusted-text-enters-the-prompt).
+* **Hardware:** GPU, NPU, Metal, OpenVINO and Core ML are not validated on real hardware. CI validates CPU
+  inference on all 4 platforms.
 
 ## Integration points for later workstreams (no implementation in 9.8)
 
