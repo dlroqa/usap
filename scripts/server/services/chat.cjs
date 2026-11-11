@@ -11,13 +11,13 @@
 // are one extra "user" message after the leading system messages (see docs/security/WEB_CONTENT_TRUST.md).
 "use strict";
 
-const REQUIRED = ["state","errorBody","errorStatus","http","json","requestJson","runExclusiveLlmOperation","startLlm","webSearch"];
+const REQUIRED = ["state","errorBody","errorStatus","http","json","redactPaths","requestJson","runExclusiveLlmOperation","startLlm","webSearch"];
 
 function createChatService(deps) {
   for (const name of REQUIRED) {
     if (deps[name] === undefined || deps[name] === null) throw new Error(`chat: missing dependency ${name}`);
   }
-  const { state, errorBody, errorStatus, http, json, requestJson, runExclusiveLlmOperation, startLlm, webSearch } = deps;
+  const { state, errorBody, errorStatus, http, json, redactPaths, requestJson, runExclusiveLlmOperation, startLlm, webSearch } = deps;
 
   // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
   const llmHttpAgent = new http.Agent({
@@ -112,7 +112,7 @@ function createChatService(deps) {
                   console.error("Failed OOM recovery retry:", retryErr);
                 }
               }
-              json(res, clientRes.statusCode || 500, { ok: false, error: message });
+              json(res, clientRes.statusCode || 500, { ok: false, error: redactPaths(message) });
             });
             return;
           }
@@ -174,6 +174,8 @@ function createChatService(deps) {
               console.error("Failed OOM recovery retry:", retryErr);
             }
           }
+          // #67: an engine error answers like the streaming path: the engine's status and message.
+          if (err.upstreamStatus) return json(res, err.upstreamStatus, { ok: false, error: redactPaths(err.message) });
           throw err;
         }
       }
