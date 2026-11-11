@@ -1,6 +1,6 @@
 # Step 9.9: resource scheduling (plan)
 
-Status: **planned**. This document only describes and plans; nothing in it is implemented yet. Each rollout stage
+Status: **planned** (owner decisions in section 5). This document only describes and plans; nothing in it is implemented yet. Each rollout stage
 below is a separate PR that needs the owner's approval. Part of [STEP9_BACKEND_PLAN.md](STEP9_BACKEND_PLAN.md).
 
 Goal: one studio on one computer should stay responsive and never run out of memory because of what it starts
@@ -68,8 +68,8 @@ either.
 | CPU threads | One thread budget = physical cores. Each engine asks for threads when a job starts. When engines overlap, the budget is shared (for example, an image job while a chat streams gets the cores the chat isn't using, at least 2). Today's counts are kept when only one engine is busy |
 | System RAM | Before loading a model: estimated need (file size + context, from `model-metadata.cjs`) vs. `budget.freeRamBytes()`. Below the need: refuse with `INSUFFICIENT_MEMORY` and the numbers, unless the user forces it. Warn-only in the first stage |
 | VRAM | Only where a poll reports free VRAM. Used to choose GPU layers and to warn, never to refuse when the number is unknown. GPU and NPU behaviour is unverified on real hardware and stays labelled that way |
-| Heavy models | Keep "one heavy model at a time" as the default. Later, allow text and image together only when the memory check passes, and only after it is measured |
-| Chat queue | Per engine, a queue of at most N waiting requests (default 4) behind the running one. Requests past the limit get `429 QUEUE_FULL` with `Retry-After`. Queued requests that disconnect leave the queue at once. Status reports queue length |
+| Heavy models | Keep "one heavy model at a time" (decision B). Text and image together are not part of 9.9 |
+| Chat queue | Per engine, a queue of at most 4 waiting requests behind the running one (decision A). Requests past the limit get `429 QUEUE_FULL` with `Retry-After`. Queued requests that disconnect leave the queue at once. Status reports queue length |
 | Image queue | Same shape, default 2 waiting. Client disconnect cancels a queued job; cancelling a running job needs #64 |
 | Speech, voice | Keep one at a time; add queue limits (default 4) and cancel for queued jobs (#41) |
 | Fairness | First in, first out per engine. Between engines, no job waits for another engine's queue. Per-user fairness comes with multi-user accounts (#28), not before |
@@ -104,7 +104,7 @@ separate UI change is approved.
 | 9.9c | Memory check before loading a model, **warn only** (a field in the start response and a log line) | None for users; adds a field | Setting `memoryCheck: off` |
 | 9.9d | Chat queue limit and disconnect-aware queue | Requests past the limit get `429` | `chatQueue: off` restores the unbounded queue |
 | 9.9e | Thread budget shared between engines | Thread counts change only when engines overlap | `threads: off` |
-| 9.9f | Memory check **enforced** (with a force option), image/speech/voice queues, queue timeouts, stream idle timeout | New refusals, each with a clear message | Per-setting `off` |
+| 9.9f | Memory check **enforced** (with a force option), image/speech/voice queues, queue timeouts, stream idle timeout. Still one heavy model at a time (decision B) | New refusals, each with a clear message | Per-setting `off` |
 
 Each stage lands only after its tests pass on all 4 OS and the native-runtime timings (Step 9.10) don't regress.
 Stages 9.9c–f change behaviour and each needs a separate owner approval.
@@ -120,8 +120,27 @@ Stages 9.9c–f change behaviour and each needs a separate owner approval.
   recorded for Step 9.10.
 * **Rollback:** with every setting `off`, the 9.8h golden comparison (60 requests) stays identical.
 
-## 5. Open questions for the owner
+## 5. Owner decisions (2026-11-11)
 
-1. Default chat queue length (proposed 4) and whether a full queue should return `429` or wait.
-2. Whether to allow a text and an image model loaded together when memory allows (stage 9.9f or later).
-3. Whether the UI should show queue position and memory warnings (a separate, small UI change after 9.9d).
+These set the policy for later stages. They don't turn anything on: each behaviour-changing stage still needs its
+own approval.
+
+**A. Chat queue.** At most **4 waiting** chat requests per engine, not counting the one running. When the queue is
+full, a new request gets `429` with code `QUEUE_FULL` and a `Retry-After` header estimated from the running and
+queued work (at least 1 s), so nothing waits indefinitely. Queued requests are served first in, first out, so
+earlier requests are never overtaken. A queued request whose client disconnects leaves the queue at once. Rollback:
+`chatQueue: off` (setting and `USAP_CHAT_QUEUE=off`) restores today's unbounded behaviour, and a CI test checks
+that. Lands in stage 9.9d.
+
+**B. One heavy model at a time.** The current default stays: a text and an image model are never loaded together
+during the initial rollout (9.9b–9.9f). It can be reconsidered only after RAM and the relevant VRAM are reliably
+accounted for, memory headroom has been measured, real workloads have been tested on all 4 OS with clear failure
+handling and no unacceptable regressions, and the owner approves separately. **Unknown memory information never
+counts as proof that a workload fits:** when free VRAM or RAM is unknown, the answer is "unknown", never "fits".
+
+**C. Queue and memory information in the UI.** Showing queue position and memory warnings is approved as a
+concept, after the stages that produce them are tested. A minimal UI change may be proposed then, as its own PR,
+keeping the layout, visual design, navigation, themes and behaviour. No UI change is part of 9.9b–9.9f.
+
+Stage 9.9b (read-only accounting and `GET /api/resources`) is authorized for implementation; its PR needs a separate
+merge approval.
