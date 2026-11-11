@@ -58,8 +58,9 @@ const SAFE = [
 
 test("archive guard: a normal Core ML archive is accepted", () => {
   const dir = tmp();
-  const entries = guard.inspectZip(makeZip(path.join(dir, "ok.zip"), SAFE));
+  const { entries, totalBytes } = guard.inspectZip(makeZip(path.join(dir, "ok.zip"), SAFE));
   assert.deepEqual(entries.map((e) => e.name), SAFE.map((e) => e.name));
+  assert.equal(totalBytes, "weights".length + "{}".length);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -76,6 +77,12 @@ test("archive guard: unsafe entries are refused before anything is unpacked", ()
     [[{ name: "model.coreml/fifo", mode: 0o010644 }], /link or special file/],
     [[{ name: "model.coreml/dev", mode: 0o020644 }], /link or special file/],
     [[], /empty/],
+    [[{ name: "model.coreml/weights.bin:stream", data: "x" }], /colon/],
+    [[{ name: "./", data: "" }], /no name/],
+    [[{ name: "model.coreml/a.bin", data: "1" }, { name: "model.coreml/a.bin", data: "2" }], /two entries with the same name/],
+    [[{ name: "model.coreml/Weights.bin", data: "1" }, { name: "model.coreml/weights.bin", data: "2" }], /two entries with the same name/],
+    [[{ name: "model.coreml/a", data: "1" }, { name: "model.coreml/a/b.bin", data: "2" }], /file and a folder/],
+    [[{ name: "model.coreml/a/", mode: 0o040755 }, { name: "model.coreml/A", data: "2" }], /file and a folder/],
   ];
   for (const [entries, expected] of cases) {
     const zip = makeZip(path.join(dir, "bad.zip"), entries);
@@ -89,7 +96,11 @@ test("archive guard: entry-count and size limits, damaged and non-zip files", ()
   const zip = makeZip(path.join(dir, "many.zip"), SAFE);
   assert.throws(() => guard.inspectZip(zip, { ...guard.LIMITS, maxEntries: 3 }), /more than 3 entries/);
   const big = makeZip(path.join(dir, "big.zip"), [{ name: "model.coreml/huge.bin", data: "x", size: 0xfffffff0 }]);
-  assert.throws(() => guard.inspectZip(big, { ...guard.LIMITS, maxTotalBytes: 1024 ** 3 }), /size limit/);
+  const noRatio = { ...guard.LIMITS, maxRatio: Infinity }; // isolate each limit
+  assert.throws(() => guard.inspectZip(big, { ...noRatio, maxTotalBytes: 1024 ** 3 }), /unpacks to more than the size limit/);
+  assert.throws(() => guard.inspectZip(big, { ...noRatio, maxEntryBytes: 1024 ** 3 }), /file larger than the size limit/);
+  // 1 byte stored, 4 GB declared: far beyond the expansion ratio of any model file
+  assert.throws(() => guard.inspectZip(big), /expands far more/);
   fs.writeFileSync(path.join(dir, "not.zip"), "this is a web page");
   assert.throws(() => guard.inspectZip(path.join(dir, "not.zip")), /isn't a zip archive/);
   const damaged = fs.readFileSync(zip);
@@ -179,4 +190,68 @@ test("archive guard: the download service installs a normal archive", { skip: !H
   assert.equal(svc.getState().error, null);
   assert.deepEqual(fs.readdirSync(MODELS), ["model.coreml"]);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("archive guard: no room to unpack, data beyond the declared size, and a timeout all leave the folder unchanged", () => {
+  const dir = tmp();
+  const dest = path.join(dir, "models");
+  fs.mkdirSync(dest);
+  const zip = makeZip(path.join(dir, "m.zip"), SAFE);
+  assert.throws(() => guard.extractZipSafely(zip, dest, { statfs: () => ({ bavail: 1, bsize: 4 }) }), /enough free space/);
+  const overflow = (_zip, staging) => { fs.mkdirSync(path.join(staging, "model.coreml")); fs.writeFileSync(path.join(staging, "model.coreml", "big.bin"), Buffer.alloc(4096)); };
+  assert.throws(() => guard.extractZipSafely(zip, dest, { unzip: overflow }), /more data than it declared/);
+  let timeout;
+  const slow = (_zip, _staging, ms) => { timeout = ms; throw Object.assign(new Error("spawnSync unzip ETIMEDOUT"), { code: "ETIMEDOUT" }); };
+  assert.throws(() => guard.extractZipSafely(zip, dest, { unzip: slow }), /ETIMEDOUT/);
+  assert.equal(timeout, guard.LIMITS.unzipTimeoutMs);
+  assert.deepEqual(fs.readdirSync(dest), [], "no staging folder left");
+});
+
+test("archive guard: installing several items is all or nothing", () => {
+  const dir = tmp();
+  const dest = path.join(dir, "models");
+  fs.mkdirSync(path.join(dest, "a.coreml"), { recursive: true });
+  fs.writeFileSync(path.join(dest, "a.coreml", "weights.bin"), "installed a");
+  fs.mkdirSync(path.join(dest, "b.coreml"), { recursive: true });
+  fs.writeFileSync(path.join(dest, "b.coreml", "weights.bin"), "installed b");
+  const zip = makeZip(path.join(dir, "two.zip"), [{ name: "a.coreml/weights.bin", data: "new a" }, { name: "b.coreml/weights.bin", data: "new b" }]);
+  const unzip = (_zip, staging) => {
+    for (const n of ["a", "b"]) { fs.mkdirSync(path.join(staging, `${n}.coreml`)); fs.writeFileSync(path.join(staging, `${n}.coreml`, "weights.bin"), `new ${n}`); }
+  };
+  let moves = 0;
+  // The fourth rename (putting the new b in place) fails, e.g. because the engine holds the folder.
+  const rename = (from, to) => { moves += 1; if (moves === 4) throw Object.assign(new Error("EBUSY: resource busy"), { code: "EBUSY" }); fs.renameSync(from, to); };
+  assert.throws(() => guard.extractZipSafely(zip, dest, { unzip, rename }), /installed one was kept/);
+  assert.equal(fs.readFileSync(path.join(dest, "a.coreml", "weights.bin"), "utf8"), "installed a", "the first item was rolled back");
+  assert.equal(fs.readFileSync(path.join(dest, "b.coreml", "weights.bin"), "utf8"), "installed b");
+  assert.deepEqual(fs.readdirSync(dest).sort(), ["a.coreml", "b.coreml"], "no backups or staging left");
+});
+
+test("archive guard: staging folders are new each time, and ones left by a killed unpack are removed later", () => {
+  const dir = tmp();
+  const dest = path.join(dir, "models");
+  fs.mkdirSync(dest);
+  const stale = path.join(dest, `${guard.STAGING_PREFIX}old`);
+  const recent = path.join(dest, `${guard.STAGING_PREFIX}busy`);
+  fs.mkdirSync(stale);
+  fs.mkdirSync(recent);
+  const old = Date.now() / 1000 - 7 * 3600;
+  fs.utimesSync(stale, old, old);
+  const seen = [];
+  const unzip = (_zip, staging) => { seen.push(staging); fs.mkdirSync(path.join(staging, "model.coreml")); fs.writeFileSync(path.join(staging, "model.coreml", "w.bin"), "w"); };
+  const zip = makeZip(path.join(dir, "m.zip"), [{ name: "model.coreml/w.bin", data: "w" }]);
+  guard.extractZipSafely(zip, dest, { unzip });
+  guard.extractZipSafely(zip, dest, { unzip });
+  assert.notEqual(seen[0], seen[1]);
+  for (const s of seen) assert.ok(path.basename(s).startsWith(guard.STAGING_PREFIX) && path.dirname(s) === dest);
+  assert.ok(!fs.existsSync(stale), "a staging folder older than 6 hours is removed");
+  assert.ok(fs.existsSync(recent), "a recent one may belong to a running unpack and is kept");
+});
+
+test("archive guard: unzip is run without a shell, with the file names as separate arguments", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "server", "archive-guard.cjs"), "utf8");
+  assert.match(src, /execFileSync\("unzip", \["-qq", "-o", zipPath, "-d", stagingDir\]/);
+  assert.doesNotMatch(src, /\bexecSync\b|shell:\s*true/);
+  const dl = fs.readFileSync(path.join(__dirname, "..", "server", "services", "downloads.cjs"), "utf8");
+  assert.doesNotMatch(dl, /\bexecSync\b|shell:\s*true/);
 });
