@@ -12,7 +12,7 @@ describe the current boundaries, not a defence.
 | # | Entry point | Code | What enters |
 |---|---|---|---|
 | 1 | Chat with web search on | `services/web-search.cjs` `augmentMessagesWithWebSearch` ← `doLlmChat` | Search titles, URLs, snippets and fetched page text (`scripts/search/core.js` `formatWebContext`) |
-| 2 | Query planning | `services/web-search.cjs` `planWebSearchQuery` | The last 6 user and assistant messages, which can include answers based on earlier web content |
+| 2 | Query planning | `services/web-search.cjs` `planWebSearchQuery` | The user's own last 3 messages only (`query-policy.cjs`, #43). Assistant and system text is never shown |
 | 3 | `POST /api/web-search` | `routes/search.cjs` | Returned to the caller as `context` and `sources`. The server doesn't use it further |
 
 The outbound side (how the text is fetched) is covered in [Outbound request protection (Step 9.3)](../../README.md#usap-enhancements). Every
@@ -35,11 +35,27 @@ pins DNS, checks every redirect and limits the number of hops. Pages are capped 
 
 ## Known weaknesses (tracked)
 
-* [#42](https://github.com/dlroqa/usap/issues/42) **Delimiter imitation.** Page text is inserted
-  verbatim between plain-text markers, so a page can imitate the end of the web-results block.
-* [#43](https://github.com/dlroqa/usap/issues/43) **Query steering.** The planner reads earlier assistant
-  answers, which may be based on web content. A page could influence a later search query and send
-  conversation text to the search provider (inferred from code review, not demonstrated).
+* [#42](https://github.com/dlroqa/usap/issues/42) **Delimiter and role imitation (hardened).** Page text
+  used to be inserted verbatim between plain-text markers. Now (`scripts/search/core.js`):
+  * chat-template control tokens are removed, so page text can't open a new system or assistant turn
+    at the token level;
+  * code fences and rules are defused;
+  * every untrusted line is quoted with `│`;
+  * each source sits between markers carrying a random per-request id;
+  * titles, URLs, snippets and the whole context are size-capped.
+
+  **This reduces the risk but can't guarantee that a model ignores instructions written in a page.**
+* [#43](https://github.com/dlroqa/usap/issues/43) **Query steering (contained).** Before the fix, the planner
+  read earlier assistant answers, which may repeat web content. An offline test with a stand-in model
+  that obeys whatever it reads confirmed that text in those answers could add conversation content to
+  the outbound query; real models were not tested. Two code-level rules now apply (`query-policy.cjs`):
+  * the planner sees only the user's own last 3 messages;
+  * a planned query that copies any word (4+ characters) from elsewhere in the conversation is
+    refused, and the latest user message is searched instead.
+
+  Remaining risk: the user's own recent messages can still shape the query, and a refused or failed plan
+  sends the latest message, which is the request the user turned web search on for. References to text
+  only the assistant said now fall back to the user's message.
 * [#44](https://github.com/dlroqa/usap/issues/44) `/api/web-search/config` returned the absolute cache
   path (fixed: now relative, e.g. `app/cache/search`).
 * [#45](https://github.com/dlroqa/usap/issues/45) Search snippets are usually dropped by the result
