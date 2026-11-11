@@ -1,7 +1,8 @@
 # Step 9.8e plan: hardware and diagnostics module
 
-Status: **plan only.** Implementation starts after the web-search security fixes (#47, #49) are
-reviewed, as a separate PR that needs its own approval.
+Status: **implemented, in review** (separate PR, needs its own approval). The web-search security
+fixes (#47, #48, #49, #51) are merged. See [As implemented](#as-implemented) for where the code
+differs from this plan.
 
 ## What exists today (`scripts/server/serve.cjs`, about lines 430–1700, plus callers)
 
@@ -79,3 +80,30 @@ scripts/server/services/hardware.cjs   createHardwareService({ os, fs, spawnSync
   recorded-output tests are the main protection; real-GPU verification stays a separate, open item.
 * The timers start at module load today. Making them explicit has to keep the first sample timing, or
   the first telemetry response could differ (covered by test 3).
+
+## As implemented
+
+* `scripts/server/services/hardware.cjs` exports `createHardwareService(deps)`. The 26 hardware
+  functions and their caches were moved **byte for byte** (checked by an AST comparison against
+  `main`). The only edit: `pollNvidiaVram` reads the image engine process through the injected
+  `getBackendProc()`, because that state still lives in `serve.cjs`. `serve.cjs` binds the same
+  function names from `hardware.fns`, so no caller changed.
+* The service exposes `fns` (the existing functions, under their existing names) rather than the
+  `cpu/gpu/npu/memory/reports` namespaces sketched above. Grouped names can come later without moving
+  code again; keeping the old names made the move verifiable line by line.
+* **Timers:** the plan said "three 5 s timers". The code has **two** on Linux and Windows (NVIDIA VRAM,
+  llama.cpp device memory) and **three** on macOS (plus RAM from `vm_stat`). `start()` creates exactly
+  those, in the same order, at the same point of start-up; `stop()` clears them. Tests pin the count per
+  platform.
+* **Budget:** `budget.totalRamBytes()`, `freeRamBytes()`, `totalVramBytes()` and `freeVramBytes()` are
+  read-only (frozen) and use the same sources as `/api/telemetry`. **Nothing reads them yet.**
+  `chooseAutoContext` keeps reading `os.totalmem()` and `getGpuInfo()` directly, so auto-tuning is
+  unchanged. It moves to the budget with the loaders in 9.8h. `chooseAutoLayers` has no callers (it
+  was unused upstream too) and stays where it is.
+* `parseLlamaDeviceList` (used by the llama.cpp backend probe), `getBackendOptions` (with its cache)
+  and `getHardwareHash` (benchmark cache key, never in a response) stay in `serve.cjs`.
+* Golden check: on this development machine (Linux x64, no GPU), `/api/hardware-specs`,
+  `/api/backend-options` and `/api/telemetry` (without the live CPU/RAM usage) are identical between
+  `main` and this branch, and `/api/llm/backends` differs only in `generatedAt`. This is one machine,
+  not a hardware matrix; the recorded-output tests cover the other platforms and vendors.
+
