@@ -63,6 +63,7 @@ test("metadata: a GGUF text model reports format, quantization, architecture, en
   assert.equal(m.contextLength, 2048);
   assert.deepEqual(m.quantization, { type: "Q4_K_M", source: "header" });
   assert.equal(m.engine, "llama.cpp");
+  assert.equal(m.compatible, null, "detected metadata, never a compatibility claim");
   assert.equal(m.sizeBytes, fs.statSync(file).size);
   // KV cache at 4096 tokens, q8_0: 22 layers × 4096 × 4 heads × (64 + 64) × 34/32
   assert.equal(m.memory.kvCacheBytes, Math.round(22 * 4096 * 4 * 128 * 34 / 32));
@@ -195,5 +196,35 @@ test("GET /api/model-inspect: other folders, traversal and bad requests are refu
     const r = await request(srv.port, "GET", url);
     assert.equal(r.status, status, url);
     assert.equal(r.json.ok, false, url);
+  }
+});
+
+test("GET /api/model-inspect: needs sign-in when sign-in is on, and is read-only", async () => {
+  const r2 = makeRoot();
+  const dir = path.join(r2, "app", "llm-models");
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "tiny.gguf");
+  fs.writeFileSync(file, gguf({ kv: LLAMA }));
+  const before = fs.statSync(file);
+  const s2 = await startServer(r2, { UAIS_AUTH: "on" }, { readyPath: "/api/auth/status" });
+  try {
+    const anon = await request(s2.port, "GET", "/api/model-inspect?type=text&filename=tiny.gguf");
+    assert.equal(anon.status, 401);
+    const lanAuth = require("../server/lan-auth.cjs");
+    const token = lanAuth.readTokenFile(path.join(r2, "app", "config", lanAuth.TOKEN_FILE_NAME));
+    const ok = await request(s2.port, "GET", "/api/model-inspect?type=text&filename=tiny.gguf", { headers: { Authorization: `Bearer ${token}` } });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.json.compatible, null);
+    for (const method of ["POST", "PUT", "DELETE"]) {
+      const w = await request(s2.port, method, "/api/model-inspect?type=text&filename=tiny.gguf", { headers: { Authorization: `Bearer ${token}` }, body: {} });
+      assert.notEqual(w.status, 200, `${method} is not a route`);
+    }
+    const after = fs.statSync(file);
+    assert.equal(after.size, before.size);
+    assert.equal(after.mtimeMs, before.mtimeMs, "the file is never written");
+    assert.deepEqual(fs.readdirSync(dir), ["tiny.gguf"]);
+  } finally {
+    stopServer(s2);
+    try { fs.rmSync(r2, { recursive: true, force: true }); } catch (_) { /* Windows may hold files briefly */ }
   }
 });

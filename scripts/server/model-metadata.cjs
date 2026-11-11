@@ -197,14 +197,16 @@ function inspectModel(filePath, { contextSize = 4096 } = {}) {
   const lower = filePath.toLowerCase();
   if (stats.isDirectory()) {
     if (/\.(coreml|mlmodelc|mlpackage)$/.test(lower)) {
-      return { format: "coreml", kind: "image", architecture: null, quantization: null, engine: engineFor("coreml"), sizeBytes: null, memory: null, warnings };
+      return { format: "coreml", kind: "image", architecture: null, quantization: null, engine: engineFor("coreml"), compatible: null, sizeBytes: null, memory: null, warnings };
     }
     return { format: "unknown", sizeBytes: null, warnings: ["This is a folder, not a model file."] };
   }
   const sizeBytes = stats.size;
   const detected = detectModelKind(filePath);
   const kind = detected.kind;
-  const result = { format: "unknown", kind, architecture: null, name: null, quantization: null, engine: null, sizeBytes, contextLength: null, parameters: null, memory: null, warnings };
+  // `engine` is the engine that runs this kind of file. Whether this file loads in the shipped engine version is
+  // not checked (issue #61), so `compatible` is always null: detected metadata, not confirmed compatibility.
+  const result = { format: "unknown", kind, architecture: null, name: null, quantization: null, engine: null, compatible: null, sizeBytes, contextLength: null, parameters: null, memory: null, warnings };
 
   const head = Buffer.alloc(4);
   try { const fd = fs.openSync(filePath, "r"); try { fs.readSync(fd, head, 0, 4, 0); } finally { fs.closeSync(fd); } } catch (_) { /* empty file */ }

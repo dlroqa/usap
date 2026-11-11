@@ -40,7 +40,9 @@ elsewhere), and ONNX text models.
 ## Inspecting a model
 
 `GET /api/model-inspect?type=image|text|speech&filename=<file name>` reads the model's header and returns facts about
-it. It is read-only: it loads nothing, changes nothing, and returns no paths.
+it. It is read-only: it loads nothing, changes nothing, and returns no paths. Only a file name inside the type's model
+folder can be named. A model linked in place is read where it is, because you linked it; no other file outside the
+model folders can be reached. It needs sign-in like every other route when the studio is shared.
 
 | Field | Meaning |
 |---|---|
@@ -48,7 +50,8 @@ it. It is read-only: it loads nothing, changes nothing, and returns no paths.
 | `kind` | `image`, `text`, `speech` or `unknown`, as detected from the header |
 | `architecture`, `name`, `parameters`, `contextLength`, `ggufVersion` | From the GGUF metadata when present (`general.*`, `<arch>.context_length`) |
 | `quantization` | `{ type, source }`. `source` is `header` (`general.file_type`), `tensors` (the weights' most common tensor type) or `file name` (a pattern such as `Q4_K_M` in the name). Unknown values are reported as numbers (`file type 99`), not guessed. |
-| `engine` | The engine in this studio that runs this kind of file, or `null` |
+| `engine` | The engine in this studio that runs this kind of file, or `null`. This is detected from the header, not a check that this file loads |
+| `compatible` | Always `null`: USAP doesn't check a file against the shipped engine version ([#61](https://github.com/dlroqa/usap/issues/61)). A model can still fail to load |
 | `sizeBytes` | File size |
 | `memory` | A rough estimate; see below |
 | `warnings` | Damaged headers, formats no engine here runs, and similar notes |
