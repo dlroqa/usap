@@ -35,8 +35,16 @@ pins DNS, checks every redirect and limits the number of hops. Pages are capped 
 
 ## Known weaknesses (tracked)
 
-* [#42](https://github.com/dlroqa/usap/issues/42) **Delimiter imitation.** Page text is inserted
-  verbatim between plain-text markers, so a page can imitate the end of the web-results block.
+* [#42](https://github.com/dlroqa/usap/issues/42) **Delimiter and role imitation (hardened).** Page text
+  used to be inserted verbatim between plain-text markers. Now (`scripts/search/core.js`):
+  * chat-template control tokens are removed, so page text can't open a new system or assistant turn
+    at the token level;
+  * code fences and rules are defused;
+  * every untrusted line is quoted with `│`;
+  * each source sits between markers carrying a random per-request id;
+  * titles, URLs, snippets and the whole context are size-capped.
+
+  **This reduces the risk but can't guarantee that a model ignores instructions written in a page.**
 * [#43](https://github.com/dlroqa/usap/issues/43) **Query steering (contained).** Before the fix, the planner
   read earlier assistant answers, which may repeat web content. An offline test with a stand-in model
   that obeys whatever it reads confirmed that text in those answers could add conversation content to
