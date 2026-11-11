@@ -184,7 +184,23 @@ function createChatService(deps) {
     }
   }
 
-  return { doLlmChat, isOomError, retryLowerContext };
+  // Step 9.9b: counted for GET /api/resources only. `active` is chat requests the studio is answering; `waiting`
+  // is streaming requests queued for the one shared connection to the engine (maxSockets 1). Non-streaming
+  // requests use their own connection, so they never wait there. Nothing here changes how requests run.
+  let activeChats = 0;
+  function trackedDoLlmChat(req, res, body) {
+    activeChats += 1;
+    let counted = true;
+    const done = () => { if (counted) { counted = false; activeChats -= 1; } };
+    res.once("close", done);
+    res.once("finish", done);
+    return doLlmChat(req, res, body);
+  }
+  const chatStats = () => ({
+    active: activeChats,
+    waiting: Object.values(llmHttpAgent.requests || {}).reduce((n, list) => n + (Array.isArray(list) ? list.length : 0), 0),
+  });
+  return { doLlmChat: trackedDoLlmChat, isOomError, retryLowerContext, chatStats };
 }
 
 module.exports = { createChatService };
