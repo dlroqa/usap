@@ -220,7 +220,7 @@ only, no force pushes. Details: [CI_GUIDE.md](docs/ci/CI_GUIDE.md),
 | Intel macOS setup; chat, accessibility and mobile fixes | Done (#5–#8) |
 | **Step 8:** native inference verification | **CPU done** on all 4 platforms (#9); GPU pending real hardware |
 | Desktop installer requirement documented | Done (#10), planning only |
-| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection done (#16); Windows streaming tests done (#17); 9.4 download integrity done (#18); 9.5 LAN sign-in done (#25); 9.6 engine supervision done (#29); 9.7 API error consistency done (#35); 9.8 modular backend in development ([plan](docs/roadmap/STEP9_8_MODULES.md); 9.8a request pipeline and system routes done (#36); 9.8b text-to-speech module done (#37); 9.8c speech recognition module done (#40); 9.8d web search in development) |
+| **Step 9:** foundational backend | **In progress** ([plan](docs/roadmap/STEP9_BACKEND_PLAN.md), #11). 9.1 API contract tests done (#13); 9.2 single data-root resolver done (#15); 9.3 outbound request protection done (#16); Windows streaming tests done (#17); 9.4 download integrity done (#18); 9.5 LAN sign-in done (#25); 9.6 engine supervision done (#29); 9.7 API error consistency done (#35); 9.8 modular backend in development ([plan](docs/roadmap/STEP9_8_MODULES.md); 9.8a request pipeline and system routes done (#36); 9.8b text-to-speech module done (#37); 9.8c speech recognition module done (#40); 9.8d web search module done (#46); 9.8e hardware and diagnostics planned) |
 
 ## Development Roadmap
 
@@ -262,6 +262,9 @@ validation. Full priorities: [PRIORITIES.md](docs/roadmap/PRIORITIES.md).
 * **Only the text engine restarts by itself after a crash.** The image, speech and voice engines
   report the failure; the optional Intel NPU worker isn't supervised yet, and memory awareness is basic
   ([details](docs/runtime/ENGINE_SUPERVISION.md#limitations); [#30](https://github.com/dlroqa/usap/issues/30)–[#33](https://github.com/dlroqa/usap/issues/33)).
+* **Web search content is untrusted and USAP is not prompt-injection-safe.** Web results are added as
+  untrusted user-role context and can't trigger any operation, but no adversarial defence exists yet
+  ([trust boundary](docs/security/WEB_CONTENT_TRUST.md); [#42](https://github.com/dlroqa/usap/issues/42), [#43](https://github.com/dlroqa/usap/issues/43)).
 * **LAN sharing uses plain HTTP and one shared token**: no built-in HTTPS, no user accounts. Use it
   only on a trusted network, and never expose the studio directly to the internet
   ([details](docs/security/LAN_ACCESS.md#limitations); follow-ups [#26](https://github.com/dlroqa/usap/issues/26)–[#28](https://github.com/dlroqa/usap/issues/28)).
