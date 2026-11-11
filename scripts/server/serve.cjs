@@ -32,6 +32,9 @@ const { speechRoutes } = require("./routes/speech.cjs");
 const { createWebSearchService } = require("./services/web-search.cjs");
 const { createHardwareService } = require("./services/hardware.cjs");
 const { searchRoutes } = require("./routes/search.cjs");
+const { modelRoutes } = require("./routes/models.cjs");
+const { createModelStore } = require("./services/model-store.cjs");
+const { createDownloadService } = require("./services/downloads.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -737,31 +740,15 @@ function getOpenVinoPython() {
 }
 
 
-function getOpenVinoModelInfo() {
-  return OPENVINO_NPU_MODELS.map((model) => {
-    const modelPath = path.join(OPENVINO_MODELS, model.folder);
-    const requiredFiles = [
-      path.join(modelPath, "model_index.json"),
-      path.join(modelPath, "text_encoder", "openvino_model.xml"),
-      path.join(modelPath, "unet", "openvino_model.xml"),
-      path.join(modelPath, "vae_decoder", "openvino_model.xml"),
-    ];
-    const installed = requiredFiles.every((file) => fs.existsSync(file));
-    return {
-      ...model,
-      filename: model.id,
-      path: modelPath,
-      installed,
-      sizeBytes: getPathSize(modelPath),
-      size: formatBytes(getPathSize(modelPath)),
-      format: "OpenVINO",
-    };
-  });
-}
+// Model folders (listing, linked models, imports) live in services/model-store.cjs (Step 9.8f).
+const modelStore = createModelStore({
+  LLM_MODELS, MODELS, OPENVINO_MODELS, OPENVINO_NPU_MODELS, SPEECH_MODELS, badRequest, describeStorageError,
+  detectModelKindCached, ensureStorageCapacity, formatBytes, fs, getPathSize, path, replaceFileWithRetry, withFileRetrySync,
+});
+const {
+  getOpenVinoModelInfo, findOpenVinoModel, readdirVisible, describeLinkedModel, modelFolderFor, detectedKindFor, getLlmModels, isModelFile, getModelInfo, streamModelUpload,
+} = modelStore.fns;
 
-function findOpenVinoModel(modelId) {
-  return getOpenVinoModelInfo().find((model) => model.id === modelId || model.folder === modelId || model.name === modelId);
-}
 
 function pathInside(childPath, parentPath) {
   const relative = path.relative(path.resolve(parentPath), path.resolve(childPath));
@@ -970,58 +957,6 @@ function getLlmBackendCandidates() {
   return probe.available;
 }
 
-// macOS writes "._name" AppleDouble files next to real files on exFAT and FAT drives.
-// They are never models or user data, so listings of the app's data folders skip them.
-function readdirVisible(dir) {
-  return fs.readdirSync(dir).filter((name) => !name.startsWith("._"));
-}
-
-// Models can be linked in place from elsewhere on disk instead of copied in (POST /api/link-model).
-// A link reports where its file lives, and whether that file has since been moved or deleted.
-function describeLinkedModel(fullPath) {
-  try {
-    if (!fs.lstatSync(fullPath).isSymbolicLink()) return {};
-    const target = path.resolve(path.dirname(fullPath), fs.readlinkSync(fullPath));
-    return { linkedFrom: target, missing: !fs.existsSync(target) };
-  } catch (_) {
-    return {};
-  }
-}
-
-// The app's folder for each model type, and which loaded model would block moving a file out of it
-function modelFolderFor(kind) {
-  return { image: MODELS, text: LLM_MODELS, speech: SPEECH_MODELS }[kind] || null;
-}
-
-// "detectedKind" lets the UI spot a model filed under the wrong type (a text GGUF on the Image tab)
-function detectedKindFor(fullPath, link = {}) {
-  return link.missing ? "unknown" : detectModelKindCached(fullPath).kind;
-}
-
-function getLlmModels() {
-  try {
-    return readdirVisible(LLM_MODELS)
-      .filter((filename) => filename.toLowerCase().endsWith(".gguf"))
-      .map((filename) => {
-        const fullPath = path.join(LLM_MODELS, filename);
-        const link = describeLinkedModel(fullPath);
-        const sizeBytes = link.missing ? 0 : fs.statSync(fullPath).size;
-        const lower = filename.toLowerCase();
-        return {
-          filename,
-          name: filename,
-          sizeBytes,
-          size: link.missing ? "" : formatBytes(sizeBytes),
-          format: "GGUF",
-          isProjector: lower.includes("mmproj"),
-          detectedKind: detectedKindFor(fullPath, link),
-          ...link,
-        };
-      });
-  } catch (_) {
-    return [];
-  }
-}
 
 function findExistingFile(candidates) {
   return candidates.find((candidate) => candidate && fs.existsSync(candidate)) || "";
@@ -3369,301 +3304,20 @@ async function startBackend(settings = {}) {
 }
 
 // ── Model Downloader ─────────────────────────────────────────────────────────
-let downloadState = {
-  active: false,
-  filename: "",
-  progress: 0,
-  speed: "0 MB/s",
-  eta: 0,
-  totalBytes: 0,
-  downloadedBytes: 0,
-  error: null
-};
-let activeDownload = null;
+// Downloads (models, OpenVINO models, the Windows image engine) live in services/downloads.cjs (Step 9.8f).
+function invalidateBackendOptions() { cachedBackendOptions = null; }
+const downloads = createDownloadService({
+  DOWNLOAD_POLICY, LLM_MODELS, MODELS, OPENVINO_MODELS, OPENVINO_NPU_MODELS, ROOT, SPEECH_MODELS, TOOLS, TTS_MODELS,
+  downloadBlockReason, downloader, fs, getOpenVinoNpuInfo, getPathSize, integrity, osPlatform, path, spawn, spawnSync,
+  invalidateBackendOptions,
+});
+const {
+  startOpenVinoModelDownload, IMAGE_BACKEND_DOWNLOADS, startImageBackendDownload, getModelDownloadUrlIssue, startModelDownload, cancelModelDownload,
+} = downloads.fns;
 
-function startOpenVinoModelDownload(modelId) {
-  if (downloadState.active) return;
-  const npuInfo = getOpenVinoNpuInfo();
-  if (!npuInfo.supported) throw new Error(npuInfo.reason || "OpenVINO NPU runtime is not available.");
-  const model = OPENVINO_NPU_MODELS.find((item) => item.id === modelId);
-  if (!model) throw new Error("Unknown OpenVINO model.");
-
-  const destDir = path.join(OPENVINO_MODELS, model.folder);
-  fs.mkdirSync(destDir, { recursive: true });
-  downloadState = {
-    active: true,
-    filename: model.name,
-    progress: -1,
-    speed: "Downloading snapshot",
-    eta: 0,
-    totalBytes: 0,
-    downloadedBytes: 0,
-    error: null,
-  };
-
-  const script = [
-    "from huggingface_hub import snapshot_download",
-    `snapshot_download(repo_id=${JSON.stringify(model.repo)}, local_dir=${JSON.stringify(destDir)}, ignore_patterns=['safety_checker/*','feature_extractor/*','*.safetensors'])`,
-    "print('DONE')",
-  ].join("\n");
-  console.log(`  [openvino-download] Downloading ${model.repo} -> ${destDir}`);
-  const proc = spawn(npuInfo.python, ["-c", script], { stdio: "pipe" });
-  activeDownload = { process: proc, destPath: destDir, openvino: true };
-  proc.stdout.on("data", (data) => process.stdout.write("  [openvino-download] " + data.toString()));
-  proc.stderr.on("data", (data) => process.stderr.write("  [openvino-download] " + data.toString()));
-  proc.on("exit", (code) => {
-    activeDownload = null;
-    if (String(downloadState.error || "").toLowerCase().includes("cancelled")) {
-      return;
-    }
-    downloadState.active = false;
-    if (code === 0) {
-      downloadState.progress = 100;
-      downloadState.downloadedBytes = getPathSize(destDir);
-      downloadState.totalBytes = downloadState.downloadedBytes;
-      downloadState.speed = "Complete";
-      cachedBackendOptions = null;
-    } else {
-      downloadState.error = `OpenVINO model download failed with code ${code}`;
-    }
-  });
-}
-
-const IMAGE_BACKEND_DOWNLOADS = {
-  "cpu": {
-    id: "cpu",
-    label: "CPU",
-    url: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-win-cpu-x64.zip",
-    destDir: path.join(ROOT, "app", "backend", "win", "cpu"),
-    exeName: "sd-cpu.exe",
-    requiredDll: "stable-diffusion.dll",
-  },
-  "vulkan": {
-    id: "vulkan",
-    label: "Vulkan GPU",
-    url: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-685-19bdfe2/sd-master-19bdfe2-bin-win-vulkan-x64.zip",
-    destDir: path.join(ROOT, "app", "backend", "win", "vulkan"),
-    exeName: "sd-vulkan.exe",
-    requiredDll: "stable-diffusion.dll",
-  },
-  "cuda": {
-    id: "cuda",
-    label: "CUDA GPU",
-    url: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-win-cuda12-x64.zip",
-    // The CUDA build does not bundle cudart64_12.dll / cublas; without it sd-cuda.exe fails to start.
-    runtimeUrl: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/cudart-sd-bin-win-cu12-x64.zip",
-    destDir: path.join(ROOT, "app", "backend", "win", "cuda"),
-    exeName: "sd-cuda.exe",
-    requiredDll: "stable-diffusion.dll",
-  },
-};
-
-function listFilesRecursive(dir) {
-  const out = [];
-  if (!fs.existsSync(dir)) return out;
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      out.push(...listFilesRecursive(full));
-    } else if (entry.isFile()) {
-      out.push(full);
-    }
-  }
-  return out;
-}
-
-function installImageBackendArchive(zipPath, backend, runtimeOnly = false) {
-  // Extract into a temporary folder, build the complete new engine folder next to the live one, check
-  // that the executable is built for this CPU, then swap folders in one step. If anything fails, the
-  // installed engine is left exactly as it was (Step 9.4).
-  const stamp = Date.now();
-  const tempDir = path.join(TOOLS, `image-backend-${backend.id}-extract-${stamp}`);
-  const stagingDir = `${backend.destDir}.staging-${stamp}`;
-  try {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-    fs.mkdirSync(tempDir, { recursive: true });
-    fs.rmSync(stagingDir, { recursive: true, force: true });
-    if (fs.existsSync(backend.destDir)) fs.cpSync(backend.destDir, stagingDir, { recursive: true });
-    else fs.mkdirSync(stagingDir, { recursive: true });
-
-    const tar = spawnSync("tar.exe", ["-xf", zipPath, "-C", tempDir], { encoding: "utf8" });
-    if (tar.status !== 0) {
-      throw new Error((tar.stderr || tar.stdout || "Could not extract backend archive.").trim());
-    }
-
-    const files = listFilesRecursive(tempDir);
-    if (runtimeOnly) {
-      const dlls = files.filter((file) => path.extname(file).toLowerCase() === ".dll");
-      if (dlls.length === 0) throw new Error("CUDA runtime archive did not contain any DLL files.");
-      for (const file of dlls) fs.copyFileSync(file, path.join(stagingDir, path.basename(file)));
-    } else {
-      const exeSource = files.find((file) => ["sd-server.exe", "sd.exe"].includes(path.basename(file).toLowerCase()));
-      const dllSource = files.find((file) => path.basename(file).toLowerCase() === backend.requiredDll.toLowerCase());
-      if (!exeSource || !dllSource) {
-        throw new Error("Backend archive did not contain the expected stable-diffusion executable and DLL.");
-      }
-
-      fs.copyFileSync(exeSource, path.join(stagingDir, backend.exeName));
-      fs.copyFileSync(dllSource, path.join(stagingDir, backend.requiredDll));
-      for (const file of files) {
-        const ext = path.extname(file).toLowerCase();
-        if (ext !== ".dll" && ext !== ".exe") continue;
-        if (file === exeSource) continue;
-        fs.copyFileSync(file, path.join(stagingDir, path.basename(file)));
-      }
-
-      if (!fs.existsSync(path.join(stagingDir, backend.exeName)) || !fs.existsSync(path.join(stagingDir, backend.requiredDll))) {
-        throw new Error(`Backend install did not create ${backend.exeName} and ${backend.requiredDll}.`);
-      }
-      // Windows on Arm runs these x64 builds through its built-in emulation; every other host must match.
-      integrity.assertNativeBinary(path.join(stagingDir, backend.exeName), {
-        accept: process.arch === "arm64" ? ["arm64", "x64"] : [process.arch],
-      });
-    }
-    try {
-      integrity.atomicReplaceDir(stagingDir, backend.destDir);
-    } catch (err) {
-      throw new Error(`${err.message} Stop image generation (the engine may be running) and try again.`);
-    }
-    cachedBackendOptions = null;
-  } finally {
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
-    try { fs.rmSync(stagingDir, { recursive: true, force: true }); } catch (_) {}
-  }
-}
 
 // ── Verified downloads (Step 9.4) ───────────────────────────────────────────
-// Bumped on every new download and on cancel, so a superseded transfer never overwrites the status.
-let downloadGeneration = 0;
-const DOWNLOAD_USER_AGENT = "Uncensored-AI-Studio/1.0 (+https://github.com/techjarves/Uncensored-AI-Studio)";
 
-function downloadProgressUpdater() {
-  let lastTime = Date.now();
-  let lastBytes = 0;
-  return ({ bytes, totalBytes }) => {
-    if (bytes < lastBytes) lastBytes = 0; // a retry restarted from byte zero
-    downloadState.downloadedBytes = bytes;
-    downloadState.totalBytes = totalBytes;
-    const now = Date.now();
-    const elapsed = (now - lastTime) / 1000;
-    if (elapsed < 0.5) return;
-    const speed = (bytes - lastBytes) / elapsed; // bytes/sec
-    lastBytes = bytes;
-    lastTime = now;
-    downloadState.speed = `${(speed / (1024 * 1024)).toFixed(1)} MB/s`;
-    if (totalBytes > 0) {
-      downloadState.progress = Math.round((bytes / totalBytes) * 100);
-      downloadState.eta = Math.round((totalBytes - bytes) / Math.max(1, speed));
-    } else {
-      downloadState.progress = -1; // Indeterminate
-      downloadState.eta = -1;
-    }
-  };
-}
-
-function describeDownloadFailure(err, label) {
-  if (!err) return `Download of ${label} failed.`;
-  if (err.name === "BlockedRequestError" || err.name === "IntegrityError" || err.code === "USAP_HTTP") return err.message;
-  if (err.code === "USAP_INTERRUPTED" || err.code === "USAP_STALLED" || downloader.TRANSIENT.has(err.code)) {
-    return `Download interrupted before ${label} finished: ${err.message} Retry the download.`;
-  }
-  if (err.code === "USAP_WRITE") return `Could not write ${label}: ${err.message}`;
-  return err.message || String(err);
-}
-
-// The redirect arguments are unused since Step 9.4 (the downloader follows redirects); the signature is kept.
-function startImageBackendDownload(backendId, _redirectCount = 0, _redirectUrl = "", stage = "main") {
-  const isRuntimeStage = stage === "runtime";
-  if (downloadState.active && !isRuntimeStage) {
-    throw new Error("Another download is already active.");
-  }
-  if (osPlatform !== "win32") {
-    throw new Error(osPlatform === "linux"
-      ? "In-app backend downloads are only available on Windows. On Linux, run `bash scripts/setup/setup.sh` (it installs the Vulkan/CUDA/ROCm backends that match your GPU), or build them with scripts/build/build_from_source.sh if the prebuilt binaries do not run on your distribution."
-      : "In-app backend downloads are only available on Windows. Run the platform setup script again to install or repair backends.");
-  }
-  const backend = IMAGE_BACKEND_DOWNLOADS[String(backendId || "").toLowerCase()];
-  if (!backend) {
-    throw new Error("This backend cannot be installed from the app yet. Use the platform setup script.");
-  }
-
-  fs.mkdirSync(TOOLS, { recursive: true });
-  const url = isRuntimeStage ? backend.runtimeUrl : backend.url;
-  const filename = isRuntimeStage ? `${backend.id}-runtime.zip` : `${backend.id}-backend.zip`;
-  const destPath = path.join(TOOLS, filename);
-  const label = `${backend.label} backend`;
-  downloadState = {
-    active: true,
-    filename: isRuntimeStage ? `${backend.label} runtime` : backend.label,
-    progress: 0,
-    speed: "0 MB/s",
-    eta: 0,
-    totalBytes: 0,
-    downloadedBytes: 0,
-    error: null,
-    kind: "backend",
-    backendId: backend.id,
-    integrity: null,
-    sha256: null,
-  };
-  const generation = ++downloadGeneration;
-  const failDownload = (message, err = null) => {
-    if (generation !== downloadGeneration) return;
-    downloadState.active = false;
-    downloadState.error = message;
-    if (err) console.error("  [backend-download]", message, err.code || "");
-    else console.error("  [backend-download] Failed:", message);
-    activeDownload = null;
-  };
-
-  const blockedReason = downloadBlockReason(url);
-  if (blockedReason) return failDownload(blockedReason);
-  console.log(`  [backend-download] Downloading ${backend.label} backend from ${url}`);
-  const controller = new AbortController();
-  const progress = downloadProgressUpdater();
-  activeDownload = { abort: () => controller.abort(), destPath, tempPath: `${destPath}.part` };
-  downloader.downloadVerified(url, destPath, {
-    policy: DOWNLOAD_POLICY,
-    signal: controller.signal,
-    label,
-    requirePinned: true, // engines are only installed when they match a reviewed digest
-    headers: { "User-Agent": DOWNLOAD_USER_AGENT, "Accept": "application/zip, application/octet-stream, */*" },
-    checkResponse: (res, current) => (res.statusCode === 200 ? null : describeDownloadHttpError(res.statusCode, current, res.headers)),
-    onRedirect: () => { if (generation === downloadGeneration) downloadState.speed = "Following redirect"; },
-    onProgress: (p) => { if (generation === downloadGeneration) progress(p); },
-    onRetry: ({ attempt, error }) => {
-      console.warn(`  [backend-download] ${label}: ${error.message} Retrying (attempt ${attempt + 1}).`);
-      if (generation === downloadGeneration) downloadState.speed = "Retrying";
-    },
-  }).then((result) => {
-    if (generation !== downloadGeneration) { try { fs.rmSync(destPath, { force: true }); } catch (_) {} return; }
-    downloadState.speed = "Installing";
-    downloadState.progress = 95;
-    try {
-      installImageBackendArchive(destPath, backend, isRuntimeStage);
-    } catch (err) {
-      return failDownload(`Could not install ${backend.label} backend: ${err.message}`, err);
-    } finally {
-      try { fs.unlinkSync(destPath); } catch (_) {}
-    }
-    console.log(`  [backend-download] ${filename}: ${result.status}, sha256 ${result.sha256}`);
-    if (!isRuntimeStage && backend.runtimeUrl) {
-      activeDownload = null;
-      console.log(`  [backend-download] Installed ${backend.label} backend, fetching runtime libraries`);
-      startImageBackendDownload(backend.id, 0, "", "runtime");
-      return;
-    }
-    downloadState.active = false;
-    downloadState.progress = 100;
-    downloadState.downloadedBytes = result.bytes;
-    downloadState.error = null;
-    downloadState.speed = "Complete";
-    downloadState.integrity = result.status;
-    downloadState.sha256 = result.sha256;
-    activeDownload = null;
-    console.log(`  [backend-download] Installed ${backend.label} backend`);
-  }, (err) => failDownload(describeDownloadFailure(err, label), err));
-}
 
 // ── Generation State (Real-time progress parser) ─────────────────────────────
 let generationState = {
@@ -3688,205 +3342,6 @@ function resetGenerationState() {
   };
 }
 
-function describeDownloadHttpError(statusCode, url, headers = {}) {
-  const host = (() => {
-    try { return new URL(url).hostname; } catch (_) { return ""; }
-  })();
-  const isHuggingFace = host.includes("huggingface.co") || host.includes("hf.co");
-  const hfErrorCode = headers["x-error-code"];
-  const hfErrorMessage = headers["x-error-message"];
-
-  if (isHuggingFace && hfErrorCode === "GatedRepo") {
-    return `HTTP ${statusCode}: Hugging Face says this model is gated. Open the model page in your browser, accept access/login, then use a Hugging Face token or download the file manually.`;
-  }
-  if (isHuggingFace && hfErrorMessage) {
-    return `HTTP ${statusCode}: Hugging Face rejected the download request: ${hfErrorMessage}`;
-  }
-
-  if (statusCode === 401 || statusCode === 403) {
-    return isHuggingFace
-      ? `HTTP ${statusCode}: Hugging Face rejected the download request. If this model is public, retry after restarting the app; otherwise open the model page in your browser and accept any license/login requirement.`
-      : `HTTP ${statusCode}: This download URL requires authorization or permission. Use a public direct download URL.`;
-  }
-  if (statusCode === 404) {
-    return `HTTP 404: Model file not found. Check that the URL points directly to a .safetensors, .gguf, or .ckpt file.`;
-  }
-  return `HTTP ${statusCode}`;
-}
-
-const MODEL_FILE_URL_HINT = "Use a direct link to a single model file ending in .safetensors, .gguf or .ckpt. On Hugging Face, open the repository's Files tab and copy the download link of one file.";
-
-// Rejects URLs that point at a web page instead of a downloadable file, e.g. a
-// Hugging Face repository page, which otherwise "downloads" as a small HTML file.
-function getModelDownloadUrlIssue(url) {
-  let parsed;
-  try {
-    parsed = new URL(String(url || "").trim());
-  } catch (_) {
-    return "That is not a valid URL.";
-  }
-  if (!/^https?:$/.test(parsed.protocol)) return "Only http(s) download URLs are supported.";
-  const blocked = downloadBlockReason(parsed.toString());
-  if (blocked) return blocked;
-  if (/(^|\.)huggingface\.co$/i.test(parsed.hostname)) {
-    const parts = parsed.pathname.split("/").filter(Boolean);
-    const isFileUrl = parts.includes("resolve") || parts.includes("blob");
-    if (!isFileUrl) return `That URL is a Hugging Face repository page, not a model file. ${MODEL_FILE_URL_HINT}`;
-  }
-  if (!path.extname(path.basename(parsed.pathname))) {
-    return `That URL does not point to a model file (no file extension). ${MODEL_FILE_URL_HINT}`;
-  }
-  return "";
-}
-
-function startModelDownload(url, overrideFilename = null, targetDir = MODELS, kind = "image") {
-  if (downloadState.active && !overrideFilename) {
-    console.log("  [download] Already downloading a model");
-    return;
-  }
-
-  // Convert HuggingFace viewer URL (/blob/) to direct download URL (/resolve/)
-  if (url.includes("huggingface.co") && url.includes("/blob/")) {
-    url = url.replace("/blob/", "/resolve/");
-  }
-
-  let filename = overrideFilename;
-  if (!filename) {
-    filename = "model.gguf";
-    try {
-      const parsed = new URL(url);
-      filename = path.basename(parsed.pathname);
-    } catch (e) {
-      console.error("Failed to parse URL filename:", e);
-    }
-  }
-
-  const destPath = path.join(targetDir, filename);
-  const tempPath = `${destPath}.part`;
-  downloadState = {
-    active: true,
-    filename: filename,
-    progress: 0,
-    speed: "0 MB/s",
-    eta: 0,
-    totalBytes: 0,
-    downloadedBytes: 0,
-    error: null,
-    kind,
-    // Step 9.4 (additive): "verified" | "source-checksum" | "unverified" once finished.
-    integrity: null,
-    sha256: null,
-  };
-  const generation = ++downloadGeneration;
-
-  const blockedReason = downloadBlockReason(url);
-  if (blockedReason) {
-    downloadState.active = false;
-    downloadState.error = blockedReason;
-    console.error("  [download] Refused:", blockedReason);
-    return;
-  }
-
-  console.log(`  [download] Starting download of ${filename} from ${url}`);
-  const controller = new AbortController();
-  activeDownload = { abort: () => controller.abort(), destPath, tempPath };
-  const progress = downloadProgressUpdater();
-  downloader.downloadVerified(url, destPath, {
-    tempPath,
-    policy: DOWNLOAD_POLICY,
-    signal: controller.signal,
-    label: filename,
-    headers: {
-      "User-Agent": DOWNLOAD_USER_AGENT,
-      "Accept": "application/octet-stream, application/x-safetensors, */*",
-      "Referer": "https://huggingface.co/",
-    },
-    checkResponse: (res, current) => {
-      if (res.statusCode !== 200) return describeDownloadHttpError(res.statusCode, current, res.headers);
-      // Repository pages, login walls and error pages come back as 200 + text/html.
-      if (String(res.headers["content-type"] || "").toLowerCase().includes("text/html")) {
-        return `That URL returned a web page, not a model file. ${MODEL_FILE_URL_HINT}`;
-      }
-      return null;
-    },
-    // Handle redirects (HuggingFace resolve URLs redirect to Cloudfront/S3); each hop is re-validated.
-    onRedirect: () => {
-      console.log(`  [download] Following redirect for ${filename}`);
-      if (generation === downloadGeneration) downloadState.speed = "Following redirect";
-    },
-    onProgress: (p) => { if (generation === downloadGeneration) progress(p); },
-    onRetry: ({ attempt, error }) => {
-      console.warn(`  [download] ${filename}: ${error.message} Retrying from the start (attempt ${attempt + 1}).`);
-      if (generation === downloadGeneration) downloadState.speed = "Retrying";
-    },
-  }).then((result) => {
-    console.log(`  [download] ${filename}: ${result.status} (${result.message}) sha256 ${result.sha256}`);
-    if (generation !== downloadGeneration) return; // cancelled or superseded; status already set
-    if (destPath.toLowerCase().endsWith(".zip")) {
-      try {
-        // execFile with an argument list: the path is never interpreted by a shell (S-8).
-        const { execFileSync } = require("child_process");
-        execFileSync("unzip", ["-o", destPath, "-d", path.dirname(destPath)], { stdio: "ignore" });
-        fs.unlinkSync(destPath);
-      } catch(err) {
-        console.error("Failed to unzip", err);
-      }
-    }
-    downloadState.active = false;
-    downloadState.progress = 100;
-    downloadState.downloadedBytes = result.bytes;
-    downloadState.error = null;
-    downloadState.integrity = result.status;
-    downloadState.sha256 = result.sha256;
-    activeDownload = null;
-    console.log(`  [download] Completed download of ${filename}`);
-  }, (err) => {
-    if (generation !== downloadGeneration) return;
-    downloadState.active = false;
-    downloadState.error = describeDownloadFailure(err, filename);
-    activeDownload = null;
-    console.error("  [download] Failed:", downloadState.error);
-  });
-}
-
-function cancelModelDownload() {
-  if (!downloadState.active) {
-    return false;
-  }
-  const filename = downloadState.filename;
-  if (activeDownload) {
-    if (activeDownload.process) {
-      try { activeDownload.process.kill("SIGTERM"); } catch (_) {}
-      setTimeout(() => { try { activeDownload?.process?.kill("SIGKILL"); } catch (_) {} }, 1000);
-    } else if (activeDownload.abort) {
-      downloadGeneration++; // the aborted transfer must not overwrite the "cancelled" status
-      try { activeDownload.abort(); } catch (_) {} // the downloader removes its partial file
-    }
-  } else if (filename) {
-    const targetDir = downloadState.kind === "text"
-      ? LLM_MODELS
-      : downloadState.kind === "speech"
-        ? SPEECH_MODELS
-        : downloadState.kind === "tts"
-          ? TTS_MODELS
-          : MODELS;
-    try { fs.unlinkSync(`${path.join(targetDir, filename)}.part`); } catch (_) {}
-  }
-  activeDownload = null;
-  downloadState = {
-    active: false,
-    filename,
-    progress: 0,
-    speed: "0 MB/s",
-    eta: 0,
-    totalBytes: 0,
-    downloadedBytes: 0,
-    error: "Download cancelled",
-    kind: downloadState.kind || "image",
-  };
-  console.log(`  [download] Cancelled download of ${filename}`);
-  return true;
-}
 
 // ── MIME types ────────────────────────────────────────────────────────────────
 const MIME = {
@@ -3897,44 +3352,6 @@ const MIME = {
   ".woff2":"font/woff2", ".woff": "font/woff", ".ttf": "font/ttf",
 };
 
-function isModelFile(filename) {
-  const lower = String(filename || "").toLowerCase();
-  if (lower.endsWith(".safetensors") || lower.endsWith(".gguf") || lower.endsWith(".ckpt") || lower.endsWith(".coreml") || lower.endsWith(".coreml.zip")) {
-    return true;
-  }
-  const fullPath = path.join(MODELS, filename);
-  try {
-    const stat = fs.statSync(fullPath);
-    if (stat.isDirectory()) {
-      const files = fs.readdirSync(fullPath).map(f => f.toLowerCase());
-      const hasTextEncoder = files.includes("text_encoder.mlpackage") || 
-                             files.includes("text_encoder.mlmodelc") ||
-                             files.includes("textencoder.mlpackage") || 
-                             files.includes("textencoder.mlmodelc");
-      
-      const hasUnet = files.includes("unet.mlpackage") || 
-                      files.includes("unet.mlmodelc");
-                      
-      if (hasTextEncoder && hasUnet) return true;
-      
-      const checkSubdirs = ["split_einsum/packages", "split_einsum/compiled", "original/packages", "original/compiled", "split_einsum", "original"];
-      for (const subdir of checkSubdirs) {
-        const subPath = path.join(fullPath, subdir);
-        if (fs.existsSync(subPath)) {
-          const subFiles = fs.readdirSync(subPath).map(f => f.toLowerCase());
-          const subTextEncoder = subFiles.includes("text_encoder.mlpackage") || 
-                                 subFiles.includes("text_encoder.mlmodelc") ||
-                                 subFiles.includes("textencoder.mlpackage") || 
-                                 subFiles.includes("textencoder.mlmodelc");
-          const subUnet = subFiles.includes("unet.mlpackage") || 
-                          subFiles.includes("unet.mlmodelc");
-          if (subTextEncoder && subUnet) return true;
-        }
-      }
-    }
-  } catch (_) {}
-  return false;
-}
 
 function formatBytes(bytes) {
   const value = Number(bytes) || 0;
@@ -4048,33 +3465,6 @@ function describeBackendExitCode(code, backendPath) {
   return `exited with code ${code}`;
 }
 
-function getModelInfo(filename) {
-  const safeFilename = path.basename(filename || "");
-  const fullPath = path.join(MODELS, safeFilename);
-  const link = describeLinkedModel(fullPath);
-  if (link.missing) {
-    return { filename: safeFilename, sizeBytes: 0, size: "", ...link };
-  }
-  const stats = fs.statSync(fullPath);
-  
-  if (stats.isDirectory()) {
-    const dirSize = getPathSize(fullPath);
-    return {
-      filename: safeFilename,
-      sizeBytes: dirSize,
-      size: formatBytes(dirSize),
-      format: "CoreML",
-    };
-  }
-
-  return {
-    filename: safeFilename,
-    sizeBytes: stats.size,
-    size: formatBytes(stats.size),
-    detectedKind: detectedKindFor(fullPath, link),
-    ...link,
-  };
-}
 
 function readBody(req, { emptyOnly = false } = {}) {
   return new Promise((resolve, reject) => {
@@ -4329,89 +3719,6 @@ function deleteGeneratedOutputs(outputs = []) {
   return deleted;
 }
 
-function streamModelUpload(req, filename, targetDir = MODELS, mode = "image") {
-  return new Promise((resolve, reject) => {
-    const safeFilename = path.basename(filename || "");
-    const lowerName = safeFilename.toLowerCase();
-    const valid = mode === "text"
-      ? lowerName.endsWith(".gguf")
-      : mode === "speech"
-        ? lowerName.endsWith(".bin")
-        : mode === "tts"
-          ? lowerName.endsWith(".json")
-        : isModelFile(lowerName);
-    if (!safeFilename || !valid) {
-      reject(badRequest("INVALID_FILENAME", mode === "text"
-        ? "Filename must end with .gguf"
-        : mode === "speech"
-          ? "Filename must end with .bin"
-          : mode === "tts"
-            ? "Filename must end with .json"
-            : "Filename must end with .gguf, .safetensors, or .ckpt"));
-      return;
-    }
-
-    const destPath = path.join(targetDir, safeFilename);
-    const tempPath = `${destPath}.part`;
-    try {
-      ensureStorageCapacity(targetDir, req.headers?.["content-length"]);
-    } catch (err) {
-      reject(new Error(describeStorageError(err, destPath)));
-      return;
-    }
-
-    let fileDescriptor;
-    try {
-      fileDescriptor = withFileRetrySync(() => fs.openSync(tempPath, "w"));
-    } catch (err) {
-      reject(new Error(describeStorageError(err, tempPath)));
-      return;
-    }
-    const out = fs.createWriteStream(tempPath, { fd: fileDescriptor, autoClose: true });
-    let finished = false;
-
-    const cleanupPartial = () => {
-      if (finished) return;
-      out.destroy();
-      try { fs.unlinkSync(tempPath); } catch (_) {}
-    };
-
-    req.pipe(out);
-    req.on("error", err => {
-      cleanupPartial();
-      reject(err);
-    });
-    req.on("aborted", () => {
-      cleanupPartial();
-      reject(new Error("Import cancelled by user"));
-    });
-    req.on("close", () => {
-      if (!finished && req.aborted) {
-        cleanupPartial();
-      }
-    });
-    out.on("error", err => {
-      cleanupPartial();
-      reject(new Error(describeStorageError(err, tempPath)));
-    });
-    out.on("finish", () => {
-      try {
-        finished = true;
-        replaceFileWithRetry(tempPath, destPath);
-        console.log(`  [api] Imported model file: ${safeFilename}`);
-        if (mode === "text" || mode === "speech") {
-          const stats = fs.statSync(destPath);
-          resolve({ filename: safeFilename, name: safeFilename, sizeBytes: stats.size, size: formatBytes(stats.size), format: mode === "speech" ? "Whisper GGML" : "GGUF" });
-        } else {
-          resolve(getModelInfo(safeFilename));
-        }
-      } catch (err) {
-        try { fs.unlinkSync(tempPath); } catch (_) {}
-        reject(new Error(describeStorageError(err, destPath)));
-      }
-    });
-  });
-}
 
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
@@ -4442,7 +3749,7 @@ async function getDiagnostics() {
     generatedAt: new Date().toISOString(),
     health: await getHealth(),
     cleanupCandidates: getCleanupCandidates(),
-    download: downloadState,
+    download: downloads.getState(),
     generation: generationState,
     llm: {
       ready: llmReady,
@@ -4499,8 +3806,17 @@ const router = createRouter();
 // Status responses carry shortened paths for every client (issue #52); internal callers keep absolute ones.
 router.use(systemRoutes({ json, getHealth: async () => publicPaths(await getHealth()), getDiagnostics: async () => publicPaths(await getDiagnostics()), getCleanupCandidates, getHardwareSpecs, getBackendOptions: () => publicPaths(getBackendOptions()), getTelemetry }));
 router.use(ttsRoutes({ tts, json, readJsonBody, jsonErrorStatus, errorStatus, errorBody, streamModelUpload, pathInside, fs, path, MIME, TTS_MODELS, TTS_OUTPUTS }));
-router.use(speechRoutes({ speech, SPEECH_MODELS, TRANSCRIPTIONS, downloadBlockReason, getDownloadState: () => downloadState, errorBody, errorStatus, fs, json, jsonErrorStatus, path, pathInside, readBinaryBody, readJsonBody, startModelDownload, streamModelUpload }));
+router.use(speechRoutes({ speech, SPEECH_MODELS, TRANSCRIPTIONS, downloadBlockReason, getDownloadState: () => downloads.getState(), errorBody, errorStatus, fs, json, jsonErrorStatus, path, pathInside, readBinaryBody, readJsonBody, startModelDownload, streamModelUpload }));
 router.use(searchRoutes({ webSearch, json, readJsonBody, errorStatus, errorBody }));
+router.use(modelRoutes({
+  IMAGE_BACKEND_DOWNLOADS, LLM_MODELS, MODELS, OPENVINO_MODELS, SPEECH_MODELS, addHuggingFaceFileSize, cancelModelDownload,
+  describeLinkedModel, detectModelKindCached, downloadBlockReason, errorBody, errorStatus, execFile, findOpenVinoModel, fs,
+  getBackendProc: () => backendProc, getCurrentSettings: () => currentSettings, getDownloadProgress: downloads.getDownloadProgress,
+  getDownloadState: downloads.getState, getLlmModels, getLlmProc: () => llmProc, getLlmSettings: () => llmSettings,
+  getModelDownloadUrlIssue, getModelInfo, getOpenVinoModelInfo, getOpenVinoNpuInfo, invalidateBackendOptions, isModelFile, json,
+  killLlm, modelFolderFor, os, path, pathInside, publicMessage, readJsonBody, readdirVisible, resolveHuggingFaceProjector,
+  searchHuggingFaceModels, speech, startImageBackendDownload, startModelDownload, startOpenVinoModelDownload, streamModelUpload,
+}));
 
 // Routes not yet moved into modules, then static files. Only reached through the pipeline.
 async function legacyRoutes(req, res) {
@@ -4607,35 +3923,6 @@ async function legacyRoutes(req, res) {
     }
   }
 
-  if (req.url === "/api/llm/models" && req.method === "GET") {
-    return json(res, 200, { models: getLlmModels() });
-  }
-
-  if (req.url.startsWith("/api/huggingface/models") && req.method === "GET") {
-    const parsed = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-    const query = String(parsed.searchParams.get("query") || "").slice(0, 120);
-    const filters = String(parsed.searchParams.get("filters") || "")
-      .split(",")
-      .map((value) => value.trim().toLowerCase())
-      .filter((value) => ["vision", "uncensored"].includes(value));
-    const page = Math.max(1, Math.min(20, Number(parsed.searchParams.get("page")) || 1));
-    const pageSize = 9;
-    try {
-      const rankedModels = await searchHuggingFaceModels(query, [...new Set(filters)]);
-      const start = (page - 1) * pageSize;
-      const pageModels = rankedModels.slice(start, start + pageSize);
-      const models = await Promise.all(pageModels.map(addHuggingFaceFileSize));
-      return json(res, 200, {
-        ok: true,
-        source: "huggingface",
-        models,
-        page,
-        hasMore: start + models.length < rankedModels.length,
-      });
-    } catch (err) {
-      return json(res, 502, { ok: false, error: err.message || "Hugging Face search failed." });
-    }
-  }
 
   if (req.url === "/api/llm/start" && req.method === "POST") {
     const body = await readJsonBody(req, res);
@@ -5032,27 +4319,6 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     return json(res, 200, { ok: true, recommendations, source: recommendations ? "llmfit" : "fallback" });
   }
 
-  // GET /api/models — list available model files
-  if (req.url === "/api/models" && req.method === "GET") {
-    try {
-      let files = readdirVisible(MODELS).filter(isModelFile).map(getModelInfo);
-      if (downloadState.active && downloadState.filename) {
-        files = files.filter(model => model.filename !== downloadState.filename);
-      }
-      return json(res, 200, { models: files });
-    } catch (_) { return json(res, 200, { models: [] }); }
-  }
-
-  if (req.url === "/api/openvino-models" && req.method === "GET") {
-    const npuInfo = getOpenVinoNpuInfo();
-    return json(res, 200, {
-      supported: npuInfo.supported,
-      reason: npuInfo.reason || "",
-      npu: npuInfo.npu || null,
-      python: npuInfo.python || "",
-      models: npuInfo.supported ? getOpenVinoModelInfo() : [],
-    });
-  }
 
   // POST /api/restart-backend — restart with new settings
   if (req.url === "/api/restart-backend" && req.method === "POST") {
@@ -5150,115 +4416,6 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     return json(res, 200, { ok: true });
   }
 
-  // POST /api/download-backend
-  if (req.url === "/api/download-backend" && req.method === "POST") {
-    const body = await readJsonBody(req, res);
-    if (!body) return;
-    if (downloadState.active) return json(res, 409, { ok: false, error: "Another download is already active." });
-    try {
-      const backendId = String(body.backend_id || body.backendId || body.id || "");
-      startImageBackendDownload(backendId);
-      return json(res, 200, { ok: true, message: "Backend download started", backendId });
-    } catch (err) {
-      return json(res, 400, { ok: false, error: err.message || String(err) });
-    }
-  }
-
-  // POST /api/download-model
-  if (req.url === "/api/download-model" && req.method === "POST") {
-    const body = await readJsonBody(req, res);
-    if (!body) return;
-    const { url } = body;
-    if (!url) return json(res, 400, { error: "URL is required" });
-    // Catalog entries pass a filename for URLs that don't end in one (e.g. Civitai API links).
-    const overrideFilename = body.filename ? path.basename(String(body.filename)) : null;
-    if (overrideFilename && !/\.(safetensors|gguf|ckpt)$/i.test(overrideFilename)) {
-      return json(res, 400, { ok: false, error: "Image model filename must end in .safetensors, .gguf or .ckpt." });
-    }
-    const urlIssue = overrideFilename
-      ? (/^https?:\/\//i.test(String(url)) ? downloadBlockReason(url) : "Only http(s) download URLs are supported.")
-      : getModelDownloadUrlIssue(url);
-    if (urlIssue) return json(res, 400, { ok: false, error: urlIssue });
-    // startModelDownload only guards against concurrent downloads when no filename is passed.
-    if (overrideFilename && downloadState.active) return json(res, 409, { ok: false, error: "Another model download is already active." });
-
-    startModelDownload(url, overrideFilename);
-    return json(res, 200, { ok: true, message: "Download started" });
-  }
-
-  if (req.url === "/api/llm/download-model" && req.method === "POST") {
-    const body = await readJsonBody(req, res);
-    if (!body) return;
-    const url = String(body.url || "");
-    if (!url) return json(res, 400, { ok: false, error: "URL is required" });
-    if (downloadState.active) return json(res, 409, { ok: false, error: "Another model download is already active." });
-    try {
-      const directUrl = url.includes("huggingface.co") ? url.replace("/blob/", "/resolve/") : url;
-      const blocked = downloadBlockReason(directUrl);
-      if (blocked) return json(res, 400, { ok: false, error: blocked });
-      const overrideFilename = body.filename ? path.basename(String(body.filename)) : null;
-      const filename = overrideFilename || path.basename(new URL(directUrl).pathname);
-      if (!filename.toLowerCase().endsWith(".gguf")) {
-        return json(res, 400, { ok: false, error: "Text model URL must point to a .gguf file." });
-      }
-      const projector = body.projectorUrl && body.projectorFilename
-        ? { url: String(body.projectorUrl), filename: path.basename(String(body.projectorFilename)) }
-        : await resolveHuggingFaceProjector(directUrl, filename);
-      startModelDownload(directUrl, filename, LLM_MODELS, "text");
-      return json(res, 200, {
-        ok: true,
-        message: "Text model download started",
-        filename,
-        projectorUrl: projector?.url || "",
-        projectorFilename: projector?.filename || "",
-      });
-    } catch (err) {
-      return json(res, 400, { ok: false, error: err.message || String(err) });
-    }
-  }
-
-  if (req.url === "/api/download-openvino-model" && req.method === "POST") {
-    const body = await readJsonBody(req, res);
-    if (!body) return;
-    const modelId = String(body.model_id || body.modelId || "");
-    if (!modelId) return json(res, 400, { ok: false, error: "model_id is required" });
-    try {
-      startOpenVinoModelDownload(modelId);
-      return json(res, 200, { ok: true, message: "OpenVINO model download started" });
-    } catch (err) {
-      return json(res, errorStatus(err), errorBody(err));
-    }
-  }
-
-  // GET /api/download-progress
-  if (req.url === "/api/download-progress" && req.method === "GET") {
-    if (!downloadState.active && downloadState.kind === "backend" && downloadState.backendId) {
-      const backend = IMAGE_BACKEND_DOWNLOADS[downloadState.backendId];
-      const installed = backend &&
-        fs.existsSync(path.join(backend.destDir, backend.exeName)) &&
-        fs.existsSync(path.join(backend.destDir, backend.requiredDll));
-      if (installed && !downloadState.error) {
-        cachedBackendOptions = null;
-        downloadState = {
-          active: false,
-          filename: "",
-          progress: 0,
-          speed: "0 MB/s",
-          eta: 0,
-          totalBytes: 0,
-          downloadedBytes: 0,
-          error: null,
-        };
-      }
-    }
-    return json(res, 200, downloadState);
-  }
-
-  // POST /api/cancel-download
-  if (req.url === "/api/cancel-download" && req.method === "POST") {
-    const cancelled = cancelModelDownload();
-    return json(res, 200, { ok: true, cancelled });
-  }
 
   // GET /api/generation-progress
   if (req.url === "/api/generation-progress" && req.method === "GET") {
@@ -5327,217 +4484,6 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
     }
   }
 
-  // POST /api/import-model?filename=...
-  if (req.url.startsWith("/api/import-model") && req.method === "POST") {
-    try {
-      const parsed = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-      const result = await streamModelUpload(req, parsed.searchParams.get("filename"));
-      return json(res, 200, { ok: true, message: `Imported ${result.filename}`, model: result, filename: result.filename });
-    } catch (err) {
-      console.error("  [api] Failed to import model:", err);
-      return json(res, errorStatus(err), errorBody(err));
-    }
-  }
-
-  if (req.url.startsWith("/api/llm/import-model") && req.method === "POST") {
-    try {
-      const parsed = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-      const result = await streamModelUpload(req, parsed.searchParams.get("filename"), LLM_MODELS, "text");
-      return json(res, 200, { ok: true, message: `Imported ${result.filename}`, model: result });
-    } catch (err) {
-      console.error("  [api] Failed to import text model:", err);
-      return json(res, errorStatus(err), errorBody(err));
-    }
-  }
-
-  if (req.url === "/api/llm/delete-model" && req.method === "POST") {
-    const body = await readJsonBody(req, res);
-    if (!body) return;
-    const filename = path.basename(String(body.filename || ""));
-    const modelPath = path.join(LLM_MODELS, filename);
-    if (!filename || !pathInside(modelPath, LLM_MODELS)) {
-      return json(res, 400, { ok: false, error: "Invalid filename" });
-    }
-    if (llmSettings.model === filename && llmProc) await killLlm();
-    try {
-      fs.unlinkSync(modelPath);
-      return json(res, 200, { ok: true });
-    } catch (err) {
-      return json(res, err.code === "ENOENT" ? 404 : 500, {
-        ok: false,
-        error: err.code === "ENOENT" ? "Text model not found" : err.message,
-      });
-    }
-  }
-
-  // POST /api/move-model { filename, from, to }: refile a model under the right type (a text GGUF
-  // sitting with the image models). Moving a linked model moves only the link.
-  if (req.url === "/api/move-model" && req.method === "POST") {
-    const body = await readJsonBody(req, res);
-    if (!body) return;
-    const filename = path.basename(String(body.filename || ""));
-    const fromDir = modelFolderFor(String(body.from || ""));
-    const toDir = modelFolderFor(String(body.to || ""));
-    if (!filename || !fromDir || !toDir || fromDir === toDir) {
-      return json(res, 400, { ok: false, error: "Choose a model and where to move it." });
-    }
-    const loaded = (body.from === "image" && currentSettings.model === filename && backendProc)
-      || (body.from === "text" && llmSettings.model === filename && llmProc)
-      || (body.from === "speech" && speech.getSettings().model === filename && speech.isReady());
-    if (loaded) return json(res, 409, { ok: false, error: "Unload the model before moving it." });
-    const fromPath = path.join(fromDir, filename);
-    const toPath = path.join(toDir, filename);
-    if (!fs.existsSync(fromPath) && !describeLinkedModel(fromPath).linkedFrom) {
-      return json(res, 404, { ok: false, error: "Model not found." });
-    }
-    if (fs.existsSync(toPath) || describeLinkedModel(toPath).linkedFrom) {
-      return json(res, 409, { ok: false, error: `${filename} is already there.` });
-    }
-    try {
-      fs.mkdirSync(toDir, { recursive: true });
-      fs.renameSync(fromPath, toPath);
-      cachedBackendOptions = null;
-      console.log(`  [api] Moved model ${filename} from ${body.from} to ${body.to}`);
-      return json(res, 200, { ok: true, filename });
-    } catch (err) {
-      return json(res, errorStatus(err), errorBody(err, { error: `Couldn't move the model: ${publicMessage(err)}` }));
-    }
-  }
-
-  // POST /api/pick-model-file { type }: open the system's own file dialog and return the chosen path.
-  // The page can't learn a file's real location from a browser picker, but this server runs on the same machine.
-  if (req.url === "/api/pick-model-file" && req.method === "POST") {
-    const body = await readJsonBody(req, res);
-    if (!body) return;
-    const extensions = { image: ["safetensors", "ckpt", "gguf"], text: ["gguf"], speech: ["bin"] }[String(body.type || "image")];
-    if (!extensions) return json(res, 400, { ok: false, error: "Browsing is available for image, text and speech models." });
-    const prompt = "Choose a model file to use from where it is";
-    let command;
-    let args;
-    if (process.platform === "darwin") {
-      // "activate" brings the dialog in front of the browser
-      command = "osascript";
-      args = ["-e", "activate", "-e", `POSIX path of (choose file with prompt ${JSON.stringify(prompt)})`];
-    } else if (process.platform === "win32") {
-      const filter = `Model files (${extensions.map((ext) => `*.${ext}`).join(", ")})|${extensions.map((ext) => `*.${ext}`).join(";")}`;
-      command = "powershell";
-      args = ["-NoProfile", "-STA", "-Command", [
-        "Add-Type -AssemblyName System.Windows.Forms",
-        "$d = New-Object System.Windows.Forms.OpenFileDialog",
-        `$d.Title = '${prompt}'`,
-        `$d.Filter = '${filter}'`,
-        "$f = New-Object System.Windows.Forms.Form -Property @{TopMost = $true}",
-        "if ($d.ShowDialog($f) -eq 'OK') { [Console]::Out.Write($d.FileName) }",
-      ].join("; ")];
-    } else {
-      command = "zenity";
-      args = ["--file-selection", `--title=${prompt}`, `--file-filter=Model files | ${extensions.map((ext) => `*.${ext}`).join(" ")}`];
-    }
-    execFile(command, args, { timeout: 10 * 60 * 1000, windowsHide: false }, (err, stdout) => {
-      const picked = String(stdout || "").trim();
-      if (picked) return json(res, 200, { ok: true, path: picked });
-      // Closing the dialog is not an error; a missing helper (no zenity on Linux) is
-      if (err && err.code === "ENOENT") {
-        return json(res, 501, { ok: false, error: "This system has no file dialog helper. Paste the path instead." });
-      }
-      return json(res, 200, { ok: true, path: "", cancelled: true });
-    });
-    return;
-  }
-
-  // POST /api/link-model { path, type }: use a model file where it already is, without copying it
-  if (req.url === "/api/link-model" && req.method === "POST") {
-    const body = await readJsonBody(req, res);
-    if (!body) return;
-    const type = String(body.type || "image");
-    const targets = {
-      image: { dir: MODELS, valid: (name) => /\.(safetensors|ckpt|gguf)$/i.test(name), hint: ".safetensors, .ckpt or .gguf" },
-      text: { dir: LLM_MODELS, valid: (name) => /\.gguf$/i.test(name), hint: ".gguf" },
-      speech: { dir: SPEECH_MODELS, valid: (name) => /\.bin$/i.test(name), hint: ".bin" },
-    };
-    const target = targets[type];
-    if (!target) return json(res, 400, { ok: false, error: "Linking is available for image, text and speech models." });
-
-    // Accept what Finder (Option-Command-C) or Explorer ("Copy as path") puts on the clipboard
-    let source = String(body.path || "").trim().replace(/^["']|["']$/g, "");
-    if (source.startsWith("file://")) source = decodeURIComponent(new URL(source).pathname);
-    if (source.startsWith("~")) source = path.join(os.homedir(), source.slice(1));
-    if (!source || !path.isAbsolute(source)) {
-      return json(res, 400, { ok: false, error: "Paste the full path to the file, starting from the drive or your home folder." });
-    }
-    let stats;
-    try {
-      stats = fs.statSync(source);
-    } catch (_) {
-      return json(res, 404, { ok: false, error: `Nothing was found at ${source}.` });
-    }
-    const filename = path.basename(source);
-    // File it by what it actually is, not by the tab it was added from
-    const detected = stats.isFile() ? detectModelKindCached(source) : { kind: "unknown" };
-    const kind = targets[detected.kind] && targets[detected.kind].valid(filename) ? detected.kind : type;
-    const chosen = targets[kind];
-    if (!stats.isFile() || !chosen.valid(filename)) {
-      return json(res, 400, { ok: false, error: `That isn't a ${type} model file. Choose a ${target.hint} file.` });
-    }
-    if (pathInside(source, chosen.dir)) {
-      return json(res, 400, { ok: false, error: "That file is already in the app's models folder." });
-    }
-    const dest = path.join(chosen.dir, filename);
-    if (fs.existsSync(dest) || describeLinkedModel(dest).linkedFrom) {
-      return json(res, 409, { ok: false, error: `A model named ${filename} is already in the app.` });
-    }
-    try {
-      fs.mkdirSync(chosen.dir, { recursive: true });
-      try {
-        fs.symlinkSync(source, dest, "file");
-      } catch (err) {
-        // Windows only allows symlinks in Developer Mode; a hard link also uses no extra space on the same drive
-        if (err.code !== "EPERM" && err.code !== "EACCES") throw err;
-        fs.linkSync(source, dest);
-      }
-      cachedBackendOptions = null;
-      console.log(`  [api] Linked ${kind} model in place: ${source}`);
-      return json(res, 200, { ok: true, filename, linkedFrom: source, kind, detail: detected.detail || "" });
-    } catch (err) {
-      const crossDrive = err.code === "EXDEV";
-      return json(res, errorStatus(err), errorBody(err, {
-        error: crossDrive
-          ? "This system can't link to a file on another drive. Use Import a copy instead."
-          : `Couldn't link the file: ${publicMessage(err)}`,
-      }));
-    }
-  }
-
-  // POST /api/delete-model
-  if (req.url === "/api/delete-model" && req.method === "POST") {
-    const body = await readJsonBody(req, res);
-    if (!body) return;
-    const { filename } = body;
-    if (!filename) return json(res, 400, { error: "Filename is required" });
-    
-    const openvinoModel = findOpenVinoModel(filename);
-    const safeFilename = path.basename(filename);
-    const modelPath = path.join(MODELS, safeFilename);
-    
-    try {
-      if (openvinoModel?.installed && openvinoModel.path && pathInside(openvinoModel.path, OPENVINO_MODELS)) {
-        fs.rmSync(openvinoModel.path, { recursive: true, force: true });
-        cachedBackendOptions = null;
-        console.log(`  [api] Deleted OpenVINO model: ${openvinoModel.id}`);
-        return json(res, 200, { ok: true, message: `Deleted ${openvinoModel.name}` });
-      } else if (fs.existsSync(modelPath) || describeLinkedModel(modelPath).linkedFrom) {
-        // For a linked model this removes only the link; the original file stays where it is
-        fs.unlinkSync(modelPath);
-        console.log(`  [api] Deleted model file: ${safeFilename}`);
-        return json(res, 200, { ok: true, message: `Deleted ${safeFilename}` });
-      } else {
-        return json(res, 404, { error: "Model file not found" });
-      }
-    } catch (err) {
-      console.error(`  [api] Failed to delete model ${safeFilename}:`, err);
-      return json(res, errorStatus(err), errorBody(err));
-    }
-  }
 
   if (req.url.startsWith("/api/")) {
     return json(res, 404, { ok: false, error: "Unknown API endpoint" });

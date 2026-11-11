@@ -232,9 +232,11 @@ test("model imports retry locked files and explain large-drive failures", () => 
   const server = read("scripts/server/serve.cjs");
   assert.match(server, /function withFileRetrySync/);
   assert.match(server, /function replaceFileWithRetry/);
-  assert.match(server, /fs\.openSync\(tempPath, "w"\)/);
   assert.match(server, /FAT32 files are limited to 4 GB/);
-  assert.match(server, /ensureStorageCapacity\(targetDir/);
+  // Streamed imports moved to services/model-store.cjs in Step 9.8f; the server still provides the helpers.
+  const store = read("scripts/server/services/model-store.cjs");
+  assert.match(store, /fs\.openSync\(tempPath, "w"\)/);
+  assert.match(store, /ensureStorageCapacity\(targetDir/);
 });
 
 test("CoreML setup installs and validates PyTorch", () => {
@@ -271,13 +273,15 @@ test("issue 90: llama.cpp backend updates on release bumps and mllama fails with
 });
 
 test("issue 84: in-app CUDA image backend download also installs the CUDA runtime", () => {
-  const server = read("scripts/server/serve.cjs");
+  // The image-engine download moved to services/downloads.cjs in Step 9.8f.
+  const server = read("scripts/server/services/downloads.cjs");
   assert.match(server, /runtimeUrl: "https:\/\/github\.com\/leejet\/stable-diffusion\.cpp\/releases\/download\/master-782-b290693\/cudart-sd-bin-win-cu12-x64\.zip"/);
   assert.match(server, /startImageBackendDownload\(backend\.id, 0, "", "runtime"\)/);
 });
 
 test("issue 96: model downloads reject repository pages and HTML responses", () => {
-  const server = read("scripts/server/serve.cjs");
+  // Model downloads moved to services/downloads.cjs in Step 9.8f.
+  const server = read("scripts/server/services/downloads.cjs");
   assert.match(server, /function getModelDownloadUrlIssue/);
   assert.match(server, /Hugging Face repository page, not a model file/);
   assert.match(server, /content-type"\] \|\| ""\)\.toLowerCase\(\)\.includes\("text\/html"\)/);
