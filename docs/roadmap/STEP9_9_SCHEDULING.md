@@ -29,8 +29,8 @@ either.
   8 (capped since #9). Speech uses min(8, CPUs). Engines running at the same time can together use more threads than
   the CPU has.
 * **Memory before loading:** there is no general headroom check. Text chooses its context and GPU layers from the
-  model size and the hardware (`chooseAutoContext`, `chooseAutoLayers`). After an out-of-memory failure the
-  streaming chat path retries once with a smaller context; the non-streaming path doesn't (#67).
+  model size and the hardware (`chooseAutoContext`, `chooseAutoLayers`). After an out-of-memory failure chat
+  retries once with a smaller context, streaming or not (#67).
 * **Memory after a crash:** `restart-policy.cjs` restarts a crashed text engine at most 3 times in 10 minutes, and
   never after it ran out of memory or when free memory is below the model size. The image, speech and voice engines
   are not restarted automatically (#32). Resource-aware recovery is #33.
@@ -46,7 +46,7 @@ either.
 2. Image, speech and voice jobs can't be cancelled from the studio (#64, #41).
 3. Several engines can be busy at once with no shared CPU limit.
 4. Loading a model can push the computer into swapping or out-of-memory, with no check first.
-5. A text engine that can't be started stops the server (#68). The fix (PR #72) lands before any scheduling work.
+5. Fixed before any scheduling work: an engine that can't be started no longer stops the server (#68, PR #72).
 
 ## 2. Design
 
@@ -99,7 +99,7 @@ separate UI change is approved.
 
 | Stage | PR | Behaviour change | Rollback |
 |---|---|---|---|
-| 9.9a | Fix #68 (unstartable engine stops the server; PR #72) and #67 (non-streaming chat errors; PR #73) | Bug fixes only | Revert the PR |
+| 9.9a (done) | Fix #68 (unstartable engine stops the server; PR #72) and #67 (non-streaming chat errors; PR #73), both merged | Bug fixes only | Revert the PR |
 | 9.9b | `services/scheduler.cjs` with read-only accounting; `GET /api/resources`; tests | None: it only records and reports | `USAP_SCHEDULER=off` hides the route |
 | 9.9c | Memory check before loading a model, **warn only** (a field in the start response and a log line) | None for users; adds a field | Setting `memoryCheck: off` |
 | 9.9d | Chat queue limit and disconnect-aware queue | Requests past the limit get `429` | `chatQueue: off` restores the unbounded queue |
