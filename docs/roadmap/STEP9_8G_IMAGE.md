@@ -1,6 +1,6 @@
 # Step 9.8g: image generation
 
-Status: **in review** (not merged). Part of the modular backend plan in [STEP9_8_MODULES.md](STEP9_8_MODULES.md).
+Status: **done** (#65, merged). Part of the modular backend plan in [STEP9_8_MODULES.md](STEP9_8_MODULES.md).
 
 This step moves image generation out of `scripts/server/serve.cjs` into two modules. The code is moved, not
 rewritten. API responses, model and output folders, engine choice, defaults and the interface are unchanged. No new
