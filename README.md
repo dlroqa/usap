@@ -263,7 +263,9 @@ validation. Full priorities: [PRIORITIES.md](docs/roadmap/PRIORITIES.md).
   report the failure; the optional Intel NPU worker isn't supervised yet, and memory awareness is basic
   ([details](docs/runtime/ENGINE_SUPERVISION.md#limitations); [#30](https://github.com/dlroqa/usap/issues/30)–[#33](https://github.com/dlroqa/usap/issues/33)).
 * **Web search content is untrusted and USAP is not prompt-injection-safe.** Web results are added as
-  untrusted user-role context and can't trigger any operation, but no adversarial defence exists yet
+  untrusted user-role context and can't trigger any operation, but no adversarial defence exists yet.
+  Automatically planned search queries use only your own recent messages, and a query that copies
+  other conversation text is refused (#43)
   ([trust boundary](docs/security/WEB_CONTENT_TRUST.md); [#42](https://github.com/dlroqa/usap/issues/42), [#43](https://github.com/dlroqa/usap/issues/43)).
 * **LAN sharing uses plain HTTP and one shared token**: no built-in HTTPS, no user accounts. Use it
   only on a trusted network, and never expose the studio directly to the internet
