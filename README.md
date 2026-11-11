@@ -114,7 +114,8 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   SHA-256 digests pinned in this repository before they are used (Node.js digests come from its signed
   checksum list). Downloads stream to a temporary file and only replace an existing file once every check
   passes, so a failed, interrupted or tampered download keeps the previous version. Community models are
-  marked **unverified** (or source-checksum only); the publisher is not authenticated.
+  marked **unverified** (or source-checksum only); the publisher is not authenticated. Model archives
+  (Core ML `.zip`) are checked entry by entry and unpacked into a staging folder before they are installed.
   [What is covered](docs/security/DOWNLOAD_INTEGRITY.md).
 * **Sign-in for network sharing** (Step 9.5, [#25](https://github.com/dlroqa/usap/pull/25)): when the studio is shared on your network,
   every other device must sign in with a generated access token. This computer is unaffected, and so is

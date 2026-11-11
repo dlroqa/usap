@@ -60,6 +60,12 @@ GPU engine archives are pinned, but GPU acceleration itself is still unverified 
    the engine is running and Windows locks its folder, the swap is refused and the installed engine stays.
    Setup does the same for llama.cpp updates on Linux and macOS. Windows setup still replaces image
    engines in place (the archive is verified first, but a failed extraction can leave no engine): [#19](https://github.com/dlroqa/usap/issues/19).
+   Model archives (Core ML `.zip`) are checked before they are unpacked (`scripts/server/archive-guard.cjs`):
+   every entry must be a plain relative file or folder (no absolute paths, `..`, backslashes, control
+   characters, links or special files), with at most 20,000 entries and 64 GB unpacked. They are unpacked
+   into a hidden staging folder, checked again, and each top-level item is then moved into place in one
+   step, replacing a model folder with the same name. An archive that fails the checks is refused and
+   deleted, and the download status says why.
 5. **Retries:** interrupted or stalled transfers are retried twice, each time **from byte zero**. A partial
    file is never resumed, because its first bytes can't be trusted across attempts. A digest mismatch is
    never retried. Cancelling stops the transfer and deletes the partial file.
