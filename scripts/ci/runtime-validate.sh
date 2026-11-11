@@ -151,6 +151,27 @@ if fetch_verified "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolv
     text="$(echo "$reply" | json_get choices.0.message.content)"
     [[ -z "${text// /}" ]] && text="$(echo "$reply" | json_get content)"
     [[ -n "${text// /}" ]] && record "LLM inference (app API)" PASS "reply: ${text:0:60}" || record "LLM inference (app API)" FAIL "${reply:0:200}"
+    # Streaming (Step 9.8h): SSE headers, several incremental content events, a finish reason, then [DONE].
+    curl -s -N -m 300 -D "$CACHE/stream-headers.txt" -o "$CACHE/stream-body.txt" -X POST -H 'content-type: application/json' \
+      --data '{"messages":[{"role":"user","content":"Count from 1 to 10, separated by spaces."}],"max_tokens":48,"temperature":0,"stream":true}' "$BASE/api/llm/chat"
+    sres="$(node -e '
+      const fs = require("fs");
+      const head = fs.readFileSync(process.argv[1], "utf8").toLowerCase();
+      const events = fs.readFileSync(process.argv[2], "utf8").split("\n\n").filter(Boolean);
+      const data = events.filter((e) => e.startsWith("data: {")).map((e) => JSON.parse(e.slice(6)));
+      const text = data.map((d) => d.choices?.[0]?.delta?.content || "").join("");
+      const pieces = data.filter((d) => d.choices?.[0]?.delta?.content).length;
+      const finish = data.some((d) => d.choices?.[0]?.finish_reason);
+      const ok = /content-type: text\/event-stream/.test(head) && pieces >= 2 && finish && events.at(-1) === "data: [DONE]" && text.trim().length > 0;
+      console.log(`${ok ? "OK" : "BAD"} ${pieces} content events, finish ${finish}, last ${JSON.stringify(events.at(-1) || "").slice(0, 20)}: ${JSON.stringify(text.slice(0, 50))}`);
+    ' "$CACHE/stream-headers.txt" "$CACHE/stream-body.txt" 2>&1)"
+    [[ "$sres" == OK* ]] && record "LLM streaming (app API)" PASS "${sres#OK }" || record "LLM streaming (app API)" FAIL "${sres:0:200}"
+    # A client that leaves mid-stream must not break the engine: the next request still works.
+    curl -s -N -m 2 -o /dev/null -X POST -H 'content-type: application/json' \
+      --data '{"messages":[{"role":"user","content":"Write a long story about a lighthouse."}],"max_tokens":512,"stream":true}' "$BASE/api/llm/chat"
+    after="$(api POST /api/llm/chat '{"messages":[{"role":"user","content":"Reply with exactly one word: yes"}],"max_tokens":8,"temperature":0,"stream":false}')"
+    atext="$(echo "$after" | json_get choices.0.message.content)"
+    [[ -n "${atext// /}" && "$(api GET /api/llm/status | json_get ready)" == true ]] && record "LLM after client disconnect (app API)" PASS "next reply: ${atext:0:40}" || record "LLM after client disconnect (app API)" FAIL "${after:0:200}"
   else
     record "LLM load (app API)" FAIL "start: ${start:0:200} status: ${status:0:200}"
   fi
