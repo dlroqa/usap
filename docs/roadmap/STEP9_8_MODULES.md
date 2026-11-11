@@ -55,7 +55,7 @@ scripts/server/
 | **9.8e** (#56, done: [plan](STEP9_8E_PLAN.md)) | `services/hardware.cjs` (detection used by several routes) | Medium: shared |
 | **9.8f** (#59, #60, #63, done: [notes](STEP9_8F_MODELS.md)) | `routes/models.cjs` + `services/model-store.cjs` + `services/downloads.cjs` | Medium: file operations; traversal tests already exist |
 | **9.8g** (#65, done: [notes](STEP9_8G_IMAGE.md)) | `routes/image.cjs` + `services/image-engine.cjs` (proxy included) | Medium |
-| 9.8h | `routes/llm.cjs` + `services/llm-engine.cjs` (chat streaming last) | Highest: streaming contract tests on all 4 OS |
+| 9.8h (in review: [notes](STEP9_8H_CHAT.md)) | `routes/llm.cjs` + `services/llm-engine.cjs` + `services/chat.cjs` + `services/conversations.cjs` (chat streaming last) | Highest: streaming contract tests on all 4 OS |
 
 Each PR is reviewed and merged separately, with owner approval.
 

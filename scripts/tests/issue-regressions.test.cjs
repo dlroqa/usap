@@ -266,7 +266,8 @@ test("text chat accepts document attachments without requiring a vision model", 
 test("issue 90: llama.cpp backend updates on release bumps and mllama fails with a clear message", () => {
   const ps1 = read("scripts/setup/setup-llama.ps1");
   const sh = read("scripts/setup/setup-llama.sh");
-  const server = read("scripts/server/serve.cjs");
+  // The text engine moved to services/llm-engine.cjs in Step 9.8h.
+  const server = read("scripts/server/services/llm-engine.cjs");
 
   assert.match(ps1, /\.llama-release/);
   assert.match(sh, /\.llama-release/);
@@ -302,7 +303,8 @@ test("issue 85: chat shows reasoning, scrolls only the message list, renders tab
   assert.match(chat, /extractPdfText/);
   // The web-search query planner moved to services/web-search.cjs in Step 9.8d; the server still uses it.
   assert.match(read("scripts/server/services/web-search.cjs"), /async function planWebSearchQuery/);
-  assert.match(read("scripts/server/serve.cjs"), /webSearch\.augmentMessagesWithWebSearch\(/);
+  // Chat requests moved to services/chat.cjs in Step 9.8h.
+  assert.match(read("scripts/server/services/chat.cjs"), /webSearch\.augmentMessagesWithWebSearch\(/);
 });
 
 test("issue 82: speech upload converts any browser-decodable audio to 16 kHz WAV", () => {
