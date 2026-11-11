@@ -135,6 +135,11 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   machine-readable `code`. Invalid requests answer 400 instead of 500, and a missing engine answers 503.
   A malformed request can no longer stop the server. Messages never include stack traces or the host's
   folder paths. [Reference](docs/runtime/API_ERRORS.md).
+* **Model formats and quantization** (Step 9.8f): which formats and quantized variants each engine reads, and
+  which were verified in CI, are documented in [Model formats](docs/runtime/QUANTIZED_MODELS.md). A read-only
+  `GET /api/model-inspect` reports a model's format, quantization, architecture, engine and a rough memory
+  estimate from its header (**Implemented**; the interface doesn't use it yet). Not every quantized model
+  runs: only what the shipped engine versions read.
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
 * **UI regression protection** ([#4](https://github.com/dlroqa/usap/pull/4)): pixel-exact
@@ -231,15 +236,18 @@ only, no force pushes. Details: [CI_GUIDE.md](docs/ci/CI_GUIDE.md),
 
 * **Step 9, foundational backend** (current): API contract tests; a paths/config module ready for
   portable and installed storage; remaining security findings; engine crash supervision and
-  diagnostics; consistent API errors; modular backend; resource scheduling; performance
-  benchmarks; an optimized Intel image engine. [Plan](docs/roadmap/STEP9_BACKEND_PLAN.md).
+  diagnostics; consistent API errors; modular backend (9.8; 9.8g image generation and 9.8h chat and
+  streaming remain); 9.9 resource scheduling; 9.10 performance benchmarks; 9.11 an optimized Intel
+  image engine; 9.12 installed-mode storage preparation. [Plan](docs/roadmap/STEP9_BACKEND_PLAN.md).
 * **Step 10, desktop installers** (planned): an installed edition next to the portable one,
   Windows `.exe`/`.msi`, Linux AppImage/`.deb`, macOS Apple Silicon and Intel `.dmg`, from the same
   code and interface. [Requirements](docs/roadmap/DESKTOP_INSTALLERS.md).
 * **Step 11, installation and release testing** (planned): install, first launch, upgrade and
   uninstall tests that preserve user data; signing and notarization.
 * **Step 12, production release** (planned): validated architecture-specific releases.
-* **Later, optional** (planned): cloud inference and model routing, off by default.
+* **Later, as separate modules** (planned, none implemented): multi-user accounts and API keys
+  ([#28](https://github.com/dlroqa/usap/issues/28)), Cloudflare-backed user data with offline/online
+  sync, a dedicated prompt-injection defence layer, and optional cloud inference and model routing, off by default.
 
 USAP is not production-release-ready until both the portable and the installed editions pass their
 validation. Full priorities: [PRIORITIES.md](docs/roadmap/PRIORITIES.md).
