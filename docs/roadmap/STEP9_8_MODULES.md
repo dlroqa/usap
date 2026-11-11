@@ -73,11 +73,12 @@ when 9.8 finished:
   non-streaming chat reports the engine's error and retries once after running out of memory (#67, PR #73).
 * **Reliability:** image generation
   can't be cancelled (#64), nor can transcription (#41). The llmfit cache is never reused (#69). Concurrent
-  requests have no queue limits or shared CPU and memory budget (Step 9.9). Crash recovery exists for the text
+  requests have no queue limits or shared CPU and memory budget, and streaming chat has no engine timeout (Step 9.9). Crash recovery exists for the text
   engine only (#32, #33). An engine can be orphaned if only its guard is force-killed (#31).
 * **Error responses:** some validation errors still answer `500` (Step 9.7 notes, #38, #39).
 * **Privacy:** model lists show absolute paths of linked models (#57). The `/api/restart-backend` response
-  includes the image model's absolute path.
+  includes the image model's absolute path. Speech-engine failures return whisper.cpp's raw output, which can contain
+  local paths (#39).
 * **Model files:** same-name replacement, partial downloads and the host file dialog (#58).
 * **Prompt injection:** reduced, not prevented. Untrusted text that enters prompts without marking is listed in
   [STEP9_8H_CHAT.md](STEP9_8H_CHAT.md#where-untrusted-text-enters-the-prompt).
