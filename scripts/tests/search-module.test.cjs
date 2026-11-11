@@ -48,8 +48,9 @@ test("web-search service: dependencies are checked; config is unchanged", () => 
   assert.deepEqual(svc.config(), {
     ok: true, provider: "duckduckgo",
     providers: [{ key: "duckduckgo", name: "DuckDuckGo", requiresApiKey: false, active: true }],
-    cachePath: "/cache/dir", defaults: { resultLimit: 5, fetchLimit: 3, timeFilter: "any" },
+    cachePath: "app/cache/search", defaults: { resultLimit: 5, fetchLimit: 3, timeFilter: "any" },
   });
+  assert.equal(createWebSearchService({ search: async () => ({}), cacheDir: "/abs/x", publicCachePath: "~/data/cache", completeChat: async () => ({}), isLlmReady: () => false, getMessageText }).config().cachePath, "~/data/cache");
 });
 
 test("web-search service: off unless requested; the API search keeps its defaults", async () => {
@@ -202,8 +203,14 @@ test("server: the search routes keep their responses and validation (no network 
   const root = makeRoot();
   const srv = await startServer(root);
   try {
-    const cfg = (await request(srv.port, "GET", "/api/web-search/config")).json;
+    const raw = await request(srv.port, "GET", "/api/web-search/config");
+    const cfg = raw.json;
     assert.deepEqual(Object.keys(cfg).sort(), ["cachePath", "defaults", "ok", "provider", "providers"]);
+    // #44: the field stays a string but no longer reveals the host's folders.
+    assert.equal(cfg.cachePath, "app/cache/search");
+    assert.ok(!raw.text.includes(root), "no studio root path");
+    assert.ok(!raw.text.includes(require("node:os").homedir()), "no home folder");
+    assert.doesNotMatch(raw.text, /^[A-Za-z]:\\|"\//m, "no absolute path at all");
     assert.equal(cfg.provider, "duckduckgo");
     const empty = await request(srv.port, "POST", "/api/web-search", { body: { query: "   " } });
     assert.equal(empty.status, 200);
