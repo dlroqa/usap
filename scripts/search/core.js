@@ -31,6 +31,14 @@ const CONTROL_TOKENS = [
   /<\/?(?:tool_call|tool_response)>/gi,                  // Qwen / Hermes tool-call tags
 ];
 
+// Only the chat-template control tokens; the text is otherwise unchanged (P3 history marking uses this, so code
+// fences and formatting in earlier answers stay as they are).
+function stripControlTokens(value) {
+  let text = String(value);
+  for (const re of CONTROL_TOKENS) text = text.replace(re, "[token removed]");
+  return text;
+}
+
 function neutralizeUntrusted(value, maxChars) {
   let text = String(value || "");
   for (const re of CONTROL_TOKENS) text = text.replace(re, "[token removed]");
@@ -135,5 +143,6 @@ module.exports = {
   // Exported for the issue #42 tests.
   formatWebContext,
   neutralizeUntrusted,
+  stripControlTokens,
   LIMITS,
 };

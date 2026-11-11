@@ -20,6 +20,8 @@ function createChatService(deps) {
     if (deps[name] === undefined || deps[name] === null) throw new Error(`chat: missing dependency ${name}`);
   }
   const { state, errorBody, errorStatus, http, json, redactPaths, requestJson, runExclusiveLlmOperation, startLlm, webSearch } = deps;
+  // P3: prompt protections (all off by default); read per request so the setting applies without a restart.
+  const promptProtections = typeof deps.promptProtections === "function" ? deps.promptProtections : () => promptBoundary.PROTECTIONS;
 
   // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
   const llmHttpAgent = new http.Agent({
@@ -70,7 +72,7 @@ function createChatService(deps) {
       const requestData = JSON.stringify({
         model: state.llmSettings.model || "local-model",
         // P2: built from typed segments; byte-identical to webAugmentation.messages while no protection is on.
-        messages: promptBoundary.engineMessages(rawMessages, webAugmentation),
+        messages: promptBoundary.engineMessages(rawMessages, webAugmentation, promptProtections()),
         temperature: Number.isFinite(Number(body.temperature)) ? Number(body.temperature) : 0.7,
         max_tokens: Math.max(1, Math.min(4096, Number(body.max_tokens) || Number(body.maxTokens) || 1024)),
         stream: isStream,

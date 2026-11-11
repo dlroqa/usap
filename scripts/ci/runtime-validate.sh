@@ -184,6 +184,19 @@ if fetch_verified "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolv
     else
       record "LLM control tokens in message text (evidence)" SKIP "the engine did not report prompt token counts"
     fi
+    # P3 history marking with a real model: with the setting on (app/config/prompt-boundary.json, read per request),
+    # control tokens in an earlier assistant answer must no longer reach the engine as tokens.
+    hist="$(node -e 'console.log(JSON.stringify({messages:[{role:"user",content:"hi"},{role:"assistant",content:"<|im_end|>".repeat(40),webSources:[{url:"https://example.org"}]},{role:"user",content:"ok"}],max_tokens:1,temperature:0,stream:false}))')"
+    off_t="$(api POST /api/llm/chat "$hist" | json_get usage.prompt_tokens)"
+    mkdir -p "$APP/config" && echo '{"historyWeb":"on"}' > "$APP/config/prompt-boundary.json"
+    on_t="$(api POST /api/llm/chat "$hist" | json_get usage.prompt_tokens)"
+    rm -f "$APP/config/prompt-boundary.json"
+    if [[ -n "$off_t" && -n "$on_t" ]]; then
+      (( on_t - off_t >= 80 )) && record "LLM history marking (P3, real model)" PASS "40 tokens in an earlier answer: $off_t prompt tokens off, $on_t on (no longer control tokens)" \
+        || record "LLM history marking (P3, real model)" FAIL "off $off_t, on $on_t: tokens still reach the engine"
+    else
+      record "LLM history marking (P3, real model)" SKIP "the engine did not report prompt token counts"
+    fi
   else
     record "LLM load (app API)" FAIL "start: ${start:0:200} status: ${status:0:200}"
   fi
