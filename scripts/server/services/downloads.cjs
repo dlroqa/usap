@@ -7,7 +7,10 @@
 // come from `deps`, and `cachedBackendOptions = null` became invalidateBackendOptions().
 // getDownloadProgress() is the body of the old GET /api/download-progress handler. No HTTP here
 // (see routes/models.cjs).
+// Since the move, one change: downloaded archives are installed through archive-guard.cjs.
 "use strict";
+
+const archiveGuard = require("../archive-guard.cjs");
 
 const REQUIRED = ["DOWNLOAD_POLICY","LLM_MODELS","MODELS","OPENVINO_MODELS","OPENVINO_NPU_MODELS","ROOT","SPEECH_MODELS","TOOLS","TTS_MODELS","downloadBlockReason","downloader","fs","getOpenVinoNpuInfo","getPathSize","integrity","osPlatform","path","spawn","spawnSync","invalidateBackendOptions"];
 
@@ -450,11 +453,19 @@ function createDownloadService(deps) {
       if (generation !== downloadGeneration) return; // cancelled or superseded; status already set
       if (destPath.toLowerCase().endsWith(".zip")) {
         try {
-          // execFile with an argument list: the path is never interpreted by a shell (S-8).
-          const { execFileSync } = require("child_process");
-          execFileSync("unzip", ["-o", destPath, "-d", path.dirname(destPath)], { stdio: "ignore" });
+          // Checked entry by entry, unpacked into a hidden staging folder, then moved into place.
+          archiveGuard.extractZipSafely(destPath, path.dirname(destPath));
           fs.unlinkSync(destPath);
         } catch(err) {
+          if (err.name === "ArchiveError") {
+            // An unsafe archive is not kept; the models folder is unchanged.
+            try { fs.unlinkSync(destPath); } catch (_) {}
+            downloadState.active = false;
+            downloadState.error = `${filename} can't be installed: ${err.message}`;
+            activeDownload = null;
+            console.error("  [download] Refused archive:", downloadState.error);
+            return;
+          }
           console.error("Failed to unzip", err);
         }
       }
