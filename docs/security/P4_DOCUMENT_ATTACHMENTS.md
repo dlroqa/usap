@@ -56,17 +56,28 @@ A `user` message in `POST /api/llm/chat` may carry an `attachments` array next t
 }
 ```
 
-**Per message, not per request.** The field sits on the user message it belongs to, so earlier turns in a
-conversation keep their documents, a re-sent conversation is marked the same way, and saved conversation files carry
-the record unchanged (the storage sanitizer already keeps extra message fields). The P1 `todo` test currently sends
-a top-level `attachments` field; the implementation PR moves it onto the message. *Owner decision:* per-message
-(recommended) or a top-level field that applies only to the newest user message.
+**Per message, not per request (owner decision, 2026-11-11).** The field sits on the user message it belongs to,
+so earlier turns in a conversation keep their documents, a re-sent conversation is marked the same way, and saved
+conversation files carry the record unchanged (the storage sanitizer already keeps extra message fields). A
+top-level request field is not accepted. The P1 `todo` test currently sends a top-level `attachments` field; the
+implementation PR moves it onto the message.
+
+**Ownership and identity are assigned by the server.**
+
+* *Ownership:* a record belongs only to the user message that carries it. It can't refer to, or be moved into,
+  another message, and records on any other role are rejected.
+* *Identity:* the server numbers documents itself (message position and order within the message) and uses that
+  number, with the per-request random id, in its markers. The client's `name` is a display label only. It is never
+  used to identify, deduplicate, look up or trust a document, and two documents may share a name.
+* *Provenance:* only the presence of a valid record makes text a document. File names, user text and legacy
+  `[Attached File: …]` markers never do, in either direction: they can't make text a document, and they can't make
+  a document's text count as the user's.
 
 **Server validation** (in `services/prompt-boundary.cjs`, before web search runs):
 
 | Check | Rule | On failure |
 |---|---|---|
-| Placement | only on `role: "user"` messages; must be an array | 400 `INVALID_ATTACHMENTS` |
+| Placement | only on `role: "user"` messages; must be an array; a top-level request `attachments` field is rejected | 400 `INVALID_ATTACHMENTS` |
 | Count | at most 8 per message (setting) | 400 `INVALID_ATTACHMENTS` |
 | `type` | exactly `"document"`; images stay `image_url` content parts as today | 400 `INVALID_ATTACHMENTS` |
 | `name` | string, 1–200 characters after trimming; shown on one line with control tokens and marker brackets neutralized | 400 `INVALID_ATTACHMENTS` |
@@ -150,7 +161,8 @@ the record and mention it in the notice line, without dropping the text: the use
 
 ## Tests
 
-* Validation: every rule in the table, the 400 code and envelope, records on non-user roles, image-type records,
+* Validation: every rule in the table, the 400 code and envelope, records on non-user roles, a top-level field,
+  duplicate and hostile names (no effect on numbering or markers), image-type records,
   unknown keys never reaching the engine, truncation at both limits and the response flag.
 * Legacy text: `content` containing `[Attached File: …]`, fake document markers and look-alike headers is
   byte-identical to today with the setting `off` and `mark`.
