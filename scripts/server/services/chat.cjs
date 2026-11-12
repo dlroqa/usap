@@ -11,6 +11,8 @@
 // are one extra "user" message after the leading system messages (see docs/security/WEB_CONTENT_TRUST.md).
 "use strict";
 
+const promptBoundary = require("./prompt-boundary.cjs");
+
 const REQUIRED = ["state","errorBody","errorStatus","http","json","redactPaths","requestJson","runExclusiveLlmOperation","startLlm","webSearch"];
 
 function createChatService(deps) {
@@ -67,7 +69,8 @@ function createChatService(deps) {
       const webAugmentation = await webSearch.augmentMessagesWithWebSearch(rawMessages, body);
       const requestData = JSON.stringify({
         model: state.llmSettings.model || "local-model",
-        messages: webAugmentation.messages,
+        // P2: built from typed segments; byte-identical to webAugmentation.messages while no protection is on.
+        messages: promptBoundary.engineMessages(rawMessages, webAugmentation),
         temperature: Number.isFinite(Number(body.temperature)) ? Number(body.temperature) : 0.7,
         max_tokens: Math.max(1, Math.min(4096, Number(body.max_tokens) || Number(body.maxTokens) || 1024)),
         stream: isStream,
@@ -184,7 +187,23 @@ function createChatService(deps) {
     }
   }
 
-  return { doLlmChat, isOomError, retryLowerContext };
+  // Step 9.9b: counted for GET /api/resources only. `active` is chat requests the studio is answering; `waiting`
+  // is streaming requests queued for the one shared connection to the engine (maxSockets 1). Non-streaming
+  // requests use their own connection, so they never wait there. Nothing here changes how requests run.
+  let activeChats = 0;
+  function trackedDoLlmChat(req, res, body) {
+    activeChats += 1;
+    let counted = true;
+    const done = () => { if (counted) { counted = false; activeChats -= 1; } };
+    res.once("close", done);
+    res.once("finish", done);
+    return doLlmChat(req, res, body);
+  }
+  const chatStats = () => ({
+    active: activeChats,
+    waiting: Object.values(llmHttpAgent.requests || {}).reduce((n, list) => n + (Array.isArray(list) ? list.length : 0), 0),
+  });
+  return { doLlmChat: trackedDoLlmChat, isOomError, retryLowerContext, chatStats };
 }
 
 module.exports = { createChatService };

@@ -143,6 +143,44 @@
     },
     {
       "method": "GET",
+      "path": "/api/resources",
+      "status": 200,
+      "contentType": "application/json",
+      "depth": 2,
+      "shape": {
+        "cpu": {
+          "logicalCores": "object",
+          "physicalCores": "object"
+        },
+        "engines": {
+          "download": "object",
+          "image": "object",
+          "speech": "object",
+          "text": "object",
+          "voice": "object"
+        },
+        "generatedAt": "string",
+        "heavyModel": "any",
+        "limits": {
+          "chatQueue": "string",
+          "memoryCheck": "string",
+          "queueTimeouts": "string",
+          "threads": "string"
+        },
+        "memory": {
+          "ram": "object",
+          "vram": "object"
+        },
+        "ok": "boolean",
+        "scheduler": {
+          "decisions": "boolean",
+          "mode": "string",
+          "stage": "string"
+        }
+      }
+    },
+    {
+      "method": "GET",
       "path": "/api/models",
       "status": 200,
       "contentType": "application/json",

@@ -13,6 +13,7 @@ const GET_ROUTES = [
   ["/api/diagnostics", { depth: 1 }],
   ["/api/hardware-specs", { depth: 1 }],
   ["/api/telemetry", { depth: 1 }],
+  ["/api/resources", { depth: 2 }], // Step 9.9b, read-only
   ["/api/models", {}],
   ["/api/outputs", {}],
   ["/api/llm/models", {}],
