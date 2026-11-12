@@ -44,6 +44,13 @@ async function fakeEngine(onRequest) {
         seen.perSocket.push(onSocket);
         const what = onRequest(seen.requests, onSocket);
         if (what === "drop") { socket.destroy(); return; }
+        if (what === "hang") return; // never answers (a slow engine the client gives up on)
+        if (what === "drop-late") { setTimeout(() => socket.destroy(), 2500); return; } // fails after the retry window
+        if (what === "partial-drop") { // status line and some output, then the connection is lost
+          socket.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" + chunk(SSE.slice(0, 60)));
+          setTimeout(() => socket.destroy(), 100);
+          return;
+        }
         if (what === "slowstream") { // headers and the first event now, the rest later (a second request waits meanwhile)
           socket.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" + chunk(SSE.slice(0, 60)));
           setTimeout(() => socket.write(chunk(SSE.slice(60)) + "0\r\n\r\n"), 400);
@@ -89,7 +96,10 @@ function post(port, body) {
   return new Promise((resolve, reject) => {
     const data = Buffer.from(JSON.stringify(body));
     const req = http.request({ host: "127.0.0.1", port, path: "/", method: "POST", agent: false, headers: { "content-type": "application/json", "content-length": data.length } }, (res) => {
-      let text = ""; res.setEncoding("utf8"); res.on("data", (c) => { text += c; }); res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, text }));
+      let text = ""; res.setEncoding("utf8"); res.on("data", (c) => { text += c; });
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, text, ended: true }));
+      res.on("close", () => resolve({ status: res.statusCode, headers: res.headers, text, ended: false })); // a cut stream
+      res.on("error", () => {});
     });
     req.on("error", reject); req.end(data);
   });
@@ -138,7 +148,7 @@ test("the retry happens once: if the new connection fails too, the error is answ
     assert.equal((await stream(app.port)).status, 200);
     const b = await stream(app.port);
     assert.equal(b.status, 500);
-    assert.match(JSON.parse(b.text).error, /socket hang up/);
+    assert.equal(JSON.parse(b.text).code, "ENGINE_CONNECTION_ERROR");
     assert.equal(engine.seen.requests, 3, "one reuse + one retry, nothing more");
   } finally { await app.close(); await engine.close(); }
 });
@@ -186,4 +196,66 @@ test("unchanged: a working engine answers streams and JSON as before", async () 
     assert.equal(r.status, 200);
     assert.equal(JSON.parse(r.text).choices[0].message.content, "ok");
   } finally { await app2.close(); await engine2.close(); }
+});
+
+// Upload a request, then give up after `ms` (the client cancels).
+function cancelAfter(port, body, ms) {
+  return new Promise((resolve) => {
+    const data = Buffer.from(JSON.stringify(body));
+    const req = http.request({ host: "127.0.0.1", port, path: "/", method: "POST", agent: false, headers: { "content-type": "application/json", "content-length": data.length } }, (res) => { res.resume(); });
+    req.on("error", () => resolve());
+    req.on("close", () => resolve());
+    req.end(data);
+    setTimeout(() => req.destroy(), ms);
+  });
+}
+
+test("cancellation: a client that leaves before the engine answers never starts a retry", async () => {
+  const engine = await fakeEngine((n) => (n === 1 ? "stream" : "hang"));
+  const app = await chatApp(engine.port);
+  try {
+    assert.equal((await stream(app.port)).status, 200);
+    await cancelAfter(app.port, { messages: [{ role: "user", content: "hi" }], stream: true }, 200);
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(engine.seen.requests, 2, "the cancelled request reached the engine once and was not sent again");
+    assert.equal(engine.seen.connections, 1, "no new connection was opened for it");
+  } finally { await app.close(); await engine.close(); }
+});
+
+test("no retry after the engine answered: partial output followed by a lost connection ends the stream, nothing is resent", async () => {
+  const engine = await fakeEngine((n) => (n === 1 ? "stream" : "partial-drop"));
+  const app = await chatApp(engine.port);
+  try {
+    assert.equal((await stream(app.port)).status, 200);
+    const r = await stream(app.port);
+    assert.equal(r.status, 200, "the engine's answer had started");
+    assert.ok(!r.text.includes("[DONE]"), "the cut stream is not completed artificially");
+    await new Promise((res) => setTimeout(res, 300));
+    assert.equal(engine.seen.requests, 2, "no retry once output started");
+  } finally { await app.close(); await engine.close(); }
+});
+
+test("no retry for a late failure: a reused connection that fails after the retry window may have done work", async () => {
+  const engine = await fakeEngine((n) => (n === 1 ? "stream" : "drop-late"));
+  const app = await chatApp(engine.port);
+  try {
+    assert.equal((await stream(app.port)).status, 200);
+    const r = await stream(app.port);
+    assert.equal(r.status, 500);
+    assert.equal(engine.seen.requests, 2, "not resent");
+  } finally { await app.close(); await engine.close(); }
+});
+
+test("connection errors never disclose the engine's address, paths or Node's raw message", async () => {
+  const engine = await fakeEngine(() => "drop");
+  const app = await chatApp(engine.port);
+  try {
+    for (const streamFlag of [true, false]) {
+      const r = await post(app.port, { messages: [{ role: "user", content: "hi" }], stream: streamFlag });
+      assert.equal(r.status, 500);
+      const body = JSON.parse(r.text);
+      assert.equal(body.code, "ENGINE_CONNECTION_ERROR");
+      assert.doesNotMatch(r.text, new RegExp(`127\\.0\\.0\\.1|:${engine.port}\\b|socket hang up|/home|\\\\Users`));
+    }
+  } finally { await app.close(); await engine.close(); }
 });
