@@ -106,9 +106,13 @@ function createLlmEngine(deps) {
     performanceProfile: "balanced",
   };
 
+  let pendingOperations = 0;
   function runExclusiveLlmOperation(operation) {
     const run = llmOperationQueue.catch(() => {}).then(operation);
     llmOperationQueue = run.catch(() => {});
+    // Step 9.9b: counted for GET /api/resources only (running + waiting); order and timing are unchanged.
+    pendingOperations += 1;
+    llmOperationQueue.then(() => { pendingOperations -= 1; });
     return run;
   }
 
@@ -1169,6 +1173,7 @@ function createLlmEngine(deps) {
   });
   return {
     state,
+    pendingOperations: () => pendingOperations, // Step 9.9b, read-only accounting
     routeState: Object.freeze({
       get PORT_LLM() { return PORT_LLM; },
       get llmProc() { return llmProc; },

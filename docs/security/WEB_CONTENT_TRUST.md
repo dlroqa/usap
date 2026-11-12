@@ -52,7 +52,9 @@ pins DNS, checks every redirect and limits the number of hops. Pages are capped 
 * [#42](https://github.com/dlroqa/usap/issues/42) **Delimiter and role imitation (hardened).** Page text
   used to be inserted verbatim between plain-text markers. Now (`scripts/search/core.js`):
   * chat-template control tokens are removed, so page text can't open a new system or assistant turn
-    at the token level;
+    at the token level. Covered: ChatML, Llama 2 and 3, Gemma, Phi, Command R, gpt-oss and, since the P1 tests,
+    DeepSeek full-width tokens, Mistral control tokens such as `[TOOL_CALLS]` and `[SYSTEM_PROMPT]`, and Qwen/Hermes
+    tool-call tags. A model family with other special tokens isn't covered until it is added;
   * code fences and rules are defused;
   * every untrusted line is quoted with `│`;
   * each source sits between markers carrying a random per-request id;
