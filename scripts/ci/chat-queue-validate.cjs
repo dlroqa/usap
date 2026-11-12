@@ -99,7 +99,8 @@ function sse(text) {
 
 // --fake: a local dry run of this script's mechanics against the contract-test fake engine (never used in CI).
 const FAKE = process.argv.includes("--fake");
-const LONG = { messages: [{ role: "user", content: `Write a very long, detailed story about a lighthouse keeper during a storm. Describe every hour of the night in detail.${FAKE ? " MODE:slow" : ""}` }], max_tokens: 1024, temperature: 0.8, stream: true };
+// Counting keeps a small model generating until max_tokens (a story can end early), so the queue stays held.
+const LONG = { messages: [{ role: "user", content: `Count from 1 to 3000. Write each number on its own line and nothing else.${FAKE ? " MODE:slow" : ""}` }], max_tokens: 1024, temperature: 0, stream: true };
 const SHORT = (i, extra = {}) => ({ messages: [{ role: "user", content: `Reply with exactly one word: ok${i}` }], max_tokens: 8, temperature: 0, stream: false, ...extra });
 
 // ── Processes ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -270,7 +271,7 @@ async function queueOnScenarios(srv) {
     const bFirst = await b.first;
     const serial = bFirst !== null && bFirst >= ra.at - 50;
     const ok = [ra, rb].every((r) => r.status === 200 && /text\/event-stream/.test(r.headers["content-type"] || "")) && sa.done && sb.done && sa.finish && sb.finish && sa.pieces >= 2 && sb.pieces >= 2;
-    record("streaming: complete SSE streams with finish and [DONE]", ok ? "PASS" : "FAIL", `A ${sa.pieces} pieces done ${sa.done}; B ${sb.pieces} pieces done ${sb.done}: ${JSON.stringify(sb.content.slice(0, 40))}`);
+    record("streaming: complete SSE streams with finish and [DONE]", ok ? "PASS" : "FAIL", `A ${ra.status} ${sa.pieces} pieces done ${sa.done}; B ${rb.status} ${sb.pieces} pieces done ${sb.done}: ${JSON.stringify((sb.pieces ? sb.content : rb.text).slice(0, 80))}`);
     record("streaming: the second stream starts after the first ends", serial ? "PASS" : "FAIL", `B first content ${bFirst ? bFirst - ra.at : "none"} ms after A ended`);
     record("queue slots released after streams", (await idle()) ? "PASS" : "FAIL", JSON.stringify(await chatStats()));
   });
@@ -320,7 +321,8 @@ async function queueOnScenarios(srv) {
     const w1 = await enqueue(SHORT(11), 1);
     const w2 = await enqueue(SHORT(12), 2);
     const t = Date.now();
-    killEngineHard(srv.enginePids);
+    const killed = srv.enginePids.slice();
+    killEngineHard(killed);
     const [rh, r1, r2] = await Promise.all([hold.promise, w1.promise, w2.promise].map((p) => Promise.race([p, sleep(120000).then(() => ({ status: "timeout" }))])));
     const settled = [rh, r1, r2].every((r) => r.status !== "timeout");
     const streamCut = rh.status === 200 && !sse(rh.text).done;
@@ -328,7 +330,13 @@ async function queueOnScenarios(srv) {
     record("crash: waiting requests are answered", settled ? "PASS" : "FAIL", `answered within ${Math.round((Date.now() - t) / 1000)} s`);
     const codes = [r1, r2].map((r) => `${r.status}${parseJson(r.text)?.code ? ` ${parseJson(r.text).code}` : ""}`);
     record("crash: what waiting requests get", "EXPECTED", `${codes.join(", ")} (409 ENGINE_NOT_READY when the engine is down at their turn, an engine error, or 200 after a restart)`);
-    const back = await waitUntil(async () => (await getJson(PORT, "/api/llm/status")).json?.ready === true, 180000, 1000);
+    // Ready again means a NEW engine process is listening (the status can still say ready for a moment after a kill).
+    const back = await waitUntil(async () => {
+      const st = (await getJson(PORT, "/api/llm/status")).json;
+      if (st?.ready !== true) return false;
+      const pids = listenerPids(st.port).filter((pid) => pid !== srv.child.pid);
+      return pids.length > 0 && pids.every((pid) => !killed.includes(pid));
+    }, 180000, 500);
     record("crash: the engine is restarted by the supervisor", back ? "PASS" : "FAIL", back ? `ready again after ${Math.round((Date.now() - t) / 1000)} s` : "not ready after 180 s");
     if (back) {
       srv.enginePort = (await getJson(PORT, "/api/llm/status")).json.port;
@@ -393,6 +401,14 @@ async function rollbackScenario(label, env, expectResources, writeConfig) {
     const burst = await Promise.all(Array.from({ length: 7 }, (_, i) => call(PORT, "POST", "/api/llm/chat", SHORT(40 + i, { max_tokens: 4 })).promise));
     const statuses = burst.map((r) => r.status);
     const resOk = expectResources === 404 ? res.status === 404 : res.status === 200 && res.json?.limits?.chatQueue === "off";
+    // Two simultaneous streams with the queue off (the behaviour before 9.9c), to tell queue bugs from older ones.
+    const s1 = call(PORT, "POST", "/api/llm/chat", { ...LONG, max_tokens: 48 });
+    await s1.first;
+    const s2 = call(PORT, "POST", "/api/llm/chat", { messages: [{ role: "user", content: "Count from 1 to 10, separated by spaces." }], max_tokens: 32, temperature: 0, stream: true });
+    const [r1, r2] = await Promise.all([s1.promise, s2.promise]);
+    const both = [r1, r2].map((r) => ({ status: r.status, ...sse(r.text) }));
+    record(`queue off (${label}): two overlapping streams both complete`, both.every((b) => b.status === 200 && b.done && b.pieces >= 2) ? "PASS" : "FAIL",
+      both.map((b, i) => `stream ${i + 1}: ${b.status}, ${b.pieces} pieces, done ${b.done}`).join("; "));
     record(`rollback (${label}): queue off, nothing refused`, resOk && statuses.every((s) => s === 200) ? "PASS" : "FAIL",
       `/api/resources ${res.status}${res.json?.limits ? ` chatQueue=${res.json.limits.chatQueue}` : ""}; 7 simultaneous requests: ${statuses.join(",")}`);
   } catch (err) {
