@@ -72,6 +72,9 @@ implementation PR moves it onto the message.
 * *Provenance:* only the presence of a valid record makes text a document. File names, user text and legacy
   `[Attached File: …]` markers never do, in either direction: they can't make text a document, and they can't make
   a document's text count as the user's.
+* *No marker grants anything:* file names, user text and legacy markers establish neither provenance, ownership
+  (which message a document belongs to) nor trusted status. A valid record doesn't grant trust either: document
+  text is always untrusted reference material, never instructions.
 
 **Server validation** (in `services/prompt-boundary.cjs`, before web search runs):
 
