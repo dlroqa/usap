@@ -72,7 +72,10 @@ test("snapshot: counts become running/waiting; broken accessors are unknown; eve
   assert.deepEqual(s.engines.speech.operations, { running: null, waiting: null, known: false });
   assert.deepEqual(s.engines.image.queue, { running: null, waiting: null, known: false }, "the studio keeps no image queue");
   assert.deepEqual(s.limits, { chatQueue: "off", memoryCheck: "off", threads: "off", queueTimeouts: "off" });
-  assert.deepEqual(s.scheduler, { mode: "observe", stage: "9.9b", decisions: false });
+  assert.deepEqual(s.scheduler, { mode: "observe", stage: "9.9c", decisions: false }, "the chat queue is off by default");
+  const on = createScheduler({ cpu, budget: { totalRamBytes: () => 1, freeRamBytes: () => 1, totalVramBytes: () => 0, freeVramBytes: () => null }, engines: fakeEngines(), chatQueue: { mode: "on" } }).snapshot();
+  assert.deepEqual(on.scheduler, { mode: "chat-queue", stage: "9.9c", decisions: true });
+  assert.deepEqual(on.limits, { chatQueue: "on", memoryCheck: "off", threads: "off", queueTimeouts: "chat" });
   assert.deepEqual(s.heavyModel, { type: "text" });
   assert.throws(() => createScheduler({}), /scheduler: missing dependency/);
 });
