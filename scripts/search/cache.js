@@ -1,3 +1,4 @@
+// (CI trigger probe: this draft PR is closed unmerged)
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
