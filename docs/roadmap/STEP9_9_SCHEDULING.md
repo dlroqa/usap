@@ -143,6 +143,26 @@ Numbering: the owner asked for the bounded chat queue as 9.9c, so it swapped pla
 * Evidence: `scripts/tests/chat-queue.test.cjs` (10 tests: queue order, limits, disconnects, timeouts, settings, a
   burst of 12, stopping and crashing the engine while requests wait, stopping the server, and off/rollback). The
   9.8h 60-request comparison against `main` is identical with the queue off and on.
+* Real-model validation (opt-in, `scripts/ci/chat-queue-validate.cjs`, native-runtime job on all 4 OS): after the
+  first launch stops, the script starts its own servers from the checkout with `USAP_CHAT_QUEUE=on` in their
+  environment only (the installed default stays off), loads Qwen2.5 0.5B Q4_K_M with real llama.cpp on the CPU, and
+  checks from outside, through the app API and the engine's own `/metrics`:
+  * 1 running + 4 waiting, `429 QUEUE_FULL` with a `Retry-After` that matches the body, FIFO completion order;
+  * a cancelled waiting request leaving the queue and never reaching the engine (engine prompt-token counter);
+  * a cancelled running request stopping engine generation (`requests_processing` back to 0, no more tokens);
+  * two streams through the queue (complete SSE, `finish_reason`, `[DONE]`, the second starting after the first);
+  * recovery after a request the engine refuses (prompt longer than the context);
+  * 5 rounds of a full queue with 2 MB waiting requests cancelled: no leaked slots, engine idle, bounded memory;
+  * a hard engine kill with requests waiting (stream cut, waiting requests answered, supervisor restart, chat
+    works again);
+  * server shutdown with requests queued (every client answered or closed, engine process and ports gone);
+  * `503 QUEUE_TIMEOUT` with a 3 s limit;
+  * rollback: `USAP_SCHEDULER=off`, and `USAP_CHAT_QUEUE=off` over a `scheduler.json` that says on (7 simultaneous
+    requests, none refused).
+
+  The script only touches the engine its own server started (found by its listening port, never by name). What
+  the queue doesn't do is recorded as `UNSUPPORTED`, not passed: memory-pressure admission (9.9d/9.9f) and a
+  timeout for the running request. Which error a waiting request gets after a crash is recorded as `EXPECTED`.
 
 ## 4. Tests (GitHub Actions)
 
