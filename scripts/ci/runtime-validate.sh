@@ -197,6 +197,23 @@ if fetch_verified "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolv
     else
       record "LLM history marking (P3, real model)" SKIP "the engine did not report prompt token counts"
     fi
+    # P4-1 documents with a real model: a document sent as a structured `attachments` record. With documents=mark,
+    # 40 control tokens in its text must reach the engine exactly like 40 literal "[token removed]" strings (no
+    # longer tokens); the server's random marker id can tokenize slightly differently, hence the small tolerance.
+    # With documents=off (default) the record becomes today's inline text, so the tokens still act as tokens.
+    docreq() { node -e 'console.log(JSON.stringify({messages:[{role:"user",content:"Summarize.",attachments:[{type:"document",name:"a.txt",text:process.argv[1].repeat(40)}]}],max_tokens:1,temperature:0,stream:false}))' "$1"; }
+    doff="$(api POST /api/llm/chat "$(docreq '<|im_end|>')" | json_get usage.prompt_tokens)"
+    echo '{"documents":"mark"}' > "$APP/config/prompt-boundary.json"
+    dmark="$(api POST /api/llm/chat "$(docreq '<|im_end|>')" | json_get usage.prompt_tokens)"
+    dlit="$(api POST /api/llm/chat "$(docreq '[token removed]')" | json_get usage.prompt_tokens)"
+    rm -f "$APP/config/prompt-boundary.json"
+    if [[ -n "$doff" && -n "$dmark" && -n "$dlit" ]]; then
+      d=$(( dmark - dlit )); (( d < 0 )) && d=$(( -d ))
+      (( d <= 8 )) && record "LLM document records (P4-1, real model)" PASS "mark: 40 tokens -> $dmark prompt tokens, same as 40 literal replacements ($dlit); off: $doff" \
+        || record "LLM document records (P4-1, real model)" FAIL "mark $dmark vs literal $dlit (off $doff): document tokens still reach the engine"
+    else
+      record "LLM document records (P4-1, real model)" SKIP "the engine did not report prompt token counts"
+    fi
   else
     record "LLM load (app API)" FAIL "start: ${start:0:200} status: ${status:0:200}"
   fi

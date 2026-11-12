@@ -286,8 +286,10 @@ validation. Full priorities: [PRIORITIES.md](docs/roadmap/PRIORITIES.md).
   other conversation text is refused (#43). Results marked as sponsored, and ad-click redirects, are
   never used as sources or opened (#50). Chat-template control tokens are removed from web text (the engine
   would otherwise read them as real turn markers). An optional setting also removes them from earlier answers
-  sent back with the conversation (P3, **Implemented**, off by default: `USAP_PROMPT_HISTORY_WEB=on`). Attached
-  documents aren't marked yet, and none of this stops plain-language instructions
+  sent back with the conversation (P3, **Implemented**, off by default: `USAP_PROMPT_HISTORY_WEB=on`). The server
+  can mark documents sent as structured `attachments` records as untrusted (P4-1, **Experimental**, off by default:
+  `USAP_PROMPT_DOCUMENTS=mark`), but the chat screen still sends attached documents as plain text, so they aren't
+  marked yet. None of this stops plain-language instructions
   ([trust boundary](docs/security/WEB_CONTENT_TRUST.md); [#42](https://github.com/dlroqa/usap/issues/42), [#43](https://github.com/dlroqa/usap/issues/43), [#50](https://github.com/dlroqa/usap/issues/50)).
 * **LAN sharing uses plain HTTP and one shared token**: no built-in HTTPS, no user accounts. Use it
   only on a trusted network, and never expose the studio directly to the internet
