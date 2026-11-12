@@ -13,6 +13,7 @@
 //   MODE:echo       one chunk (or message) whose content is the exact JSON request the engine received
 //   MODE:oom        HTTP 500 with a llama.cpp-style allocation failure, before any streaming (Step 9.8h)
 //   MODE:garbage    HTTP 200 event stream with bytes that are not SSE, then the end (malformed stream)
+//   MODE:delay=MS   one chunk naming the request's TAG:<x> (if any), then the end after MS ms (queue order checks)
 // GET /fake/stats reports {requests, completed, aborted, pid} so tests can observe aborts;
 // GET /fake/last returns the last chat request body as received (prompt order and role checks).
 //
@@ -48,6 +49,8 @@ const finish = (n) => `data: ${JSON.stringify({ choices: [{ index: 0, delta: {},
 
 function modeOf(body) {
   const text = JSON.stringify(body.messages || []);
+  const d = text.match(/MODE:delay=(\d+)/);
+  if (d) return { name: "delay", ms: Math.min(60000, Number(d[1])), tag: (text.match(/TAG:([A-Za-z0-9_-]+)/) || [])[1] || "" };
   const m = text.match(/MODE:(count=(\d+)|http-error|crash-mid|slow|echo|oom|garbage)/);
   if (!m) return { name: "default" };
   return m[2] ? { name: "count", n: Math.min(500, Number(m[2])) } : { name: m[1] };
@@ -107,6 +110,13 @@ const server = http.createServer((req, res) => {
         res.write(chunk(raw));
         res.write(finish(1));
         return res.end("data: [DONE]\n\n");
+      }
+      if (mode.name === "delay") {
+        stats.order = (stats.order || []).concat(mode.tag);
+        res.write(chunk(`tag=${mode.tag} `));
+        const t = setTimeout(() => { stats.completed++; res.write(finish(1)); res.end("data: [DONE]\n\n"); }, mode.ms);
+        res.on("close", () => { if (!res.writableEnded) { clearTimeout(t); stats.aborted++; } });
+        return;
       }
       if (mode.name === "crash-mid") {
         res.write(chunk("partial-1 "));
