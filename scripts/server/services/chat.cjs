@@ -64,6 +64,23 @@ function createChatService(deps) {
     await runExclusiveLlmOperation(() => startLlm(newSettings));
   }
 
+  // The engine refused the connection: it isn't listening (stopped, or crashed before the server noticed). Answer
+  // like the chat route does when it knows the engine is down, instead of a raw 500 that names the engine's port.
+  const ENGINE_GONE = { ok: false, code: "ENGINE_NOT_READY", error: "The text engine isn't running (it stopped or crashed). Load a text model, or wait for it to restart, then try again." };
+
+  // Engine sockets that have already carried a request. Node marks `reusedSocket` only when a request takes an idle
+  // socket, not when it waited for the one socket (maxSockets 1) and got it as the previous response ended, so the
+  // studio keeps track itself.
+  const usedEngineSockets = new WeakSet();
+  // A stale kept-alive connection fails at once after it is handed to a request; a request the engine worked on
+  // fails later. Only a failure within this window of the attempt getting its connection is retried (a request can
+  // wait longer than that for the one connection while another stream runs, so creation time doesn't count).
+  const STALE_RETRY_WINDOW_MS = 2000;
+  // Connection errors (ECONNRESET, ETIMEDOUT, …) are answered without Node's message, which can name the engine's
+  // local address and port.
+  const isTransportError = (err) => Boolean(err && !err.upstreamStatus && typeof err.code === "string" && /^E[A-Z]+$/.test(err.code) && (err.syscall || /socket hang up/i.test(err.message || "")));
+  const transportBody = (err) => ({ ok: false, code: "ENGINE_CONNECTION_ERROR", error: `The connection to the text engine failed (${err.code}). Try again.` });
+
   async function doLlmChat(req, res, body, retryCount = 0) {
     try {
       const isStream = body.stream === true;
@@ -88,7 +105,18 @@ function createChatService(deps) {
       });
 
       if (isStream) {
-        const clientReq = http.request({
+        let clientReq;
+        let cancelled = false; // the client left: never recover, only clean up
+        res.on("close", () => {
+          if (res.writableEnded) return;
+          cancelled = true;
+          if (clientReq && !clientReq.destroyed) clientReq.destroy();
+        });
+        // One engine request; `fresh` is true for the single retry after a reused connection was closed (below).
+        const sendToEngine = (fresh) => {
+        let answered = false; // the engine sent a status line (and maybe output): never retry after that
+        let acquiredAt = null; // when THIS attempt got its engine connection
+        clientReq = http.request({
           hostname: "127.0.0.1",
           port: state.PORT_LLM,
           path: "/v1/chat/completions",
@@ -99,6 +127,7 @@ function createChatService(deps) {
           },
           agent: llmHttpAgent,  // ✅ HTTP keep-alive: eliminates TCP handshake per turn
         }, (clientRes) => {
+          answered = true;
           if (clientRes.statusCode < 200 || clientRes.statusCode >= 300) {
             let errorBody = "";
             clientRes.setEncoding("utf8");
@@ -139,7 +168,26 @@ function createChatService(deps) {
           clientRes.on("error", (err) => res.destroy(err));
         });
 
+        let reused = false;
+        clientReq.on("socket", (socket) => {
+          acquiredAt = Date.now();
+          reused = usedEngineSockets.has(socket);
+          usedEngineSockets.add(socket);
+        });
         clientReq.on("error", async (err) => {
+          // A kept-alive engine connection that llama-server closed just as it was reused (seen when a stream starts
+          // right after another one ends): nothing came back, so the engine never answered it. Send it once more on
+          // a new connection; the prompt and web results are reused, nothing else runs again. Only when ALL hold:
+          // first attempt, the connection had carried an earlier request, a reset/broken pipe within the window,
+          // no status line or output from the engine, nothing sent to the client, and the client is still there.
+          const stale = !fresh && !cancelled && !answered && (reused || clientReq.reusedSocket)
+            && (err.code === "ECONNRESET" || err.code === "EPIPE") && acquiredAt !== null && Date.now() - acquiredAt < STALE_RETRY_WINDOW_MS
+            && !res.headersSent && !res.destroyed;
+          if (cancelled) return; // the client cancelled: the engine request was aborted on purpose
+          if (stale) {
+            console.log("  [llm] the engine closed a reused connection; sending the request again on a new one");
+            return sendToEngine(true);
+          }
           console.error("LLM stream request error:", err);
           if (isOomError(err.message) && retryCount === 0) {
             try {
@@ -149,9 +197,10 @@ function createChatService(deps) {
               console.error("Failed OOM recovery retry:", retryErr);
             }
           }
+          if (!res.headersSent && err.code === "ECONNREFUSED") return json(res, 409, ENGINE_GONE);
           if (!res.headersSent) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ ok: false, error: err.message }));
+            res.end(JSON.stringify(isTransportError(err) ? transportBody(err) : { ok: false, error: redactPaths(err.message) }));
           } else {
             res.end();
           }
@@ -159,9 +208,8 @@ function createChatService(deps) {
 
         clientReq.write(requestData);
         clientReq.end();
-        res.on("close", () => {
-          if (!res.writableEnded && !clientReq.destroyed) clientReq.destroy();
-        });
+        };
+        sendToEngine(false);
         return;
       } else {
         try {
@@ -181,6 +229,9 @@ function createChatService(deps) {
           }
           // #67: an engine error answers like the streaming path: the engine's status and message.
           if (err.upstreamStatus) return json(res, err.upstreamStatus, { ok: false, error: redactPaths(err.message) });
+          if (err.code === "ECONNREFUSED") return json(res, 409, ENGINE_GONE);
+          // Not retried: a non-streaming request may already have run (e.g. ECONNRESET while the engine was dying).
+          if (isTransportError(err)) return json(res, 500, transportBody(err));
           throw err;
         }
       }
