@@ -51,9 +51,9 @@ async function fakeEngine(onRequest) {
           setTimeout(() => socket.destroy(), 100);
           return;
         }
-        if (what === "slowstream") { // headers and the first event now, the rest later (a second request waits meanwhile)
+        if (what === "slowstream" || what === "longstream") { // headers and the first event now, the rest later
           socket.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" + chunk(SSE.slice(0, 60)));
-          setTimeout(() => socket.write(chunk(SSE.slice(60)) + "0\r\n\r\n"), 400);
+          setTimeout(() => socket.write(chunk(SSE.slice(60)) + "0\r\n\r\n"), what === "longstream" ? 2500 : 400);
           continue;
         }
         if (what === "json") {
@@ -138,6 +138,28 @@ test("overlapping streams: a stream that waited for the engine connection while 
     assert.equal(rb.text, SSE);
     assert.equal(engine.seen.connections, 2);
     assert.equal(engine.seen.requests, 3);
+  } finally { await app.close(); await engine.close(); }
+});
+
+test("overlapping streams on a slow engine: the window starts when the waiting request gets the connection, not when it was created", async () => {
+  // The macOS Intel case: the first stream holds the one engine connection for 2.5 s (longer than the 2 s window);
+  // the second request is created meanwhile, waits, gets the reused connection, and the engine drops it at once.
+  const engine = await fakeEngine((n, onSocket) => (onSocket >= 2 ? "drop" : n === 1 ? "longstream" : "stream"));
+  const app = await chatApp(engine.port);
+  try {
+    const t0 = Date.now();
+    const a = stream(app.port);
+    await new Promise((r) => setTimeout(r, 100));
+    const b = stream(app.port);
+    const [ra, rb] = await Promise.all([a, b]);
+    assert.ok(Date.now() - t0 >= 2400, "the first stream really held the connection for more than the window");
+    assert.equal(ra.status, 200);
+    assert.equal(ra.text, SSE);
+    assert.equal(rb.status, 200, rb.text);
+    assert.equal(rb.text, SSE, "one complete copy of the answer, nothing duplicated");
+    assert.deepEqual(engine.seen.perSocket, [1, 2, 1], "first stream, the dropped reuse, the retry on a new connection");
+    assert.equal(engine.seen.requests, 3, "exactly one retry");
+    assert.equal(app.searches(), 2, "web search once per chat request");
   } finally { await app.close(); await engine.close(); }
 });
 
@@ -251,8 +273,10 @@ test("connection errors never disclose the engine's address, paths or Node's raw
   const app = await chatApp(engine.port);
   try {
     for (const streamFlag of [true, false]) {
+      const before = engine.seen.requests;
       const r = await post(app.port, { messages: [{ role: "user", content: "hi" }], stream: streamFlag });
       assert.equal(r.status, 500);
+      assert.equal(engine.seen.requests - before, 1, `${streamFlag ? "stream" : "non-stream"}: sent once, not retried`);
       const body = JSON.parse(r.text);
       assert.equal(body.code, "ENGINE_CONNECTION_ERROR");
       assert.doesNotMatch(r.text, new RegExp(`127\\.0\\.0\\.1|:${engine.port}\\b|socket hang up|/home|\\\\Users`));
