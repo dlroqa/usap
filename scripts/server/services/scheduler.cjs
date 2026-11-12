@@ -32,6 +32,24 @@ function schedulerMode({ env = process.env, configDir } = {}) {
   return "observe";
 }
 
+/**
+ * Step 9.9c chat queue setting. Off unless USAP_CHAT_QUEUE=on or app/config/scheduler.json has "chatQueue": "on";
+ * the environment wins, and USAP_SCHEDULER=off turns it off too. Read at start-up: changing it needs a restart.
+ * chatQueueMaxWaitMs (or USAP_CHAT_QUEUE_MAX_WAIT_MS) sets the longest wait, 1 s to 1 hour, default 10 minutes.
+ */
+function chatQueueSetting({ env = process.env, configDir } = {}) {
+  let cfg = {};
+  if (configDir) {
+    try { cfg = JSON.parse(fs.readFileSync(path.join(configDir, "scheduler.json"), "utf8")) || {}; } catch (_) { cfg = {}; }
+  }
+  const pick = (v) => { const s = String(v || "").trim().toLowerCase(); return s === "on" || s === "off" ? s : null; };
+  let mode = pick(env.USAP_CHAT_QUEUE) || pick(cfg.chatQueue) || "off";
+  if (schedulerMode({ env, configDir }) === "off") mode = "off";
+  const validWait = (v) => { const n = Number(v); return v !== undefined && v !== null && v !== "" && Number.isFinite(n) && n >= 1000 && n <= 3600000 ? Math.round(n) : null; };
+  const maxWaitMs = validWait(env.USAP_CHAT_QUEUE_MAX_WAIT_MS) || validWait(cfg.chatQueueMaxWaitMs) || 600000;
+  return Object.freeze({ mode, limit: 4, maxWaitMs });
+}
+
 const count = (fn) => {
   try {
     const n = Number(fn());
@@ -52,7 +70,7 @@ const queue = (pending) => (pending === null
  * @param {object} deps.engines  read-only accessors per engine (see serve.cjs)
  * @param {() => number} [deps.now]
  */
-function createScheduler({ budget, cpu, engines, now = Date.now }) {
+function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" } }) {
   for (const [name, value] of Object.entries({ budget, cpu, engines })) {
     if (!value) throw new Error(`scheduler: missing dependency ${name}`);
   }
@@ -98,18 +116,18 @@ function createScheduler({ budget, cpu, engines, now = Date.now }) {
   function snapshot() {
     return {
       ok: true,
-      scheduler: { mode: "observe", stage: "9.9b", decisions: false },
+      scheduler: { mode: chatQueue.mode === "on" ? "chat-queue" : "observe", stage: "9.9c", decisions: chatQueue.mode === "on" },
       generatedAt: new Date(now()).toISOString(),
       cpu: { logicalCores: known(count(cpu.logicalCores)), physicalCores: known(count(cpu.physicalCores)) },
       memory: memory(),
       heavyModel: engines.heavyModel(),
       engines: engineSnapshot(),
       // Every limit in the plan is off in this stage; nothing is refused or delayed.
-      limits: { chatQueue: "off", memoryCheck: "off", threads: "off", queueTimeouts: "off" },
+      limits: { chatQueue: chatQueue.mode === "on" ? "on" : "off", memoryCheck: "off", threads: "off", queueTimeouts: chatQueue.mode === "on" ? "chat" : "off" },
     };
   }
 
   return { snapshot };
 }
 
-module.exports = { createScheduler, schedulerMode };
+module.exports = { createScheduler, schedulerMode, chatQueueSetting };

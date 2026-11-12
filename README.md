@@ -143,7 +143,8 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
 * **Resource view** (Step 9.9b): a read-only `GET /api/resources` reports memory (marking what is unknown), CPU
   cores, which kind of heavy model is loaded, and how much work each engine has running and waiting
   (**Implemented**, observe only: it limits nothing, and the interface doesn't use it yet). `USAP_SCHEDULER=off`
-  removes it. [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
+  removes it. A bounded chat queue (Step 9.9c: 4 waiting at most, then `429 QUEUE_FULL`) is **Implemented** but
+  off by default (`USAP_CHAT_QUEUE=on` turns it on). [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
 * **UI regression protection** ([#4](https://github.com/dlroqa/usap/pull/4)): pixel-exact

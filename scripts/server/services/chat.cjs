@@ -193,17 +193,41 @@ function createChatService(deps) {
   // is streaming requests queued for the one shared connection to the engine (maxSockets 1). Non-streaming
   // requests use their own connection, so they never wait there. Nothing here changes how requests run.
   let activeChats = 0;
+  // Step 9.9c: the bounded chat queue (services/chat-queue.cjs), only when deps.chatQueue is given (setting on).
+  const chatQueue = deps.chatQueue || null;
   function trackedDoLlmChat(req, res, body) {
     activeChats += 1;
     let counted = true;
     const done = () => { if (counted) { counted = false; activeChats -= 1; } };
     res.once("close", done);
     res.once("finish", done);
-    return doLlmChat(req, res, body);
+    if (!chatQueue) return doLlmChat(req, res, body);
+    return queuedDoLlmChat(req, res, body);
+  }
+  async function queuedDoLlmChat(req, res, body) {
+    const turn = await chatQueue.admit((cb) => res.once("close", () => { if (!res.writableEnded) cb(); }));
+    if (!turn.ok) {
+      if (turn.code === "CLIENT_GONE" || res.destroyed || res.writableEnded) return undefined; // nobody to answer
+      res.writeHead(turn.status, { "Content-Type": "application/json", "Retry-After": String(turn.retryAfterSeconds) });
+      res.end(JSON.stringify({ ok: false, error: turn.error, code: turn.code, retryAfterSeconds: turn.retryAfterSeconds }));
+      return undefined;
+    }
+    let released = false;
+    const release = () => { if (!released) { released = true; turn.release(); } };
+    res.once("close", release);
+    res.once("finish", release);
+    if (res.destroyed) { release(); return undefined; }
+    // The engine may have stopped or crashed while this request waited.
+    if (!state.llmReady) {
+      json(res, 409, { ok: false, error: "The text engine stopped while this request was waiting. Load a text model, then try again.", code: "ENGINE_NOT_READY" });
+      return undefined;
+    }
+    try { return await doLlmChat(req, res, body); } finally { if (res.writableEnded || res.destroyed) release(); }
   }
   const chatStats = () => ({
-    active: activeChats,
-    waiting: Object.values(llmHttpAgent.requests || {}).reduce((n, list) => n + (Array.isArray(list) ? list.length : 0), 0),
+    active: chatQueue ? chatQueue.stats().running : activeChats,
+    waiting: chatQueue ? chatQueue.stats().waiting
+      : Object.values(llmHttpAgent.requests || {}).reduce((n, list) => n + (Array.isArray(list) ? list.length : 0), 0),
   });
   return { doLlmChat: trackedDoLlmChat, isOomError, retryLowerContext, chatStats };
 }

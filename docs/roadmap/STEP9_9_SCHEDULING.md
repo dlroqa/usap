@@ -100,9 +100,9 @@ separate UI change is approved.
 | Stage | PR | Behaviour change | Rollback |
 |---|---|---|---|
 | 9.9a (done) | Fix #68 (unstartable engine stops the server; PR #72) and #67 (non-streaming chat errors; PR #73), both merged | Bug fixes only | Revert the PR |
-| 9.9b (in review) | `services/scheduler.cjs` with read-only accounting; `GET /api/resources`; tests | None: it only records and reports | `USAP_SCHEDULER=off` (or `"scheduler": "off"` in `app/config/scheduler.json`) leaves the route out |
-| 9.9c | Memory check before loading a model, **warn only** (a field in the start response and a log line) | None for users; adds a field | Setting `memoryCheck: off` |
-| 9.9d | Chat queue limit and disconnect-aware queue | Requests past the limit get `429` | `chatQueue: off` restores the unbounded queue |
+| 9.9b (done, #77) | `services/scheduler.cjs` with read-only accounting; `GET /api/resources`; tests | None: it only records and reports | `USAP_SCHEDULER=off` (or `"scheduler": "off"` in `app/config/scheduler.json`) leaves the route out |
+| 9.9c (in review, off by default) | Bounded chat queue (decision A): 1 running + 4 waiting per engine, FIFO, `429 QUEUE_FULL` with `Retry-After`, waiting requests leave on disconnect, `503 QUEUE_TIMEOUT` after the longest wait (10 min) | Only when turned on: requests past the limit get `429` | `chatQueue: off` (the default) or `USAP_SCHEDULER=off` restores the unbounded queue |
+| 9.9d | Memory check before loading a model, **warn only** (a field in the start response and a log line) | None for users; adds a field | Setting `memoryCheck: off` |
 | 9.9e | Thread budget shared between engines | Thread counts change only when engines overlap | `threads: off` |
 | 9.9f | Memory check **enforced** (with a force option), image/speech/voice queues, queue timeouts, stream idle timeout. Still one heavy model at a time (decision B) | New refusals, each with a clear message | Per-setting `off` |
 
@@ -122,6 +122,27 @@ Stages 9.9c–f change behaviour and each needs a separate owner approval.
 * Rollback: `USAP_SCHEDULER=off` or `app/config/scheduler.json` `{ "scheduler": "off" }`. The environment wins.
 * Evidence: `scripts/tests/scheduler.test.cjs` (8 tests), and the 9.8h 60-request golden comparison against
   `main` is identical with the scheduler on and off.
+
+### Stage 9.9c as built (off by default)
+
+Numbering: the owner asked for the bounded chat queue as 9.9c, so it swapped places with the warn-only memory check
+(now 9.9d). Nothing else in the rollout changed.
+
+* `services/chat-queue.cjs`: one chat runs at a time (the engine runs with `--parallel 1`, so this matches what it
+  can do), at most 4 wait, first in, first out. A full queue answers `429` `{ ok: false, code: "QUEUE_FULL",
+  retryAfterSeconds }` with a `Retry-After` header, estimated from recent chat durations (1–120 s). A waiting
+  request whose client disconnects leaves at once and never reaches the engine. Nothing waits longer than
+  `chatQueueMaxWaitMs` (10 minutes; 1 s to 1 hour): then `503 QUEUE_TIMEOUT` with `Retry-After`.
+* A request admitted after the engine stopped or crashed gets `409 ENGINE_NOT_READY` instead of reaching a missing
+  engine. The running chat is never touched by the queue.
+* Setting: `USAP_CHAT_QUEUE=on|off` or `app/config/scheduler.json` `{ "chatQueue": "on" }` (the environment wins),
+  read at start-up. Off by default; `USAP_SCHEDULER=off` also turns it off. `GET /api/resources` shows
+  `limits.chatQueue` and the running and waiting counts.
+* Unchanged: one heavy model at a time (decision B); no memory decisions (unknown memory is still reported as
+  unknown); no new timeout on the running stream; no UI change.
+* Evidence: `scripts/tests/chat-queue.test.cjs` (10 tests: queue order, limits, disconnects, timeouts, settings, a
+  burst of 12, stopping and crashing the engine while requests wait, stopping the server, and off/rollback). The
+  9.8h 60-request comparison against `main` is identical with the queue off and on.
 
 ## 4. Tests (GitHub Actions)
 
@@ -144,7 +165,7 @@ full, a new request gets `429` with code `QUEUE_FULL` and a `Retry-After` header
 queued work (at least 1 s), so nothing waits indefinitely. Queued requests are served first in, first out, so
 earlier requests are never overtaken. A queued request whose client disconnects leaves the queue at once. Rollback:
 `chatQueue: off` (setting and `USAP_CHAT_QUEUE=off`) restores today's unbounded behaviour, and a CI test checks
-that. Lands in stage 9.9d.
+that. Lands in stage 9.9c (built: see below).
 
 **B. One heavy model at a time.** The current default stays: a text and an image model are never loaded together
 during the initial rollout (9.9b–9.9f). It can be reconsidered only after RAM and the relevant VRAM are reliably
