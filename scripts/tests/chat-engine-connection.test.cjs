@@ -44,6 +44,11 @@ async function fakeEngine(onRequest) {
         seen.perSocket.push(onSocket);
         const what = onRequest(seen.requests, onSocket);
         if (what === "drop") { socket.destroy(); return; }
+        if (what === "slowstream") { // headers and the first event now, the rest later (a second request waits meanwhile)
+          socket.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" + chunk(SSE.slice(0, 60)));
+          setTimeout(() => socket.write(chunk(SSE.slice(60)) + "0\r\n\r\n"), 400);
+          continue;
+        }
         if (what === "json") {
           const body = JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] });
           socket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: keep-alive\r\n\r\n${body}`);
@@ -105,6 +110,24 @@ test("stream after stream: a reused connection the engine closed is retried once
     assert.equal(engine.seen.requests, 3, "first stream, the dropped reuse, one retry");
     assert.equal(engine.seen.connections, 2, "the retry used a new connection");
     assert.equal(app.searches(), 2, "web search ran once per chat request, never again for the retry");
+  } finally { await app.close(); await engine.close(); }
+});
+
+test("overlapping streams: a stream that waited for the engine connection while another streamed is retried too", async () => {
+  // Like llama-server: the first stream is answered, then its connection is closed when the waiting request reuses it.
+  const engine = await fakeEngine((n, onSocket) => (onSocket >= 2 ? "drop" : n === 1 ? "slowstream" : "stream"));
+  const app = await chatApp(engine.port);
+  try {
+    const a = stream(app.port);
+    await new Promise((r) => setTimeout(r, 100));
+    const b = stream(app.port);
+    const [ra, rb] = await Promise.all([a, b]);
+    assert.equal(ra.status, 200);
+    assert.equal(ra.text, SSE);
+    assert.equal(rb.status, 200, rb.text);
+    assert.equal(rb.text, SSE);
+    assert.equal(engine.seen.connections, 2);
+    assert.equal(engine.seen.requests, 3);
   } finally { await app.close(); await engine.close(); }
 });
 

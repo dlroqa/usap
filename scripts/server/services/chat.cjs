@@ -68,6 +68,11 @@ function createChatService(deps) {
   // like the chat route does when it knows the engine is down, instead of a raw 500 that names the engine's port.
   const ENGINE_GONE = { ok: false, code: "ENGINE_NOT_READY", error: "The text engine isn't running (it stopped or crashed). Load a text model, or wait for it to restart, then try again." };
 
+  // Engine sockets that have already carried a request. Node marks `reusedSocket` only when a request takes an idle
+  // socket, not when it waited for the one socket (maxSockets 1) and got it as the previous response ended, so the
+  // studio keeps track itself.
+  const usedEngineSockets = new WeakSet();
+
   async function doLlmChat(req, res, body, retryCount = 0) {
     try {
       const isStream = body.stream === true;
@@ -149,11 +154,16 @@ function createChatService(deps) {
           clientRes.on("error", (err) => res.destroy(err));
         });
 
+        let reused = false;
+        clientReq.on("socket", (socket) => {
+          reused = usedEngineSockets.has(socket);
+          usedEngineSockets.add(socket);
+        });
         clientReq.on("error", async (err) => {
           // A kept-alive engine connection that llama-server closed just as it was reused (seen when a stream starts
           // right after another one ends): nothing came back, so the engine never answered it. Send it once more on
           // a new connection; the prompt and web results are reused, nothing else runs again.
-          if (!fresh && clientReq.reusedSocket && (err.code === "ECONNRESET" || err.code === "EPIPE") && !res.headersSent && !res.destroyed) {
+          if (!fresh && (reused || clientReq.reusedSocket) && (err.code === "ECONNRESET" || err.code === "EPIPE") && !res.headersSent && !res.destroyed) {
             console.log("  [llm] the engine closed a reused connection; sending the request again on a new one");
             return sendToEngine(true);
           }
