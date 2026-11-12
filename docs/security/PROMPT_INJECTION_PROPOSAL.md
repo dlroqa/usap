@@ -81,7 +81,7 @@ representative real models, include a rollback setting and compatibility behavio
 prompt-injection limits.
 
 **P4, document attachments: the concept of a minimal internal UI change is approved.** Detailed proposal:
-[P4_DOCUMENT_ATTACHMENTS.md](P4_DOCUMENT_ATTACHMENTS.md) (a server-side first stage needs no UI change). It sends extracted document
+[P4_DOCUMENT_ATTACHMENTS.md](P4_DOCUMENT_ATTACHMENTS.md) (documents arrive in a server-validated `attachments` record; inline text markers never establish provenance). It sends extracted document
 text separately from the user's own text. The visual interface and PDF and document attachment behaviour stay as
 they are. Older API clients keep working. Extracted text is labelled untrusted, processing is bounded and
 validated, and document text can never become privileged instructions. Implementation and merge each need
