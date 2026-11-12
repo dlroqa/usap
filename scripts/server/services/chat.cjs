@@ -64,6 +64,10 @@ function createChatService(deps) {
     await runExclusiveLlmOperation(() => startLlm(newSettings));
   }
 
+  // The engine refused the connection: it isn't listening (stopped, or crashed before the server noticed). Answer
+  // like the chat route does when it knows the engine is down, instead of a raw 500 that names the engine's port.
+  const ENGINE_GONE = { ok: false, code: "ENGINE_NOT_READY", error: "The text engine isn't running (it stopped or crashed). Load a text model, or wait for it to restart, then try again." };
+
   async function doLlmChat(req, res, body, retryCount = 0) {
     try {
       const isStream = body.stream === true;
@@ -88,7 +92,13 @@ function createChatService(deps) {
       });
 
       if (isStream) {
-        const clientReq = http.request({
+        let clientReq;
+        res.on("close", () => {
+          if (!res.writableEnded && clientReq && !clientReq.destroyed) clientReq.destroy();
+        });
+        // One engine request; `fresh` is true for the single retry after a reused connection was closed (below).
+        const sendToEngine = (fresh) => {
+        clientReq = http.request({
           hostname: "127.0.0.1",
           port: state.PORT_LLM,
           path: "/v1/chat/completions",
@@ -140,6 +150,13 @@ function createChatService(deps) {
         });
 
         clientReq.on("error", async (err) => {
+          // A kept-alive engine connection that llama-server closed just as it was reused (seen when a stream starts
+          // right after another one ends): nothing came back, so the engine never answered it. Send it once more on
+          // a new connection; the prompt and web results are reused, nothing else runs again.
+          if (!fresh && clientReq.reusedSocket && (err.code === "ECONNRESET" || err.code === "EPIPE") && !res.headersSent && !res.destroyed) {
+            console.log("  [llm] the engine closed a reused connection; sending the request again on a new one");
+            return sendToEngine(true);
+          }
           console.error("LLM stream request error:", err);
           if (isOomError(err.message) && retryCount === 0) {
             try {
@@ -149,6 +166,7 @@ function createChatService(deps) {
               console.error("Failed OOM recovery retry:", retryErr);
             }
           }
+          if (!res.headersSent && err.code === "ECONNREFUSED") return json(res, 409, ENGINE_GONE);
           if (!res.headersSent) {
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: err.message }));
@@ -159,9 +177,8 @@ function createChatService(deps) {
 
         clientReq.write(requestData);
         clientReq.end();
-        res.on("close", () => {
-          if (!res.writableEnded && !clientReq.destroyed) clientReq.destroy();
-        });
+        };
+        sendToEngine(false);
         return;
       } else {
         try {
@@ -181,6 +198,7 @@ function createChatService(deps) {
           }
           // #67: an engine error answers like the streaming path: the engine's status and message.
           if (err.upstreamStatus) return json(res, err.upstreamStatus, { ok: false, error: redactPaths(err.message) });
+          if (err.code === "ECONNREFUSED") return json(res, 409, ENGINE_GONE);
           throw err;
         }
       }
