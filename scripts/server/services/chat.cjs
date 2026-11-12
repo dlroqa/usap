@@ -72,8 +72,9 @@ function createChatService(deps) {
   // socket, not when it waited for the one socket (maxSockets 1) and got it as the previous response ended, so the
   // studio keeps track itself.
   const usedEngineSockets = new WeakSet();
-  // A stale kept-alive connection fails at once; a request the engine worked on fails later. Only an immediate
-  // failure is retried.
+  // A stale kept-alive connection fails at once after it is handed to a request; a request the engine worked on
+  // fails later. Only a failure within this window of the attempt getting its connection is retried (a request can
+  // wait longer than that for the one connection while another stream runs, so creation time doesn't count).
   const STALE_RETRY_WINDOW_MS = 2000;
   // Connection errors (ECONNRESET, ETIMEDOUT, …) are answered without Node's message, which can name the engine's
   // local address and port.
@@ -114,7 +115,7 @@ function createChatService(deps) {
         // One engine request; `fresh` is true for the single retry after a reused connection was closed (below).
         const sendToEngine = (fresh) => {
         let answered = false; // the engine sent a status line (and maybe output): never retry after that
-        const sentAt = Date.now();
+        let acquiredAt = null; // when THIS attempt got its engine connection
         clientReq = http.request({
           hostname: "127.0.0.1",
           port: state.PORT_LLM,
@@ -169,6 +170,7 @@ function createChatService(deps) {
 
         let reused = false;
         clientReq.on("socket", (socket) => {
+          acquiredAt = Date.now();
           reused = usedEngineSockets.has(socket);
           usedEngineSockets.add(socket);
         });
@@ -179,7 +181,7 @@ function createChatService(deps) {
           // first attempt, the connection had carried an earlier request, a reset/broken pipe within the window,
           // no status line or output from the engine, nothing sent to the client, and the client is still there.
           const stale = !fresh && !cancelled && !answered && (reused || clientReq.reusedSocket)
-            && (err.code === "ECONNRESET" || err.code === "EPIPE") && Date.now() - sentAt < STALE_RETRY_WINDOW_MS
+            && (err.code === "ECONNRESET" || err.code === "EPIPE") && acquiredAt !== null && Date.now() - acquiredAt < STALE_RETRY_WINDOW_MS
             && !res.headersSent && !res.destroyed;
           if (cancelled) return; // the client cancelled: the engine request was aborted on purpose
           if (stale) {
