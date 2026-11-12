@@ -150,7 +150,8 @@ Numbering: the owner asked for the bounded chat queue as 9.9c, so it swapped pla
   * 1 running + 4 waiting, `429 QUEUE_FULL` with a `Retry-After` that matches the body, FIFO completion order;
   * a cancelled waiting request leaving the queue and never reaching the engine (engine prompt-token counter);
   * a cancelled running request stopping engine generation (`requests_processing` back to 0, no more tokens);
-  * two streams through the queue (complete SSE, `finish_reason`, `[DONE]`, the second starting after the first);
+  * two streams through the queue (complete SSE, `finish_reason`, `[DONE]`, the second starting after the first),
+    and three consecutive streams, with the queue on and off; two overlapping streams with the queue off;
   * recovery after a request the engine refuses (prompt longer than the context);
   * 5 rounds of a full queue with 2 MB waiting requests cancelled: no leaked slots, engine idle, bounded memory;
   * a hard engine kill with requests waiting (stream cut, waiting requests answered, supervisor restart, chat

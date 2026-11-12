@@ -190,6 +190,16 @@ async function enqueue(body, expectWaiting) {
   if (!ok) throw new Error(`queue did not reach ${expectWaiting} waiting`);
   return r;
 }
+// Two streams one after the other (the second starts right after the first ends, as a user's next message does).
+async function consecutiveStreams(label) {
+  const out = [];
+  for (let i = 0; i < 3; i++) {
+    const r = await call(PORT, "POST", "/api/llm/chat", { messages: [{ role: "user", content: `Count from 1 to ${5 + i}, separated by spaces.` }], max_tokens: 24, temperature: 0, stream: true }).promise;
+    out.push({ status: r.status, ...sse(r.text) });
+  }
+  record(`${label}: consecutive streams all complete`, out.every((o) => o.status === 200 && o.done && o.pieces >= 2) ? "PASS" : "FAIL",
+    out.map((o, i) => `stream ${i + 1}: ${o.status}, ${o.pieces} pieces, done ${o.done}`).join("; "));
+}
 const validRetryAfter = (r) => {
   const h = Number(r.headers?.["retry-after"]);
   const b = parseJson(r.text)?.retryAfterSeconds;
@@ -276,6 +286,8 @@ async function queueOnScenarios(srv) {
     record("queue slots released after streams", (await idle()) ? "PASS" : "FAIL", JSON.stringify(await chatStats()));
   });
 
+  await scenario("consecutive streams (queue on)", async () => { await consecutiveStreams("queue on"); });
+
   await scenario("recovery after failed requests", async () => {
     const hold = await holdEngine();
     // A prompt longer than the 2048-token context: the engine refuses it when its turn comes.
@@ -341,6 +353,8 @@ async function queueOnScenarios(srv) {
     if (back) {
       srv.enginePort = (await getJson(PORT, "/api/llm/status")).json.port;
       srv.enginePids = listenerPids(srv.enginePort).filter((pid) => pid !== srv.child.pid);
+      record("crash: no leaked engine process (old one gone, one engine listening)", killed.every((pid) => !alive(pid)) && srv.enginePids.length === 1 ? "PASS" : "FAIL",
+        `killed ${killed.join(",")} alive ${killed.filter(alive).join(",") || "none"}; listening now ${srv.enginePids.join(",")}`);
     }
     const after = await call(PORT, "POST", "/api/llm/chat", SHORT(13)).promise;
     const clean = await idle();
@@ -401,6 +415,7 @@ async function rollbackScenario(label, env, expectResources, writeConfig) {
     const burst = await Promise.all(Array.from({ length: 7 }, (_, i) => call(PORT, "POST", "/api/llm/chat", SHORT(40 + i, { max_tokens: 4 })).promise));
     const statuses = burst.map((r) => r.status);
     const resOk = expectResources === 404 ? res.status === 404 : res.status === 200 && res.json?.limits?.chatQueue === "off";
+    await consecutiveStreams(`queue off (${label})`);
     // Two simultaneous streams with the queue off (the behaviour before 9.9c), to tell queue bugs from older ones.
     const s1 = call(PORT, "POST", "/api/llm/chat", { ...LONG, max_tokens: 48 });
     await s1.first;
