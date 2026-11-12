@@ -179,9 +179,13 @@ function createTtsService(deps) {
     };
   }
 
+  let pendingOperations = 0;
   function runExclusiveTtsOperation(operation) {
     const run = ttsOperationQueue.catch(() => {}).then(operation);
     ttsOperationQueue = run.catch(() => {});
+    // Step 9.9b: counted for GET /api/resources only (running + waiting); order and timing are unchanged.
+    pendingOperations += 1;
+    ttsOperationQueue.then(() => { pendingOperations -= 1; });
     return run;
   }
 
@@ -489,6 +493,7 @@ function createTtsService(deps) {
     preferredPort: PREFERRED_TTS_PORT,
     voices: TTS_VOICES,
     catalog: TTS_MODEL_CATALOG,
+    getPendingOperations: () => pendingOperations,
     // operations
     getTtsModels, resolveTtsModel, getTtsRuntimeStatus, installTtsCatalogModel, readTtsManifest,
     runExclusiveTtsOperation, startTts, stopTts, synthesizeTts, saveTtsOutput, listTtsOutputs,

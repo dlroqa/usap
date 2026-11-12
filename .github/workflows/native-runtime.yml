@@ -16,6 +16,7 @@ on:
       - "scripts/setup/**"
       - "scripts/server/**"
       - "scripts/workers/**"
+      - "scripts/search/**" # web text that enters chat prompts (token filter, page extraction)
       - "scripts/ci/runtime-validate.sh"
       - "scripts/ci/stop-app.sh"
       - ".github/workflows/native-runtime.yml"

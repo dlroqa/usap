@@ -34,6 +34,8 @@ const { createHardwareService } = require("./services/hardware.cjs");
 const { searchRoutes } = require("./routes/search.cjs");
 const { imageRoutes } = require("./routes/image.cjs");
 const { llmRoutes } = require("./routes/llm.cjs");
+const { resourceRoutes } = require("./routes/resources.cjs");
+const { createScheduler, schedulerMode } = require("./services/scheduler.cjs");
 const { createLlmEngine, createLlmfitLookup } = require("./services/llm-engine.cjs");
 const { createChatService } = require("./services/chat.cjs");
 const { protectionSettings } = require("./services/prompt-boundary.cjs");
@@ -1633,6 +1635,31 @@ const conversations = createConversationStore({ CHAT_HISTORY, badRequest, format
 router.use(llmRoutes({
   state: llmEngine.routeState, PREFERRED_LLM_PORT, benchmarkLlmModel, deleteChatConversation: conversations.deleteChatConversation, doLlmChat: chatService.doLlmChat, errorBody, errorStatus, getLlmBackend, getLlmBackendProbe, getLlmRuntimeStats, getLlmfitRecommendations: (...args) => createLlmfitLookup({ ROOT, fs, getGpuInfo, os, osPlatform, path, spawnSync }).getLlmfitRecommendations(...args), getPersistedLlmModelSettings, json, jsonErrorStatus, killLlm, listChatConversations: conversations.listChatConversations, llmEngineState, llmLifecycleSnapshot, path, publicPaths, readJsonBody, runExclusiveLlmOperation, saveChatConversation: conversations.saveChatConversation, startLlm, stopLlmNow, updateLlmModelSettings,
 }));
+// Resource accounting (Step 9.9b): read-only, no scheduling decisions. USAP_SCHEDULER=off leaves the route out.
+const SCHEDULER_MODE = schedulerMode({ configDir: LLM_CONFIG_DIR });
+if (SCHEDULER_MODE !== "off") {
+  const img = imageEngine.state;
+  const scheduler = createScheduler({
+    budget: hardware.budget,
+    cpu: { logicalCores: () => os.cpus().length, physicalCores: () => getPhysicalCores() },
+    engines: {
+      text: () => ({
+        state: llmEngineState(), loaded: Boolean(llmEngine.state.llmReady && llmEngine.state.llmProc),
+        pendingOperations: llmEngine.pendingOperations, chatActive: () => chatService.chatStats().active, chatWaiting: () => chatService.chatStats().waiting,
+      }),
+      image: () => ({
+        state: img.backendReady || img.openvinoReady ? "ready" : (img.backendProc || img.openvinoProc || (img.backendLoadState && img.backendLoadState.active)) ? "loading" : "stopped",
+        loaded: Boolean(img.backendReady || img.openvinoReady), generating: Boolean(img.generationState && img.generationState.active),
+      }),
+      speech: () => ({ state: speech.isReady() ? "ready" : "stopped", active: Boolean(speech.getTranscriptionState().active), pendingOperations: speech.getPendingOperations }),
+      voice: () => ({ state: tts.isReady() ? "ready" : "stopped", active: Boolean(tts.getGenerationState().active), pendingOperations: tts.getPendingOperations }),
+      download: () => downloads.getState(),
+      // Which kind of heavy model is loaded, without its name.
+      heavyModel: () => { const r = getActiveHeavyRuntime(); return r ? { type: r.type } : null; },
+    },
+  });
+  router.use(resourceRoutes({ scheduler, json }));
+}
 
 // Routes not yet moved into modules, then static files. Only reached through the pipeline.
 async function legacyRoutes(req, res) {
