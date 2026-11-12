@@ -18,6 +18,7 @@ on:
       - "scripts/workers/**"
       - "scripts/search/**" # web text that enters chat prompts (token filter, page extraction)
       - "scripts/ci/runtime-validate.sh"
+      - "scripts/ci/chat-queue-validate.cjs"
       - "scripts/ci/stop-app.sh"
       - ".github/workflows/native-runtime.yml"
   schedule:
@@ -102,6 +103,21 @@ jobs:
 
       - name: Stop first launch
         if: always()
+        run: bash scripts/ci/stop-app.sh
+
+      # Step 9.9c bounded chat queue, real model, opt-in: the queue is switched on only in the environment of the
+      # test servers this script starts (port 14920); the installed default stays off. Real Qwen2.5 0.5B Q4_K_M
+      # (installed by the validation step above) on the CPU.
+      - name: Chat queue with a real model (queue on for test servers only)
+        run: |
+          set -o pipefail
+          node scripts/ci/chat-queue-validate.cjs --model qwen2.5-0.5b-instruct-q4_k_m.gguf \
+            --results ci-logs/chat-queue-results.jsonl --logs ci-logs | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop chat queue test servers
+        if: always()
+        env:
+          FRONTEND_PORT: "14920"
         run: bash scripts/ci/stop-app.sh
 
       - name: Second launch must not re-run setup
