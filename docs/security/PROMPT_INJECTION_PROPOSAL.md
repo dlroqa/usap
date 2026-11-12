@@ -62,7 +62,7 @@ passing client messages through unchanged.
 |---|---|---|
 | P1 (done, #78) | Adversarial test suite (no behaviour change; `scripts/tests/prompt-injection.test.cjs`): fixtures for each concern above, run against the real server with the fake engine (`/fake/last` shows exactly what the model would see) | None |
 | P2 (in review) | Typed segments inside the server (`services/prompt-boundary.cjs`); output byte-identical to today (proved by the 9.8h golden comparison) | None |
-| P3 | Control-token removal and markers for assistant turns with `webSources` (#1, #5) | Prompts change for those turns only; setting to turn it off |
+| P3 (in review, off by default) | History marking (`historyWeb`): control tokens removed from every earlier assistant turn, and marker brackets defused in turns that cited web sources; no other text, role or order changes; saved files untouched (#1, #5) | Prompts change for assistant turns only, when the setting is on; `app/config/prompt-boundary.json` or `USAP_PROMPT_HISTORY_WEB` |
 | P4 | `attachments` field and document marking (#2), with the UI change | Old clients unchanged |
 | P5 | Role policy for API keys and multi-user (#3, #6), with #28 | Single-user default unchanged |
 
