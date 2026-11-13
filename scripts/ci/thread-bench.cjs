@@ -20,6 +20,12 @@
 // Get-Process). OS thread counts include idle and I/O threads: they are an upper bound, not compute threads.
 //
 //   node scripts/ci/thread-bench.cjs --jfk .ci-model-cache/jfk.wav --out ci-logs/thread-bench [--reps 5 --image-reps 3]
+//
+// Policy comparison (Step 9.9e implementation): `--set whisper` runs only the windows a transcription thread budget
+// affects (chat, transcription, voice and image alone; chat + transcription, voice + transcription, image +
+// transcription), with transcriptions requesting 4 threads as the WebUI does by default. `--studio-env K=V,...`
+// adds environment variables for the studio server (e.g. USAP_THREADS=on) and `--label` names the run. Run it once
+// per setting in the same job, then `--compare <dirA> <dirB>` prints the side-by-side table.
 "use strict";
 
 const fs = require("fs");
@@ -35,6 +41,10 @@ const arg = (name, def) => { const i = process.argv.indexOf(`--${name}`); return
 const OUT = path.resolve(arg("out", path.join(ROOT, "ci-logs", "thread-bench")));
 const JFK = path.resolve(arg("jfk", path.join(ROOT, ".ci-model-cache", "jfk.wav")));
 const REPS = Number(arg("reps", "5"));
+const SET = arg("set", "full");
+const LABEL = arg("label", SET === "full" ? "default" : "run");
+const STUDIO_ENV = Object.fromEntries(String(arg("studio-env", "")).split(",").filter(Boolean).map((kv) => { const i = kv.indexOf("="); return [kv.slice(0, i), kv.slice(i + 1)]; }));
+const UI_WHISPER_THREADS = 4; // the WebUI's default speech setting
 const IMAGE_REPS = Number(arg("image-reps", "3"));
 const PORT = Number(arg("port", "14930"));
 const SIDE_PORT = PORT + 1; // the standalone llama-server for image + chat
@@ -48,11 +58,11 @@ const PLATFORM = `${process.platform}-${process.arch}`;
 
 fs.mkdirSync(OUT, { recursive: true });
 const RESULTS = path.join(OUT, "thread-bench.jsonl");
-fs.writeFileSync(RESULTS, "");
+if (!process.argv.includes("--compare")) fs.writeFileSync(RESULTS, ""); // compare mode only reads
 const SERVER_LOG = path.join(OUT, "studio.log");
 const rows = [];
 function emit(row) {
-  const r = { platform: PLATFORM, ...row };
+  const r = { platform: PLATFORM, label: LABEL, ...row };
   rows.push(r);
   fs.appendFileSync(RESULTS, JSON.stringify(r) + "\n");
 }
@@ -222,7 +232,7 @@ async function overlap(name, fg, fgName, bg, bgName, reps, { outsideStudio = fal
 let studio = null; let side = null;
 async function startStudio() {
   const log = fs.openSync(SERVER_LOG, "w");
-  studio = spawn(NODE, [SERVE], { cwd: ROOT, env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT) }, stdio: ["ignore", log, log], windowsHide: true });
+  studio = spawn(NODE, [SERVE], { cwd: ROOT, env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT), ...STUDIO_ENV }, stdio: ["ignore", log, log], windowsHide: true });
   if (!(await waitUntil(async () => (await get("/api/health")).status === 200, 60000, 500))) throw new Error("studio did not start");
 }
 function loggedLine(re) {
@@ -237,8 +247,51 @@ async function stopAll() {
   if (studio && studio.exitCode === null) { studio.kill("SIGTERM"); await waitUntil(() => studio.exitCode !== null || studio.signalCode !== null, 20000); if (studio.exitCode === null) { try { studio.kill("SIGKILL"); } catch (_) { /* gone */ } } }
 }
 
+async function mainWhisperSet() {
+  if (!jfk) throw new Error(`the transcription sample is missing: ${JFK}`);
+  const wj = () => whisperJob(UI_WHISPER_THREADS);
+  const start = await call(PORT, "POST", "/api/llm/start", { model: QWEN, contextSize: 2048, gpuLayers: 0 });
+  if (start.status !== 200 || !(await waitUntil(async () => (await get("/api/llm/status")).json?.ready === true, 240000, 1000))) throw new Error(`text model did not load: ${start.text.slice(0, 200)}`);
+  await baseline("chat", chatJob, REPS);
+  await baseline("transcription", wj, REPS);
+  await baseline("voice", ttsJob, REPS);
+  await overlap("chat + transcription", chatJob, "chat", wj, "transcription", REPS);
+  await overlap("voice + transcription", ttsJob, "voice", wj, "transcription", REPS);
+  await call(PORT, "POST", "/api/llm/stop", {});
+  const img = await call(PORT, "POST", "/api/restart-backend", { model: SD, width: 256, height: 256, steps: 4, backend_type: "cpu", use_gpu: false });
+  if (img.status !== 200 || !(await waitUntil(async () => (await get("/api/backend-status")).json?.ready === true, 900000, 2000))) throw new Error(`image model did not load: ${img.text.slice(0, 200)}`);
+  await baseline("image", imageJob, IMAGE_REPS);
+  await overlap("image + transcription", imageJob, "image", wj, "transcription", IMAGE_REPS);
+  const r = (await get("/api/resources")).json || {};
+  emit({ kind: "policy", limitsThreads: r.limits && r.limits.threads, lastTranscription: r.threads ? r.threads.lastTranscription : null });
+}
+
+function compare(dirA, dirB) {
+  const load = (d) => fs.readFileSync(path.join(d, "thread-bench.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const A = load(dirA); const B = load(dirB);
+  const cells = (rows) => { const o = {}; for (const r of rows) { if (r.kind === "baseline") o[`alone | ${r.workload}`] = r; if (r.kind === "overlap") { o[`${r.workload} | ${r.foreground.workload}`] = r.foreground; o[`${r.workload} | ${r.background.workload} (behind)`] = r.background; } } return o; };
+  const a = cells(A); const b = cells(B);
+  const la = (A.find((r) => r.label) || {}).label; const lb = (B.find((r) => r.label) || {}).label;
+  const ms = (s) => (s && s.ms ? s.ms.median : null);
+  const fmt = (s) => (s && s.ms ? `${(s.ms.median / 1000).toFixed(2)} s (cv ${s.ms.cv}, n ${s.ms.n})` : "none");
+  const lines = [`## Policy comparison (${PLATFORM}): ${la} vs ${lb}`, "", `| Window | Workload | ${la} | ${lb} | Change |`, "|---|---|---|---|---|"];
+  for (const k of Object.keys(a)) {
+    const [w, wl] = k.split(" | ");
+    const ch = ms(a[k]) && ms(b[k]) ? `${Math.round((ms(b[k]) / ms(a[k]) - 1) * 100)}%` : "n/a";
+    lines.push(`| ${w} | ${wl} | ${fmt(a[k])} | ${fmt(b[k])} | ${ch} |`);
+  }
+  const pol = B.find((r) => r.kind === "policy");
+  if (pol) lines.push("", `${lb}: limits.threads ${pol.limitsThreads}; last transcription ${JSON.stringify(pol.lastTranscription)}`);
+  return lines.join("\n");
+}
+
 async function main() {
   await startStudio();
+  if (SET === "whisper") {
+    const res = (await get("/api/resources")).json || {};
+    emit({ kind: "hardware", cpuModel: (os.cpus()[0] || {}).model || null, logicalCores: res.cpu && res.cpu.logicalCores.value, physicalCores: res.cpu && res.cpu.physicalCores.value, totalRamMb: Math.round(os.totalmem() / 1048576), reps: REPS, imageReps: IMAGE_REPS, studioEnv: STUDIO_ENV });
+    return mainWhisperSet();
+  }
   const res = (await get("/api/resources")).json || {};
   const hw = {
     cpuModel: (os.cpus()[0] || {}).model || null,
@@ -336,5 +389,10 @@ function report() {
   console.log(md);
 }
 
-main().catch((e) => { emit({ kind: "error", error: String(e && e.message || e) }); console.error(e); })
+if (process.argv.includes("--compare")) {
+  const i = process.argv.indexOf("--compare");
+  const md = compare(process.argv[i + 1], process.argv[i + 2]);
+  fs.writeFileSync(path.join(OUT, "compare.md"), md + "\n");
+  console.log(md);
+} else main().catch((e) => { emit({ kind: "error", error: String(e && e.message || e) }); console.error(e); })
   .finally(async () => { await stopAll(); report(); });
