@@ -118,19 +118,43 @@ function chat(port, content, { stream = true, onRequest } = {}) {
 const engineStats = async (s) => JSON.parse((await request(s.srv.enginePort, "GET", "/fake/stats")).text);
 const resources = async (s) => (await request(s.srv.port, "GET", "/api/resources")).json;
 
+// The burst is driven by observed state, not by timers: r0 is held inside the fake engine until the test releases
+// it, each of r1..r4 is sent only after the previous one is seen waiting, and each of r5..r11 only after the
+// previous one got its 429. A slow or busy runner therefore can't let r0 finish early and change the 1/4/7 split.
 test("server, queue on: a burst of 12 gets 1 running + 4 queued served in order; the other 7 get 429 QUEUE_FULL with Retry-After", async (t) => {
   const s = await serverWith({ USAP_CHAT_QUEUE: "on" });
-  t.after(() => close(s));
+  const release = () => request(s.srv.enginePort, "POST", "/fake/release", { body: {} }).catch(() => {});
+  t.after(async () => { await release(); await close(s); }); // always free a held request before stopping
   assert.equal((await resources(s)).limits.chatQueue, "on");
+  const { pid } = await engineStats(s);
+  const chatState = async () => (await resources(s)).engines.text.chat;
   const sent = [];
-  for (let i = 0; i < 12; i++) { sent.push(chat(s.srv.port, `MODE:delay=400 TAG:r${i}`)); await sleep(25); }
+  // r0 runs and is held by the engine.
+  sent.push(chat(s.srv.port, "MODE:hold TAG:r0"));
+  await waitFor(async () => (await engineStats(s)).held === 1 && (await chatState()).active === 1, 10000, "r0 running and held");
+  // r1..r4 wait, one at a time, in order.
+  for (let i = 1; i <= 4; i++) {
+    sent.push(chat(s.srv.port, `MODE:delay=50 TAG:r${i}`));
+    await waitFor(async () => (await chatState()).waitingForEngineConnection === i, 10000, `r${i} waiting`);
+  }
+  // r5..r11 arrive while the queue is full; each is answered before the next is sent.
+  for (let i = 5; i < 12; i++) {
+    const p = chat(s.srv.port, `MODE:delay=50 TAG:r${i}`);
+    sent.push(p);
+    assert.equal((await p).status, 429, `r${i} refused while the queue is full`);
+  }
   const during = await resources(s);
   assert.equal(during.engines.text.chat.active, 1);
   assert.equal(during.engines.text.chat.waitingForEngineConnection, 4);
+  const held = await engineStats(s);
+  assert.equal(held.requests, 1, "only the running request has reached the engine");
+  assert.equal(held.held, 1, "r0 is still held: the state above was observed with the burst complete");
+  assert.equal((await release()).json.released, 1);
   const results = await Promise.all(sent);
   const served = results.map((r, i) => [i, r]).filter(([, r]) => r.status === 200);
   const refused = results.filter((r) => r.status === 429);
   assert.equal(served.length, 5); assert.equal(refused.length, 7);
+  assert.deepEqual(served.map(([i]) => i), [0, 1, 2, 3, 4], "the first 5 are the ones served");
   for (const [, r] of served) assert.ok(r.text.trimEnd().endsWith("data: [DONE]"), "every admitted stream completes");
   for (const r of refused) {
     const body = JSON.parse(r.text);
@@ -138,8 +162,16 @@ test("server, queue on: a burst of 12 gets 1 running + 4 queued served in order;
     assert.ok(Number(r.headers["retry-after"]) >= 1, "Retry-After header");
     assert.equal(Number(r.headers["retry-after"]), body.retryAfterSeconds);
   }
-  assert.deepEqual((await engineStats(s)).order, ["r0", "r1", "r2", "r3", "r4"], "the engine saw the admitted requests in arrival order");
+  const after = await engineStats(s);
+  assert.deepEqual(after.order, ["r0", "r1", "r2", "r3", "r4"], "the engine saw the admitted requests in arrival order");
+  assert.equal(after.completed, 5); assert.equal(after.aborted, 0);
+  assert.equal(after.holdTimeouts, 0, "r0 was released by the test, not by the fake engine's safety limit");
   assert.deepEqual((await resources(s)).engines.text.chat, { active: 0, waitingForEngineConnection: 0 });
+  // No engine process is left once the engine is stopped.
+  assert.equal((await request(s.srv.port, "POST", "/api/llm/stop", { body: {} })).status, 200);
+  const diag = (await request(s.srv.port, "GET", "/api/diagnostics")).json;
+  assert.deepEqual(diag.engines.processes.supervised.filter((p) => p.label === "llm"), [], "no engine left running");
+  await waitFor(() => { try { process.kill(pid, 0); return false; } catch (_) { return true; } }, 15000, "engine process gone");
 });
 
 test("server, queue on: a waiting client that disconnects leaves the queue at once and never reaches the engine", async (t) => {
