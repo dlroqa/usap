@@ -36,6 +36,8 @@ const { imageRoutes } = require("./routes/image.cjs");
 const { llmRoutes } = require("./routes/llm.cjs");
 const { resourceRoutes } = require("./routes/resources.cjs");
 const { createScheduler, schedulerMode, chatQueueSetting } = require("./services/scheduler.cjs");
+const { createMemoryAdvisor, memoryCheckSetting } = require("./services/memory-check.cjs");
+const { inspectModel } = require("./model-metadata.cjs");
 const { createChatQueue } = require("./services/chat-queue.cjs");
 const { createLlmEngine, createLlmfitLookup } = require("./services/llm-engine.cjs");
 const { createChatService } = require("./services/chat.cjs");
@@ -196,12 +198,33 @@ const OPENVINO_NPU_MODELS = [
   },
 ];
 
+// Step 9.9d: warn-only memory check before a model loads (services/memory-check.cjs). It records and logs an
+// estimate; it never refuses, delays or changes a load. USAP_MEMORY_CHECK=off (or scheduler.json
+// "memoryCheck": "off", or USAP_SCHEDULER=off) leaves it out. Its inputs are read when a model loads.
+const MEMORY_CHECK = memoryCheckSetting({ configDir: LLM_CONFIG_DIR, schedulerMode: schedulerMode({ configDir: LLM_CONFIG_DIR }) });
+const memoryAdvisor = MEMORY_CHECK.mode === "warn" ? createMemoryAdvisor({
+  setting: MEMORY_CHECK,
+  inspectModel,
+  budget: {
+    totalRamBytes: () => hardware.budget.totalRamBytes(),
+    freeRamBytes: () => hardware.budget.freeRamBytes(),
+    freeRamSource: () => hardware.budget.freeRamSource(),
+  },
+  activity: () => ({
+    chatActive: chatService.chatStats().active > 0,
+    imageGenerating: Boolean(imageEngine.state.generationState && imageEngine.state.generationState.active),
+    transcribing: Boolean(speech.getTranscriptionState().active),
+    synthesizing: Boolean(tts.getGenerationState().active),
+  }),
+}) : null;
+
 // ── Backend process state ─────────────────────────────────────────────────────
 // Image generation (stable-diffusion.cpp, OpenVINO NPU, Core ML) lives in services/image-engine.cjs (Step 9.8g).
 // Functions bound later in this file are passed as wrappers, resolved when called.
 const imageEngine = createImageEngine({
   BACKEND_PATHS, IS_MAC_INTEL, MAC_INTEL_IMAGE_MESSAGE, MODELS, OUTPUTS, PREFERRED_BACKEND_PORT, ROOT, assertNoOtherActiveRuntime, backendValidationErrors, badRequest, checkPort, conflict, describeLinuxRuntimeLinkerError, findOpenVinoModel: (...args) => findOpenVinoModel(...args), fs, getBackendOptions, getDefaultModel, getModelLoadIssue, getOpenVinoModelInfo: (...args) => getOpenVinoModelInfo(...args), getOpenVinoNpuInfo: (...args) => getOpenVinoNpuInfo(...args), getPreferredVulkanBackendName: (...args) => getPreferredVulkanBackendName(...args), http, json, killLlm: (...args) => killLlm(...args), os, osPlatform, path, pollNvidiaVram: (...args) => pollNvidiaVram(...args), readdirVisible: (...args) => readdirVisible(...args), requestJson, safeOutputName, spawn, spawnSync, stripAnsi, supervisor, withoutAuthHeaders, withoutCorsHeaders,
   getBackendPath: () => BACKEND_PATH,
+  memoryAdvisor, // optional (Step 9.9d)
 });
 const {
   normalizeBackendSettingValue, backendSettingsMatch, findAvailableBackendPort, getCoreMLPythonPath, backendAccepts, proxyImageBackendRequest, killOpenVinoWorker, generateWithOpenVino, killBackend, startBackend, saveGeneratedOutput, listGeneratedOutputs, deleteGeneratedOutputs,
@@ -212,6 +235,7 @@ const {
 // resolved when called.
 const llmEngine = createLlmEngine({
   ApiError, LLM_BACKEND_PATHS, LLM_BENCHMARK_PATH, LLM_MODELS, LLM_MODEL_SETTINGS_PATH, PREFERRED_LLM_PORT, assertNoOtherActiveRuntime, badRequest, checkPort, decideRestart, fs, getGpuInfo: (...args) => getGpuInfo(...args), getStableSyclGpuLayers, http, isVisionModelFilename, killBackend, killOpenVinoWorker, notFound, notInstalled, os, osPlatform, path, pathInside, readJsonFile, readdirVisible: (...args) => readdirVisible(...args), requestJson, spawnSync, supervisor, waitForChildExit, waitForPortAvailable, writeJsonFile,
+  memoryAdvisor, // optional (Step 9.9d)
 });
 const {
   llmEngineState, llmLifecycleSnapshot, runExclusiveLlmOperation, getPersistedLlmModelSettings, updateLlmModelSettings, getLlmBackend, getLlmBackendProbe, killLlm, stopLlmNow, startLlm, getLlmRuntimeStats, benchmarkLlmModel,
@@ -1620,6 +1644,7 @@ router.use(imageRoutes({
   backendSettingsMatch, deleteGeneratedOutputs, errorBody, errorStatus, findAvailableBackendPort, fs, generateWithOpenVino,
   getCoreMLPythonPath, getDefaultModel, json, jsonErrorStatus, killBackend, killOpenVinoWorker, listGeneratedOutputs, path,
   proxyImageBackendRequest, readJsonBody, saveGeneratedOutput, startBackend,
+  memoryCheck: memoryAdvisor ? () => memoryAdvisor.last("image") : null, // optional (Step 9.9d)
 }));
 router.use(modelRoutes({
   IMAGE_BACKEND_DOWNLOADS, LLM_MODELS, MODELS, OPENVINO_MODELS, SPEECH_MODELS, addHuggingFaceFileSize, cancelModelDownload,
@@ -1638,6 +1663,7 @@ const chatService = createChatService({ promptProtections: () => protectionSetti
 const conversations = createConversationStore({ CHAT_HISTORY, badRequest, formatBytes, fs, path, pathInside, readdirVisible, safeOutputName });
 router.use(llmRoutes({
   state: llmEngine.routeState, PREFERRED_LLM_PORT, benchmarkLlmModel, deleteChatConversation: conversations.deleteChatConversation, doLlmChat: chatService.doLlmChat, errorBody, errorStatus, getLlmBackend, getLlmBackendProbe, getLlmRuntimeStats, getLlmfitRecommendations: (...args) => createLlmfitLookup({ ROOT, fs, getGpuInfo, os, osPlatform, path, spawnSync }).getLlmfitRecommendations(...args), getPersistedLlmModelSettings, json, jsonErrorStatus, killLlm, listChatConversations: conversations.listChatConversations, llmEngineState, llmLifecycleSnapshot, path, publicPaths, readJsonBody, runExclusiveLlmOperation, saveChatConversation: conversations.saveChatConversation, startLlm, stopLlmNow, updateLlmModelSettings,
+  memoryCheck: memoryAdvisor ? () => memoryAdvisor.last("text") : null, // optional (Step 9.9d)
 }));
 // Resource accounting (Step 9.9b): read-only, no scheduling decisions. USAP_SCHEDULER=off leaves the route out.
 const SCHEDULER_MODE = schedulerMode({ configDir: LLM_CONFIG_DIR });
@@ -1645,6 +1671,8 @@ if (SCHEDULER_MODE !== "off") {
   const img = imageEngine.state;
   const scheduler = createScheduler({
     chatQueue: CHAT_QUEUE,
+    memoryCheck: MEMORY_CHECK,
+    memoryChecks: memoryAdvisor ? () => memoryAdvisor.snapshot() : null,
     budget: hardware.budget,
     cpu: { logicalCores: () => os.cpus().length, physicalCores: () => getPhysicalCores() },
     engines: {

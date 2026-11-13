@@ -1106,6 +1106,18 @@ function createHardwareService(deps) {
       if (osPlatform === "darwin" && cachedMacRamUsedGb !== null) return Math.max(0, os.totalmem() - cachedMacRamUsedGb * GB);
       return os.freemem();
     },
+    /**
+     * Where freeRamBytes() comes from (Step 9.9d, additive): "mem-available" (Linux: os.freemem() is
+     * /proc/meminfo MemAvailable), "available-physical" (Windows: available physical memory), "vm-stat"
+     * (macOS: free + inactive + speculative pages, polled every 5 s) or "os-free-pages" (macOS before the
+     * first vm_stat poll: free pages only, which reads low).
+     */
+    freeRamSource: () => {
+      if (osPlatform === "darwin") return cachedMacRamUsedGb !== null ? "vm-stat" : "os-free-pages";
+      if (osPlatform === "win32") return "available-physical";
+      if (osPlatform === "linux") return "mem-available";
+      return "os-freemem";
+    },
     /** Total VRAM of the detected GPU in bytes, or 0 when none is known. */
     // The same choice as getTelemetry(): the NVIDIA poll, else the llama.cpp device poll, else the
     // detected GPU's total.

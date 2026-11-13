@@ -70,21 +70,31 @@ const queue = (pending) => (pending === null
  * @param {object} deps.engines  read-only accessors per engine (see serve.cjs)
  * @param {() => number} [deps.now]
  */
-function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" } }) {
+// Step 9.9d: `memoryCheck` is the warn-only memory check setting and `memoryChecks()` the advisor's latest results
+// (services/memory-check.cjs). Both are optional; without them the snapshot is exactly the 9.9c one.
+function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null }) {
   for (const [name, value] of Object.entries({ budget, cpu, engines })) {
     if (!value) throw new Error(`scheduler: missing dependency ${name}`);
   }
 
+  const memoryWarn = memoryCheck.mode === "warn";
   function memory() {
     const totalRam = count(budget.totalRamBytes);
     const freeRam = count(budget.freeRamBytes);
     const totalVram = count(budget.totalVramBytes);
     const freeVram = (() => { try { const v = budget.freeVramBytes(); return v === null || v === undefined ? null : count(() => v); } catch (_) { return null; } })();
-    return {
+    const out = {
       ram: { totalBytes: known(totalRam), freeBytes: known(freeRam) },
       // A total of 0 means no GPU memory was detected: unknown, not "no VRAM needed".
       vram: { totalBytes: known(totalVram > 0 ? totalVram : null), freeBytes: known(freeVram) },
     };
+    // Additive (9.9d): the latest warn-only result per engine, null until a model was loaded.
+    if (memoryWarn) {
+      let checks = null;
+      try { checks = memoryChecks ? memoryChecks() : null; } catch (_) { checks = null; }
+      out.checks = { text: (checks && checks.text) || null, image: (checks && checks.image) || null };
+    }
+    return out;
   }
 
   function engineSnapshot() {
@@ -116,14 +126,15 @@ function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { m
   function snapshot() {
     return {
       ok: true,
-      scheduler: { mode: chatQueue.mode === "on" ? "chat-queue" : "observe", stage: "9.9c", decisions: chatQueue.mode === "on" },
+      // Memory warnings are not decisions: they never refuse or delay anything.
+      scheduler: { mode: chatQueue.mode === "on" ? "chat-queue" : "observe", stage: memoryWarn ? "9.9d" : "9.9c", decisions: chatQueue.mode === "on" },
       generatedAt: new Date(now()).toISOString(),
       cpu: { logicalCores: known(count(cpu.logicalCores)), physicalCores: known(count(cpu.physicalCores)) },
       memory: memory(),
       heavyModel: engines.heavyModel(),
       engines: engineSnapshot(),
       // Every limit in the plan is off in this stage; nothing is refused or delayed.
-      limits: { chatQueue: chatQueue.mode === "on" ? "on" : "off", memoryCheck: "off", threads: "off", queueTimeouts: chatQueue.mode === "on" ? "chat" : "off" },
+      limits: { chatQueue: chatQueue.mode === "on" ? "on" : "off", memoryCheck: memoryWarn ? "warn" : "off", threads: "off", queueTimeouts: chatQueue.mode === "on" ? "chat" : "off" },
     };
   }
 

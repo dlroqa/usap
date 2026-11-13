@@ -147,6 +147,9 @@ if fetch_verified "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolv
   status="$(api GET /api/llm/status)"
   if [[ "$(echo "$status" | json_get ready)" == true ]]; then
     record "LLM load (app API)" PASS "$(( $(date +%s) - t0 ))s; backend $(echo "$status" | json_get settings.backendMode)"
+    # Step 9.9d: the warn-only memory result of this real load (advisory; the load above succeeded regardless).
+    IFS=$'\t' read -r mst mname mdetail < <(echo "$start" | node "$ROOT/scripts/ci/memory-check-report.cjs" text "${SERVER_LOG:-}" 2>&1 || true)
+    record "${mname:-Memory check, text load (9.9d, warn only)}" "${mst:-FAIL}" "${mdetail:-the check produced no result}"
     reply="$(api POST /api/llm/chat '{"messages":[{"role":"user","content":"Reply with exactly one word: hello"}],"max_tokens":16,"temperature":0,"stream":false}')"
     text="$(echo "$reply" | json_get choices.0.message.content)"
     [[ -z "${text// /}" ]] && text="$(echo "$reply" | json_get content)"
@@ -329,6 +332,10 @@ image_test() { # backend id (cpu|metal|vulkan|cuda|rocm)
   fi
   local mode; mode="$(echo "$st" | json_get loading.backendMode)"; [[ -z "$mode" ]] && mode="$(echo "$st" | json_get settings.backendMode)"
   record "$label load" PASS "$(( $(date +%s) - t0 ))s; mode ${mode:-?}"
+  if [[ "$B" == cpu ]]; then # Step 9.9d: warn-only memory result of the CPU image load
+    IFS=$'\t' read -r mst mname mdetail < <(echo "$start" | node "$ROOT/scripts/ci/memory-check-report.cjs" image "${SERVER_LOG:-}" 2>&1 || true)
+    record "${mname:-Memory check, image load (9.9d, warn only)}" "${mst:-FAIL}" "${mdetail:-the check produced no result}"
+  fi
   t1=$(date +%s)
   gen="$(curl -s -m 2700 -X POST -H 'content-type: application/json' --data "{\"prompt\":\"a red apple on a wooden table\",\"negative_prompt\":\"\",\"width\":$IMAGE_SIZE,\"height\":$IMAGE_SIZE,\"steps\":$IMAGE_STEPS,\"cfg_scale\":7,\"seed\":42,\"sampler_name\":\"euler_a\",\"batch_size\":1}" "$BASE/sdapi/v1/txt2img")"
   rm -f "$ROOT/ci-image-$B.png"

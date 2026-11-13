@@ -13,6 +13,9 @@ function imageRoutes(deps) {
   for (const name of REQUIRED) {
     if (deps[name] === undefined || deps[name] === null) throw new Error(`routes/image: missing dependency ${name}`);
   }
+  // Optional (Step 9.9d): the warn-only memory check's latest image result. Without it, responses are unchanged.
+  const memoryCheck = typeof deps.memoryCheck === "function" ? deps.memoryCheck : () => null;
+  const withMemoryCheck = (body, before) => { let after = null; try { after = memoryCheck(); } catch (_) { after = null; } return after && after !== before ? { ...body, memoryCheck: after } : body; };
   const { state, MIME, MODELS, OUTPUTS, PREFERRED_BACKEND_PORT, SERVER_BUILD, appleNpuRuntimeMatches, assertNoOtherActiveRuntime, backendSettingsMatch, deleteGeneratedOutputs, errorBody, errorStatus, findAvailableBackendPort, fs, generateWithOpenVino, getCoreMLPythonPath, getDefaultModel, json, jsonErrorStatus, killBackend, killOpenVinoWorker, listGeneratedOutputs, path, proxyImageBackendRequest, readJsonBody, saveGeneratedOutput, startBackend } = deps;
   return (r) => {
     // Original condition: (req.url.startsWith("/v1/") || req.url.startsWith("/sdapi/")) && GET or POST
@@ -60,6 +63,8 @@ function imageRoutes(deps) {
     if (typeof body.vae_tiling === "boolean") newSettings.vaeTiling = body.vae_tiling;
     if (typeof body.vae_on_cpu === "boolean") newSettings.vaeOnCpu = body.vae_on_cpu;
     if (typeof body.flash_attn === "boolean") newSettings.flashAttn = body.flash_attn;
+    let memoryBefore = null;
+    try { memoryBefore = memoryCheck(); } catch (_) { memoryBefore = null; }
     try {
       const targetModel = newSettings.model || state.currentSettings.model || getDefaultModel();
       assertNoOtherActiveRuntime("image", targetModel);
@@ -121,10 +126,10 @@ function imageRoutes(deps) {
         return json(res, 200, { ok: true, message: "Apple NPU backend starting...", settings: { ...state.currentSettings, ...newSettings }, port: backendPort });
       }
       await startBackend(newSettings);
-      return json(res, 200, { ok: true, message: "Backend restarting...", settings: state.currentSettings, port: state.PORT_BACKEND });
+      return json(res, 200, withMemoryCheck({ ok: true, message: "Backend restarting...", settings: state.currentSettings, port: state.PORT_BACKEND }, memoryBefore));
     } catch (err) {
       state.backendError = err.message || String(err);
-      return json(res, jsonErrorStatus(err), errorBody(err, { error: state.backendError, code: err.code || "", activeRuntime: err.activeRuntime || null, port: state.PORT_BACKEND }));
+      return json(res, jsonErrorStatus(err), withMemoryCheck(errorBody(err, { error: state.backendError, code: err.code || "", activeRuntime: err.activeRuntime || null, port: state.PORT_BACKEND }), memoryBefore));
     }
     });
 
