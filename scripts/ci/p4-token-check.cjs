@@ -11,8 +11,9 @@
 //      40 literal "[token removed]" strings must give byte-identical messages, with no known control token left in
 //      the document block, and exactly the same prompt-token count from the real model (zero tolerance).
 //   2. Negative control: the same marked prompt with the tokens left in (what would be sent without
-//      neutralization) must give clearly FEWER prompt tokens on the real model, which shows the gate would catch
-//      control tokens reaching the engine.
+//      neutralization) must give at least 40 FEWER prompt tokens on the real model: each of the 40 strings is read as
+//      ONE control token, while each literal "[token removed]" takes at least two. (Strings kept as plain text would
+//      make the prompt longer instead.) So the exact gate would catch control tokens reaching the engine.
 //   3. End to end through the app API (documents=mark), comparing a real-token and a literal request: allowed
 //      difference = occurrences of the id in the prompt x (max - min tokens of a 12-hex id), measured with the
 //      engine's own /tokenize over 64 random ids. It must be well below the negative-control gap, or the
@@ -93,8 +94,8 @@ const get = (url) => new Promise((resolve, reject) => {
   const gap = tLit - tUnsafe;
   out(tReal === tLit ? "PASS" : "FAIL", "LLM document records (P4-1, real model, exact)",
     `normalized id: 40 document tokens -> ${tReal} prompt tokens, 40 literal replacements -> ${tLit} (must be equal)`);
-  out(gap >= 80 ? "PASS" : "FAIL", "LLM document records (P4-1, negative control)",
-    `the same prompt with the tokens left in -> ${tUnsafe} prompt tokens (${gap} fewer: the engine reads them as control tokens, so the exact check would catch them)`);
+  out(gap >= 40 ? "PASS" : "FAIL", "LLM document records (P4-1, negative control)",
+    `the same prompt with the tokens left in -> ${tUnsafe} prompt tokens (${gap} fewer, at least 40 required: one token per surviving control string, so the exact check would catch them)`);
 
   // 3. End to end through the app API, with a bound measured from the engine's tokenizer.
   const lens = [];
