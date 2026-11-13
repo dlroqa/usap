@@ -15,6 +15,11 @@ function llmRoutes(deps) {
   for (const name of REQUIRED) {
     if (deps[name] === undefined || deps[name] === null) throw new Error(`routes/llm: missing dependency ${name}`);
   }
+  // Optional (Step 9.9d): the warn-only memory check's latest text result. Without it, responses are unchanged.
+  const memoryCheck = typeof deps.memoryCheck === "function" ? deps.memoryCheck : () => null;
+  // Additive field: only a result produced by this start, so a start that failed before loading never carries an
+  // older one.
+  const withMemoryCheck = (body, before) => { let after = null; try { after = memoryCheck(); } catch (_) { after = null; } return after && after !== before ? { ...body, memoryCheck: after } : body; };
   const { state, PREFERRED_LLM_PORT, benchmarkLlmModel, deleteChatConversation, doLlmChat, errorBody, errorStatus, getLlmBackend, getLlmBackendProbe, getLlmRuntimeStats, getLlmfitRecommendations, getPersistedLlmModelSettings, json, jsonErrorStatus, killLlm, listChatConversations, llmEngineState, llmLifecycleSnapshot, path, publicPaths, readJsonBody, runExclusiveLlmOperation, saveChatConversation, startLlm, stopLlmNow, updateLlmModelSettings } = deps;
   return (r) => {
     r.get("/api/llm/status", async (req, res) => {
@@ -91,15 +96,17 @@ function llmRoutes(deps) {
     r.post("/api/llm/start", async (req, res) => {
     const body = await readJsonBody(req, res);
     if (!body) return;
+    let memoryBefore = null;
+    try { memoryBefore = memoryCheck(); } catch (_) { memoryBefore = null; }
     try {
       await runExclusiveLlmOperation(() => startLlm(body));
-      return json(res, 200, { ok: true, ready: state.llmReady, port: state.PORT_LLM, settings: state.llmSettings });
+      return json(res, 200, withMemoryCheck({ ok: true, ready: state.llmReady, port: state.PORT_LLM, settings: state.llmSettings }, memoryBefore));
     } catch (err) {
       state.llmError = err.message || String(err);
       if (err.code !== "MODEL_ALREADY_ACTIVE") {
         await runExclusiveLlmOperation(() => killLlm());
       }
-      return json(res, jsonErrorStatus(err), errorBody(err, { error: state.llmError, code: err.code || "", activeRuntime: err.activeRuntime || null }));
+      return json(res, jsonErrorStatus(err), withMemoryCheck(errorBody(err, { error: state.llmError, code: err.code || "", activeRuntime: err.activeRuntime || null }), memoryBefore));
     }
     });
 

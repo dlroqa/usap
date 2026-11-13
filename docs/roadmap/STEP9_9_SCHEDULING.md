@@ -102,7 +102,7 @@ separate UI change is approved.
 | 9.9a (done) | Fix #68 (unstartable engine stops the server; PR #72) and #67 (non-streaming chat errors; PR #73), both merged | Bug fixes only | Revert the PR |
 | 9.9b (done, #77) | `services/scheduler.cjs` with read-only accounting; `GET /api/resources`; tests | None: it only records and reports | `USAP_SCHEDULER=off` (or `"scheduler": "off"` in `app/config/scheduler.json`) leaves the route out |
 | 9.9c (in review, off by default) | Bounded chat queue (decision A): 1 running + 4 waiting per engine, FIFO, `429 QUEUE_FULL` with `Retry-After`, waiting requests leave on disconnect, `503 QUEUE_TIMEOUT` after the longest wait (10 min) | Only when turned on: requests past the limit get `429` | `chatQueue: off` (the default) or `USAP_SCHEDULER=off` restores the unbounded queue |
-| 9.9d | Memory check before loading a model, **warn only** (a field in the start response and a log line) | None for users; adds a field | Setting `memoryCheck: off` |
+| 9.9d (in review) | Memory check before loading a model, **warn only** (a field in the start response and a log line) | None for users; adds a field | Setting `memoryCheck: off` |
 | 9.9e | Thread budget shared between engines | Thread counts change only when engines overlap | `threads: off` |
 | 9.9f | Memory check **enforced** (with a force option), image/speech/voice queues, queue timeouts, stream idle timeout. Still one heavy model at a time (decision B) | New refusals, each with a clear message | Per-setting `off` |
 
@@ -167,8 +167,52 @@ Numbering: the owner asked for the bounded chat queue as 9.9c, so it swapped pla
   the bounded execution and timeout work of stage 9.9f.
 
   The script only touches the engine its own server started (found by its listening port, never by name). What
-  the queue doesn't do is recorded as `UNSUPPORTED`, not passed: memory-pressure admission (9.9d/9.9f) and a
+  the queue doesn't do is recorded as `UNSUPPORTED`, not passed: memory-pressure admission (9.9f) and a
   timeout for the running request. Which error a waiting request gets after a crash is recorded as `EXPECTED`.
+
+### Stage 9.9d as built (warn only)
+
+* `services/memory-check.cjs` runs just before an engine process starts with a model: the text engine
+  (llama.cpp, after any previous engine has stopped and the context size, KV-cache type and GPU layers are final,
+  including automatic restarts after a crash and the out-of-memory retry) and the image engine
+  (stable-diffusion.cpp; Core ML folders are not assessed). It is an optional dependency of both engines, wrapped
+  so that nothing it does can refuse, delay or change a load: it never returns an error, unloads, restarts,
+  reroutes, queues or reorders anything, and changes no thread count, context size or other setting.
+* **Measured:** total RAM and available RAM from `hardware.budget`, and model file sizes (plus a vision projector).
+  Available RAM is `MemAvailable` on Linux (`os.freemem()`, checked to be identical), available physical memory on
+  Windows, and on macOS free + inactive + speculative pages from `vm_stat` (polled every 5 s; before the first poll
+  only free pages are known, which reads low and is marked `macos-available-memory-pessimistic`).
+* **Estimated:** the KV cache at the context the engine is started with, from the GGUF header (layers, KV heads,
+  key/value length) and the cache type (`q8_0`, `f16`, `q4_0`, ...), plus a fixed 256 MiB allowance for compute
+  buffers. Estimates are rounded to MiB and labelled `estimate`; file sizes are labelled `measured-file-size`.
+  Image working memory depends on resolution and pipeline and is **not estimated**.
+* **Verdicts:** `may-not-fit` (the model files alone are larger than available memory), `tight` (available memory
+  is below the estimate plus a margin of 5% of RAM, at least 512 MiB), `likely-fits`, or `unknown`. Unknown memory
+  is never "enough": the verdict is `unknown` when available or total memory can't be read or is implausible
+  (`null`, not a number, negative, more than the total), when the header has no usable metadata, when layers are
+  offloaded to a discrete GPU (GPU memory isn't assessed in this stage), and for image models unless the files alone
+  don't fit. Apple Silicon offload is compared with the shared memory pool (`unified`). Other work running at the
+  time (chat, transcription, voice, image generation) is listed and never changes the verdict.
+* **Output:** `memoryCheck` in the `POST /api/llm/start` and `POST /api/restart-backend` responses (only when that
+  request produced a result), `memory.checks.text` / `memory.checks.image` and `limits.memoryCheck: "warn"` in
+  `GET /api/resources`, and one `[memory]` server log line per load. A result contains sizes, a verdict, a
+  warning code (`MEMORY_MAY_NOT_FIT`, `MEMORY_TIGHT`) and reason codes: no model, file or folder name, path, user
+  name, prompt or process argument. No UI change.
+* Cost: about 45 ms on a header with a 152,000-token vocabulary, once per model load; bounded by
+  `model-metadata.cjs` read limits.
+* Setting: `USAP_MEMORY_CHECK=warn|off` or `app/config/scheduler.json` `{ "memoryCheck": "off" }` (the environment
+  wins), read at start-up. Default `warn`; `USAP_SCHEDULER=off` also turns it off. Off gives the responses, log and
+  `/api/resources` of 9.9c exactly (`limits.memoryCheck: "off"`, no `memory.checks`, `stage: "9.9c"`).
+* Limits of the estimate: it doesn't predict peak use, whether memory-mapped weights stay resident (the OS can
+  page them out and back in, so "may not fit" can mean heavy swapping rather than a failed load), GPU memory, or
+  memory other programs will take later. It is a hint for the user and an input for 9.9f, not a guarantee.
+* Evidence: `scripts/tests/memory-check.test.cjs` (17 tests: sufficient, tight and insufficient memory; unknown
+  and malformed readings; missing and broken metadata; a 70B-class estimate; cache types; GPU offload and unified
+  memory; concurrent work; never throwing; privacy; settings; and, on the real server with the fake engines, a
+  model estimated not to fit that loads and chats exactly like the check off (success and failure responses), the
+  same chat-queue admission with and without a warning, a crash restart that is assessed again, a failed start
+  without a stale result, `USAP_SCHEDULER=off`, and an image load). The native-runtime job records the real
+  Qwen2.5 0.5B and CPU image results on all 4 OS (`scripts/ci/memory-check-report.cjs`).
 
 ## 4. Tests (GitHub Actions)
 

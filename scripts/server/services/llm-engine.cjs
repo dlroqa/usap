@@ -886,6 +886,17 @@ function createLlmEngine(deps) {
       }
     }
 
+    // Step 9.9d: warn-only memory check (optional dependency). It only records and logs; it can't refuse,
+    // delay or change this start, and anything it throws is ignored.
+    if (deps.memoryAdvisor) {
+      try {
+        deps.memoryAdvisor.beforeLoad("text", {
+          modelPath, projectorPath: mmprojPath, contextSize: llmSettings.contextSize, cacheTypeK: llmSettings.cacheTypeK,
+          cacheTypeV: llmSettings.cacheTypeV, gpuLayers: llmSettings.gpuLayers, backendMode: llmSettings.backendMode,
+        });
+      } catch (_) { /* advisory only */ }
+    }
+
     const args = [
       "--model", modelPath,
       "--host", "127.0.0.1",

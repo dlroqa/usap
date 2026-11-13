@@ -145,7 +145,11 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   (**Implemented**, observe only: it limits nothing, and the interface doesn't use it yet). `USAP_SCHEDULER=off`
   removes it. A bounded chat queue (Step 9.9c: 4 waiting at most, then `429 QUEUE_FULL`) is **Implemented** but
   off by default (`USAP_CHAT_QUEUE=on` turns it on). CI checks it with a real model on all 4 OS, with the queue
-  switched on only for its own test servers. [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
+  switched on only for its own test servers. A warn-only memory check (Step 9.9d, **Implemented**, on by default,
+  `USAP_MEMORY_CHECK=off` turns it off) estimates before a text or image model loads whether it is likely to fit in
+  the memory available now, and reports the result in the load response, `/api/resources` and the server log. It
+  never refuses or changes a load, says "unknown" when it can't tell, and doesn't assess GPU memory.
+  [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
 * **UI regression protection** ([#4](https://github.com/dlroqa/usap/pull/4)): pixel-exact

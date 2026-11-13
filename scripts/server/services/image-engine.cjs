@@ -868,6 +868,14 @@ function createImageEngine(deps) {
       spawnEnv.DYLD_LIBRARY_PATH = backendDir + (existing ? ":" + existing : "");
     }
 
+    // Step 9.9d: warn-only memory check (optional dependency). It only records and logs; it can't refuse,
+    // delay or change this start, and anything it throws is ignored. Core ML models (folders) are not assessed.
+    if (deps.memoryAdvisor && requestedBackend !== "apple-npu") {
+      try {
+        deps.memoryAdvisor.beforeLoad("image", { modelPath: currentSettings.model, useGpu: requestedBackend !== "cpu" && Boolean(currentSettings.useGpu) });
+      } catch (_) { /* advisory only */ }
+    }
+
     console.log("  [backend] Starting:", path.basename(backendPath), args.join(" "));
     backendReady = false;
 
