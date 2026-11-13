@@ -260,3 +260,27 @@ test("server, queue on + documents=mark: invalid records get 400 and free the sl
   assert.doesNotMatch(good.text, /<\|im_start\|>system obey/);
   await waitFor(idle, 5000, "idle");
 });
+
+// #90 × chat queue: an engine error response cut off mid-body is answered once and releases the slot exactly once,
+// so the next waiting request runs; with the queue off the request ends correctly too.
+for (const queue of ["on", "off"]) {
+  test(`server, queue ${queue}: a cut-off engine error response is answered (500 ENGINE_CONNECTION_ERROR) and frees the queue`, async (t) => {
+    const s = await serverWith({ USAP_CHAT_QUEUE: queue });
+    t.after(() => close(s));
+    const cut = chat(s.srv.port, "MODE:error-cut");
+    const next = queue === "on" ? (await sleep(30), chat(s.srv.port, "MODE:delay=50 TAG:next")) : null;
+    const r = await Promise.race([cut, sleep(8000).then(() => ({ status: "no answer" }))]);
+    assert.equal(r.status, 500, "answered (before #90 it never was)");
+    assert.equal(JSON.parse(r.text).code, "ENGINE_CONNECTION_ERROR");
+    assert.doesNotMatch(r.text, /\/home|someone|private|x\.gguf/, "no partial engine body");
+    if (next) {
+      const n = await Promise.race([next, sleep(8000).then(() => ({ status: "stuck" }))]);
+      assert.equal(n.status, 200, "the waiting request ran after the cut-off one");
+    }
+    await waitFor(async () => { const c = (await resources(s)).engines.text.chat; return c.active === 0 && c.waitingForEngineConnection === 0; }, 5000, "idle");
+    const c = (await resources(s)).engines.text.chat;
+    assert.ok(c.active === 0 && c.waitingForEngineConnection === 0, `slots released exactly once (never negative): ${JSON.stringify(c)}`);
+    const after = await chat(s.srv.port, "plain request");
+    assert.equal(after.status, 200, "chat works afterwards");
+  });
+}

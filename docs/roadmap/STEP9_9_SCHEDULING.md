@@ -161,6 +161,11 @@ Numbering: the owner asked for the bounded chat queue as 9.9c, so it swapped pla
   * rollback: `USAP_SCHEDULER=off`, and `USAP_CHAT_QUEUE=off` over a `scheduler.json` that says on (7 simultaneous
     requests, none refused).
 
+  Two different engine failures, handled differently: an engine connection that **ends** (crash, reset, a cut-off
+  error body) produces a terminal event, and the chat answers at once (#90 for error responses). An engine
+  connection that **stalls** (stays open and sends nothing) produces no event, so nothing ends it today; that needs
+  the bounded execution and timeout work of stage 9.9f.
+
   The script only touches the engine its own server started (found by its listening port, never by name). What
   the queue doesn't do is recorded as `UNSUPPORTED`, not passed: memory-pressure admission (9.9d/9.9f) and a
   timeout for the running request. Which error a waiting request gets after a crash is recorded as `EXPECTED`.
