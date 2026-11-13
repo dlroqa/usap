@@ -14,6 +14,33 @@
 const promptBoundary = require("./prompt-boundary.cjs");
 const { prepareAttachments } = require("./attachments.cjs");
 
+/**
+ * Call `done(complete)` exactly once when an engine response is over: complete=true after `end`, false when it was
+ * cut off first (`aborted`, `error`, or `close` before the body was complete). Listeners are removed afterwards, so
+ * late or repeated events do nothing (#90). An engine connection that stays open without any event is not covered:
+ * that needs a timeout for a running request (Step 9.9f).
+ */
+function onEngineResponseSettled(engineRes, done) {
+  let settled = false;
+  const finish = (complete) => {
+    if (settled) return;
+    settled = true;
+    engineRes.removeListener("end", onEnd);
+    engineRes.removeListener("aborted", onCut);
+    engineRes.removeListener("close", onClose);
+    engineRes.removeListener("error", onCut);
+    engineRes.on("error", () => {}); // a late error after settling must not become an uncaught exception
+    done(complete);
+  };
+  const onEnd = () => finish(true);
+  const onCut = () => finish(false);
+  const onClose = () => finish(engineRes.complete === true);
+  engineRes.on("end", onEnd);
+  engineRes.on("aborted", onCut);
+  engineRes.on("error", onCut);
+  engineRes.on("close", onClose);
+}
+
 const REQUIRED = ["state","errorBody","errorStatus","http","json","redactPaths","requestJson","runExclusiveLlmOperation","startLlm","webSearch"];
 
 function createChatService(deps) {
@@ -138,7 +165,14 @@ function createChatService(deps) {
             let errorBody = "";
             clientRes.setEncoding("utf8");
             clientRes.on("data", (chunk) => { errorBody += chunk; });
-            clientRes.on("end", async () => {
+            // #90: the engine answered with an error status; its body can be cut off (engine crash, reset). Answer the
+            // client once either way. Never retried: the engine had already answered.
+            onEngineResponseSettled(clientRes, async (complete) => {
+              if (!complete) {
+                if (cancelled || res.destroyed || res.writableEnded) return; // the client left: nothing to answer
+                if (!res.headersSent) return json(res, 500, transportBody({ code: "ECONNRESET" }));
+                return res.end();
+              }
               let message = `Text backend returned HTTP ${clientRes.statusCode}`;
               try {
                 message = JSON.parse(errorBody || "{}").error?.message || message;
@@ -290,4 +324,4 @@ function createChatService(deps) {
   return { doLlmChat: trackedDoLlmChat, isOomError, retryLowerContext, chatStats };
 }
 
-module.exports = { createChatService };
+module.exports = { createChatService, onEngineResponseSettled };

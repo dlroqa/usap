@@ -8,6 +8,7 @@
 //   (none)          3 chunks "Contract", " test", " reply."
 //   MODE:count=N    N numbered chunks "0 ".."N-1 " (ordering checks)
 //   MODE:http-error HTTP 400 with an OpenAI-style error body, before any streaming
+//   MODE:error-cut  HTTP 500 announcing a longer body, part of it, then the connection is destroyed (#90)
 //   MODE:crash-mid  2 chunks, then the connection is destroyed (no finish, no [DONE])
 //   MODE:slow       a chunk every 50 ms for 5 s (client-disconnect checks)
 //   MODE:echo       one chunk (or message) whose content is the exact JSON request the engine received
@@ -51,7 +52,7 @@ function modeOf(body) {
   const text = JSON.stringify(body.messages || []);
   const d = text.match(/MODE:delay=(\d+)/);
   if (d) return { name: "delay", ms: Math.min(60000, Number(d[1])), tag: (text.match(/TAG:([A-Za-z0-9_-]+)/) || [])[1] || "" };
-  const m = text.match(/MODE:(count=(\d+)|http-error|crash-mid|slow|echo|oom|garbage)/);
+  const m = text.match(/MODE:(count=(\d+)|http-error|error-cut|crash-mid|slow|echo|oom|garbage)/);
   if (!m) return { name: "default" };
   return m[2] ? { name: "count", n: Math.min(500, Number(m[2])) } : { name: m[1] };
 }
@@ -85,6 +86,11 @@ const server = http.createServer((req, res) => {
         stats.completed++;
         res.writeHead(200, { "content-type": "application/json" });
         return res.end(JSON.stringify({ choices: [{ index: 0, message: { role: "assistant", content: raw }, finish_reason: "stop" }] }));
+      }
+      if (mode.name === "error-cut") {
+        res.writeHead(500, { "content-type": "application/json", "content-length": "400" });
+        res.write('{"error":{"code":500,"message":"engine failed at /home/someone/private/models/x.gguf');
+        return setTimeout(() => res.socket.destroy(), 100);
       }
       if (mode.name === "http-error") {
         res.writeHead(400, { "content-type": "application/json" });
