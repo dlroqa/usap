@@ -324,7 +324,7 @@ async function queueOnScenarios(srv) {
     const growth = after - before;
     record("server memory after 20 waiting 2 MB requests were cancelled", Number.isFinite(growth) ? (growth < 150 ? "PASS" : "FAIL") : "SKIP",
       `RSS ${before} MB before, ${after} MB after (+${growth} MB; limit +150 MB)`);
-    record("memory-pressure admission", "UNSUPPORTED", "the queue doesn't check free memory; waiting requests are bounded only by count (4) and the 64 MB body limit (Steps 9.9d/9.9f, not implemented)");
+    record("memory-pressure admission", "UNSUPPORTED", "the queue doesn't check free memory; waiting requests are bounded only by count (4) and the 64 MB body limit. Step 9.9d's warn-only memory check (implemented) only reports at model load; enforced memory-aware admission is Step 9.9f, not implemented");
   });
 
   await scenario("engine crash while requests wait", async () => {
