@@ -10,6 +10,9 @@
 name: thread-bench
 
 on:
+  # TEMPORARY, verification branch only (never in a PR): run the Step 9.9e whisper policy comparison on push.
+  push:
+    branches: [verify/thread-budget-bench]
   workflow_dispatch:
     inputs:
       reps:
@@ -79,7 +82,7 @@ jobs:
 
       - name: Contention measurements (own server on port 14930)
         env:
-          BENCH_SET: ${{ inputs.set || 'full' }}
+          BENCH_SET: ${{ inputs.set || 'whisper' }}
           REPS: ${{ inputs.reps || '5' }}
           IMAGE_REPS: ${{ inputs.image_reps || '3' }}
         run: |
