@@ -197,6 +197,12 @@ if fetch_verified "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolv
     else
       record "LLM history marking (P3, real model)" SKIP "the engine did not report prompt token counts"
     fi
+    # P4-1 documents with a real model (scripts/ci/p4-token-check.cjs): exact comparison with the marker id normalized in
+    # the test's own copy (production ids stay random), a negative control with the tokens left in, and an end-to-end
+    # app API comparison whose allowed difference is measured from the engine's tokenizer. Recorded per line.
+    while IFS=$'\t' read -r st name detail; do
+      [[ -n "$st" ]] && record "$name" "$st" "$detail"
+    done < <(BASE="$BASE" node "$ROOT/scripts/ci/p4-token-check.cjs" 2>&1 | grep -E $'^(PASS|FAIL|SKIP)\t' || echo $'FAIL\tLLM document records (P4-1)\tthe check produced no result')
   else
     record "LLM load (app API)" FAIL "start: ${start:0:200} status: ${status:0:200}"
   fi

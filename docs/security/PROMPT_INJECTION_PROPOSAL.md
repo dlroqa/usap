@@ -63,7 +63,7 @@ passing client messages through unchanged.
 | P1 (done, #78) | Adversarial test suite (no behaviour change; `scripts/tests/prompt-injection.test.cjs`): fixtures for each concern above, run against the real server with the fake engine (`/fake/last` shows exactly what the model would see) | None |
 | P2 (in review) | Typed segments inside the server (`services/prompt-boundary.cjs`); output byte-identical to today (proved by the 9.8h golden comparison) | None |
 | P3 (in review, off by default) | History marking (`historyWeb`): control tokens removed from every earlier assistant turn, and marker brackets defused in turns that cited web sources; no other text, role or order changes; saved files untouched (#1, #5) | Prompts change for assistant turns only, when the setting is on; `app/config/prompt-boundary.json` or `USAP_PROMPT_HISTORY_WEB` |
-| P4 | `attachments` field and document marking (#2), with the UI change | Old clients unchanged |
+| P4 (P4-1 server in review, off by default; P4-2 UI not started) | Per-message `attachments` records validated by the server and document marking (#2), then the UI change ([P4_DOCUMENT_ATTACHMENTS.md](P4_DOCUMENT_ATTACHMENTS.md)) | Requests without records unchanged; `documents` setting in `app/config/prompt-boundary.json` or `USAP_PROMPT_DOCUMENTS` |
 | P5 | Role policy for API keys and multi-user (#3, #6), with #28 | Single-user default unchanged |
 
 Each stage has an `off` setting, a CHANGELOG entry, and native tests on all 4 OS with a real model where the

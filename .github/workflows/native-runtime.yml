@@ -19,6 +19,7 @@ on:
       - "scripts/search/**" # web text that enters chat prompts (token filter, page extraction)
       - "scripts/ci/runtime-validate.sh"
       - "scripts/ci/chat-queue-validate.cjs"
+      - "scripts/ci/p4-token-check.cjs"
       - "scripts/ci/stop-app.sh"
       - ".github/workflows/native-runtime.yml"
   schedule:

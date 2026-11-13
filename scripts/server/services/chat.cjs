@@ -12,6 +12,7 @@
 "use strict";
 
 const promptBoundary = require("./prompt-boundary.cjs");
+const { prepareAttachments } = require("./attachments.cjs");
 
 const REQUIRED = ["state","errorBody","errorStatus","http","json","redactPaths","requestJson","runExclusiveLlmOperation","startLlm","webSearch"];
 
@@ -84,12 +85,17 @@ function createChatService(deps) {
   async function doLlmChat(req, res, body, retryCount = 0) {
     try {
       const isStream = body.stream === true;
-      const rawMessages = Array.isArray(body.messages) ? body.messages : [];
+      const protections = promptProtections();
+      // P4-1: validate `attachments` records (400 INVALID_ATTACHMENTS) before anything else runs. Without records
+      // this is the client's own array, unchanged.
+      const prepared = prepareAttachments(body, protections.documents);
+      const rawMessages = prepared.messages;
+      if (prepared.truncated && !res.headersSent) res.setHeader("X-USAP-Attachments-Truncated", "1");
       const webAugmentation = await webSearch.augmentMessagesWithWebSearch(rawMessages, body);
       const requestData = JSON.stringify({
         model: state.llmSettings.model || "local-model",
         // P2: built from typed segments; byte-identical to webAugmentation.messages while no protection is on.
-        messages: promptBoundary.engineMessages(rawMessages, webAugmentation, promptProtections()),
+        messages: promptBoundary.engineMessages(rawMessages, webAugmentation, protections, prepared),
         temperature: Number.isFinite(Number(body.temperature)) ? Number(body.temperature) : 0.7,
         max_tokens: Math.max(1, Math.min(4096, Number(body.max_tokens) || Number(body.maxTokens) || 1024)),
         stream: isStream,
@@ -217,6 +223,7 @@ function createChatService(deps) {
           if (webAugmentation.webSources.length) {
             result.web_sources = webAugmentation.webSources;
           }
+          if (prepared.truncated) result.attachments_truncated = true;
           return json(res, 200, result);
         } catch (err) {
           if (isOomError(err.message) && retryCount === 0) {

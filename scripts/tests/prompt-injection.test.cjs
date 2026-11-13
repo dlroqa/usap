@@ -212,11 +212,15 @@ test("documents (today): extracted document text is part of the user's message, 
   const sent = await send(convo);
   assert.deepEqual(sent.messages, convo);
 });
-test("documents (P4): attached document text is marked untrusted and its control tokens are removed", { todo: "P4 in docs/security/PROMPT_INJECTION_PROPOSAL.md (needs the attachments field)" }, async () => {
-  const sent = await send([SYS, { role: "user", content: "MODE:echo Summarize this." }], { attachments: [{ type: "document", name: "report.pdf", text: HOSTILE_DOC }] });
-  const all = JSON.stringify(sent.messages);
-  assert.match(all, /untrusted/i);
-  for (const re of TOKEN_RE) assert.doesNotMatch(all, re);
+test("documents (P4-1, documents=mark): a document sent as a record on its user message is marked untrusted and its control tokens are removed", async () => {
+  protections = { ...protections, documents: "mark" };
+  try {
+    const sent = await send([SYS, { role: "user", content: "MODE:echo Summarize this.", attachments: [{ type: "document", name: "report.pdf", text: HOSTILE_DOC }] }]);
+    const all = JSON.stringify(sent.messages);
+    assert.match(all, /untrusted/i);
+    for (const re of TOKEN_RE) assert.doesNotMatch(all, re);
+    assert.deepEqual(sent.messages.map((m) => m.role), ["system", "user"]);
+  } finally { protections = { ...protections, documents: "off" }; }
 });
 
 test("roles (today, single user): a client's system messages are passed on as sent; nothing is added", async () => {
