@@ -191,8 +191,12 @@ A user who wants an older document marked attaches the file again.
   from the planner request. The P1 `todo` test becomes a passing test.
 * Real chat screen (render-e2e, P4-2): attaching a text file and a PDF gives the same screen as before; screenshot
   baselines unchanged; an old saved conversation opens and re-sends unchanged.
-* Native (all 4 OS, Qwen2.5 0.5B): the prompt-token comparison shows document control tokens no longer act as tokens
-  with `mark`, and are unchanged with `off`.
+* Native (all 4 OS, Qwen2.5 0.5B, `scripts/ci/p4-token-check.cjs`): with the marker id normalized in the test's own
+  copy of the prompt (production ids stay random), a document of 40 control tokens and one of 40 literal
+  `[token removed]` strings must give byte-identical messages and exactly the same prompt-token count; a negative
+  control with the tokens left in must give clearly fewer tokens (the engine reads them as control tokens); and an
+  end-to-end app API comparison is allowed only the difference that random ids can cause, measured with the
+  engine's own tokenizer.
 * Before proposing P4-3: long documents near the limits, multiple documents, PDFs with `[Page n]` headings,
   code-heavy and non-Latin documents, and answer quality on a real model, as for P3.
 
