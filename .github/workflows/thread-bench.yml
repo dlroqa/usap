@@ -1,0 +1,97 @@
+# Step 9.9e prerequisite: CPU contention measurements with real models on the 4 native targets
+# (docs/roadmap/STEP9_9E_THREADS.md). Measurement only: the same first-time setup and model installs as
+# native-runtime, then scripts/ci/thread-bench.cjs runs its own studio server (port 14930) and times each
+# workload alone and next to another one. It changes no setting or default and judges nothing: results are
+# artifacts and a job summary. Hosted runners are CPU only; no GPU or NPU result comes from here.
+# Not a required check. Runs when the benchmark itself changes, and on demand.
+name: thread-bench
+
+on:
+  pull_request:
+    paths:
+      - "scripts/ci/thread-bench.cjs"
+      - ".github/workflows/thread-bench.yml"
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: "Repetitions per chat, transcription and voice window"
+        default: "5"
+      image_reps:
+        description: "Repetitions per image window"
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: thread-bench-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: thread-bench (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 170
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: macos-arm64,  runner: macos-15,       arch: arm64,  launcher: ./mac.sh }
+          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, launcher: ./mac.sh }
+          - { label: linux-x64,    runner: ubuntu-24.04,   arch: x86_64, launcher: ./linux.sh }
+          - { label: windows-x64,  runner: windows-2025,   arch: x86_64, launcher: "cmd //c windows.bat" }
+    env:
+      FRONTEND_PORT: "14900"
+      USAP_SKIP_COREML: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: First launch via the launcher (runs first-time setup)
+        run: |
+          mkdir -p ci-logs
+          ( yes '' | ${{ matrix.launcher }} > ci-logs/first-launch.log 2>&1 & )
+          for i in $(seq 1 270); do
+            if curl -fs "http://127.0.0.1:$FRONTEND_PORT/api/health" >/dev/null; then echo "server up after $((i*10))s"; break; fi
+            if grep -q "Setup failed" ci-logs/first-launch.log; then break; fi
+            sleep 10
+          done
+          curl -fs "http://127.0.0.1:$FRONTEND_PORT/api/health" >/dev/null || { tail -60 ci-logs/first-launch.log; echo "::error::server did not start after setup"; exit 1; }
+
+      # Installs the pinned models (Qwen2.5 0.5B, whisper tiny.en + JFK sample, Kokoro q8, SD 1.5 Q4_0) and
+      # confirms each engine works before anything is timed.
+      - name: Install models and validate the engines
+        run: |
+          EXPECTED_ARCH=${{ matrix.arch }} BASE="http://127.0.0.1:$FRONTEND_PORT" RESULTS=ci-logs/runtime-results.jsonl \
+            IMAGE_BACKENDS="cpu" SERVER_LOG=ci-logs/first-launch.log bash scripts/ci/runtime-validate.sh > ci-logs/runtime-validate.md
+          ! grep -q '"status":"FAIL"' ci-logs/runtime-results.jsonl
+
+      - name: Stop first launch
+        if: always()
+        run: bash scripts/ci/stop-app.sh
+
+      - name: Contention measurements (own server on port 14930)
+        run: |
+          node scripts/ci/thread-bench.cjs --jfk .ci-model-cache/jfk.wav --out ci-logs/thread-bench \
+            --reps "${{ inputs.reps || '5' }}" --image-reps "${{ inputs.image_reps || '3' }}"
+          cat ci-logs/thread-bench/thread-bench.md >> "$GITHUB_STEP_SUMMARY"
+          ! grep -q '"kind":"error"' ci-logs/thread-bench/thread-bench.jsonl
+
+      - name: Stop measurement server
+        if: always()
+        env:
+          FRONTEND_PORT: "14930"
+        run: bash scripts/ci/stop-app.sh
+
+      - name: Upload results (no models)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: thread-bench-${{ matrix.label }}
+          path: ci-logs/
+          retention-days: 14
+          if-no-files-found: warn
