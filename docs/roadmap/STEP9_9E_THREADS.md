@@ -25,7 +25,7 @@ per-job transcription or voice job, or transcription plus voice. Chat plus image
 ## 2. Measurements
 
 Tooling: `scripts/ci/thread-bench.cjs`, run by `.github/workflows/thread-bench.yml` on the 4 native targets
-(run 43419228555, commit `99760e4`). It uses the native-runtime models: Qwen2.5 0.5B Q4_K_M (CPU, 2048 context,
+(run 43419228555 on `99760e4`, the tables below unless noted; repeated as run 43444789975, see Repeatability). It uses the native-runtime models: Qwen2.5 0.5B Q4_K_M (CPU, 2048 context,
 128 tokens per chat), whisper tiny.en (JFK sample, 11 s), Kokoro 82M q8 (one sentence) and SD 1.5 Q4_0 (CPU,
 256x256, 4 steps). It runs each workload alone (one warm-up, then 5 timed runs; 3 for image), then each pair with
 the longer job in front (5 or 3 runs) and the other running back to back behind it. Image + chat ran with a second
@@ -65,10 +65,33 @@ Median, with the change against running alone.
 | Image + transcription | image 57.7 s (+90%); transcription 4.0 s (+419%) | image 51.1 s (+21%); transcription 6.4 s (+459%) | image 120.7 s (+240%); transcription 38.3 s (+614%) | image 262 s (−9%); transcription 145 s (+9789%) |
 | Image + transcription at 2 threads | image 48.2 s (+59%); transcription 1.30 s (+70%) | image 48.8 s (+16%); transcription 6.4 s (+472%) | image 82.2 s (+132%); transcription 9.6 s (+59%) | image 279 s (−3%); transcription 115 s (+7146%) |
 | Image + voice | image 40.2 s (+32%); voice 6.8 s (+86%) | image 55.2 s (+31%); voice 11.0 s (+149%) | image 50.2 s (+42%); voice 9.0 s (+44%) | image 524 s (+82%); voice 19.5 s (+93%) |
-| Image + chat (outside the studio, decision B) | image 57.5 s (+89%); chat 30.5 s (+787%) | image 44.8 s (+6%); chat 45.2 s (+1793%) | image 115.5 s (+226%); chat 55.7 s (+2090%) | **not measured**: the job reached its 170-minute limit before this last window |
+| Image + chat (outside the studio, decision B) | image 57.5 s (+89%); chat 30.5 s (+787%) | image 44.8 s (+6%); chat 45.2 s (+1793%) | image 115.5 s (+226%); chat 55.7 s (+2090%) | run 1 stopped at its 170-minute limit before this window; **run 2**: image 1587.7 s (+581% against 233.1 s alone in the same run); chat 752 s, 0.2 tok/s (182x slower) |
 
 Percentages for "at 2 threads" compare with the same workload alone at its default threads, except transcription
 (compared with transcription alone at 2 threads; both are nearly identical).
+
+### Repeatability (two runs)
+
+The design PR ran the benchmark twice on the same code (run 43419228555 on `99760e4` and run 43444789975 on
+`af1fd43`; the second commit changed only documentation). GitHub assigned different hardware to two targets:
+
+| Target | Run 1 CPU | Run 2 CPU | Medians, run 2 vs run 1 (cells within ±15%) |
+|---|---|---|---|
+| Linux x64 | Xeon 6975P-C | Xeon Platinum 8573C | −49% to +84% (3 of 21); chat alone 2.25 → 1.94 s, image alone 30.4 → 39.0 s |
+| Windows x64 | EPYC 9V45 | EPYC 9V74 | +12% to +90%, every cell slower (1 of 21); image alone 42.1 → 63.5 s |
+| macOS arm64 | M1 (Virtual) | M1 (Virtual) | −29% to +29% (15 of 21) |
+| macOS Intel | i7-8700B | i7-8700B | −37% to +47% (12 of 19 comparable cells; run 1 lacks the decision-B window); image alone 288.6 → 233.1 s |
+
+Absolute times are therefore not comparable across runs on Linux and Windows. Every qualitative finding repeated:
+chat + transcription collapses on Linux in both runs (96.6 s and 78.9 s against about 2 s alone); transcription at
+2 threads improves chat on Linux (24.7 s and 16.5 s), Windows (2.33 s and 2.82 s against 3.86 s and 5.92 s at the
+default) and macOS arm64 (17.4 s and 14.0 s); on macOS Intel, transcription stays badly starved next to an image
+in both runs (145 s and 138 s at default threads, 115 s and 104 s at 2) while the image itself is unaffected or
+faster; the decision-B pair (image + chat) slows chat 6–28x on Linux, Windows and macOS arm64 and 182x on macOS
+Intel (run 2).
+Thresholds in an implementation must come from same-run comparisons (policy off and on in one job), never from
+these absolute numbers. Full per-run tables: `ci-evidence` artifacts of both runs (14-day retention on GitHub; the
+owner's local copy keeps them).
 
 Variability: alone, CV was ≤ 0.07 except chat on macOS (0.19 arm64, 0.46 Intel with one outlier). In overlaps CV
 was 0.1–0.4, and macOS Intel's chat + transcription windows completed only one background transcription, so those
@@ -99,7 +122,14 @@ text engine 0.5–0.7 GB, image engine 1.8–2.2 GB, whisper-cli 0.17–0.35 GB,
 4. **Kokoro behaves like a full-width CPU job** (11–18 OS threads, 39–90% of the CPU alone) and slows a chat by
    56–751%. The studio can't control it without changing the worker.
 
-## 3. Proposed policy (for approval; not implemented)
+## 3. Proposed policy (owner-approved direction; not implemented)
+
+**What it is and isn't.** The budget is an **advisory scheduling heuristic**, not enforcement. It decides only the
+thread count of a per-job engine at the moment that job starts. It never limits, pauses or restarts the persistent
+text or image engine, whose counts stay as they are today, so the total number of busy threads can still exceed
+the logical CPUs while a heavy engine and a per-job engine overlap. It reduces oversubscription; it doesn't
+prevent it. One heavy model at a time (decision B) and the macOS Intel image thread cap stay unchanged, and the
+initial default is `limits.threads: "off"`.
 
 **Budget.** `B` = logical CPU count (what every engine already sizes itself by). Physical cores are reported and
 used only as an advisory input, because the measurements show they are unreliable on VMs and lowering to them
@@ -120,7 +150,12 @@ A per-job engine is busy while its job runs.
    `t = max(1, min(default, 2, B − 1))`. With 4 or more logical CPUs that is 2 (the measured value), with 3 it is
    2, with 2 it is 1, and with 1 it is 1 (no change possible). For whisper this is the `-t` value of that job; a job
    already running keeps its count (no mid-job change), so a chat that starts after a transcription still competes
-   with it until the transcription ends.
+   with it until the transcription ends. The WebUI always sends its own `threads` setting (default 4, 1–32) with a
+   transcription, so the reduction applies to the requested value: `t = max(1, min(requested, 2, B − 1))`; alone,
+   the requested value is used unchanged, as today. Whether another workload is busy comes from server state
+   (running chats, an image generation, a Kokoro job), never from the request.
+   On macOS Intel the measurements show little benefit next to an image (transcription is starved either way);
+   the rule still applies there, and the implementation's benchmark must report that platform separately.
 4. **Kokoro is unmanaged in 9.9e.** It is counted as a busy CPU workload (so a transcription next to it gets the
    reduced count) and reported as `threads: { known: false }`. Controlling it needs a separate, measured worker
    change (§4).
@@ -166,7 +201,20 @@ skips the adjustment entirely, so every engine gets today's count. Proposed defa
   it while other work is possible could help more than any thread split, but it changes the persistent engine's
   start arguments and may cost single-chat speed. Measure separately before proposing anything.
 * **Larger machines** (8–16+ cores) and real Apple Silicon (not a 3-vCPU VM), as part of Step 9.10.
-* macOS Intel image + chat (outside the studio) was not measured (time limit); it can't happen in the studio today.
+* macOS Intel image + chat (outside the studio) was measured only in run 2 (run 1 hit its time limit): chat 182x
+  slower and the image 6.8x slower. It can't happen in the studio today, and these numbers support keeping
+  decision B.
+
+## 4a. Measurement tooling and trigger policy
+
+`scripts/ci/thread-bench.cjs` is measurement tooling, kept apart from the runtime tests: it lives in `scripts/ci/`,
+not `scripts/tests/`, isn't part of `node --test`, judges nothing (it fails only if it can't run), and is not a
+required check. `.github/workflows/thread-bench.yml` runs it **manually only** (`workflow_dispatch`; inputs `reps`,
+default 5, and `image_reps`, default 3), because a run takes about 30 minutes on Linux, Windows and macOS arm64 and
+up to 5.5 hours on macOS Intel (timeout 330 minutes there, 170 elsewhere). It ran on pull requests only while this
+design was measured. GitHub can dispatch a workflow only once it exists on the default branch, so after the design
+merges it is run from `main` (or with `--ref` for a branch). The models are the pinned native-runtime models, and
+the artifacts (`thread-bench-<target>`) carry the raw JSONL, a summary table and the studio log.
 
 ## 5. macOS Intel image thread cap
 
@@ -176,6 +224,13 @@ Intel slow the per-job engine sharply (transcription up to 99x, voice +93%) whil
 (−9% to +82%). Step 9.11 (an optimized Intel image engine with AVX instead of the SSE3-only slice) could shorten
 image jobs severalfold, which shortens every overlap window; repeat these measurements after 9.11 before tuning
 any Intel-specific share.
+
+## 5a. Recorded follow-ups (each needs its own review or approval)
+
+Kokoro ONNX Runtime thread control; llama.cpp `--poll` behaviour; further macOS Intel image optimization (Step
+9.11); an explicit `approximate` indicator for macOS memory readings (§6); Step 9.9f memory enforcement and
+running-request timeouts; P4-2 chat-screen attachment integration. None is part of this design or of the
+whisper-only implementation.
 
 ## 6. Separate assessment: an `approximate` marker for macOS memory readings (not part of this design)
 

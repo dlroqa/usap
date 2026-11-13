@@ -3,14 +3,13 @@
 # native-runtime, then scripts/ci/thread-bench.cjs runs its own studio server (port 14930) and times each
 # workload alone and next to another one. It changes no setting or default and judges nothing: results are
 # artifacts and a job summary. Hosted runners are CPU only; no GPU or NPU result comes from here.
-# Not a required check. Runs when the benchmark itself changes, and on demand.
+# Not a required check. Manual only (Actions > thread-bench > Run workflow, or
+# `gh workflow run thread-bench.yml -R dlroqa/usap -f reps=5 -f image_reps=3`): one run takes about 30 minutes on
+# Linux, Windows and macOS arm64 and up to 5.5 hours on macOS Intel, so it never runs on pull requests or pushes.
+# The inputs below are the only knobs; the models are the pinned native-runtime models.
 name: thread-bench
 
 on:
-  pull_request:
-    paths:
-      - "scripts/ci/thread-bench.cjs"
-      - ".github/workflows/thread-bench.yml"
   workflow_dispatch:
     inputs:
       reps:
@@ -24,20 +23,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: thread-bench-${{ github.event.pull_request.number || github.ref }}
+  group: thread-bench-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   bench:
     name: thread-bench (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 170
+    # macOS Intel needs ~5 min per CPU image: 3 repetitions per image window took > 170 min (run 43419228555).
+    timeout-minutes: ${{ matrix.timeout || 170 }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - { label: macos-arm64,  runner: macos-15,       arch: arm64,  launcher: ./mac.sh }
-          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, launcher: ./mac.sh }
+          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, launcher: ./mac.sh, timeout: 330 }
           - { label: linux-x64,    runner: ubuntu-24.04,   arch: x86_64, launcher: ./linux.sh }
           - { label: windows-x64,  runner: windows-2025,   arch: x86_64, launcher: "cmd //c windows.bat" }
     env:
