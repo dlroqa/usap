@@ -103,7 +103,7 @@ separate UI change is approved.
 | 9.9b (done, #77) | `services/scheduler.cjs` with read-only accounting; `GET /api/resources`; tests | None: it only records and reports | `USAP_SCHEDULER=off` (or `"scheduler": "off"` in `app/config/scheduler.json`) leaves the route out |
 | 9.9c (in review, off by default) | Bounded chat queue (decision A): 1 running + 4 waiting per engine, FIFO, `429 QUEUE_FULL` with `Retry-After`, waiting requests leave on disconnect, `503 QUEUE_TIMEOUT` after the longest wait (10 min) | Only when turned on: requests past the limit get `429` | `chatQueue: off` (the default) or `USAP_SCHEDULER=off` restores the unbounded queue |
 | 9.9d (in review) | Memory check before loading a model, **warn only** (a field in the start response and a log line) | None for users; adds a field | Setting `memoryCheck: off` |
-| 9.9e (design in review: [STEP9_9E_THREADS.md](STEP9_9E_THREADS.md)) | Thread budget shared between engines | Thread counts change only when engines overlap | `threads: off` |
+| 9.9e (design: [STEP9_9E_THREADS.md](STEP9_9E_THREADS.md); whisper only, in review, off by default) | Thread budget shared between engines | Thread counts change only when engines overlap | `threads: off` (the default) |
 | 9.9f | Memory check **enforced** (with a force option), image/speech/voice queues, queue timeouts, stream idle timeout. Still one heavy model at a time (decision B) | New refusals, each with a clear message | Per-setting `off` |
 
 Each stage lands only after its tests pass on all 4 OS and the native-runtime timings (Step 9.10) don't regress.
@@ -213,6 +213,35 @@ Numbering: the owner asked for the bounded chat queue as 9.9c, so it swapped pla
   same chat-queue admission with and without a warning, a crash restart that is assessed again, a failed start
   without a stale result, `USAP_SCHEDULER=off`, and an image load). The native-runtime job records the real
   Qwen2.5 0.5B and CPU image results on all 4 OS (`scripts/ci/memory-check-report.cjs`).
+
+### Stage 9.9e as built (whisper only, off by default)
+
+Design and measurements: `docs/roadmap/STEP9_9E_THREADS.md` (design PR #95). This stage implements only the part
+the owner approved: whisper's per-job thread count.
+
+* `services/thread-budget.cjs`: when a transcription starts while another CPU workload is busy, whisper.cpp gets
+  `max(1, min(requested, 2, logical CPUs − 1))` threads for that job (`-t`); alone it gets the requested count
+  (the WebUI's speech setting, or the server default `min(8, logical CPUs)`), exactly as before. It is an advisory
+  heuristic, not enforcement: the text (llama.cpp) and image (stable-diffusion.cpp) engines keep their start-up
+  counts and are never restarted, Kokoro is untouched, a running job keeps its count, and nothing is refused,
+  queued or delayed.
+* "Busy" is server state read when the job starts: a chat the studio is answering (`chatStats().active`), an image
+  generation (the engine's progress, or a generation request in flight through the studio's image proxy, counted
+  in `services/image-engine.cjs`), or a voice job. Requests can't declare anything busy. An unknown CPU count or a
+  failing activity check gives the requested count, so the budget can only lower a count when it is sure.
+* Unchanged: one heavy model at a time (decision B), the macOS Intel image thread cap, chat-queue capacity and
+  order, the memory check, model loading and routing.
+* Setting: `USAP_THREADS=on|off` or `app/config/scheduler.json` `{ "threads": "on" }` (the environment wins), read at
+  start-up. **Off by default**; `USAP_SCHEDULER=off` also turns it off. Off gives exactly the earlier behaviour
+  (`limits.threads: "off"`, no `threads` field, the same `-t`). On: `limits.threads: "on"`, `scheduler.stage:
+  "9.9e"`, `scheduler.decisions: true`, and `threads.lastTranscription` (requested, used, reason, busy workloads)
+  in `GET /api/resources`, plus one `[threads]` log line when a count is lowered.
+* Evidence: `scripts/tests/thread-budget.test.cjs` (10 tests: the rule for 1–64 logical CPUs and unknown counts;
+  settings; failures; the scheduler snapshot; and on the real server with fake engines and a whisper stand-in that
+  records `-t`: off is unchanged while a chat runs; on, alone is unchanged, a running chat or a generating image
+  lowers the count and the chat and image complete normally, the engines' own counts don't change, chat-queue
+  admission (1 + 4, `429 QUEUE_FULL`) is unchanged, an engine crash or whisper crash leaves the legacy behaviour,
+  and `USAP_SCHEDULER=off` wins). Real-model results (policy off and on in the same job) are recorded with the PR.
 
 ## 4. Tests (GitHub Actions)
 
