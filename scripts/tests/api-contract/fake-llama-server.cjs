@@ -15,7 +15,11 @@
 //   MODE:oom        HTTP 500 with a llama.cpp-style allocation failure, before any streaming (Step 9.8h)
 //   MODE:garbage    HTTP 200 event stream with bytes that are not SSE, then the end (malformed stream)
 //   MODE:delay=MS   one chunk naming the request's TAG:<x> (if any), then the end after MS ms (queue order checks)
-// GET /fake/stats reports {requests, completed, aborted, pid} so tests can observe aborts;
+//   MODE:hold       like delay, but the end waits for POST /fake/release, so a test controls exactly when the
+//                   request finishes instead of racing a timer. A safety limit (HOLD_MAX_MS) ends it anyway and
+//                   counts it in stats.holdTimeouts, which tests assert is 0.
+// GET /fake/stats reports {requests, completed, aborted, pid, held, holdTimeouts} so tests can observe aborts;
+// POST /fake/release ends every held request now (and is harmless when nothing is held);
 // GET /fake/last returns the last chat request body as received (prompt order and role checks).
 //
 // Lifecycle modes for the engine-supervision tests (Step 9.6), chosen by a marker in the model
@@ -37,7 +41,9 @@ if (args.includes("--version")) { console.log("version: 0 (contract-test fake ll
 if (args.includes("--help") || args.includes("--list-devices")) { console.log("contract-test fake llama-server"); process.exit(0); }
 const model = path.basename(arg("--model", "fake.gguf"));
 const WORDS = ["Contract", " test", " reply."];
-const stats = { requests: 0, completed: 0, aborted: 0, pid: process.pid };
+const stats = { requests: 0, completed: 0, aborted: 0, pid: process.pid, held: 0, holdTimeouts: 0 };
+const HOLD_MAX_MS = 30000;
+const held = new Set(); // end functions of requests in MODE:hold
 let lastBody = null;
 if (model.includes("oom-after-ready")) setTimeout(() => { console.error("ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 4294967296"); process.exit(1); }, 3000);
 if (model.includes("fail-start")) { console.error("fake engine: failed to load model (fail-start)"); process.exit(3); }
@@ -50,8 +56,10 @@ const finish = (n) => `data: ${JSON.stringify({ choices: [{ index: 0, delta: {},
 
 function modeOf(body) {
   const text = JSON.stringify(body.messages || []);
+  const tag = (text.match(/TAG:([A-Za-z0-9_-]+)/) || [])[1] || "";
   const d = text.match(/MODE:delay=(\d+)/);
-  if (d) return { name: "delay", ms: Math.min(60000, Number(d[1])), tag: (text.match(/TAG:([A-Za-z0-9_-]+)/) || [])[1] || "" };
+  if (d) return { name: "delay", ms: Math.min(60000, Number(d[1])), tag };
+  if (/MODE:hold\b/.test(text)) return { name: "hold", tag };
   const m = text.match(/MODE:(count=(\d+)|http-error|error-cut|crash-mid|slow|echo|oom|garbage)/);
   if (!m) return { name: "default" };
   return m[2] ? { name: "count", n: Math.min(500, Number(m[2])) } : { name: m[1] };
@@ -68,6 +76,11 @@ const server = http.createServer((req, res) => {
   }
   if (req.url.startsWith("/health")) { res.writeHead(200, { "content-type": "application/json" }); return res.end('{"status":"ok"}'); }
   if (req.url.startsWith("/fake/last")) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify(lastBody)); }
+  if (req.url.startsWith("/fake/release") && req.method === "POST") {
+    const n = held.size;
+    for (const end of [...held]) end();
+    res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ released: n }));
+  }
   if (req.url.startsWith("/fake/stats")) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify(stats)); }
   if (req.url.startsWith("/v1/chat/completions") && req.method === "POST") {
     let raw = "";
@@ -122,6 +135,21 @@ const server = http.createServer((req, res) => {
         res.write(chunk(`tag=${mode.tag} `));
         const t = setTimeout(() => { stats.completed++; res.write(finish(1)); res.end("data: [DONE]\n\n"); }, mode.ms);
         res.on("close", () => { if (!res.writableEnded) { clearTimeout(t); stats.aborted++; } });
+        return;
+      }
+      if (mode.name === "hold") {
+        stats.order = (stats.order || []).concat(mode.tag);
+        res.write(chunk(`tag=${mode.tag} `));
+        const end = (timedOut) => {
+          if (!held.delete(end)) return;
+          clearTimeout(safety); stats.held = held.size;
+          if (timedOut === true) stats.holdTimeouts++;
+          if (res.writableEnded || res.destroyed) return;
+          stats.completed++; res.write(finish(1)); res.end("data: [DONE]\n\n");
+        };
+        const safety = setTimeout(() => end(true), HOLD_MAX_MS);
+        held.add(end); stats.held = held.size;
+        res.on("close", () => { if (!res.writableEnded) { stats.aborted++; held.delete(end); clearTimeout(safety); stats.held = held.size; } });
         return;
       }
       if (mode.name === "crash-mid") {
