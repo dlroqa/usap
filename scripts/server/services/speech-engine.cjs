@@ -28,6 +28,17 @@ const REQUIRED_HELPERS = ["describeLinkedModel", "detectedKindFor", "findAvailab
 
 function createSpeechService(deps) {
   const { paths, osPlatform, fs, path, supervisor, errors, helpers, preferredPort } = deps;
+  // Step 9.9e (optional): the thread budget may lower this job's count while another workload is busy. Off, absent
+  // or failing, the requested count is used unchanged. It can only lower the count, never raise it.
+  const jobThreads = (requested) => {
+    if (!deps.threadBudget) return requested;
+    try {
+      const t = deps.threadBudget.forTranscription(requested);
+      return Number.isInteger(t) && t >= 1 && t <= requested ? t : requested;
+    } catch (_) {
+      return requested;
+    }
+  };
   const { ROOT, SPEECH_MODELS, SPEECH_BACKEND_ROOT, SPEECH_BACKEND_PATHS, TRANSCRIPTIONS } = paths;
   const { badRequest, notFound, notInstalled } = errors;
   for (const name of REQUIRED_HELPERS) {
@@ -316,7 +327,7 @@ function createSpeechService(deps) {
         "-otxt",
         "-oj",
         "-of", outBase,
-        "-t", String(Math.max(1, Math.min(32, Number(options.threads) || speechSettings.threads || 4))),
+        "-t", String(jobThreads(Math.max(1, Math.min(32, Number(options.threads) || speechSettings.threads || 4)))),
       ];
       if (language && language !== "auto") {
         args.push("-l", language);

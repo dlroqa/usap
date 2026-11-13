@@ -148,7 +148,10 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   switched on only for its own test servers. A warn-only memory check (Step 9.9d, **Implemented**, on by default,
   `USAP_MEMORY_CHECK=off` turns it off) estimates before a text or image model loads whether it is likely to fit in
   the memory available now, and reports the result in the load response, `/api/resources` and the server log. It
-  never refuses or changes a load, says "unknown" when it can't tell, and doesn't assess GPU memory.
+  never refuses or changes a load, says "unknown" when it can't tell, and doesn't assess GPU memory. A thread budget
+  for transcription (Step 9.9e, **Experimental**, off by default, `USAP_THREADS=on` turns it on) gives whisper.cpp
+  fewer threads while a chat, an image or a voice job is busy, to reduce CPU oversubscription; alone, transcription
+  uses its usual count. The text and image engines' thread counts never change.
   [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).

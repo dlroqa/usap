@@ -37,6 +37,7 @@ const { llmRoutes } = require("./routes/llm.cjs");
 const { resourceRoutes } = require("./routes/resources.cjs");
 const { createScheduler, schedulerMode, chatQueueSetting } = require("./services/scheduler.cjs");
 const { createMemoryAdvisor, memoryCheckSetting } = require("./services/memory-check.cjs");
+const { createThreadBudget, threadsSetting } = require("./services/thread-budget.cjs");
 const { inspectModel } = require("./model-metadata.cjs");
 const { createChatQueue } = require("./services/chat-queue.cjs");
 const { createLlmEngine, createLlmfitLookup } = require("./services/llm-engine.cjs");
@@ -215,6 +216,22 @@ const memoryAdvisor = MEMORY_CHECK.mode === "warn" ? createMemoryAdvisor({
     imageGenerating: Boolean(imageEngine.state.generationState && imageEngine.state.generationState.active),
     transcribing: Boolean(speech.getTranscriptionState().active),
     synthesizing: Boolean(tts.getGenerationState().active),
+  }),
+}) : null;
+
+// Step 9.9e: thread budget, whisper only (services/thread-budget.cjs). Off by default (USAP_THREADS=on or
+// scheduler.json "threads": "on"; USAP_SCHEDULER=off forces off). When on, a transcription that starts while a chat
+// runs, an image generates or a voice job runs gets fewer whisper threads; nothing else changes. Busy flags are
+// read from server state when a transcription starts.
+const THREADS = threadsSetting({ configDir: LLM_CONFIG_DIR, schedulerMode: schedulerMode({ configDir: LLM_CONFIG_DIR }) });
+if (THREADS.mode === "on") console.log("  [scheduler] Thread budget on (transcription only).");
+const threadBudget = THREADS.mode === "on" ? createThreadBudget({
+  setting: THREADS,
+  logicalCpus: () => os.cpus().length,
+  activity: () => ({
+    chat: chatService.chatStats().active > 0,
+    image: Boolean((imageEngine.state.generationState && imageEngine.state.generationState.active) || imageEngine.activeGenerations() > 0),
+    voice: Boolean(tts.getGenerationState().active),
   }),
 }) : null;
 
@@ -624,6 +641,7 @@ const speech = createSpeechService({
   errors: { badRequest, notFound, notInstalled },
   helpers: { describeLinkedModel, detectedKindFor, findAvailableSpeechPort, findExistingFile, formatBytes, getPathSize, isWaveBuffer, pathInside, readdirVisible, safeOutputName },
   preferredPort: PREFERRED_SPEECH_PORT,
+  threadBudget, // optional (Step 9.9e)
 });
 
 
@@ -1673,6 +1691,8 @@ if (SCHEDULER_MODE !== "off") {
     chatQueue: CHAT_QUEUE,
     memoryCheck: MEMORY_CHECK,
     memoryChecks: memoryAdvisor ? () => memoryAdvisor.snapshot() : null,
+    threads: THREADS,
+    threadBudget: threadBudget ? () => threadBudget.snapshot() : null,
     budget: hardware.budget,
     cpu: { logicalCores: () => os.cpus().length, physicalCores: () => getPhysicalCores() },
     engines: {
