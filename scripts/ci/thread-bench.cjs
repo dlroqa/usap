@@ -165,8 +165,8 @@ async function sideChatJob() { // the standalone llama-server (outside the studi
   return { ok: r.status === 200, ms: r.ms, tps: t.predicted_per_second ? Math.round(t.predicted_per_second * 10) / 10 : null, tokens: t.predicted_n ?? null, error: r.status === 200 ? null : r.text.slice(0, 160) };
 }
 const jfk = fs.existsSync(JFK) ? fs.readFileSync(JFK) : null;
-async function whisperJob() {
-  const r = await call(PORT, "POST", `/api/speech/transcribe?model=${WHISPER}&language=en&save=false&filename=jfk.wav`, jfk, { type: "audio/wav" });
+async function whisperJob(threads = null) {
+  const r = await call(PORT, "POST", `/api/speech/transcribe?model=${WHISPER}&language=en&save=false&filename=jfk.wav${threads ? `&threads=${threads}` : ""}`, jfk, { type: "audio/wav" });
   const ok = r.status === 200 && /your country/i.test(r.text);
   return { ok, ms: r.ms, error: ok ? null : r.text.slice(0, 160) };
 }
@@ -260,8 +260,21 @@ async function main() {
   await baseline("chat", chatJob, REPS);
   if (jfk) await baseline("transcription", whisperJob, REPS);
   await baseline("voice", ttsJob, REPS);
-  if (jfk) await overlap("chat + transcription", chatJob, "chat", whisperJob, "transcription", REPS);
+  if (jfk) {
+    await overlap("chat + transcription", chatJob, "chat", whisperJob, "transcription", REPS);
+    // The per-job lever a budget would use: whisper with 2 threads (the proposed minimum), alone and next to chat.
+    await baseline("transcription (2 threads)", () => whisperJob(2), REPS);
+    await overlap("chat + transcription (2 threads)", chatJob, "chat", () => whisperJob(2), "transcription (2 threads)", REPS);
+  }
   await overlap("chat + voice", chatJob, "chat", ttsJob, "voice", REPS);
+  // Single-engine check for a physical-core budget: chat with threads = physical cores (today: logical, max 16).
+  if (hw.physicalCores && hw.logicalCores && hw.physicalCores !== hw.logicalCores) {
+    await call(PORT, "POST", "/api/llm/stop", {});
+    const r2 = await call(PORT, "POST", "/api/llm/start", { model: QWEN, contextSize: 2048, gpuLayers: 0, threads: hw.physicalCores });
+    if (r2.status === 200 && (await waitUntil(async () => (await get("/api/llm/status")).json?.ready === true, 240000, 1000))) {
+      await baseline(`chat (threads = ${hw.physicalCores} physical cores)`, chatJob, REPS);
+    } else emit({ kind: "skipped", workload: "chat at physical-core threads", reason: r2.text.slice(0, 160) });
+  } else emit({ kind: "skipped", workload: "chat at physical-core threads", reason: "physical and logical core counts are equal or unknown" });
   await call(PORT, "POST", "/api/llm/stop", {});
 
   // Image phase: image + speech + voice; image + chat outside the studio (decision B).
@@ -270,7 +283,10 @@ async function main() {
   const sdLine = loggedLine(/\[backend\] Starting:/);
   emit({ kind: "threads", engine: "image (stable-diffusion.cpp)", configured: (await get("/api/backend-status")).json?.settings?.threads ?? null, passedToEngine: threadsArg(sdLine, "--threads"), source: "setting (default 8), at most 4 with a GPU, at most the logical CPUs (#9 cap); --threads on the logged command line", fixedAtStart: true });
   await baseline("image", imageJob, IMAGE_REPS);
-  if (jfk) await overlap("image + transcription", imageJob, "image", whisperJob, "transcription", IMAGE_REPS);
+  if (jfk) {
+    await overlap("image + transcription", imageJob, "image", whisperJob, "transcription", IMAGE_REPS);
+    await overlap("image + transcription (2 threads)", imageJob, "image", () => whisperJob(2), "transcription (2 threads)", IMAGE_REPS);
+  }
   await overlap("image + voice", imageJob, "image", ttsJob, "voice", IMAGE_REPS);
 
   // The studio's own llama-server command line, on another port, outside the studio.
