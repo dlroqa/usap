@@ -638,14 +638,21 @@ function createLlmEngine(deps) {
     return "";
   }
 
-  async function startLlm(settings = {}, { restart = false } = {}) {
+  // Step 9.9f-2: `admissionPath` names an internal caller for the memory-admission report ("oom-retry",
+  // "benchmark-restore"); it is never read from a request body. A request's `memoryOverride` field is ignored: it is
+  // only reported, and never kept in llmLastStartRequest, so an automatic restart can't inherit it.
+  async function startLlm(settings = {}, { restart = false, admissionPath = null } = {}) {
     const token = llmStartToken;
     if (!restart) cancelLlmRestart();
     llmStarting = true;
     llmRestarting = restart;
+    const admission = {
+      path: restart ? "restart" : (typeof admissionPath === "string" && admissionPath) || "start",
+      overrideRequested: Boolean(settings && Object.prototype.hasOwnProperty.call(settings, "memoryOverride")),
+    };
     try {
-      await startLlmAttempts(settings, token);
-      const { __loadProfile, ...request } = settings;
+      await startLlmAttempts(settings, token, admission);
+      const { __loadProfile, memoryOverride, ...request } = settings;
       llmLastStartRequest = request;
       llmCrash = null;
       if (!restart) llmRestartAttempts = [];
@@ -655,7 +662,7 @@ function createLlmEngine(deps) {
     }
   }
 
-  async function startLlmAttempts(settings, token) {
+  async function startLlmAttempts(settings, token, admission = { path: "start", overrideRequested: false }) {
     const filename = path.basename(String(settings.model || ""));
     const modelPath = path.join(LLM_MODELS, filename);
     if (!filename) throw badRequest("MODEL_REQUIRED", "Select a downloaded GGUF text model first.");
@@ -690,7 +697,12 @@ function createLlmEngine(deps) {
       for (const profile of buildLlmLoadProfiles(settings, backend)) {
         if (token !== llmStartToken) throw engineStartCancelledError();
         try {
-          await startLlmWithBackend({ ...settings, __loadProfile: profile }, backend);
+          // The safer profile after a failed (not refused) first attempt is the existing recovery path: assessed, never refused.
+          const recoveryPath = ["restart", "oom-retry", "benchmark-restore"].includes(admission.path);
+          const attemptPath = profile.name === "safe" && !recoveryPath ? "profile-fallback" : admission.path;
+          await startLlmWithBackend({ ...settings, __loadProfile: profile }, backend, {
+            admissionPath: attemptPath, overrideRequested: admission.overrideRequested, attemptCurrent: () => token === llmStartToken,
+          });
           llmSettings.backendFallbacks = failures;
           updateLlmModelSettings(filename, {
             // Only pin the backend when the first choice worked; a CPU fallback after a
@@ -715,6 +727,12 @@ function createLlmEngine(deps) {
           if (token !== llmStartToken || err.code === "ENGINE_START_CANCELLED") {
             await killLlm();
             throw engineStartCancelledError();
+          }
+          // Step 9.9f-2: an enforced memory refusal ends the whole start. Nothing was spawned; no other profile or
+          // backend is tried (the files are the same size for every one).
+          if (err.code === "MEMORY_INSUFFICIENT") {
+            await killLlm();
+            throw err;
           }
           const message = err.message || String(err);
           failures.push({
@@ -755,7 +773,20 @@ function createLlmEngine(deps) {
     return llamaServerHelpCache.get(binaryPath).includes(flag);
   }
 
-  async function startLlmWithBackend(settings = {}, backend) {
+  // How llama.cpp will hold the weights. Also used for the --load-mode/--mmap/--mlock arguments, so the admission
+  // report and the spawn agree. Builds without --load-mode map the file by default, so they always count as mapped.
+  function memoryLoadFlags(backend, settings) {
+    const isGpuMode = backend.mode.includes("GPU") || backend.mode.includes("CUDA") ||
+                      backend.mode.includes("HIP") || backend.mode.includes("ROCm") ||
+                      backend.mode.includes("Vulkan") || backend.mode.includes("Metal") ||
+                      backend.mode.includes("SYCL");
+    const lockMemory = !isGpuMode && settings.mlock;
+    const loadModeFlag = llamaServerSupportsFlag(backend.path, "--load-mode");
+    const loadMode = settings.mmap ? (lockMemory ? "mmap+mlock" : "mmap") : (lockMemory ? "mlock" : "none");
+    return { isGpuMode, lockMemory, loadModeFlag, loadMode, effectiveLoadMode: loadModeFlag ? loadMode : (lockMemory ? "mmap+mlock" : "mmap") };
+  }
+
+  async function startLlmWithBackend(settings = {}, backend, admissionOpts = {}) {
     const filename = path.basename(String(settings.model || ""));
     const modelPath = path.join(LLM_MODELS, filename);
     if (!filename) throw badRequest("MODEL_REQUIRED", "Select a downloaded GGUF text model first.");
@@ -771,9 +802,20 @@ function createLlmEngine(deps) {
     }
 
     assertNoOtherActiveRuntime("text", filename);
+    // Step 9.9f-2 (only when memory admission is on): the engine processes that exist now must all be seen to exit
+    // before a refusal can rest on the memory reading taken after these stops.
+    const ma = deps.memoryAdmission || null;
+    let heldBefore = null;
+    if (ma) {
+      try { heldBefore = [llmProc, ...(ma.otherProcesses() || [])].filter(Boolean); } catch (_) { heldBefore = null; }
+    }
     await killBackend();
     await killOpenVinoWorker();
     await killLlm();
+    const releasedAt = ma ? Date.now() : null;
+    // A refused attempt must leave no setting behind (llmSettings keeps mlock/mmap from earlier starts), so a
+    // refused memory-mapping-off request can't turn the next ordinary load into another refusal.
+    const settingsBeforeAttempt = ma ? llmSettings : null;
     PORT_LLM = await findAvailableLlmPort();
     llmError = null;
 
@@ -888,13 +930,45 @@ function createLlmEngine(deps) {
 
     // Step 9.9d: warn-only memory check (optional dependency). It only records and logs; it can't refuse,
     // delay or change this start, and anything it throws is ignored.
+    let assessment = null;
+    let measuredAt = null;
     if (deps.memoryAdvisor) {
       try {
-        deps.memoryAdvisor.beforeLoad("text", {
+        measuredAt = Date.now();
+        assessment = deps.memoryAdvisor.beforeLoad("text", {
           modelPath, projectorPath: mmprojPath, contextSize: llmSettings.contextSize, cacheTypeK: llmSettings.cacheTypeK,
           cacheTypeV: llmSettings.cacheTypeV, gpuLayers: llmSettings.gpuLayers, backendMode: llmSettings.backendMode,
         });
       } catch (_) { /* advisory only */ }
+    }
+
+    // Step 9.9f-2: memory admission (optional dependency, off by default). Synchronous, and nothing awaits between
+    // this decision and the spawn below. observe only records; enforce refuses only on may-not-fit with high
+    // confidence; any failure here lets the load continue.
+    if (ma) {
+      let decision = null;
+      try {
+        let confirmed = false;
+        try {
+          confirmed = Array.isArray(heldBefore) && heldBefore.every((p) => p.exitCode !== null || p.signalCode !== null) && ma.liveEngines() === 0;
+        } catch (_) { confirmed = false; }
+        let activity = null;
+        try { activity = ma.activity(); } catch (_) { activity = null; }
+        let attemptCurrent = false;
+        try { attemptCurrent = typeof admissionOpts.attemptCurrent === "function" ? admissionOpts.attemptCurrent() === true : false; } catch (_) { attemptCurrent = false; }
+        decision = ma.admission.decide({
+          assessment, path: admissionOpts.admissionPath || "start", release: { confirmed, releasedAt }, measuredAt,
+          loadMode: memoryLoadFlags(backend, llmSettings).effectiveLoadMode, activity, attemptCurrent,
+          overrideRequested: admissionOpts.overrideRequested === true,
+        });
+        if (assessment && typeof assessment === "object") assessment.admission = decision.report;
+      } catch (_) { decision = null; /* fail open */ }
+      if (decision && decision.refuse) {
+        llmSettings = settingsBeforeAttempt;
+        const err = new ApiError(409, "MEMORY_INSUFFICIENT", decision.message);
+        err.admission = decision.report;
+        throw err;
+      }
     }
 
     const args = [
@@ -923,14 +997,9 @@ function createLlmEngine(deps) {
     }
     
     // CPU mode: lock memory to prevent OS paging (critical for consistent speed)
-    const isGpuMode = backend.mode.includes("GPU") || backend.mode.includes("CUDA") ||
-                      backend.mode.includes("HIP") || backend.mode.includes("ROCm") ||
-                      backend.mode.includes("Vulkan") || backend.mode.includes("Metal") ||
-                      backend.mode.includes("SYCL");
-    const lockMemory = !isGpuMode && llmSettings.mlock;
-    if (llamaServerSupportsFlag(backend.path, "--load-mode")) {
+    const { lockMemory, loadModeFlag, loadMode } = memoryLoadFlags(backend, llmSettings);
+    if (loadModeFlag) {
       // llama.cpp b11000+ replaced --mmap/--mlock with --load-mode and rejects the old flags.
-      const loadMode = llmSettings.mmap ? (lockMemory ? "mmap+mlock" : "mmap") : (lockMemory ? "mlock" : "none");
       args.push("--load-mode", loadMode);
     } else {
       if (lockMemory) {
@@ -1066,7 +1135,7 @@ function createLlmEngine(deps) {
       contextSize: Math.min(2048, Number(baseSettings.contextSize) || 2048),
       gpuLayers: Number.isFinite(Number(baseSettings.gpuLayers)) ? Number(baseSettings.gpuLayers) : -1,
       enableThinking: false,
-    }, backend);
+    }, backend, { admissionPath: "benchmark", attemptCurrent: () => true });
 
     const result = await requestJson(`http://127.0.0.1:${PORT_LLM}/v1/chat/completions`, {
       model: llmSettings.model || "local-model",
@@ -1154,7 +1223,7 @@ function createLlmEngine(deps) {
 
     if (previous.ready && previous.model && previous.model === filename && winner) {
       try {
-        await startLlm({ ...previous.settings, model: filename, preferredBackend: winner.backendKey });
+        await startLlm({ ...previous.settings, model: filename, preferredBackend: winner.backendKey }, { admissionPath: "benchmark-restore" });
       } catch (err) {
         console.warn("  [llm] Failed to restore text model after benchmark:", err.message || err);
       }

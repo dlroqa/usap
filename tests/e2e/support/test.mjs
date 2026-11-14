@@ -92,6 +92,11 @@ class MockApi {
       const deleted = this.conversations.delete(body?.id);
       return reply(200, { ok: true, deleted });
     }
+    // Optional (Step 9.9f-2): a test sets mockApi.llmStart to answer POST /api/llm/start; unset, it stays unmocked.
+    if (method === "POST" && url.pathname === "/api/llm/start" && typeof this.llmStart === "function") {
+      const r = this.llmStart(body);
+      return route.fulfill({ status: r.status, contentType: "application/json", body: JSON.stringify(r.json) });
+    }
     if (method === "POST" && url.pathname === "/api/llm/chat") {
       const r = this.chat(body);
       return route.fulfill({ status: r.status, contentType: r.contentType, body: r.body });

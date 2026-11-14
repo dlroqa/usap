@@ -166,6 +166,13 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   engine stopped: no new chat is sent to it until its own `/metrics` shows it idle, and if that can't be confirmed,
   chats get `503 ENGINE_UNRESPONSIVE` until it is idle or the model is reloaded. CI checks it with a real model on
   all 4 OS, including a suspended engine ([details](docs/roadmap/STEP9_9F_TIMEOUTS.md)).
+  Memory-aware text-model loading (Step 9.9f-2, **Experimental**, off by default; `USAP_MEMORY_ADMISSION=observe`
+  only records, `enforce` can refuse) builds on the memory check: a text model is refused (`409 MEMORY_INSUFFICIENT`)
+  only when its files alone are clearly larger than the memory available now, memory mapping is off (so the whole
+  model must fit), and every reading behind that is trustworthy. A memory-mapped load (the default) is never
+  refused, nor is anything "tight" or "unknown", a GPU load, an automatic restart or the out-of-memory retry. Only
+  Linux readings count for now; on Windows and macOS it only records. There is no "load anyway" request
+  option yet ([details](docs/roadmap/STEP9_9F_MEMORY_ADMISSION.md)).
   [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
