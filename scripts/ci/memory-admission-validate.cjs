@@ -218,37 +218,43 @@ function platformMemoryEvidence() {
     } finally { await stopServer(srv); }
   });
 
-  // D. enforce: mapping off (refusable on Linux only), the override field, then an ordinary mapped load, then a crash.
+  // D. enforce: a memory-mapped load first; then mapping off (refusable on Linux only) and the override field; then, on
+  // Linux, a mapped load again (the refusal left no setting behind); then a crash restart. Order matters: once a load
+  // with mapping off has *succeeded* (Windows/macOS), the studio keeps mmap off for the rest of the process
+  // (pre-existing, design §12), so the mapped check must come first.
   await scenario("Memory admission enforce", async () => {
     const srv = await startServer("enforce", { USAP_MEMORY_ADMISSION: "enforce", ...INFLATE });
     try {
+      const mappedCheck = async (label) => {
+        const m = await start({});
+        const ma = m.json && m.json.memoryCheck && m.json.memoryCheck.admission;
+        const loaded = m.status === 200 && Boolean(await ready());
+        const answered = loaded && Boolean(await chatOk());
+        record(label, loaded && answered && ma && ma.decision === "allowed" && ma.loadMode === "mmap" && ma.confidenceReasons.includes("c8-memory-mapped") ? "PASS" : "FAIL",
+          `start ${m.status}; decision ${ma && ma.decision}, loadMode ${ma && ma.loadMode} (${ma && ma.confidenceReasons && ma.confidenceReasons.join(", ")}); chat answered: ${answered}`);
+      };
+      await mappedCheck("Memory admission enforce: memory-mapped load allowed");
       const r = await start({ mmap: false });
       const a = r.json && (r.json.admission || (r.json.memoryCheck && r.json.memoryCheck.admission));
       if (LINUX) {
         const st = await status();
-        const spawned = /\[llm\] Starting:/.test(logText(srv));
-        const ok = r.status === 409 && r.json.code === "MEMORY_INSUFFICIENT" && a && a.decision === "refused" && a.confidence === "high" && r.json.admission && r.json.admission.overridable !== true && st.running === false && !spawned;
+        const spawns = (logText(srv).match(/\[llm\] Starting:/g) || []).length;
+        const ok = r.status === 409 && r.json.code === "MEMORY_INSUFFICIENT" && a && a.decision === "refused" && a.confidence === "high" && r.json.admission && r.json.admission.overridable !== true && st.running === false && spawns === 1;
         record("Memory admission enforce (Linux): refused, nothing started", ok ? "PASS" : "FAIL",
-          `start ${r.status} ${r.json && r.json.code}; decision ${a && a.decision} (${a && a.confidence}${a && a.confidenceReasons && a.confidenceReasons.length ? `: ${a.confidenceReasons.join(", ")}` : ""}); engine running: ${st.running}; llama-server started: ${spawned}`);
+          `start ${r.status} ${r.json && r.json.code}; decision ${a && a.decision} (${a && a.confidence}${a && a.confidenceReasons && a.confidenceReasons.length ? `: ${a.confidenceReasons.join(", ")}` : ""}); engine running: ${st.running}; llama-server starts in total: ${spawns} (1 = only the earlier mapped load)`);
         const o = await start({ mmap: false, memoryOverride: true });
         const oa = o.json && o.json.admission;
         record("Memory admission enforce (Linux): memoryOverride ignored", o.status === 409 && oa && oa.override && oa.override.accepted === false ? "PASS" : "FAIL",
           `with memoryOverride: start ${o.status}; override ${JSON.stringify(oa && oa.override)}`);
+        await mappedCheck("Memory admission enforce (Linux): a mapped load after the refusals is allowed");
       } else {
         const ok = r.status === 200 && a && a.decision === "allowed" && a.confidenceReasons.includes("c3-source-unvalidated");
         record("Memory admission enforce (Windows/macOS): never refused (C3, unvalidated reading)", ok ? "PASS" : "FAIL",
           `start ${r.status}; decision ${a && a.decision} (${a && a.confidence}: ${a && a.confidenceReasons.join(", ")}); source ${a && a.measurement && a.measurement.source}`);
         record("Memory admission enforce: refusal path", "UNSUPPORTED", `${process.platform}: refusals need a validated memory reading (Linux MemAvailable only, by design); not exercised here`);
-        await call("POST", "/api/llm/stop", {});
+        await ready();
       }
-      // An ordinary (memory-mapped) load right after: allowed, loads and answers.
-      const m = await start({});
-      const ma = m.json && m.json.memoryCheck && m.json.memoryCheck.admission;
-      const loaded = m.status === 200 && Boolean(await ready());
-      const answered = loaded && Boolean(await chatOk());
-      record("Memory admission enforce: memory-mapped load allowed", loaded && answered && ma && ma.decision === "allowed" && ma.confidenceReasons.includes("c8-memory-mapped") ? "PASS" : "FAIL",
-        `start ${m.status}; decision ${ma && ma.decision} (${ma && ma.confidenceReasons && ma.confidenceReasons.join(", ")}); chat answered: ${answered}`);
-      // Kill the engine: the bounded automatic restart is assessed as exempt and the model is back.
+      // Kill the running engine: the bounded automatic restart is assessed as exempt and the model is back.
       const port = (await status()).port;
       const pid = listenerPids(port).find((p) => p !== srv.child.pid);
       if (!pid) { record("Memory admission enforce: crash restart exempt", "FAIL", "no engine process found on its port"); return; }
