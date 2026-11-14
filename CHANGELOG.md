@@ -101,7 +101,7 @@
 ### Documentation
 * Step 9.9e thread-budget design with measurements (`docs/roadmap/STEP9_9E_THREADS.md`, proposal only; nothing implemented).
 * Step 9.9f first-substage design: chat-engine timeouts, cancellation and cleanup (`docs/roadmap/STEP9_9F_TIMEOUTS.md`, proposal only; nothing implemented; the planned setting is off by default).
-* Step 9.9f second-substage design: memory-aware text-model load admission (`docs/roadmap/STEP9_9F_MEMORY_ADMISSION.md`, proposal only; nothing implemented; the planned `memoryAdmission` setting is off by default, and refusals would need high confidence, an explicit per-request override and a separate approval). It also lists the measurements needed before Step 9.9f-1 chat timeouts could be turned on by default.
+* Step 9.9f second-substage design: memory-aware text-model load admission (`docs/roadmap/STEP9_9F_MEMORY_ADMISSION.md`, proposal only; nothing implemented; the planned `memoryAdmission` setting is off by default, refusals would need `may-not-fit` with every high-confidence condition met and a separate approval, and the first implementation has no request-based override because local callers can't yet be told apart from remote ones). It also lists the measurements needed before Step 9.9f-1 chat timeouts could be turned on by default.
 * The README now describes USAP as its own project, with origins, credits and attribution to Portable Local Studio by techjarves. The original README is kept verbatim as `docs/USAGE_UPSTREAM.md`.
 * Roadmap: desktop installers (planning only), Step 9 backend plan (#10, #11).
 
