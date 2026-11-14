@@ -43,7 +43,9 @@ const path = require("node:path");
 const args = process.argv.slice(2);
 const arg = (name, fallback) => { const i = args.indexOf(name); return i === -1 ? fallback : args[i + 1]; };
 if (args.includes("--version")) { console.log("version: 0 (contract-test fake llama-server)"); process.exit(0); }
-if (args.includes("--help") || args.includes("--list-devices")) { console.log("contract-test fake llama-server"); process.exit(0); }
+// FAKE_LLAMA_HELP_LOAD_MODE=1 (Step 9.9f-2 tests only): --help lists --load-mode, so the studio passes --load-mode
+// like with a current llama.cpp build. Unset: the original output, so other tests see the older flags as before.
+if (args.includes("--help") || args.includes("--list-devices")) { console.log("contract-test fake llama-server" + (process.env.FAKE_LLAMA_HELP_LOAD_MODE === "1" && args.includes("--help") ? "\n  --load-mode MODE" : "")); process.exit(0); }
 const model = path.basename(arg("--model", "fake.gguf"));
 const WORDS = ["Contract", " test", " reply."];
 const stats = { requests: 0, completed: 0, aborted: 0, pid: process.pid, held: 0, holdTimeouts: 0, open: 0, metricsRequests: 0 };
@@ -115,6 +117,7 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
+  if (req.url.startsWith("/fake/args")) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify(args)); } // Step 9.9f-2 tests
   if (req.url.startsWith("/fake/stats")) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify(stats)); }
   if (req.url.startsWith("/v1/chat/completions") && req.method === "POST") {
     let raw = "";

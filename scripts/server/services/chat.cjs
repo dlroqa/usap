@@ -93,7 +93,8 @@ function createChatService(deps) {
       enableThinking: state.llmSettings.enableThinking,
     };
     
-    await runExclusiveLlmOperation(() => startLlm(newSettings));
+    // Step 9.9f-2: the existing out-of-memory recovery path; memory admission assesses it but never refuses it.
+    await runExclusiveLlmOperation(() => startLlm(newSettings, { admissionPath: "oom-retry" }));
   }
 
   // The engine refused the connection: it isn't listening (stopped, or crashed before the server noticed). Answer

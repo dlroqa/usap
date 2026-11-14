@@ -93,13 +93,16 @@ function fileSize(p) {
  * What a text model is estimated to need: the GGUF file (and vision projector), the KV cache at the context
  * size the engine is started with, and a fixed allowance for compute buffers.
  */
-function textRequirement(info, inspectModel, sizeOf) {
+function textRequirement(info, inspectModel, sizeOf, inflateBytes = 0) {
   const reasons = [];
   const weights = sizeOf(info.modelPath);
   const projector = info.projectorPath ? sizeOf(info.projectorPath) : 0;
   if (weights === null) reasons.push("model-size-unavailable");
   if (info.projectorPath && projector === null) reasons.push("projector-size-unavailable");
   const weightsBytes = weights === null || projector === null ? null : weights + projector;
+  // Test-only (Step 9.9f-2 native checks): added to the need so a refusal can be exercised without exhausting a
+  // runner's memory. Only ever adds; 0 (the default, and always when admission is off) changes nothing.
+  const inflate = Number.isSafeInteger(inflateBytes) && inflateBytes > 0 ? inflateBytes : 0;
 
   let kvCacheBytes = null;
   const contextSize = Number(info.contextSize) > 0 ? Math.round(Number(info.contextSize)) : null;
@@ -114,17 +117,19 @@ function textRequirement(info, inspectModel, sizeOf) {
     else if (!k || !v) reasons.push("cache-type-unknown");
     else kvCacheBytes = Math.round(q8 * ((k + v) / 2) / Q8_0); // K and V are the same size per layer here
   }
-  const estimate = weightsBytes !== null && kvCacheBytes !== null ? roundMib(weightsBytes + kvCacheBytes + TEXT_OVERHEAD_BYTES) : null;
+  const estimate = weightsBytes !== null && kvCacheBytes !== null ? roundMib(weightsBytes + kvCacheBytes + TEXT_OVERHEAD_BYTES + inflate) : null;
+  const parts = {
+    weightsBytes: value(weightsBytes, "measured-file-size"),
+    kvCacheBytes: value(kvCacheBytes === null ? null : roundMib(kvCacheBytes), "estimate-from-model-header", { cacheType: kvCacheBytes === null ? null : `${info.cacheTypeK || "q8_0"}/${info.cacheTypeV || "q8_0"}` }),
+    overheadBytes: value(weightsBytes === null ? null : TEXT_OVERHEAD_BYTES, "fixed-allowance"),
+  };
+  if (inflate) parts.testInflationBytes = value(inflate, "test-only-inflation");
   return {
-    reasons,
+    reasons: inflate ? [...reasons, "test-inflation"] : reasons,
     contextSize,
-    lowerBound: weightsBytes,
+    lowerBound: weightsBytes === null ? null : weightsBytes + inflate,
     estimate,
-    parts: {
-      weightsBytes: value(weightsBytes, "measured-file-size"),
-      kvCacheBytes: value(kvCacheBytes === null ? null : roundMib(kvCacheBytes), "estimate-from-model-header", { cacheType: kvCacheBytes === null ? null : `${info.cacheTypeK || "q8_0"}/${info.cacheTypeV || "q8_0"}` }),
-      overheadBytes: value(weightsBytes === null ? null : TEXT_OVERHEAD_BYTES, "fixed-allowance"),
-    },
+    parts,
   };
 }
 
@@ -174,10 +179,10 @@ const MESSAGES = {
  * @param {object} [o.activity] other work running now: { chatActive, imageGenerating, transcribing, synthesizing } (booleans)
  * @param {Function} [o.sizeOf] file size in bytes or null (tests inject this for very large models)
  */
-function assessModelLoad({ kind, info = {}, budget, inspectModel, activity = {}, platform = process.platform, arch = process.arch, now = Date.now, sizeOf = fileSize }) {
+function assessModelLoad({ kind, info = {}, budget, inspectModel, activity = {}, platform = process.platform, arch = process.arch, now = Date.now, sizeOf = fileSize, inflateBytes = 0 }) {
   try {
     const mem = budget ? measureMemory(budget, platform) : { total: null, free: null, source: null, reasons: ["available-memory-unavailable"] };
-    const req = kind === "text" ? textRequirement(info || {}, inspectModel, sizeOf) : kind === "image" ? imageRequirement(info || {}, sizeOf) : { reasons: ["workload-unknown"], lowerBound: null, estimate: null, contextSize: null, parts: {} };
+    const req = kind === "text" ? textRequirement(info || {}, inspectModel, sizeOf, inflateBytes) : kind === "image" ? imageRequirement(info || {}, sizeOf) : { reasons: ["workload-unknown"], lowerBound: null, estimate: null, contextSize: null, parts: {} };
     const pool = memoryPool({ kind, info, platform, arch });
     const reasons = [...mem.reasons, ...req.reasons];
     if (pool === "gpu-offload-not-assessed") reasons.push("gpu-memory-not-assessed");
@@ -242,14 +247,14 @@ function describe(a) {
  * The advisor the engines call. `beforeLoad` returns the assessment (or null when off) and never throws.
  * @param {{ mode: "warn"|"off" }} setting
  */
-function createMemoryAdvisor({ setting = { mode: "warn" }, budget, inspectModel, activity = () => ({}), log = (line) => console.log(line), platform, arch, now, sizeOf } = {}) {
+function createMemoryAdvisor({ setting = { mode: "warn" }, budget, inspectModel, activity = () => ({}), log = (line) => console.log(line), platform, arch, now, sizeOf, textInflateBytes = 0 } = {}) {
   const last = { text: null, image: null };
   const enabled = setting.mode === "warn";
   function beforeLoad(kind, info) {
     if (!enabled) return null;
     let current = {};
     try { current = activity() || {}; } catch (_) { current = {}; }
-    const a = assessModelLoad({ kind, info, budget, inspectModel, activity: current, platform, arch, now, sizeOf });
+    const a = assessModelLoad({ kind, info, budget, inspectModel, activity: current, platform, arch, now, sizeOf, inflateBytes: kind === "text" ? textInflateBytes : 0 });
     if (kind === "text" || kind === "image") last[kind] = a;
     try { log(describe(a)); } catch (_) { /* logging never matters more than loading */ }
     return a;

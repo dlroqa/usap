@@ -255,6 +255,26 @@ test.describe("chat error states", () => {
   });
 });
 
+test.describe("model load errors", () => {
+  test.use({ allowConsoleErrors: true });
+
+  test("an enforced memory refusal (409 MEMORY_INSUFFICIENT) is shown with the server's message by the existing load-error alert [9.9f-2]", async ({ page, mockApi }) => {
+    const file = "fixture-big-model-q4_0.gguf";
+    mockApi.overrides["/api/llm/models"] = { models: [{ filename: file, name: file, sizeBytes: 8589934592, size: "8.0 GB", format: "GGUF", isProjector: false }] };
+    mockApi.overrides["/api/huggingface/models"] = { models: [], source: "huggingface", page: 1, hasMore: false }; // the Text tab's catalog
+    const message = "The model's files (7.6 GB) are larger than the memory available now (5.1 GB), and memory mapping is off, so the whole model would have to fit in memory. It was not loaded. Close other programs and try again, choose a smaller model, or load it with memory mapping on (slower if memory runs short).";
+    mockApi.llmStart = () => ({ status: 409, json: { ok: false, code: "MEMORY_INSUFFICIENT", error: message, admission: { mode: "enforce", decision: "refused", confidence: "high", overridable: false } } });
+    await openRoute(page, "models");
+    await page.getByRole("tab", { name: "Text" }).click();
+    await page.getByRole("button", { name: /^Load / }).first().click();
+    await expect(page.getByText("Model Load Failed")).toBeVisible();
+    await expect(page.getByText("larger than the memory available now (5.1 GB)", { exact: false })).toBeVisible();
+    expect(mockApi.callsTo("POST", "/api/llm/start")).toHaveLength(1);
+    expect(mockApi.callsTo("POST", "/api/llm/start")[0].body.memoryOverride, "the original UI sends no override").toBeUndefined();
+    await expect(page.getByText("Unload it before loading")).toHaveCount(0);
+  });
+});
+
 test.describe("responsive layout", () => {
   test.use({ viewport: { width: 390, height: 844 } });
   for (const { route } of ROUTES) {

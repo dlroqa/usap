@@ -74,7 +74,7 @@ const queue = (pending) => (pending === null
 // (services/memory-check.cjs). Both are optional; without them the snapshot is exactly the 9.9c one.
 // Step 9.9e: `threads` is the thread-budget setting and `threadBudget()` its latest decision (services/thread-budget.cjs).
 // Optional; without them (or with threads off) the snapshot is exactly the 9.9d one.
-function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null, chatTimeouts = null }) {
+function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null, chatTimeouts = null, memoryAdmission = null }) {
   for (const [name, value] of Object.entries({ budget, cpu, engines })) {
     if (!value) throw new Error(`scheduler: missing dependency ${name}`);
   }
@@ -153,6 +153,17 @@ function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { m
       let t = null;
       try { t = chatTimeouts(); } catch (_) { t = null; }
       if (t) { out.limits.runningTimeouts = t.mode; out.chatTimeouts = t; }
+    }
+    // Additive (9.9f-2, only when memoryAdmission is observe or enforce): mode, decision counts, why confidence was
+    // low, and the latest decision; sizes, fixed words and codes only. Absent when off (the default).
+    if (memoryAdmission) {
+      let m = null;
+      try { m = memoryAdmission(); } catch (_) { m = null; }
+      if (m) {
+        out.limits.memoryAdmission = m.mode;
+        out.memoryAdmission = m;
+        if (m.mode === "enforce") out.scheduler.decisions = true; // a refusal is a decision; observe makes none
+      }
     }
     if (!threadsOn) return out;
     // Additive (9.9e, only when on): the budget's scope and its latest transcription decision (a report; the

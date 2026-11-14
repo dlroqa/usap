@@ -106,7 +106,7 @@ function llmRoutes(deps) {
       if (err.code !== "MODEL_ALREADY_ACTIVE") {
         await runExclusiveLlmOperation(() => killLlm());
       }
-      return json(res, jsonErrorStatus(err), withMemoryCheck(errorBody(err, { error: state.llmError, code: err.code || "", activeRuntime: err.activeRuntime || null }), memoryBefore));
+      return json(res, jsonErrorStatus(err), withMemoryCheck(errorBody(err, { error: state.llmError, code: err.code || "", activeRuntime: err.activeRuntime || null, ...(err.admission ? { admission: err.admission } : {}) }), memoryBefore));
     }
     });
 

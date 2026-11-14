@@ -38,6 +38,7 @@ const { resourceRoutes } = require("./routes/resources.cjs");
 const { createScheduler, schedulerMode, chatQueueSetting } = require("./services/scheduler.cjs");
 const { chatTimeoutSetting, createChatTimeouts, httpMetricsFetcher } = require("./services/chat-timeouts.cjs");
 const { createMemoryAdvisor, memoryCheckSetting } = require("./services/memory-check.cjs");
+const { createMemoryAdmission, memoryAdmissionSetting } = require("./services/memory-admission.cjs");
 const { createThreadBudget, threadsSetting } = require("./services/thread-budget.cjs");
 const { createWhisperThreadCap, whisperThreadCapSetting } = require("./services/whisper-thread-cap.cjs");
 const { inspectModel } = require("./model-metadata.cjs");
@@ -205,8 +206,17 @@ const OPENVINO_NPU_MODELS = [
 // estimate; it never refuses, delays or changes a load. USAP_MEMORY_CHECK=off (or scheduler.json
 // "memoryCheck": "off", or USAP_SCHEDULER=off) leaves it out. Its inputs are read when a model loads.
 const MEMORY_CHECK = memoryCheckSetting({ configDir: LLM_CONFIG_DIR, schedulerMode: schedulerMode({ configDir: LLM_CONFIG_DIR }) });
+// Step 9.9f-2: memory-aware text-model load admission (services/memory-admission.cjs). Off by default
+// (USAP_MEMORY_ADMISSION=observe|enforce or scheduler.json "memoryAdmission"; USAP_SCHEDULER=off or memoryCheck off
+// force it off). Off: not created, and the load path is the one from before 9.9f-2.
+const MEMORY_ADMISSION = memoryAdmissionSetting({ configDir: LLM_CONFIG_DIR, schedulerMode: schedulerMode({ configDir: LLM_CONFIG_DIR }), memoryCheckMode: MEMORY_CHECK.mode });
+for (const x of MEMORY_ADMISSION.ignored) console.warn(`  [memory] ignored ${x.name} from ${x.source} (${x.reason}); using the next setting or the default`);
+if (MEMORY_ADMISSION.forcedOffBy) console.warn(`  [memory] memory admission "${MEMORY_ADMISSION.requested}" is off because ${MEMORY_ADMISSION.forcedOffBy === "scheduler-off" ? "USAP_SCHEDULER=off" : "the memory check is off"}.`);
+if (MEMORY_ADMISSION.mode !== "off") console.log(`  [memory] Memory admission: ${MEMORY_ADMISSION.mode} (text-model loads only).${MEMORY_ADMISSION.inflateBytes ? ` TEST-ONLY inflation of the estimated need by ${MEMORY_ADMISSION.inflateBytes} bytes.` : ""}`);
+const memoryAdmissionEngine = MEMORY_ADMISSION.mode === "off" ? null : createMemoryAdmission({ setting: MEMORY_ADMISSION });
 const memoryAdvisor = MEMORY_CHECK.mode === "warn" ? createMemoryAdvisor({
   setting: MEMORY_CHECK,
+  textInflateBytes: MEMORY_ADMISSION.inflateBytes, // 0 unless admission is on and the test-only setting is given
   inspectModel,
   budget: {
     totalRamBytes: () => hardware.budget.totalRamBytes(),
@@ -261,6 +271,27 @@ const {
 const llmEngine = createLlmEngine({
   ApiError, LLM_BACKEND_PATHS, LLM_BENCHMARK_PATH, LLM_MODELS, LLM_MODEL_SETTINGS_PATH, PREFERRED_LLM_PORT, assertNoOtherActiveRuntime, badRequest, checkPort, decideRestart, fs, getGpuInfo: (...args) => getGpuInfo(...args), getStableSyclGpuLayers, http, isVisionModelFilename, killBackend, killOpenVinoWorker, notFound, notInstalled, os, osPlatform, path, pathInside, readJsonFile, readdirVisible: (...args) => readdirVisible(...args), requestJson, spawnSync, supervisor, waitForChildExit, waitForPortAvailable, writeJsonFile,
   memoryAdvisor, // optional (Step 9.9d)
+  // Optional (Step 9.9f-2), only when memory admission is not off. Read at each text load decision.
+  memoryAdmission: MEMORY_ADMISSION.mode === "off" ? null : {
+    admission: memoryAdmissionEngine,
+    // Other engine processes whose exit must be seen before a refusal (OpenVINO isn't supervised).
+    otherProcesses: () => [imageEngine.state.backendProc, imageEngine.state.openvinoProc],
+    // Text or image engine processes still alive (exit not yet observed), including ones stopped by earlier requests.
+    liveEngines: () => supervisor.snapshot().supervised.filter((r) => r.label === "llm" || r.label === "image").length,
+    // C5: every value must be exactly false. Unknown activity counts as not false.
+    activity: () => {
+      const img = imageEngine.state;
+      return {
+        chatActive: chatService.chatStats().active > 0,
+        imageGenerating: Boolean(img.generationState && img.generationState.active) || imageEngine.activeGenerations() > 0,
+        imageLoading: Boolean(img.backendLoadState && img.backendLoadState.active),
+        imageUnloading: Boolean(img.backendUnloadState && img.backendUnloadState.active),
+        imageEngineRunning: Boolean(img.backendProc || img.openvinoProc || img.backendReady || img.openvinoReady),
+        transcribing: Boolean(speech.getTranscriptionState().active),
+        synthesizing: Boolean(tts.getGenerationState().active),
+      };
+    },
+  },
 });
 const {
   llmEngineState, llmLifecycleSnapshot, runExclusiveLlmOperation, getPersistedLlmModelSettings, updateLlmModelSettings, getLlmBackend, getLlmBackendProbe, killLlm, stopLlmNow, startLlm, getLlmRuntimeStats, benchmarkLlmModel,
@@ -1707,6 +1738,7 @@ if (SCHEDULER_MODE !== "off") {
   const scheduler = createScheduler({
     chatQueue: CHAT_QUEUE,
     chatTimeouts: chatTimeouts ? () => chatTimeouts.snapshot() : null,
+    memoryAdmission: memoryAdmissionEngine ? () => memoryAdmissionEngine.snapshot() : null,
     memoryCheck: MEMORY_CHECK,
     memoryChecks: memoryAdvisor ? () => memoryAdvisor.snapshot() : null,
     threads: THREADS,

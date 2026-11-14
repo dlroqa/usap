@@ -1,10 +1,9 @@
 # Step 9.9f, second substage: memory-aware model-load admission (design)
 
-Status: **design only, in review (revised after owner review). Nothing is implemented.** The planned setting
-`memoryAdmission` is off by default, and turning on enforcement needs a separate owner approval after observe-mode
-evidence (§10). Revision: the request-scoped override is **disabled in the first implementation**, because the
-studio can't yet tell an authorized local caller from a remote one (§5). A refused load is never forced through
-an API request.
+Status: design merged (#103). **Implemented, off by default** (`memoryAdmission: "off"`), with the refinements in
+§12 ("As built"), which take precedence over §2–§10 where they differ. There is no request override (§5). Turning
+on `observe` or `enforce` by default, or extending refusals beyond the Linux high-confidence case, needs separate
+owner approval.
 
 Scope: whether, and how, the studio refuses to **start the text engine with a model** when memory is likely
 insufficient. Builds on the Step 9.9d warn-only check (`services/memory-check.cjs`). Part of
@@ -518,3 +517,72 @@ proposal to turn on `observe` or `on` by default needs at least:
   latency. Currently unvalidated; hosted runners are CPU-only.
 * **A llama.cpp version bump** must pass the native timeout checks (metric names, cancel behaviour) before a
   default can rely on them.
+
+## 12. As built (Step 9.9f-2 implementation)
+
+Module `scripts/server/services/memory-admission.cjs`, called from `startLlmWithBackend` in
+`services/llm-engine.cjs` at the 9.9d call site. Tests: `scripts/tests/memory-admission.test.cjs` (unit, server
+with the fake engine, 16 mutations). Native: `scripts/ci/memory-admission-validate.cjs`. Playwright: one check in
+`tests/e2e/specs/behavior.spec.mjs`.
+
+**As designed:**
+- the modes and precedence (§2);
+- the order T0–T5 (§3.1), with no `await` between the decision and the spawn;
+- the eight conditions C1–C8 and the evaluation rule (§4.1);
+- Linux `MemAvailable` as the only validated source;
+- no studio `vm_stat` read;
+- the ignored override (§5.2);
+- `409 MEMORY_INSUFFICIENT` with `overridable: false` (§6.1);
+- the exempt recovery paths (§6.4);
+- fail-open (§6.5);
+- additive reporting only when not `off` (§7).
+
+**Refinements:**
+- **C2, the release.**
+  - Every engine process that existed before T1 (text, image, OpenVINO) must report an exit (`exitCode` or
+    `signalCode`).
+  - In addition, the supervisor's registry must show no live `llm` or `image` child. That registry drops an entry
+    only on the observed `exit`, so it also covers engines stopped by an *earlier* request (for example
+    `/api/stop-backend`, whose stop resolves without waiting for the exit).
+- **C5 activity** covers:
+  - chats in flight;
+  - image generation (including proxied requests);
+  - an image load or unload in progress, or any image or OpenVINO process or ready state;
+  - transcription;
+  - voice synthesis.
+
+  Every value must be exactly `false`.
+- **The attempt binding (owner condition):** the decision uses the assessment returned for *this* attempt, and the
+  attempt must still be current (its start token unchanged). Otherwise it is `attempt-not-current` and low.
+- **C8 load mode** is taken from the same helper that builds the `--load-mode`/`--mmap`/`--mlock` arguments.
+  llama.cpp builds without `--load-mode` map the file by default, so they always count as mapped.
+- **A refused attempt restores the text-engine settings from before it.** `llmSettings` keeps `mlock`/`mmap` from
+  earlier starts (see the findings below). Without the restore, a refused `mmap: false` request would have turned
+  the next ordinary load into another refusal. The tests caught this, and a mutation proves the restore matters.
+- **Benchmarks** are assessed per backend (`path: "benchmark"`). A refusal there is recorded like any other backend
+  failure, and the benchmark continues as before (existing ordering kept). The restore of the previous model after
+  a benchmark is a recovery path (`benchmark-restore`, exempt).
+- **The test-only inflation** (`USAP_TEST_MEMORY_ADMISSION_INFLATE_BYTES`) is applied inside the 9.9d text
+  assessment, and only when admission isn't off. It is labelled (`parts.testInflationBytes`, reason
+  `test-inflation`, `admission.testInflation: true`) and logged at startup.
+- **Reporting:** in `enforce`, `/api/resources` `scheduler.decisions` is `true`; `observe` leaves it unchanged.
+- **Test fixtures only:** the fake llama-server lists `--load-mode` in `--help` only with
+  `FAKE_LLAMA_HELP_LOAD_MODE=1`, and answers `GET /fake/args`. The Playwright mock can answer `POST /api/llm/start`
+  when a test sets `mockApi.llmStart`.
+
+**Pre-existing behaviour found during implementation** (unchanged, reported):
+1. **`llmSettings` keeps `mlock: true` and `mmap: false` for the life of the process** once any start used them
+   (`settings.mlock || llmSettings.mlock`, `settings.mmap !== false && llmSettings.mmap !== false`). A later request
+   can't switch back until the studio restarts. Admission restores the settings after a refusal, but after a
+   *successful* load with mapping off, later loads stay unmapped. With `enforce` on, those could be refused, so the
+   §5.2 path "load with memory mapping on" then also needs a studio restart.
+2. **A text load while an image model is loaded answers `500 ENGINE_START_FAILED`.** The message is "… is already
+   loaded as a Image model …". The heavy-model check's `MODEL_ALREADY_ACTIVE` error is thrown inside the profile
+   loop and caught there as an ordinary failure. The WebUI checks this before calling, so users normally don't see
+   it. Added to #105.
+3. **`/api/llm/start?…` with a query string answers 404** (the router matches the exact path). It isn't related to
+   admission, but it means a query string can never carry admission input.
+
+**Native result:** see the PR (four platforms). On Windows and macOS the refusal path is `UNSUPPORTED` by design;
+the check that they never refuse is a real assertion.
+
