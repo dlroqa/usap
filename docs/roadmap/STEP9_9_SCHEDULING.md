@@ -103,7 +103,7 @@ separate UI change is approved.
 | 9.9b (done, #77) | `services/scheduler.cjs` with read-only accounting; `GET /api/resources`; tests | None: it only records and reports | `USAP_SCHEDULER=off` (or `"scheduler": "off"` in `app/config/scheduler.json`) leaves the route out |
 | 9.9c (in review, off by default) | Bounded chat queue (decision A): 1 running + 4 waiting per engine, FIFO, `429 QUEUE_FULL` with `Retry-After`, waiting requests leave on disconnect, `503 QUEUE_TIMEOUT` after the longest wait (10 min) | Only when turned on: requests past the limit get `429` | `chatQueue: off` (the default) or `USAP_SCHEDULER=off` restores the unbounded queue |
 | 9.9d (in review) | Memory check before loading a model, **warn only** (a field in the start response and a log line) | None for users; adds a field | Setting `memoryCheck: off` |
-| 9.9e (whisper only, in review, off by default) | Thread budget shared between engines | Thread counts change only when engines overlap | `threads: off` (the default) |
+| 9.9e (design done, #95: [STEP9_9E_THREADS.md](STEP9_9E_THREADS.md); whisper-only implementation in review, off by default) | Thread budget shared between engines | Thread counts change only when engines overlap | `threads: off` (the default) |
 | 9.9f | Memory check **enforced** (with a force option), image/speech/voice queues, queue timeouts, stream idle timeout. Still one heavy model at a time (decision B) | New refusals, each with a clear message | Per-setting `off` |
 
 Each stage lands only after its tests pass on all 4 OS and the native-runtime timings (Step 9.10) don't regress.
@@ -216,8 +216,8 @@ Numbering: the owner asked for the bounded chat queue as 9.9c, so it swapped pla
 
 ### Stage 9.9e as built (whisper only, off by default)
 
-Design and measurements: `docs/roadmap/STEP9_9E_THREADS.md` (design PR #95). This stage implements only the part
-the owner approved: whisper's per-job thread count.
+Design and measurements: [STEP9_9E_THREADS.md](STEP9_9E_THREADS.md) (#95). This stage implements only the part
+the owner approved: whisper's per-job thread count. Real-model results, including the regression, are in §7 there.
 
 * `services/thread-budget.cjs`: when a transcription starts while another CPU workload is busy, whisper.cpp gets
   `max(1, min(requested, 2, logical CPUs − 1))` threads for that job (`-t`); alone it gets the requested count
