@@ -195,8 +195,12 @@ A user who wants an older document marked attaches the file again.
   copy of the prompt (production ids stay random), a document of 40 control tokens and one of 40 literal
   `[token removed]` strings must give byte-identical messages and exactly the same prompt-token count; a negative
   control with the tokens left in must give clearly fewer tokens (the engine reads them as control tokens); and an
-  end-to-end app API comparison is allowed only the difference that random ids can cause, measured with the
-  engine's own tokenizer.
+  end-to-end app API comparison must give exactly the same prompt-token count for both documents. That last check
+  runs on a short-lived test server started by the check, from the same code with `documents: mark` in its
+  environment only. A test-only preload (`scripts/ci/p4-fixed-document-id.cjs`) pins the marker id in that process
+  alone, and the check requires the server's log to confirm the pin. Two random 12-hex ids can tokenize up to
+  6 tokens apart (more in context), so comparing two requests that each had a random id needed a tolerance that a
+  random pair could exceed (#102). The installed server's ids stay random.
 * Before proposing P4-3: long documents near the limits, multiple documents, PDFs with `[Page n]` headings,
   code-heavy and non-Latin documents, and answer quality on a real model, as for P3.
 

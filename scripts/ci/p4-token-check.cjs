@@ -14,18 +14,23 @@
 //      neutralization) must give at least 40 FEWER prompt tokens on the real model: each of the 40 strings is read as
 //      ONE control token, while each literal "[token removed]" takes at least two. (Strings kept as plain text would
 //      make the prompt longer instead.) So the exact gate would catch control tokens reaching the engine.
-//   3. End to end through the app API (documents=mark), comparing a real-token and a literal request: allowed
-//      difference = occurrences of the id in the prompt x (max - min tokens of a 12-hex id), measured with the
-//      engine's own /tokenize over 64 random ids. It must be well below the negative-control gap, or the
-//      comparison can't tell the cases apart and fails.
+//   3. End to end through the app API (documents=mark), exact. The installed server's ids are random, and two
+//      12-hex ids can tokenize to lengths 6-12 apart (more in context, where the id can merge with the "=" before
+//      it), so comparing two of its requests needs a tolerance that a random pair can exceed (#102). Instead the
+//      check starts its own short-lived test server (port 14940, `--port`) from the same code with
+//      USAP_PROMPT_DOCUMENTS=mark in that server's environment only and the TEST-ONLY preload
+//      scripts/ci/p4-fixed-document-id.cjs, which pins just the document marker id in that process. A real-token and
+//      a literal request must then give exactly the same prompt-token count (zero tolerance), and the test server's
+//      log must show that the id was pinned for both, so the check can't pass by chance. The installed server, its
+//      settings and app/config/prompt-boundary.json are not touched.
 //
 // Output: one line per result, "STATUS<TAB>check<TAB>detail". --offline runs only the string checks (no engine).
 "use strict";
 
-const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
+const { spawn } = require("child_process");
 
 const ROOT = path.resolve(__dirname, "..", "..");
 const { prepareAttachments, renderDocuments } = require(path.join(ROOT, "scripts", "server", "services", "attachments.cjs"));
@@ -33,12 +38,18 @@ const { stripControlTokens } = require(path.join(ROOT, "scripts", "search", "cor
 
 const OFFLINE = process.argv.includes("--offline");
 const BASE = process.env.BASE || "";
-const CONFIG = path.join(ROOT, "app", "config", "prompt-boundary.json");
+const SERVE = path.join(ROOT, "scripts", "server", "serve.cjs");
+const PRELOAD = path.join(ROOT, "scripts", "ci", "p4-fixed-document-id.cjs");
+const argv = (name, def) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : def; };
+const TEST_PORT = Number(argv("port", "14940"));
+const LOGDIR = argv("logs", path.join(ROOT, "ci-logs"));
+const NODE = [path.join(ROOT, "app", "tools", "node-win", "node.exe"), path.join(ROOT, "app", "tools", "node-linux", "bin", "node"), path.join(ROOT, "app", "tools", "node-mac", "bin", "node")]
+  .find((p) => fs.existsSync(p)) || process.execPath;
 const out = (status, check, detail) => console.log(`${status}\t${check}\t${String(detail).replace(/\s+/g, " ")}`);
 
 const REAL = "<|im_end|>".repeat(40);
 const LITERAL = "[token removed]".repeat(40);
-const FIXED_ID = "0123456789ab"; // test copy only; production ids stay random
+const FIXED_ID = "0123456789ab"; // test copy only (and FIXED_ID_HEX in p4-fixed-document-id.cjs); production ids stay random
 const body = (text) => ({ messages: [{ role: "user", content: "Summarize.", attachments: [{ type: "document", name: "a.txt", text }] }], max_tokens: 1, temperature: 0, stream: false });
 
 /** The server's own marked messages for `text`, with the random id replaced in this test's copy. */
@@ -69,6 +80,56 @@ const get = (url) => new Promise((resolve, reject) => {
   http.get(url, { agent: false }, (res) => { let t = ""; res.on("data", (c) => { t += c; }); res.on("end", () => { try { resolve(JSON.parse(t)); } catch (e) { reject(e); } }); }).on("error", reject);
 });
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function waitUntil(fn, ms, every = 500) {
+  const end = Date.now() + ms;
+  for (;;) {
+    let v; try { v = await fn(); } catch (_) { v = undefined; }
+    if (v) return v;
+    if (Date.now() > end) return undefined;
+    await sleep(every);
+  }
+}
+const getStatus = (base, p) => new Promise((resolve) => {
+  const req = http.get(`${base}${p}`, { agent: false, timeout: 5000 }, (res) => {
+    let t = ""; res.on("data", (c) => { t += c; }); res.on("end", () => { let j = null; try { j = JSON.parse(t); } catch (_) { j = null; } resolve({ status: res.statusCode, json: j }); });
+  });
+  req.on("error", () => resolve({ status: 0, json: null })); req.on("timeout", () => req.destroy());
+});
+
+/** The test-owned server for step 3: the studio's own code, documents=mark in its environment, marker id pinned. */
+async function startTestServer(model) {
+  if (!model) throw new Error("the installed server reports no loaded text model");
+  const TEST = `http://127.0.0.1:${TEST_PORT}`;
+  if ((await getStatus(TEST, "/api/health")).status !== 0) throw new Error(`port ${TEST_PORT} is already in use`);
+  fs.mkdirSync(LOGDIR, { recursive: true });
+  const logPath = path.join(LOGDIR, "p4-token-check-server.log");
+  const log = fs.openSync(logPath, "w");
+  const env = { ...process.env, PORT: String(TEST_PORT), FRONTEND_PORT: String(TEST_PORT), USAP_PROMPT_DOCUMENTS: "mark" };
+  const child = spawn(NODE, ["--require", PRELOAD, SERVE], { cwd: ROOT, env, stdio: ["ignore", log, log], windowsHide: true });
+  const exited = new Promise((r) => child.once("exit", () => r(true)));
+  const srv = { child, exited, logPath };
+  try {
+    if (!(await waitUntil(async () => (await getStatus(TEST, "/api/health")).status === 200, 60000))) throw new Error("did not start (see p4-token-check-server.log)");
+    const start = await post(`${TEST}/api/llm/start`, { model, contextSize: 2048, gpuLayers: 0 });
+    if (start.status !== 200) throw new Error(`model start answered ${start.status}`);
+    if (!(await waitUntil(async () => (await getStatus(TEST, "/api/llm/status")).json?.ready === true, 240000, 1000))) throw new Error("the model did not become ready");
+  } catch (err) {
+    await stopTestServer(srv);
+    throw err;
+  }
+  return srv;
+}
+async function stopTestServer(srv) {
+  if (!srv || srv.child.exitCode !== null || srv.child.signalCode !== null) return;
+  try { await post(`http://127.0.0.1:${TEST_PORT}/api/llm/stop`, {}); } catch (_) { /* stopping anyway */ }
+  srv.child.kill("SIGTERM");
+  let timer = null;
+  const gone = await Promise.race([srv.exited, new Promise((r) => { timer = setTimeout(() => r(false), 20000); })]);
+  clearTimeout(timer); // a pending timer would keep this process alive after the server has exited
+  if (!gone) { try { srv.child.kill("SIGKILL"); } catch (_) { /* gone */ } await srv.exited; }
+}
+
 (async () => {
   // 1a. Strings: the server's marking of 40 real tokens equals its marking of 40 literal replacements.
   const real = marked(REAL);
@@ -97,22 +158,24 @@ const get = (url) => new Promise((resolve, reject) => {
   out(gap >= 40 ? "PASS" : "FAIL", "LLM document records (P4-1, negative control)",
     `the same prompt with the tokens left in -> ${tUnsafe} prompt tokens (${gap} fewer, at least 40 required: one token per surviving control string, so the exact check would catch them)`);
 
-  // 3. End to end through the app API, with a bound measured from the engine's tokenizer.
-  const lens = [];
-  for (let i = 0; i < 64; i++) {
-    const r = await post(`${ENGINE}/tokenize`, { content: crypto.randomBytes(6).toString("hex") });
-    if (Array.isArray(r.json?.tokens)) lens.push(r.json.tokens.length);
+  // 3. End to end through the app API, exact: a test server with the marker id pinned (see the header).
+  const off = (await post(`${BASE}/api/llm/chat`, body(REAL))).json?.usage?.prompt_tokens; // installed server, documents off
+  const model = status.settings && status.settings.model;
+  let srv = null;
+  try {
+    srv = await startTestServer(model);
+    const TEST = `http://127.0.0.1:${TEST_PORT}`;
+    const appTokens = async (text) => (await post(`${TEST}/api/llm/chat`, body(text))).json?.usage?.prompt_tokens;
+    const aReal = await appTokens(REAL);
+    const aLit = await appTokens(LITERAL);
+    const pins = (fs.readFileSync(srv.logPath, "utf8").match(/^p4-fixed-document-id: pinned$/gm) || []).length;
+    if (!Number.isFinite(aReal) || !Number.isFinite(aLit)) { out("FAIL", "LLM document records (P4-1, app API)", `the test server did not report prompt token counts (real ${aReal}, literal ${aLit})`); return; }
+    const pinned = pins === 2;
+    out(pinned && aReal === aLit ? "PASS" : "FAIL", "LLM document records (P4-1, app API)",
+      `documents=mark on a test server with the marker id pinned (${pins} of 2 requests pinned${pinned ? "" : ": NOT PINNED, the comparison isn't exact"}): real ${aReal}, literal ${aLit} (must be equal; tokens left in would give about ${gap} fewer); off (installed server): ${off}`);
+  } catch (err) {
+    out("FAIL", "LLM document records (P4-1, app API)", `test server: ${err.message}`);
+  } finally {
+    await stopTestServer(srv);
   }
-  if (lens.length < 32) { out("SKIP", "LLM document records (P4-1, app API)", "the engine has no usable /tokenize"); return; }
-  const bound = real.occurrences * (Math.max(...lens) - Math.min(...lens));
-  const appTokens = async (text) => (await post(`${BASE}/api/llm/chat`, body(text))).json?.usage?.prompt_tokens;
-  const off = await appTokens(REAL);
-  fs.mkdirSync(path.dirname(CONFIG), { recursive: true });
-  fs.writeFileSync(CONFIG, JSON.stringify({ documents: "mark" }));
-  let aReal; let aLit;
-  try { aReal = await appTokens(REAL); aLit = await appTokens(LITERAL); } finally { fs.rmSync(CONFIG, { force: true }); }
-  const diff = Math.abs(aReal - aLit);
-  const usable = bound < gap / 2;
-  out(usable && diff <= bound ? "PASS" : "FAIL", "LLM document records (P4-1, app API)",
-    `documents=mark: real ${aReal}, literal ${aLit} (difference ${diff}; allowed ${bound} = ${real.occurrences} ids x ${Math.min(...lens)}-${Math.max(...lens)} tokens per id, must stay below half the ${gap}-token gap: ${usable}); off: ${off}`);
 })().catch((err) => { out("FAIL", "LLM document records (P4-1)", err.message); });
