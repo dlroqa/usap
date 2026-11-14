@@ -23,9 +23,18 @@
 //
 // Policy comparison (Step 9.9e implementation): `--set whisper` runs only the windows a transcription thread budget
 // affects (chat, transcription, voice and image alone; chat + transcription, voice + transcription, image +
-// transcription), with transcriptions requesting 4 threads as the WebUI does by default. `--studio-env K=V,...`
-// adds environment variables for the studio server (e.g. USAP_THREADS=on) and `--label` names the run. Run it once
-// per setting in the same job, then `--compare <dirA> <dirB>` prints the side-by-side table.
+// transcription), with transcriptions explicitly requesting 4 threads. (4 is NOT the WebUI's unconditional
+// default: the WebUI defaults to min(8, navigator.hardwareConcurrency), and 4 only when the browser reports no CPU
+// count; the server defaults to min(8, logical CPUs). On the 4-logical-CPU runners 4 equals both defaults; on the
+// 3-vCPU macOS arm64 runner it is one more than the CPUs, like an API or LAN client asking for more threads than the
+// server has.) `--studio-env K=V,...` adds environment variables for the studio server (e.g. USAP_THREADS=on) and
+// `--label` names the run. Run it once per setting in the same job, then `--compare <dirA> <dirB>` prints the
+// side-by-side table.
+//
+// Whisper thread sweep: `--set whisper-sweep [--threads-list 2,3,4,default]` runs one transcription at a time with
+// nothing else busy, each configuration in rotating order per round, first with no other engine loaded and then
+// with the text engine loaded and idle; it records the CPU counts and affinity the OS reports and checks each job's
+// `-t` and whisper.cpp's own thread line in the studio log. Output: whisper-sweep.md and thread-bench.jsonl.
 "use strict";
 
 const fs = require("fs");
@@ -44,7 +53,7 @@ const REPS = Number(arg("reps", "5"));
 const SET = arg("set", "full");
 const LABEL = arg("label", SET === "full" ? "default" : "run");
 const STUDIO_ENV = Object.fromEntries(String(arg("studio-env", "")).split(",").filter(Boolean).map((kv) => { const i = kv.indexOf("="); return [kv.slice(0, i), kv.slice(i + 1)]; }));
-const UI_WHISPER_THREADS = 4; // the WebUI's default speech setting
+const UI_WHISPER_THREADS = 4; // fixed request for `--set whisper` (the WebUI's fallback when the browser reports no CPU count)
 const IMAGE_REPS = Number(arg("image-reps", "3"));
 const PORT = Number(arg("port", "14930"));
 const SIDE_PORT = PORT + 1; // the standalone llama-server for image + chat
@@ -266,6 +275,116 @@ async function mainWhisperSet() {
   emit({ kind: "policy", limitsThreads: r.limits && r.limits.threads, lastTranscription: r.threads ? r.threads.lastTranscription : null });
 }
 
+// ── Whisper thread sweep (`--set whisper-sweep`) ─────────────────────────────────────────────────────────────
+// One transcription at a time, nothing else running: the same audio, model and studio, only `threads` differs.
+// Configurations rotate every round (round r starts at configuration r mod k), so each one runs equally often in
+// each position and slow drift on the runner does not favour one. The first job of each configuration is a
+// warm-up and is not counted. Every job is checked against the studio log: the `-t` the studio passed and
+// whisper.cpp's own `n_threads = N / M` line (M = the hardware concurrency whisper sees) and total time.
+const SWEEP = String(arg("threads-list", "2,3,4,default")).split(",").map((s) => s.trim()).filter(Boolean);
+function cpuFacts() {
+  const run = (cmd, args) => { try { const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 10000 }); return r.status === 0 ? String(r.stdout).trim() : null; } catch (_) { return null; } };
+  const f = { osCpusLength: os.cpus().length, availableParallelism: typeof os.availableParallelism === "function" ? os.availableParallelism() : null, cpuModel: (os.cpus()[0] || {}).model || null, totalRamMb: Math.round(os.totalmem() / 1048576) };
+  if (process.platform === "darwin") {
+    for (const k of ["hw.ncpu", "hw.activecpu", "hw.physicalcpu", "hw.logicalcpu", "hw.perflevel0.logicalcpu", "hw.perflevel1.logicalcpu", "machdep.cpu.brand_string", "kern.hv_vmm_present"]) f[k] = run("sysctl", ["-n", k]);
+    f.affinity = "not available (macOS has no CPU affinity mask for processes)";
+  } else if (process.platform === "linux") {
+    f.nproc = run("nproc", []); f.nprocAll = run("nproc", ["--all"]);
+    try { f.cpusAllowedList = (fs.readFileSync("/proc/self/status", "utf8").match(/Cpus_allowed_list:\s+(\S+)/) || [])[1] || null; } catch (_) { f.cpusAllowedList = null; }
+    try { f.cgroupCpuMax = fs.readFileSync("/sys/fs/cgroup/cpu.max", "utf8").trim(); } catch (_) { f.cgroupCpuMax = null; }
+    f.affinity = f.cpusAllowedList;
+  } else if (WIN) {
+    f.NUMBER_OF_PROCESSORS = process.env.NUMBER_OF_PROCESSORS || null;
+    f.win32Processor = run("powershell", ["-NoProfile", "-Command", "$p=Get-CimInstance Win32_Processor; \"$($p.NumberOfCores) cores / $($p.NumberOfLogicalProcessors) logical\""]);
+    f.affinity = run("powershell", ["-NoProfile", "-Command", "[Convert]::ToString([int64](Get-Process -Id $PID).ProcessorAffinity, 2)"]);
+  }
+  return f;
+}
+const logSize = () => { try { return fs.statSync(SERVER_LOG).size; } catch (_) { return 0; } };
+function logSince(offset) {
+  try { const fd = fs.openSync(SERVER_LOG, "r"); const size = fs.fstatSync(fd).size; const buf = Buffer.alloc(Math.max(0, size - offset)); fs.readSync(fd, buf, 0, buf.length, offset); fs.closeSync(fd); return buf.toString("utf8"); } catch (_) { return ""; }
+}
+async function sweepJob(config) {
+  const off = logSize(); const t0 = cpuTimes(); const l0 = os.loadavg()[0];
+  const j = await whisperJob(config === "default" ? null : Number(config));
+  await sleep(200); // let the log flush
+  const text = logSince(off);
+  const passed = (text.match(/\[speech\] Starting:.*?\s-t\s+(\d+)/) || [])[1];
+  const nt = text.match(/n_threads\s*=\s*(\d+)\s*\/\s*(\d+)/);
+  const total = (text.match(/total time\s*=\s*([\d.]+)\s*ms/) || [])[1];
+  const backend = [...new Set((text.match(/[^\n]*(Metal|Vulkan|CUDA|BLAS|no GPU found|using .*? backend)[^\n]*/gi) || []).map((s) => s.replace(/^\s*\[speech-err\]\s*/, "").trim().slice(0, 120)))].slice(0, 4);
+  return { ...j, config, passedT: passed ? Number(passed) : null, whisperThreads: nt ? Number(nt[1]) : null, whisperHwThreads: nt ? Number(nt[2]) : null, whisperTotalMs: total ? Number(total) : null, cpuBusyPct: busyPct(t0, cpuTimes()), load1Before: l0, backend };
+}
+// Seeded bootstrap of the ratio of medians (b / a), for a 95% interval; deterministic per input.
+function bootRatio(a, b, iters = 4000) {
+  if (a.length < 3 || b.length < 3) return null;
+  let s = 12345; const rnd = () => { s = (s * 1103515245 + 12345) % 2147483648; return s / 2147483648; };
+  const med = (v) => { const x = [...v].sort((p, q) => p - q); return x.length % 2 ? x[(x.length - 1) / 2] : (x[x.length / 2 - 1] + x[x.length / 2]) / 2; };
+  const pick = (v) => v.map(() => v[Math.floor(rnd() * v.length)]);
+  const r = []; for (let i = 0; i < iters; i++) r.push(med(pick(b)) / med(pick(a)));
+  r.sort((p, q) => p - q);
+  return { ratio: Math.round((med(b) / med(a)) * 100) / 100, lo: Math.round(r[Math.floor(iters * 0.025)] * 100) / 100, hi: Math.round(r[Math.floor(iters * 0.975)] * 100) / 100 };
+}
+async function sweepBlock(block) {
+  for (const c of SWEEP) { const w = await sweepJob(c); emit({ kind: "sweep-warmup", block, ...w }); } // not counted
+  for (let r = 0; r < REPS; r++) {
+    for (let p = 0; p < SWEEP.length; p++) {
+      const c = SWEEP[(r + p) % SWEEP.length];
+      const j = await sweepJob(c);
+      emit({ kind: "sweep-job", block, round: r, position: p, ...j });
+      console.log(`sweep ${block} round ${r} pos ${p} t=${c}: ${j.ms} ms (whisper ${j.whisperTotalMs} ms, n_threads ${j.whisperThreads}/${j.whisperHwThreads})${j.ok ? "" : ` FAILED ${j.error}`}`);
+    }
+  }
+}
+async function mainWhisperSweep() {
+  if (!jfk) throw new Error(`the transcription sample is missing: ${JFK}`);
+  const res = (await get("/api/resources")).json || {};
+  const speechStatus = (await get("/api/speech/status")).json || {};
+  emit({ kind: "hardware", ...cpuFacts(), studioLogicalCores: res.cpu && res.cpu.logicalCores.value, studioPhysicalCores: res.cpu && res.cpu.physicalCores.value, serverDefaultThreads: (speechStatus.settings && speechStatus.settings.threads) ?? null, sweep: SWEEP, reps: REPS, studioEnv: STUDIO_ENV });
+  // Block A (primary): no other engine loaded.
+  await sweepBlock("no other engine");
+  // Block B: the text engine loaded and idle, as in the earlier thread-bench runs.
+  const start = await call(PORT, "POST", "/api/llm/start", { model: QWEN, contextSize: 2048, gpuLayers: 0 });
+  if (start.status === 200 && (await waitUntil(async () => (await get("/api/llm/status")).json?.ready === true, 240000, 1000))) {
+    await sweepBlock("text engine loaded, idle");
+    await call(PORT, "POST", "/api/llm/stop", {});
+  } else emit({ kind: "skipped", workload: "sweep with text engine idle", reason: `text model did not load: ${start.text.slice(0, 160)}` });
+}
+function sweepReport() {
+  const hw = rows.find((r) => r.kind === "hardware") || {};
+  const jobs = rows.filter((r) => r.kind === "sweep-job");
+  const blocks = [...new Set(jobs.map((j) => j.block))];
+  const fmtS = (s) => (s ? `${(s.median / 1000).toFixed(2)} s (${(s.min / 1000).toFixed(2)}–${(s.max / 1000).toFixed(2)}, cv ${s.cv})` : "none");
+  const lines = [`## Whisper thread sweep (${PLATFORM}): ${hw.cpuModel || "?"}`, "",
+    `os.cpus ${hw.osCpusLength}; availableParallelism ${hw.availableParallelism}; studio logical/physical ${hw.studioLogicalCores}/${hw.studioPhysicalCores}; server default threads ${hw.serverDefaultThreads}; affinity ${hw.affinity ?? "unknown"}` +
+    (process.platform === "darwin" ? `; hw.ncpu ${hw["hw.ncpu"]}, activecpu ${hw["hw.activecpu"]}, physicalcpu ${hw["hw.physicalcpu"]}, perflevel0/1 logical ${hw["hw.perflevel0.logicalcpu"]}/${hw["hw.perflevel1.logicalcpu"]}, VM ${hw["kern.hv_vmm_present"]}` : "") +
+    (process.platform === "linux" ? `; nproc ${hw.nproc} (all ${hw.nprocAll}); cgroup cpu.max ${hw.cgroupCpuMax}` : "") +
+    (WIN ? `; NUMBER_OF_PROCESSORS ${hw.NUMBER_OF_PROCESSORS}; ${hw.win32Processor}` : ""),
+    "", `Rounds: ${REPS}; order rotates each round; one warm-up per configuration not counted. Wall = HTTP request to the studio; whisper = whisper.cpp's own total time.`];
+  for (const b of blocks) {
+    const bj = jobs.filter((j) => j.block === b);
+    lines.push("", `### ${b}`, "", "| threads requested | -t passed | whisper n_threads / hw | n ok (failed) | Wall median (min–max, CV) | whisper total median (CV) | CPU busy median | vs 3 threads (wall, 95% CI) |", "|---|---|---|---|---|---|---|---|");
+    const wallOf = (c) => bj.filter((j) => j.config === c && j.ok).map((j) => j.ms);
+    for (const c of SWEEP) {
+      const cj = bj.filter((j) => j.config === c);
+      const ok = cj.filter((j) => j.ok);
+      const uniq = (k) => [...new Set(ok.map((j) => j[k]))].join("/");
+      const ws = stats(ok.map((j) => j.whisperTotalMs));
+      const bs = bootRatio(wallOf("3"), wallOf(c));
+      lines.push(`| ${c} | ${uniq("passedT")} | ${uniq("whisperThreads")} / ${uniq("whisperHwThreads")} | ${ok.length} (${cj.length - ok.length}) | ${fmtS(stats(ok.map((j) => j.ms)))} | ${ws ? `${(ws.median / 1000).toFixed(2)} s (${ws.cv})` : "n/a"} | ${stats(ok.map((j) => j.cpuBusyPct))?.median ?? "?"}% | ${c === "3" || !bs ? "" : `×${bs.ratio} (${bs.lo}–${bs.hi})`} |`);
+    }
+    // Position check: median wall per position for each configuration (ordering bias would show here).
+    lines.push("", "Median wall time by position in the round (s):", "", `| threads | ${SWEEP.map((_, p) => `pos ${p}`).join(" | ")} |`, `|---|${SWEEP.map(() => "---").join("|")}|`);
+    for (const c of SWEEP) lines.push(`| ${c} | ${SWEEP.map((_, p) => { const s = stats(bj.filter((j) => j.config === c && j.ok && j.position === p).map((j) => j.ms)); return s ? (s.median / 1000).toFixed(2) : "–"; }).join(" | ")} |`);
+    const be = [...new Set(bj.flatMap((j) => j.backend || []))];
+    if (be.length) lines.push("", `whisper backend lines: ${be.join("; ")}`);
+  }
+  for (const r of rows.filter((x) => x.kind === "skipped" || x.kind === "error")) lines.push("", `**${r.kind}:** ${r.workload || ""} ${r.reason || r.error}`);
+  const md = lines.join("\n");
+  fs.writeFileSync(path.join(OUT, "whisper-sweep.md"), md + "\n");
+  console.log(md);
+}
+
 function compare(dirA, dirB) {
   const load = (d) => fs.readFileSync(path.join(d, "thread-bench.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
   const A = load(dirA); const B = load(dirB);
@@ -287,6 +406,7 @@ function compare(dirA, dirB) {
 
 async function main() {
   await startStudio();
+  if (SET === "whisper-sweep") return mainWhisperSweep();
   if (SET === "whisper") {
     const res = (await get("/api/resources")).json || {};
     emit({ kind: "hardware", cpuModel: (os.cpus()[0] || {}).model || null, logicalCores: res.cpu && res.cpu.logicalCores.value, physicalCores: res.cpu && res.cpu.physicalCores.value, totalRamMb: Math.round(os.totalmem() / 1048576), reps: REPS, imageReps: IMAGE_REPS, studioEnv: STUDIO_ENV });
@@ -395,4 +515,4 @@ if (process.argv.includes("--compare")) {
   fs.writeFileSync(path.join(OUT, "compare.md"), md + "\n");
   console.log(md);
 } else main().catch((e) => { emit({ kind: "error", error: String(e && e.message || e) }); console.error(e); })
-  .finally(async () => { await stopAll(); report(); });
+  .finally(async () => { await stopAll(); if (SET === "whisper-sweep") sweepReport(); else report(); });

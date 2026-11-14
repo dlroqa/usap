@@ -19,8 +19,11 @@ on:
         description: "Repetitions per image window"
         default: "3"
       set:
-        description: "full (all pairs) or whisper (the windows a transcription thread budget affects, run with USAP_THREADS=off and =on in the same job, then compared)"
+        description: "full (all pairs), whisper (the windows a transcription thread budget affects, run with USAP_THREADS=off and =on in the same job, then compared) or whisper-sweep (transcription alone at each threads value, rotating order; reps = rounds)"
         default: "full"
+      threads_list:
+        description: "whisper-sweep only: comma-separated thread requests (default = no threads value, the server default)"
+        default: "2,3,4,default"
 
 permissions:
   contents: read
@@ -82,8 +85,14 @@ jobs:
           BENCH_SET: ${{ inputs.set || 'full' }}
           REPS: ${{ inputs.reps || '5' }}
           IMAGE_REPS: ${{ inputs.image_reps || '3' }}
+          THREADS_LIST: ${{ inputs.threads_list || '2,3,4,default' }}
         run: |
-          if [ "$BENCH_SET" = whisper ]; then
+          if [ "$BENCH_SET" = whisper-sweep ]; then
+            node scripts/ci/thread-bench.cjs --set whisper-sweep --label whisper-sweep --threads-list "$THREADS_LIST" \
+              --jfk .ci-model-cache/jfk.wav --out ci-logs/thread-bench --reps "$REPS"
+            cat ci-logs/thread-bench/whisper-sweep.md >> "$GITHUB_STEP_SUMMARY"
+            ! grep -q '"kind":"error"' ci-logs/thread-bench/thread-bench.jsonl
+          elif [ "$BENCH_SET" = whisper ]; then
             for mode in off on; do
               node scripts/ci/thread-bench.cjs --set whisper --label "threads-$mode" --studio-env "USAP_THREADS=$mode" \
                 --jfk .ci-model-cache/jfk.wav --out "ci-logs/thread-bench/threads-$mode" --reps "$REPS" --image-reps "$IMAGE_REPS"
