@@ -188,9 +188,13 @@ async function holdChat(s) {
   await waitFor(async () => (await engineStats(s)).held === 1, 10000, "chat held in the engine");
   return { done };
 }
-const expectedBusy = (requested) => perJobThreads({ requested, logicalCpus: os.cpus().length, othersBusy: true }).threads;
+// The whisper logical-CPU cap (default on, services/whisper-thread-cap.cjs) runs before the budget: a request above
+// this machine's logical CPUs reaches the budget, and whisper, as min(requested, CPUs).
+const capped = (requested) => Math.min(requested, os.cpus().length);
+const expectedBusy = (requested) => perJobThreads({ requested: capped(requested), logicalCpus: os.cpus().length, othersBusy: true }).threads;
+const BUDGET_LINE = "busy). Other engines unchanged."; // the 9.9e budget's log line (the cap logs its own)
 
-test("server, default (off): whisper gets the requested threads even while a chat runs; nothing new is reported", async (t) => {
+test("server, default (budget off, cap on): whisper gets the requested threads, at most the logical CPUs, even while a chat runs; no budget report", async (t) => {
   const s = await server();
   t.after(() => close(s));
   await loadText(s);
@@ -200,11 +204,11 @@ test("server, default (off): whisper gets the requested threads even while a cha
   assert.equal((await transcribe(s, { threads: 4 })).status, 200);
   await release(s);
   assert.equal((await held.done).status, 200);
-  assert.deepEqual(usedThreads(s), [Math.max(1, Math.min(8, os.cpus().length)), 6, 4], "requested counts, as before 9.9e");
+  assert.deepEqual(usedThreads(s), [Math.max(1, Math.min(8, os.cpus().length)), capped(6), capped(4)], "requested counts (capped at the logical CPUs), no budget reduction");
   const r = (await request(s.srv.port, "GET", "/api/resources")).json;
   assert.equal(r.limits.threads, "off");
   assert.equal("threads" in r, false);
-  assert.ok(!s.srv.log().includes("[threads]"));
+  assert.ok(!s.srv.log().includes(BUDGET_LINE), "no budget decision");
 });
 
 test("server, USAP_THREADS=on: alone unchanged; while a chat runs the job gets the reduced count; the chat itself is untouched", async (t) => {
@@ -212,7 +216,7 @@ test("server, USAP_THREADS=on: alone unchanged; while a chat runs the job gets t
   t.after(() => close(s));
   await loadText(s);
   assert.equal((await transcribe(s, { threads: 4 })).status, 200);
-  assert.equal(lastThreads(s), 4, "alone: requested");
+  assert.equal(lastThreads(s), capped(4), "alone: requested (capped at the logical CPUs)");
   assert.equal((await transcribe(s, { threads: 1 })).status, 200);
   assert.equal(lastThreads(s), 1);
   const held = await holdChat(s);
@@ -223,16 +227,16 @@ test("server, USAP_THREADS=on: alone unchanged; while a chat runs the job gets t
   const r = (await request(s.srv.port, "GET", "/api/resources")).json;
   assert.equal(r.limits.threads, "on");
   assert.deepEqual({ requested: r.threads.lastTranscription.requested, threads: r.threads.lastTranscription.threads, busy: r.threads.lastTranscription.busy },
-    { requested: 4, threads: expectedBusy(4), busy: ["chat"] });
+    { requested: capped(4), threads: expectedBusy(4), busy: ["chat"] });
   await release(s);
   const finished = await held.done;
   assert.equal(finished.status, 200);
   assert.ok(finished.text.trimEnd().endsWith("data: [DONE]"), "the chat completes normally");
   assert.equal((await transcribe(s, { threads: 4 })).status, 200);
-  assert.equal(lastThreads(s), 4, "after the chat: requested again");
+  assert.equal(lastThreads(s), capped(4), "after the chat: requested again");
   const st = (await request(s.srv.port, "GET", "/api/llm/status")).json;
   assert.equal(st.settings.threads, Math.max(1, Math.min(16, os.cpus().length)), "the text engine's own threads are unchanged");
-  assert.ok(s.srv.log().includes("[threads] Transcription:"));
+  assert.ok(s.srv.log().includes(BUDGET_LINE), "the budget logged its reduction");
 });
 
 test("server, USAP_THREADS=on: an image generating counts as busy; the image engine's own threads are unchanged", async (t) => {
@@ -248,7 +252,7 @@ test("server, USAP_THREADS=on: an image generating counts as busy; the image eng
   assert.equal(lastThreads(s), expectedBusy(4));
   assert.equal((await gen).status, 200, "the image is generated normally");
   assert.equal((await transcribe(s, { threads: 4 })).status, 200);
-  assert.equal(lastThreads(s), 4, "after the image: requested again");
+  assert.equal(lastThreads(s), capped(4), "after the image: requested again");
   assert.equal((await request(s.srv.port, "GET", "/api/backend-status")).json.settings.threads, threadsBefore);
 });
 
@@ -281,7 +285,7 @@ test("server: an engine crash while busy, a whisper crash, and USAP_SCHEDULER=of
   await held.done; // the chat ends (cut) with the engine
   await waitFor(async () => (await request(s.srv.port, "GET", "/api/resources")).json.engines.text.chat.active === 0, 10000, "chat no longer active");
   assert.equal((await transcribe(s, { threads: 4 })).status, 200);
-  assert.equal(lastThreads(s), 4, "after the crash nothing is busy: requested");
+  assert.equal(lastThreads(s), capped(4), "after the crash nothing is busy: requested");
   const crashed = await transcribe(s, { threads: 4, model: "ggml-crash.bin" });
   assert.equal(crashed.status, 500, "a crashing whisper fails as before");
   assert.equal((await transcribe(s, { threads: 4 })).status, 200, "and the next job works");
@@ -291,7 +295,7 @@ test("server: an engine crash while busy, a whisper crash, and USAP_SCHEDULER=of
   await loadText(off);
   const held2 = await holdChat(off);
   assert.equal((await transcribe(off, { threads: 4 })).status, 200);
-  assert.equal(lastThreads(off), 4, "scheduler off: requested");
+  assert.equal(lastThreads(off), 4, "scheduler off: requested, uncapped (USAP_SCHEDULER=off turns the cap off too)");
   assert.equal((await request(off.srv.port, "GET", "/api/resources")).status, 404);
   await release(off);
   await held2.done;

@@ -38,6 +38,7 @@ const { resourceRoutes } = require("./routes/resources.cjs");
 const { createScheduler, schedulerMode, chatQueueSetting } = require("./services/scheduler.cjs");
 const { createMemoryAdvisor, memoryCheckSetting } = require("./services/memory-check.cjs");
 const { createThreadBudget, threadsSetting } = require("./services/thread-budget.cjs");
+const { createWhisperThreadCap, whisperThreadCapSetting } = require("./services/whisper-thread-cap.cjs");
 const { inspectModel } = require("./model-metadata.cjs");
 const { createChatQueue } = require("./services/chat-queue.cjs");
 const { createLlmEngine, createLlmfitLookup } = require("./services/llm-engine.cjs");
@@ -234,6 +235,12 @@ const threadBudget = THREADS.mode === "on" ? createThreadBudget({
     voice: Boolean(tts.getGenerationState().active),
   }),
 }) : null;
+
+// Whisper logical-CPU cap (services/whisper-thread-cap.cjs). On by default: a transcription never passes whisper.cpp
+// more threads than os.cpus().length (unknown count: unchanged). USAP_WHISPER_THREAD_CAP=off, scheduler.json
+// "whisperThreadCap": "off" or USAP_SCHEDULER=off restore the previous behaviour exactly. Runs before the budget above.
+const WHISPER_CAP = whisperThreadCapSetting({ configDir: LLM_CONFIG_DIR, schedulerMode: schedulerMode({ configDir: LLM_CONFIG_DIR }) });
+const whisperThreadCap = WHISPER_CAP.mode === "on" ? createWhisperThreadCap({ setting: WHISPER_CAP, logicalCpus: () => os.cpus().length }) : null;
 
 // ── Backend process state ─────────────────────────────────────────────────────
 // Image generation (stable-diffusion.cpp, OpenVINO NPU, Core ML) lives in services/image-engine.cjs (Step 9.8g).
@@ -642,6 +649,7 @@ const speech = createSpeechService({
   helpers: { describeLinkedModel, detectedKindFor, findAvailableSpeechPort, findExistingFile, formatBytes, getPathSize, isWaveBuffer, pathInside, readdirVisible, safeOutputName },
   preferredPort: PREFERRED_SPEECH_PORT,
   threadBudget, // optional (Step 9.9e)
+  whisperThreadCap, // optional (logical-CPU cap; runs before threadBudget)
 });
 
 
@@ -1693,6 +1701,7 @@ if (SCHEDULER_MODE !== "off") {
     memoryChecks: memoryAdvisor ? () => memoryAdvisor.snapshot() : null,
     threads: THREADS,
     threadBudget: threadBudget ? () => threadBudget.snapshot() : null,
+    whisperThreadCap: whisperThreadCap ? () => whisperThreadCap.snapshot() : null,
     budget: hardware.budget,
     cpu: { logicalCores: () => os.cpus().length, physicalCores: () => getPhysicalCores() },
     engines: {

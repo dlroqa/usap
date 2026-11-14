@@ -154,6 +154,11 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   uses its usual count. The text and image engines' thread counts never change. Measured results vary by
   platform: large gains on Linux and Apple Silicon runners, smaller ones on macOS Intel, and on Windows a
   transcription next to a running chat was about 21% slower ([details](docs/roadmap/STEP9_9E_THREADS.md)).
+  Transcription never passes whisper.cpp more threads than the computer has logical CPUs (**Implemented**, on by
+  default, `USAP_WHISPER_THREAD_CAP=off` turns it off): a request for more, from the API, a saved setting or a
+  browser on another machine, runs with the logical CPU count instead, and the saved setting is kept. On the 3–4-CPU
+  CI runners measured, requests above the CPU count were always slower (by 3% up to 25×); the cap is not a promised
+  speed-up on other hardware ([details](docs/roadmap/STEP9_9E_THREADS.md#9-whisper-logical-cpu-cap-on-by-default)).
   [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
