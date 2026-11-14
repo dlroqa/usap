@@ -150,8 +150,10 @@ A per-job engine is busy while its job runs.
    `t = max(1, min(default, 2, B − 1))`. With 4 or more logical CPUs that is 2 (the measured value), with 3 it is
    2, with 2 it is 1, and with 1 it is 1 (no change possible). For whisper this is the `-t` value of that job; a job
    already running keeps its count (no mid-job change), so a chat that starts after a transcription still competes
-   with it until the transcription ends. The WebUI always sends its own `threads` setting (default 4, 1–32) with a
-   transcription, so the reduction applies to the requested value: `t = max(1, min(requested, 2, B − 1))`; alone,
+   with it until the transcription ends. The WebUI always sends its own `threads` setting (1–32; default
+   `min(8, navigator.hardwareConcurrency)`, 4 only when the browser reports no CPU count; see "Whisper thread
+   defaults" below) with a transcription, so the reduction applies to the requested value:
+   `t = max(1, min(requested, 2, B − 1))`; alone,
    the requested value is used unchanged, as today. Whether another workload is busy comes from server state
    (running chats, an image generation, a Kokoro job), never from the request.
    On macOS Intel the measurements show little benefit next to an image (transcription is starved either way);
@@ -227,8 +229,9 @@ any Intel-specific share.
 
 ## 5a. Recorded follow-ups (each needs its own review or approval)
 
-A logical-CPU cap for whisper requests (the WebUI default of 4 threads on a 3-vCPU Mac made a transcription alone
-take 21.8 s, against 5.4 s at 3 threads in the design runs; pre-existing, unchanged); Kokoro ONNX Runtime thread
+A logical-CPU cap for whisper requests (a request for 4 threads on the 3-vCPU macOS arm64 runner made a
+transcription alone take 21.8 s, against about 5.3 s at the server default of 3 threads in the design runs; these
+were different runs, see "Whisper thread defaults" below; pre-existing, unchanged); Kokoro ONNX Runtime thread
 control; llama.cpp `--poll` behaviour; further macOS Intel image optimization (Step
 9.11); an explicit `approximate` indicator for macOS memory readings (§6); Step 9.9f memory enforcement and
 running-request timeouts; P4-2 chat-screen attachment integration. None is part of this design or of the
@@ -254,8 +257,9 @@ physical memory), `"approximate"` for `vm-stat`, `"pessimistic"` for macOS free 
 ## 7. Whisper-only implementation results (#96; off by default)
 
 The approved part (§3 rule 3 for whisper only; `USAP_THREADS`, default off) was compared with the policy off and on
-in the same job on each target (run 43475991621, `thread-bench --set whisper`, transcriptions requesting 4 threads
-as the WebUI does). Medians, change from off to on:
+in the same job on each target (run 43475991621, `thread-bench --set whisper`, transcriptions explicitly requesting
+4 threads: equal to the logical CPUs on Linux, Windows and macOS Intel, one more than the 3 vCPUs on macOS arm64).
+Medians, change from off to on:
 
 | Window | Workload | Linux x64 | Windows x64 | macOS arm64 | macOS Intel |
 |---|---|---|---|---|---|
@@ -279,3 +283,62 @@ as the WebUI does). Medians, change from off to on:
 * **Activation:** not approved. Before any default change: broader benchmarks, an analysis of the Windows
   regression, and lower- and higher-core machines than the 3–4-vCPU runners measured here.
 
+
+## 8. Whisper thread defaults and the logical-CPU cap measurement (measurement only; nothing changed)
+
+**Whisper thread defaults (as implemented; unchanged).**
+
+* Server: `min(8, logical CPUs)` (`os.cpus().length`), used when a request sends no `threads` value. A request
+  (`POST /api/speech/transcribe?threads=…`, or `threads` in `POST /api/speech/start`) may ask for 1–32, and that
+  value is passed to `whisper-cli -t` unchanged (the optional 9.9e budget can only lower it during an overlap).
+* WebUI: `min(8, navigator.hardwareConcurrency)`, saved in the browser; **4 only when the browser reports no CPU
+  count**. 4 is not an unconditional default. The user can set 1–32.
+* So a transcription can ask for more threads than the server has: an API client, a user-set value, a browser that
+  hides or reduces its CPU count, or a LAN client whose browser runs on a machine with more CPUs than the server.
+  The image engine already caps its threads at the logical CPUs (§5, #9); whisper has no such cap.
+
+**Same-job sweep** (`thread-bench --set whisper-sweep`, manual workflow input `set=whisper-sweep`): one transcription
+at a time (whisper tiny.en, the 11 s JFK sample), nothing else busy, the requested thread counts rotated each round
+so each runs equally often in each position, one uncounted warm-up per count. Each block is run with no other engine
+loaded and again with the text engine loaded and idle; both blocks agree. Every job was checked against the studio
+log: the `-t` passed and whisper.cpp's own `n_threads = N / M` line matched the request, and whisper.cpp's own
+total time shows the same differences as the HTTP wall time. No transcription failed.
+
+Run 43540326157 (12 rounds) and run 43542533359 (8 rounds); medians, no other engine loaded:
+
+| Requested threads | macOS arm64 (3 vCPU) | macOS Intel (4) | Linux x64 (4) | Windows x64 (4) |
+|---|---|---|---|---|
+| 2 | 5.18 s | 1.74 s | 0.74 s | 1.38 s |
+| 3 (= arm64 server default) | 4.88 s | 1.45 s | 0.73 s | 1.26 s |
+| 4 (= server default on 4 vCPU) | **20.96 s, ×4.29** (95% CI 3.72–4.75 vs 3) | 1.37 s | 0.69 s | 1.15 s |
+| 5 (run 2, vs default) | ×7.5 | ×1.20 | ×1.03 | ×1.05 |
+| 6 (run 2) | ×14.3 | ×1.38 | ×1.03 | ×1.03 |
+| 8 (run 2) | ×25.2 (116.8 s vs 4.63 s) | ×1.57 | ×1.08 | ×1.05 |
+
+* **Up to the logical CPU count, more threads is faster or equal** on every target (Linux, Windows, macOS Intel
+  5–20% faster at 4 than at 2–3; macOS arm64 2 vs 3 within noise, CV 0.15–0.18).
+* **Above the logical CPU count, every target is slower**, and the size depends heavily on the build: 3–10% on
+  Linux and Windows, 13–57% on macOS Intel, and a super-linear cliff on macOS arm64 (×4 at one thread over, ×25 at
+  8 on 3 vCPUs). The cliff is in every rotation position (20.4–22.3 s at 4 threads), so it is not an ordering effect.
+* The macOS arm64 `whisper-cli` is the Homebrew ggml build: `use gpu = 1`, the paravirtual Metal device (MTL0), BLAS
+  and an OpenMP CPU thread pool. It is not a pure CPU run, and hosted-runner Metal is paravirtual, so the size of the
+  cliff on real Apple Silicon is unmeasured. All four builds report `OPENMP = 1`.
+* Limits: hosted 3–4-vCPU virtual machines only; Linux and Windows hosts had different CPU models between runs
+  (compare within a run); macOS has no CPU affinity API, so only `hw.ncpu`/`hw.activecpu` (3) are recorded; one
+  model (tiny.en) and one 11 s sample; no machine with more than 4 logical CPUs; no GPU or NPU validation.
+
+**Mechanism check** (run 43549674698, 8 rounds, the measurement studio started with `OMP_WAIT_POLICY=PASSIVE`, which
+whisper-cli inherits): the macOS arm64 cliff is unchanged (4 threads ×4.0–4.6, 6 threads ×12.9–14.4 vs 3), so OpenMP
+spin-waiting does not explain it. On macOS Intel the slowdown at 6 threads fell from ×1.34–1.38 to ×1.21–1.22, and on
+Linux from ×1.03–1.04 to ×1.01–1.02 (Windows ×1.03 → ×1.02, within noise), so spin-waiting is part of the smaller cost
+there. (The first Windows attempt failed before measuring: Kokoro's model load in the unchanged engine-validation
+step returned `system error number 13`; the re-run of that job passed with no failed check.) The cause of the
+macOS arm64 cliff is **not identified** (candidates: ggml's own barrier waiting for a descheduled thread, the
+Metal/CPU split of this build, or the virtual machine's scheduler). The measured fact is only that requesting
+more threads than the logical CPUs is slower on every target, and much slower on macOS arm64.
+
+**Proposed follow-up (not implemented; needs separate approval).** Cap the `-t` of each transcription at the
+server's logical CPU count, before the optional 9.9e budget; keep any request at or below the cap unchanged;
+report the requested and used counts (numbers only) additively; provide a setting to turn the cap off. No engine
+restart; llama.cpp, sd.cpp and Kokoro unchanged; the 9.9e budget stays off by default. Whether the cap is on by
+default is a separate owner decision.
