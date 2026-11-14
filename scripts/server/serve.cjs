@@ -36,6 +36,7 @@ const { imageRoutes } = require("./routes/image.cjs");
 const { llmRoutes } = require("./routes/llm.cjs");
 const { resourceRoutes } = require("./routes/resources.cjs");
 const { createScheduler, schedulerMode, chatQueueSetting } = require("./services/scheduler.cjs");
+const { chatTimeoutSetting, createChatTimeouts, httpMetricsFetcher } = require("./services/chat-timeouts.cjs");
 const { createMemoryAdvisor, memoryCheckSetting } = require("./services/memory-check.cjs");
 const { createThreadBudget, threadsSetting } = require("./services/thread-budget.cjs");
 const { createWhisperThreadCap, whisperThreadCapSetting } = require("./services/whisper-thread-cap.cjs");
@@ -1684,8 +1685,16 @@ router.use(modelRoutes({
 // Chat requests and saved conversations (Step 9.8h): services/chat.cjs and services/conversations.cjs.
 // Step 9.9c: bounded chat queue, off unless turned on (USAP_CHAT_QUEUE=on or app/config/scheduler.json).
 const CHAT_QUEUE = chatQueueSetting({ configDir: LLM_CONFIG_DIR });
+// Step 9.9f-1: chat-engine timeouts (services/chat-timeouts.cjs). Off by default; read at start-up.
+const CHAT_TIMEOUTS = chatTimeoutSetting({ configDir: LLM_CONFIG_DIR, schedulerMode: schedulerMode({ configDir: LLM_CONFIG_DIR }) });
+for (const x of CHAT_TIMEOUTS.ignored) console.warn(`  [timeouts] ignored ${x.name} from ${x.source} (${x.reason}); using the next setting or the default`);
+const chatTimeouts = CHAT_TIMEOUTS.mode === "off" ? null : createChatTimeouts({
+  setting: CHAT_TIMEOUTS,
+  engine: () => ({ seq: llmEngine.state.llmProcSeq, ready: Boolean(llmEngine.state.llmReady && llmEngine.state.llmProc), port: llmEngine.state.PORT_LLM }),
+  fetchMetrics: httpMetricsFetcher(http),
+});
 if (CHAT_QUEUE.mode === "on") console.log(`  [scheduler] Chat queue on: ${CHAT_QUEUE.limit} waiting at most, ${Math.round(CHAT_QUEUE.maxWaitMs / 1000)} s longest wait.`);
-const chatService = createChatService({ promptProtections: () => protectionSettings({ configDir: LLM_CONFIG_DIR }), chatQueue: CHAT_QUEUE.mode === "on" ? createChatQueue({ limit: CHAT_QUEUE.limit, maxWaitMs: CHAT_QUEUE.maxWaitMs }) : null, state: llmEngine.state, errorBody, errorStatus, http, json, redactPaths: errors.redactPaths, requestJson, runExclusiveLlmOperation, startLlm, webSearch });
+const chatService = createChatService({ chatTimeouts, promptProtections: () => protectionSettings({ configDir: LLM_CONFIG_DIR }), chatQueue: CHAT_QUEUE.mode === "on" ? createChatQueue({ limit: CHAT_QUEUE.limit, maxWaitMs: CHAT_QUEUE.maxWaitMs }) : null, state: llmEngine.state, errorBody, errorStatus, http, json, redactPaths: errors.redactPaths, requestJson, runExclusiveLlmOperation, startLlm, webSearch });
 const conversations = createConversationStore({ CHAT_HISTORY, badRequest, formatBytes, fs, path, pathInside, readdirVisible, safeOutputName });
 router.use(llmRoutes({
   state: llmEngine.routeState, PREFERRED_LLM_PORT, benchmarkLlmModel, deleteChatConversation: conversations.deleteChatConversation, doLlmChat: chatService.doLlmChat, errorBody, errorStatus, getLlmBackend, getLlmBackendProbe, getLlmRuntimeStats, getLlmfitRecommendations: (...args) => createLlmfitLookup({ ROOT, fs, getGpuInfo, os, osPlatform, path, spawnSync }).getLlmfitRecommendations(...args), getPersistedLlmModelSettings, json, jsonErrorStatus, killLlm, listChatConversations: conversations.listChatConversations, llmEngineState, llmLifecycleSnapshot, path, publicPaths, readJsonBody, runExclusiveLlmOperation, saveChatConversation: conversations.saveChatConversation, startLlm, stopLlmNow, updateLlmModelSettings,
@@ -1697,6 +1706,7 @@ if (SCHEDULER_MODE !== "off") {
   const img = imageEngine.state;
   const scheduler = createScheduler({
     chatQueue: CHAT_QUEUE,
+    chatTimeouts: chatTimeouts ? () => chatTimeouts.snapshot() : null,
     memoryCheck: MEMORY_CHECK,
     memoryChecks: memoryAdvisor ? () => memoryAdvisor.snapshot() : null,
     threads: THREADS,

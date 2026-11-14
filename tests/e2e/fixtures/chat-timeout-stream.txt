@@ -1,0 +1,6 @@
+data: {"choices":[{"index":0,"delta":{"content":"partial-1 "}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"partial-2 "}}]}
+
+data: {"error":{"message":"The text engine stopped responding (no output for 120 s). The answer is incomplete; the request was stopped.","code":"ENGINE_TIMEOUT","phase":"idle"}}
+

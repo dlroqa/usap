@@ -1,7 +1,8 @@
 # Step 9.9f, first substage: chat-engine timeouts, cancellation and cleanup (design)
 
-Status: **design, for review. Nothing here is implemented.** The implementation is a separate PR, with the
-new behaviour **off by default**. Each merge, and any later change of default, needs separate owner approval.
+Status: design merged (#100). **Implemented, off by default** (`chatTimeouts: "off"`), with the corrections
+in §11 ("As built"), which take precedence over §2–§7 where they differ. Any change of default needs separate
+owner approval.
 
 Scope: text chat only (`POST /api/llm/chat`, streaming and non-streaming, to llama-server). Out of scope:
 memory-aware admission (enforced memory check), image/speech/voice queues, P4-2, engine restarts, and any
@@ -50,11 +51,14 @@ Other facts this design depends on:
   * For a hung engine (a stuck backend or driver, a suspended or swapped-out process) it **never** happens.
 * **Therefore: closing the HTTP connection does not prove the engine stopped computing.** The studio must
   never treat an abort as "engine free".
-* **Confirmation signal.** The studio already starts llama-server with `--metrics`. `GET /metrics` is answered
-  by the same main loop (a `METRICS` task) and reports `requests_processing`. A `/metrics` answer showing
-  `requests_processing 0` means the main loop has returned to its queue and holds no running request: computation
-  has stopped. No answer within a bounded time means the main loop is busy or stuck: cancellation is
-  **unconfirmed**. The real-model chat-queue check (`scripts/ci/chat-queue-validate.cjs`) already uses this
+* **Confirmation signal** (corrected after reading `server-queue.cpp` and `server-context.cpp`; see §11).
+  The studio already starts llama-server with `--metrics`. `GET /metrics` posts a high-priority `METRICS` task.
+  It is answered **even while a decode runs**: during `yield_to_queue` a worker thread handles `METRICS` and
+  `SLOT_GET`, and declines everything else, including `CANCEL`, until the decode is done. During a decode the slot
+  doing it is counted in `requests_processing`. A slot stops counting only when it is released, which happens
+  between decodes. So `requests_processing 0` with `requests_deferred 0`, read after the abort, means no slot is
+  computing. "No answer" is not the busy signal (a busy engine answers with 1); it means a stuck or suspended
+  process, which also never confirms anything. The real-model chat-queue check (`scripts/ci/chat-queue-validate.cjs`) already uses this
   signal: after a client cancelled a **streaming request during generation**, it observed `requests_processing`
   back to 0 (within about 2.1 s, including its own polling interval) and no further tokens, on all 4 targets
   (native run 43536307834). That covers a healthy engine during generation only: not prompt evaluation, not
@@ -335,3 +339,64 @@ error message.
 3. Manual `observe` measurements on the native targets → evidence → owner review of 600 s / 120 s.
 4. Any default change (`observe` or `on`) is a separate approval. Rollback at every step: `chatTimeouts: "off"`,
    `USAP_CHAT_TIMEOUTS=off`, or `USAP_SCHEDULER=off`.
+
+## 11. As built (Step 9.9f-1 implementation)
+
+Where this section differs from §2–§7, this section is what the code does.
+
+* **Files:** `scripts/server/services/chat-timeouts.cjs` (setting, counters, engine guard),
+  `scripts/server/services/chat.cjs` (per-request deadlines, settlement, gate, queue-slot hand-over),
+  `scripts/server/services/scheduler.cjs` (additive report) and `scripts/server/serve.cjs` (wiring). With the
+  mode `off`, the chat service gets no timeout object, and every path is the previous code.
+* **Confirmation rule (stricter than §6).** A cancellation counts as confirmed only when **all** of these hold:
+  1. two `/metrics` readings, each from a probe **sent after the latest abort**;
+  2. both show `requests_processing 0` and `requests_deferred 0`;
+  3. they are at least 3 s apart (more than twice llama-server's 1 s `HTTP_POLLING_SECONDS`, the interval at which
+     its handler notices a closed connection and posts the `CANCEL`);
+  4. `n_decode_total`, `tokens_predicted_total` and `prompt_tokens_total` didn't change between them, so no decode
+     ran in between;
+  5. both carry the same `Process-Start-Time-Unix` header;
+  6. the studio's engine sequence number (`llmProcSeq`, one per spawned process) was the same when each probe was
+     sent and when it was answered.
+
+  A reading that is missing, malformed, from another process or engine, sent before the latest abort, or
+  contradictory (anything deferred, counters moving) resets the check. Only one probe is in flight at a time,
+  and each is limited to 5 s. These readings don't identify the cancelled request: they show that **nothing** is
+  computing, which is the condition for sending the next chat. llama-server's idle-sleep mode (which would answer
+  from a cache) is off unless `--sleep-idle-seconds` is passed, and the studio doesn't pass it.
+* **Engine identity.** The guard records the sequence number of the engine the aborted request was sent to.
+  * An abort for an older process is ignored.
+  * A new process that has become ready ends CONFIRMING or UNRESPONSIVE at once: the studio starts a new engine
+    only after stopping the previous one (SIGTERM, then SIGKILL, then waiting for the port), so the uncertain work
+    ended with that process. This covers a model load or reload and the supervisor's crash restart.
+  * Answers that arrive late from the old process are discarded.
+* **Experimental settings:** the confirmation window and the UNRESPONSIVE probe interval are settings, not fixed
+  constants:
+  * `chatCancelConfirmSeconds` / `USAP_CHAT_CANCEL_CONFIRM_SECONDS`: 10–600 s, default 120;
+  * `chatUnresponsiveProbeSeconds` / `USAP_CHAT_UNRESPONSIVE_PROBE_SECONDS`: 5–300 s, default 15.
+
+  They are validated like the two limits: whole seconds only; anything else is ignored and logged, never
+  clamped. Fixed constants: probe interval while CONFIRMING 1 s, per-probe limit 5 s, quiet gap 3 s,
+  Retry-After 30 s.
+* **Queue-slot hand-over.** With the queue on, a request whose engine work was aborted hands its slot to the
+  confirmation: the queue's `release()` runs when CONFIRMING ends, either confirmed or on entering UNRESPONSIVE.
+  The next waiting request (FIFO) is then granted, and still passes the gate. Without the queue, each chat passes
+  the same gate before anything is sent. While CONFIRMING it waits there (bounded by the window); while
+  UNRESPONSIVE it is refused at once.
+* **Keep-alives.** An engine body chunk made only of SSE comment lines (`: …`) or blank lines is passed through,
+  but doesn't re-arm the idle deadline and doesn't end the first-byte deadline. llama.cpp `b11418` sends no such
+  keep-alives; this only keeps a future one from hiding a stall.
+* **Client cancellation:**
+  * **on:** streaming as before, plus the abort enters confirmation. Non-streaming requests are now aborted too.
+  * **observe:** the legacy behaviour exactly (the streaming abort only), and it is only counted.
+  * **off:** legacy.
+* **Report:** `chatTimeouts.counts` holds:
+  * `firstByte`, `idle`, `total`: the three timeout kinds;
+  * `clientCancelled`;
+  * `cancelConfirmed`, `cancelUnconfirmed`: the outcome of confirmation;
+  * `recovered`, `engineReplaced`: the two ways out of UNRESPONSIVE;
+  * `refusedUnresponsive`;
+  * `probes`, `probesRejected`.
+
+  Plus `last` (outcome, stream flag, elapsed and confirmation seconds, time). In observe, `wouldHaveTimedOut`;
+  in on, `engine` (`ready` / `confirming` / `unresponsive`).

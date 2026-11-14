@@ -159,6 +159,13 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   browser on another machine, runs with the logical CPU count instead, and the saved setting is kept. On the 3–4-CPU
   CI runners measured, requests above the CPU count were always slower (by 3% up to 25×); the cap is not a promised
   speed-up on other hardware ([details](docs/roadmap/STEP9_9E_THREADS.md#9-whisper-logical-cpu-cap-on-by-default)).
+  Chat-engine timeouts (Step 9.9f-1, **Implemented**, off by default; `USAP_CHAT_TIMEOUTS=observe` only records,
+  `on` enforces) end a chat whose engine stops responding: 600 s to the first output and 120 s between outputs
+  (experimental values, configurable), and non-streaming chats keep their existing 300 s limit. The engine request is
+  cancelled, never retried, and the engine is never restarted. A closed connection isn't taken as proof that the
+  engine stopped: no new chat is sent to it until its own `/metrics` shows it idle, and if that can't be confirmed,
+  chats get `503 ENGINE_UNRESPONSIVE` until it is idle or the model is reloaded. CI checks it with a real model on
+  all 4 OS, including a suspended engine ([details](docs/roadmap/STEP9_9F_TIMEOUTS.md)).
   [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).

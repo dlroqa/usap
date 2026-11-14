@@ -18,6 +18,11 @@
 //   MODE:hold       like delay, but the end waits for POST /fake/release, so a test controls exactly when the
 //                   request finishes instead of racing a timer. A safety limit (HOLD_MAX_MS) ends it anyway and
 //                   counts it in stats.holdTimeouts, which tests assert is 0.
+//   MODE:stall      streaming: the status line, then nothing; non-streaming: nothing at all (Step 9.9f-1)
+//   MODE:partial-stall  streaming: 2 chunks, then nothing (Step 9.9f-1)
+// GET /metrics answers like llama-server's (Prometheus text, Process-Start-Time-Unix header): requests_processing
+// is the number of chat requests still open, plus POST /fake/busy {"ms": N} extra time after one closes ("engine
+// still computing after the abort"); POST /fake/metrics {"mode":"hang"|"missing"|"no-header"|"normal"} breaks it.
 // GET /fake/stats reports {requests, completed, aborted, pid, held, holdTimeouts} so tests can observe aborts;
 // POST /fake/release ends every held request now (and is harmless when nothing is held);
 // GET /fake/last returns the last chat request body as received (prompt order and role checks).
@@ -41,7 +46,12 @@ if (args.includes("--version")) { console.log("version: 0 (contract-test fake ll
 if (args.includes("--help") || args.includes("--list-devices")) { console.log("contract-test fake llama-server"); process.exit(0); }
 const model = path.basename(arg("--model", "fake.gguf"));
 const WORDS = ["Contract", " test", " reply."];
-const stats = { requests: 0, completed: 0, aborted: 0, pid: process.pid, held: 0, holdTimeouts: 0 };
+const stats = { requests: 0, completed: 0, aborted: 0, pid: process.pid, held: 0, holdTimeouts: 0, open: 0, metricsRequests: 0 };
+const START = String(Math.floor(Date.now() / 1000));
+let metricsMode = "normal";
+let busyTailMs = 0;
+let busyUntil = 0;
+let decodes = 0;
 const HOLD_MAX_MS = 30000;
 const held = new Set(); // end functions of requests in MODE:hold
 let lastBody = null;
@@ -60,7 +70,7 @@ function modeOf(body) {
   const d = text.match(/MODE:delay=(\d+)/);
   if (d) return { name: "delay", ms: Math.min(60000, Number(d[1])), tag };
   if (/MODE:hold\b/.test(text)) return { name: "hold", tag };
-  const m = text.match(/MODE:(count=(\d+)|http-error|error-cut|crash-mid|slow|echo|oom|garbage)/);
+  const m = text.match(/MODE:(count=(\d+)|http-error|error-cut|crash-mid|slow|echo|oom|garbage|partial-stall|stall)/);
   if (!m) return { name: "default" };
   return m[2] ? { name: "count", n: Math.min(500, Number(m[2])) } : { name: m[1] };
 }
@@ -81,12 +91,40 @@ const server = http.createServer((req, res) => {
     for (const end of [...held]) end();
     res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ released: n }));
   }
+  if (req.url.startsWith("/metrics")) {
+    stats.metricsRequests++;
+    if (metricsMode === "hang") return; // never answers (a stuck engine)
+    const processing = stats.open + (Date.now() < busyUntil ? 1 : 0);
+    const lines = metricsMode === "missing" ? ["llamacpp:prompt_tokens_total 1"] : [
+      `llamacpp:prompt_tokens_total ${decodes}`, `llamacpp:tokens_predicted_total ${decodes}`, `llamacpp:n_decode_total ${decodes}`,
+      `llamacpp:requests_processing ${processing}`, "llamacpp:requests_deferred 0"];
+    const headers = { "content-type": "text/plain; version=0.0.4" };
+    if (metricsMode !== "no-header") headers["Process-Start-Time-Unix"] = START;
+    res.writeHead(200, headers);
+    return res.end(lines.map((l) => `# TYPE x gauge\n${l}`).join("\n") + "\n");
+  }
+  if ((req.url.startsWith("/fake/metrics") || req.url.startsWith("/fake/busy")) && req.method === "POST") {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      let b = {};
+      try { b = JSON.parse(raw || "{}"); } catch (_) { /* empty */ }
+      if (req.url.startsWith("/fake/metrics")) metricsMode = ["hang", "missing", "no-header", "normal"].includes(b.mode) ? b.mode : "normal";
+      else busyTailMs = Math.max(0, Math.min(120000, Number(b.ms) || 0));
+      res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ metricsMode, busyTailMs }));
+    });
+    return;
+  }
   if (req.url.startsWith("/fake/stats")) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify(stats)); }
   if (req.url.startsWith("/v1/chat/completions") && req.method === "POST") {
     let raw = "";
     req.on("data", (c) => { raw += c; });
     req.on("end", () => {
       stats.requests++;
+      stats.open++;
+      decodes++;
+      let closed = false;
+      res.on("close", () => { if (closed) return; closed = true; stats.open--; if (busyTailMs) busyUntil = Date.now() + busyTailMs; });
       let body = {};
       try { body = JSON.parse(raw || "{}"); } catch (_) { /* empty */ }
       lastBody = body;
@@ -109,6 +147,10 @@ const server = http.createServer((req, res) => {
         res.writeHead(400, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: { code: 400, message: "fake engine rejected the request", type: "invalid_request_error" } }));
       }
+      if (mode.name === "stall" && !body.stream) {
+        res.on("close", () => { if (!res.writableEnded) stats.aborted++; });
+        return; // never answers
+      }
       if (!body.stream) {
         stats.completed++;
         res.writeHead(200, { "content-type": "application/json" });
@@ -118,6 +160,12 @@ const server = http.createServer((req, res) => {
         }));
       }
       res.writeHead(200, { "content-type": "text/event-stream" });
+      if (mode.name === "stall" || mode.name === "partial-stall") {
+        res.flushHeaders();
+        if (mode.name === "partial-stall") { res.write(chunk("partial-1 ")); res.write(chunk("partial-2 ")); decodes += 2; }
+        res.on("close", () => { if (!res.writableEnded) stats.aborted++; });
+        return; // then nothing: the studio's deadlines must end it
+      }
       if (mode.name === "garbage") {
         stats.completed++;
         res.write("this is not an event stream\n");
