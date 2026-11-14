@@ -227,7 +227,9 @@ any Intel-specific share.
 
 ## 5a. Recorded follow-ups (each needs its own review or approval)
 
-Kokoro ONNX Runtime thread control; llama.cpp `--poll` behaviour; further macOS Intel image optimization (Step
+A logical-CPU cap for whisper requests (the WebUI default of 4 threads on a 3-vCPU Mac made a transcription alone
+take 21.8 s, against 5.4 s at 3 threads in the design runs; pre-existing, unchanged); Kokoro ONNX Runtime thread
+control; llama.cpp `--poll` behaviour; further macOS Intel image optimization (Step
 9.11); an explicit `approximate` indicator for macOS memory readings (§6); Step 9.9f memory enforcement and
 running-request timeouts; P4-2 chat-screen attachment integration. None is part of this design or of the
 whisper-only implementation.
@@ -248,3 +250,32 @@ physical memory), `"approximate"` for `vm-stat`, `"pessimistic"` for macOS free 
 * Tests: unit cases per source, the server test checks the field, and `memory-check-report.cjs` prints it.
   Native rows would show `approximate` on both macOS targets.
 * Not done here: it changes the 9.9d implementation, so it needs its own approval and PR.
+
+## 7. Whisper-only implementation results (#96; off by default)
+
+The approved part (§3 rule 3 for whisper only; `USAP_THREADS`, default off) was compared with the policy off and on
+in the same job on each target (run 43475991621, `thread-bench --set whisper`, transcriptions requesting 4 threads
+as the WebUI does). Medians, change from off to on:
+
+| Window | Workload | Linux x64 | Windows x64 | macOS arm64 | macOS Intel |
+|---|---|---|---|---|---|
+| chat + transcription | chat | −51% | −36% | −74% | +1% |
+| chat + transcription | transcription | −71% | **+21%** | −89% | −25% (n = 1 per mode) |
+| voice + transcription | voice | −22% | +2% | −24% | −30% |
+| voice + transcription | transcription | −49% | +1% | −85% | −32% |
+| image + transcription | image | −22% | −4% | −31% | 0% |
+| image + transcription | transcription | −47% | +1% | −86% | −23% |
+
+* **Alone, nothing changes.** The server logs show a reduction only for transcriptions that overlapped another job:
+  on Linux and both Macs the count is exactly the overlapping background jobs minus the one per window that
+  started after the front job finished (117/120, 30/33, 34/37); Windows 45/51; off, none. Differences in the
+  alone rows (−22% to +17%) are run-to-run noise with identical `-t` values.
+* **Not universally beneficial.** Linux and macOS arm64 gain in every overlap; macOS Intel gains for transcription
+  and voice only; on **Windows a transcription behind a running chat is about 21% slower** (1.31 → 1.58 s) while
+  the chat is 36% faster, and the other Windows overlaps change by 4% or less.
+* **Weak evidence:** overlap CVs reach 0.5–1.3 on macOS arm64, and macOS Intel's chat + transcription completed one
+  background transcription per mode. Two runs earlier on the same targets showed run-to-run differences of up to
+  90% from different host CPUs (§2 Repeatability).
+* **Activation:** not approved. Before any default change: broader benchmarks, an analysis of the Windows
+  regression, and lower- and higher-core machines than the 3–4-vCPU runners measured here.
+

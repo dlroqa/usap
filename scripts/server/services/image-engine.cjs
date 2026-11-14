@@ -436,7 +436,19 @@ function createImageEngine(deps) {
     });
   }
 
+  // Step 9.9e: generation requests in flight through this proxy (counted only; nothing is limited or delayed).
+  // Server state the thread budget reads to know an image is being generated, alongside generationState, which
+  // follows the engine's log and can lag at the start of a generation.
+  let generationsInFlight = 0;
+
   function proxyImageBackendRequest(req, res) {
+    if (req.method === "POST" && /^\/sdapi\/v1\/(txt2img|img2img)(?:[?#]|$)/.test(String(req.url || ""))) {
+      generationsInFlight += 1;
+      let counted = true;
+      const done = () => { if (counted) { counted = false; generationsInFlight = Math.max(0, generationsInFlight - 1); } };
+      res.once("close", done);
+      res.once("finish", done);
+    }
     const headers = withoutAuthHeaders(req.headers); // USAP credentials stay in USAP
     delete headers.host;
     headers.host = `127.0.0.1:${PORT_BACKEND}`;
@@ -1272,6 +1284,7 @@ function createImageEngine(deps) {
       set backendLoadState(value) { backendLoadState = value; },
       set PORT_BACKEND(value) { PORT_BACKEND = value; },
     }),
+    activeGenerations: () => generationsInFlight, // Step 9.9e (read-only)
     fns: { backendSupportsFlags, BACKEND_RESTART_SETTING_KEYS, normalizeBackendSettingValue, backendSettingsMatch, setBackendLoadStage, updateCoreMLLoadProgress, findAvailableBackendPort, getCoreMLPythonPath, backendAccepts, selectBackendPath, resolveBackendType, getBackendMode, markBackendReady, pingBackendReady, proxyImageBackendRequest, killOpenVinoWorker, getOpenVinoResolution, startOpenVinoWorker, generateWithOpenVino, startBackendReadyPoll, startCoreMLLoadHeartbeat, killBackend, startBackend, resetGenerationState, describeBackendError, describeBackendExitCode, saveGeneratedOutput, listGeneratedOutputs, deleteGeneratedOutputs },
   };
 }
