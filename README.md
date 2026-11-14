@@ -151,7 +151,9 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   never refuses or changes a load, says "unknown" when it can't tell, and doesn't assess GPU memory. A thread budget
   for transcription (Step 9.9e, **Experimental**, off by default, `USAP_THREADS=on` turns it on) gives whisper.cpp
   fewer threads while a chat, an image or a voice job is busy, to reduce CPU oversubscription; alone, transcription
-  uses its usual count. The text and image engines' thread counts never change.
+  uses its usual count. The text and image engines' thread counts never change. Measured results vary by
+  platform: large gains on Linux and Apple Silicon runners, smaller ones on macOS Intel, and on Windows a
+  transcription next to a running chat was about 21% slower ([details](docs/roadmap/STEP9_9E_THREADS.md)).
   [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
