@@ -248,6 +248,7 @@ async function signalChecks(srv) {
 
   await scenario("abort during prompt evaluation stops computation", async () => {
     const lp = await longPrompt(ep);
+    const before = await metrics(ep);
     const h = call(ep, "POST", "/v1/chat/completions", { messages: [{ role: "user", content: lp.text }], max_tokens: 64, temperature: 0, stream: true });
     // Wait until the engine reports the request processing while no output has been produced yet.
     let seen = null;
@@ -271,7 +272,9 @@ async function signalChecks(srv) {
     const r = await h.promise;
     record("transport abort during prompt evaluation (HTTP only; not proof)", r.ended ? "FAIL" : "PASS", `connection closed by the client after ${abortAt - h.t0} ms`);
     const s = await observeStop(ep, abortAt);
-    record("after that abort, computation stopped (metrics quiet, counters still for 3 s)", s.stopped ? "PASS" : "FAIL", s.detail);
+    const end = await metrics(ep);
+    record("after that abort, computation stopped (metrics quiet, counters still for 3 s)", s.stopped ? "PASS" : "FAIL",
+      `${s.detail}; after the abort the engine still evaluated prompt tokens up to ${end.prompt_tokens_total - before.prompt_tokens_total} of ${lp.tokens} and generated ${end.tokens_predicted_total - before.tokens_predicted_total} (an HTTP abort doesn't stop it at once)`);
   });
 
   await scenario("abort during decoding stops computation", async () => {
@@ -304,25 +307,44 @@ async function signalChecks(srv) {
   });
 }
 
+// Ground truth after the studio says "ready": the engine computes nothing more (checked with our own readings).
+async function noComputeAfter(label) {
+  const ep = currentEnginePort;
+  const a = await metrics(ep);
+  await sleep(10000);
+  const b = await metrics(ep);
+  record(`${label}: no engine computation after the studio's confirmation (10 s)`, quiet(a) && quiet(b) && counters(a) === counters(b) && a.start === b.start ? "PASS" : "FAIL",
+    `counters ${counters(a)} → ${counters(b)}, processing ${a?.requests_processing}/${b?.requests_processing}`);
+}
+let currentEnginePort = null;
+
 // ── C: through the studio, mode on ──────────────────────────────────────────────────────────────────────
 async function studioChecks(srv) {
   const ep = srv.enginePort;
+  currentEnginePort = ep;
   const pid = srv.enginePids[0];
   const r0 = await timeoutsReport();
   record("on (environment only): /api/resources reports the limits", r0 && r0.mode === "on" && r0.idleSeconds === 10 && r0.firstByteSeconds === 30 && r0.nonStreamTotalSeconds === 300 && r0.engine === "ready" ? "PASS" : "FAIL", JSON.stringify(r0 || null).slice(0, 300));
 
   await scenario("studio: client cancel during prompt evaluation is confirmed by /metrics", async () => {
     const lp = await longPrompt(ep);
+    const busyBase = await metrics(ep);
     const h = call(PORT, "POST", "/api/llm/chat", { messages: [{ role: "user", content: lp.text }], max_tokens: 64, temperature: 0, stream: true });
     const busy = await waitUntil(async () => (await metrics(ep))?.requests_processing >= 1, 30000, 50);
     if (!busy) { const r = await h.promise; throw new Error(`the request never reached the engine (studio answered ${r.status}: ${r.text.slice(0, 160)})`); }
     h.abort();
+    const abortAt = Date.now();
     const confirming = await waitUntil(async () => ["confirming", "ready"].includes((await timeoutsReport())?.engine) && (await timeoutsReport()).counts.clientCancelled >= 1, 5000, 50);
     const ready = await waitUntil(async () => (await timeoutsReport())?.engine === "ready" && (await timeoutsReport()).counts.cancelConfirmed >= 1, 30000, 200);
     const rep = await timeoutsReport();
     const m = await metrics(ep);
     record("studio: client cancel → CONFIRMING → confirmed by two quiet /metrics readings", confirming && ready && quiet(m) ? "PASS" : "FAIL",
-      `clientCancelled ${rep?.counts?.clientCancelled}, cancelConfirmed ${rep?.counts?.cancelConfirmed}, confirmSeconds ${rep?.last?.confirmSeconds}, engine ${rep?.engine}, processing ${m?.requests_processing}`);
+      `clientCancelled ${rep?.counts?.clientCancelled}, cancelConfirmed ${rep?.counts?.cancelConfirmed}, confirmSeconds ${rep?.last?.confirmSeconds} (validator saw it after ${Math.round((Date.now() - abortAt) / 100) / 10} s), engine ${rep?.engine}, processing ${m?.requests_processing}`);
+    // Ground truth: the engine must not compute anything after the studio called it stopped.
+    await sleep(10000);
+    const later = await metrics(ep);
+    record("studio: no engine computation after the confirmation (counters unchanged 10 s later)", quiet(later) && counters(later) === counters(m) && later.start === m.start ? "PASS" : "FAIL",
+      `counters at confirmation ${counters(m)}, 10 s later ${counters(later)}; prompt tokens evaluated for the cancelled request ${m.prompt_tokens_total - busyBase.prompt_tokens_total} of ${lp.tokens}, tokens generated ${m.tokens_predicted_total - busyBase.tokens_predicted_total}`);
   });
 
   // Suspension. Set it up once, honestly: UNSUPPORTED only if it can't be done at all.
@@ -357,6 +379,7 @@ async function studioChecks(srv) {
       record("engine resumed (never left suspended)", ok ? "PASS" : "FAIL", `pid still suspended: ${!ok}`);
     }
     const back = await waitUntil(async () => (await timeoutsReport())?.engine === "ready", 40000, 500);
+    await noComputeAfter("after resuming the mid-stream suspension");
     const pidsNow = listenerPids(ep).filter((p) => p !== srv.child.pid);
     const after = await call(PORT, "POST", "/api/llm/chat", { messages: [{ role: "user", content: `[${++promptSeq}] Say ok.` }], max_tokens: 8, temperature: 0, stream: true }).promise;
     const rep = await timeoutsReport();
@@ -378,6 +401,7 @@ async function studioChecks(srv) {
       record("engine resumed after the first-byte check", ok ? "PASS" : "FAIL", `resumed ${ok}`);
     }
     const back = await waitUntil(async () => (await timeoutsReport())?.engine === "ready", 60000, 500);
+    await noComputeAfter("after resuming the first-byte suspension");
     const after = await call(PORT, "POST", "/api/llm/chat", { messages: [{ role: "user", content: `[${++promptSeq}] Say ok.` }], max_tokens: 8, temperature: 0, stream: false }).promise;
     record("after the first-byte check: ready again and chat works without a restart", back && after.status === 200 && listenerPids(ep).includes(pid) ? "PASS" : "FAIL", `engine ${(await timeoutsReport())?.engine}, chat ${after.status}`);
   });
