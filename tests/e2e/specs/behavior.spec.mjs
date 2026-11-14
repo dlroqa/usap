@@ -1,5 +1,6 @@
 // Behaviour regression tests for the original UI's main tasks (mock API).
 import { test, expect, openRoute, ROUTES, MODEL_FILE, sse } from "../support/test.mjs";
+import { readFileSync } from "node:fs";
 
 const nav = (page, label) => page.getByRole("navigation", { name: "Main" }).getByRole("button", { name: label, exact: true });
 const sidebarItem = (page, label) => page.getByRole("complementary", { name: "Sidebar" }).getByRole("button", { name: label, exact: true }).first();
@@ -216,6 +217,33 @@ test.describe("chat error states", () => {
     await expect(page.getByText("Hello from the fixture model.")).toBeVisible();
     await page.waitForTimeout(500);
     await expect(page.locator(".chat-thinking-title")).toHaveText(/^Thought process/, { timeout: 2000 });
+  });
+
+  // Step 9.9f-1 (chat timeouts, off by default): the exact bytes the server sends when a stream stalls after partial
+  // output. scripts/tests/chat-timeouts.test.cjs checks that the server produces this fixture byte for byte.
+  const timeoutStream = () => ({ status: 200, contentType: "text/event-stream", body: readFileSync(new URL("../fixtures/chat-timeout-stream.txt", import.meta.url), "utf8") });
+
+  test("a streaming timeout (ENGINE_TIMEOUT event, no [DONE]) is shown as an error, not as a finished reply [9.9f-1]", async ({ page, mockApi }) => {
+    mockApi.chat = timeoutStream;
+    await openRoute(page, "chat");
+    await page.getByRole("textbox", { name: "Message" }).fill("stall please");
+    await page.getByRole("button", { name: "Send message" }).click();
+    await expect(page.locator(".chat-bubble.error")).toHaveCount(1);
+    await expect(page.locator(".chat-bubble.error")).toContainText("The text engine stopped responding (no output for 120 s)");
+    await expect(page.getByRole("textbox", { name: "Message" })).toBeEnabled();
+    // Existing WebUI behaviour (unchanged): the error replaces the partial reply, and is saved as an error.
+    await expect(page.getByText("partial-1")).toHaveCount(0);
+    await expect.poll(() => JSON.stringify([...mockApi.conversations.values()].map((c) => c.messages))).toContain("Error: The text engine stopped responding");
+    expect(JSON.stringify([...mockApi.conversations.values()].map((c) => c.messages))).not.toContain("partial-2");
+  });
+
+  test("a 504 ENGINE_TIMEOUT before streaming started is shown as an error [9.9f-1]", async ({ page, mockApi }) => {
+    mockApi.chat = () => ({ status: 504, contentType: "application/json", body: JSON.stringify({ ok: false, code: "ENGINE_TIMEOUT", phase: "first-byte", error: "The text engine didn't start answering within 600 s. The request was stopped; try again, or reload the model if this keeps happening." }) });
+    await openRoute(page, "chat");
+    await page.getByRole("textbox", { name: "Message" }).fill("no first byte");
+    await page.getByRole("button", { name: "Send message" }).click();
+    await expect(page.locator(".chat-bubble.error")).toContainText("didn't start answering within 600 s");
+    await expect(page.getByRole("textbox", { name: "Message" })).toBeEnabled();
   });
 
   test("an HTTP error from the chat endpoint is shown", async ({ page, mockApi }) => {

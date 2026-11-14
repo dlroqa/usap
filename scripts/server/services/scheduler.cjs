@@ -74,7 +74,7 @@ const queue = (pending) => (pending === null
 // (services/memory-check.cjs). Both are optional; without them the snapshot is exactly the 9.9c one.
 // Step 9.9e: `threads` is the thread-budget setting and `threadBudget()` its latest decision (services/thread-budget.cjs).
 // Optional; without them (or with threads off) the snapshot is exactly the 9.9d one.
-function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null }) {
+function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null, chatTimeouts = null }) {
   for (const [name, value] of Object.entries({ budget, cpu, engines })) {
     if (!value) throw new Error(`scheduler: missing dependency ${name}`);
   }
@@ -146,6 +146,13 @@ function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { m
       let capReport = null;
       try { capReport = whisperThreadCap(); } catch (_) { capReport = null; }
       if (capReport) out.whisperThreadCap = capReport;
+    }
+    // Additive (9.9f-1, only when chatTimeouts is observe or on): the setting in effect, counters and the engine
+    // guard's state; numbers and fixed words only. Absent when off (the default).
+    if (chatTimeouts) {
+      let t = null;
+      try { t = chatTimeouts(); } catch (_) { t = null; }
+      if (t) { out.limits.runningTimeouts = t.mode; out.chatTimeouts = t; }
     }
     if (!threadsOn) return out;
     // Additive (9.9e, only when on): the budget's scope and its latest transcription decision (a report; the

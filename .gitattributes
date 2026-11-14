@@ -1,2 +1,5 @@
 *.sh text eol=lf
 *.bat text eol=crlf
+
+# Byte-exact fixture: the server sends LF; scripts/tests/chat-timeouts.test.cjs compares it byte for byte.
+tests/e2e/fixtures/chat-timeout-stream.txt text eol=lf

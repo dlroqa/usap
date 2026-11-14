@@ -19,6 +19,7 @@ on:
       - "scripts/search/**" # web text that enters chat prompts (token filter, page extraction)
       - "scripts/ci/runtime-validate.sh"
       - "scripts/ci/chat-queue-validate.cjs"
+      - "scripts/ci/chat-timeouts-validate.cjs"
       - "scripts/ci/p4-token-check.cjs"
       - "scripts/ci/memory-check-report.cjs"
       - "scripts/ci/stop-app.sh"
@@ -121,6 +122,24 @@ jobs:
         env:
           FRONTEND_PORT: "14920"
         run: bash scripts/ci/stop-app.sh
+
+      # Step 9.9f-1 chat timeouts, real model, opt-in: switched on only in the environment of the test servers this
+      # script starts (port 14930); the installed default stays off (its first check). It suspends only its own
+      # engine process (found by port) and always resumes it.
+      - name: Chat timeouts with a real model (on for test servers only)
+        run: |
+          set -o pipefail
+          node scripts/ci/chat-timeouts-validate.cjs --model qwen2.5-0.5b-instruct-q4_k_m.gguf \
+            --results ci-logs/chat-timeouts-results.jsonl --logs ci-logs | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop chat timeout test servers
+        if: always()
+        env:
+          FRONTEND_PORT: "14930"
+        run: |
+          # A process left stopped by a failed run would ignore SIGTERM: continue it first (POSIX only).
+          if [ "$RUNNER_OS" != "Windows" ]; then pkill -CONT -f "llama-server" || true; fi
+          bash scripts/ci/stop-app.sh
 
       - name: Second launch must not re-run setup
         run: |
