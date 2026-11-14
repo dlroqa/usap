@@ -406,3 +406,24 @@ Where this section differs from §2–§7, this section is what the code does.
 
   Plus `last` (outcome, stream flag, elapsed and confirmation seconds, time). In observe, `wouldHaveTimedOut`;
   in on, `engine` (`ready` / `confirming` / `unresponsive`).
+* **Native evidence (PR #101, hosted CPU runners, Qwen2.5 0.5B Q4_K_M, 2,942-token prompt; all 4 OS).**
+  * `/metrics` answers during prompt evaluation and during decoding with `requests_processing 1`.
+  * The engine's status line comes after 5–20 ms; the first body chunk only after prompt evaluation, about 19–31 s
+    later.
+  * After a transport abort during decoding, the engine is quiet in about 0.1–0.3 s.
+  * After a transport abort **very early** in prompt evaluation (about 50–160 ms after the request), the engine
+    still evaluated the **whole** prompt and generated 2 tokens: it went quiet only 20–50 s later. An HTTP abort is
+    not proof that computation stopped, and this is the case the gate exists for.
+  * A studio client cancel while the engine was evaluating stopped after one 512-token batch. The studio confirmed
+    it in about 7 s, and the engine's counters then stayed unchanged for 10 s: no computation after the
+    confirmation. The same check passes after recovery from both suspension scenarios.
+  * Suspending the real engine (SIGSTOP; `NtSuspendProcess` on Windows, all threads verified suspended) gives:
+    * mid-stream: the idle error event at about 10 s, then CONFIRMING, then UNRESPONSIVE (503);
+    * after resuming: recovery by `/metrics` with the same engine PID (no restart), and chats work;
+    * suspended before the request: `504` with phase `first-byte` at 30 s.
+
+    No runner was left with a suspended process.
+* **Risk shown by that evidence:** on a slow CPU, a long prompt that was aborted early can keep the engine busy for
+  longer than the 120 s confirmation window. Chats are then refused (`503 ENGINE_UNRESPONSIVE`) until the
+  15-second probe sees it idle. That is bounded and safe, but visible to the user. The window is a setting
+  (10–600 s); `observe` measurements should inform it before any default-on.
