@@ -238,6 +238,33 @@ if fetch_verified "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c
   else
     record "Speech translation request (app API)" FAIL "${res:0:300}"
   fi
+  # Whisper logical-CPU cap (default on): a request for one thread more than the runner's logical CPUs must reach
+  # whisper-cli as -t <logical CPUs> and still transcribe. Checked in /api/resources and in the server log
+  # (the studio's -t and whisper.cpp's own "n_threads = N / M" line). Correctness only, not a speed claim.
+  cpus="$(api GET /api/resources | json_get cpu.logicalCores.value)"
+  if [[ "$cpus" =~ ^[0-9]+$ && "$cpus" -ge 1 && "$cpus" -lt 32 ]]; then
+    want=$(( cpus + 1 ))
+    log_from=1; [[ -n "${SERVER_LOG:-}" && -f "$SERVER_LOG" ]] && log_from=$(( $(wc -l < "$SERVER_LOG") + 1 ))
+    t0=$(date +%s)
+    res="$(curl -s -m 600 -X POST -H 'content-type: audio/wav' --data-binary @"$CACHE/jfk.wav" "$BASE/api/speech/transcribe?model=ggml-tiny.en.bin&language=en&save=false&filename=jfk.wav&threads=$want")"
+    lower="$(echo "$res" | tr "[:upper:]" "[:lower:]")"
+    cap="$(api GET /api/resources | json_get whisperThreadCap.lastTranscription)"
+    c_req="$(echo "$cap" | json_get requested)"; c_used="$(echo "$cap" | json_get threads)"; c_capped="$(echo "$cap" | json_get capped)"
+    log_t=""; log_nt=""
+    if [[ -n "${SERVER_LOG:-}" && -f "$SERVER_LOG" ]]; then
+      log_t="$(tail -n +"$log_from" "$SERVER_LOG" | grep -E '\[speech\] Starting:' | tail -1 | grep -oE ' -t [0-9]+' | grep -oE '[0-9]+')"
+      log_nt="$(tail -n +"$log_from" "$SERVER_LOG" | grep -oE 'n_threads = [0-9]+ / [0-9]+' | tail -1)"
+    fi
+    detail="logical CPUs $cpus; requested $want -> used $c_used (capped $c_capped); log -t ${log_t:-n/a}, whisper ${log_nt:-n/a}; $(( $(date +%s) - t0 ))s"
+    if [[ "$(echo "$res" | json_get ok)" == true && "$lower" == *"your country"* && "$c_req" == "$want" && "$c_used" == "$cpus" && "$c_capped" == true \
+          && ( -z "$log_t" || "$log_t" == "$cpus" ) && ( -z "$log_nt" || "$log_nt" == "n_threads = $cpus / "* ) ]]; then
+      record "Speech thread cap (oversized request)" PASS "$detail"
+    else
+      record "Speech thread cap (oversized request)" FAIL "$detail; ${res:0:200}"
+    fi
+  else
+    record "Speech thread cap (oversized request)" UNSUPPORTED "logical CPU count not reported (${cpus:-none}) or 32 or more: nothing to cap within the 1-32 request range"
+  fi
   # Saved transcript: listed, then deleted (transcription history).
   res="$(curl -s -m 600 -X POST -H 'content-type: audio/wav' --data-binary @"$CACHE/jfk.wav" "$BASE/api/speech/transcribe?model=ggml-tiny.en.bin&language=en&filename=jfk-saved.wav")"
   saved="$(echo "$res" | json_get transcription.metadata)"

@@ -337,8 +337,37 @@ macOS arm64 cliff is **not identified** (candidates: ggml's own barrier waiting 
 Metal/CPU split of this build, or the virtual machine's scheduler). The measured fact is only that requesting
 more threads than the logical CPUs is slower on every target, and much slower on macOS arm64.
 
-**Proposed follow-up (not implemented; needs separate approval).** Cap the `-t` of each transcription at the
+**Proposed follow-up** (recorded with #97; now implemented, on by default, see §9). Cap the `-t` of each transcription at the
 server's logical CPU count, before the optional 9.9e budget; keep any request at or below the cap unchanged;
 report the requested and used counts (numbers only) additively; provide a setting to turn the cap off. No engine
 restart; llama.cpp, sd.cpp and Kokoro unchanged; the 9.9e budget stays off by default. Whether the cap is on by
-default is a separate owner decision.
+default was a separate owner decision (approved: on).
+
+## 9. Whisper logical-CPU cap (on by default)
+
+Owner-approved implementation of the §8 proposal, with the cap on by default (`services/whisper-thread-cap.cjs`).
+
+* **Rule**, at the whisper-cli spawn: `threads = min(requested, logicalCpus)` with `logicalCpus = os.cpus().length`
+  (the source the server default and the image cap already use). Not the physical-core heuristic, which reports 1
+  core on the macOS arm64 VM and 2 on a 4-core CPU without hyper-threading. An unknown, zero or invalid count leaves
+  the request unchanged (nothing invented). `requested` is the 1–32 value the speech service already derives (query
+  `threads`, else the saved setting, else the server default). The count is never raised.
+* **Order:** cap first, then the optional 9.9e budget (`threads = budget(cap(requested))`), each step lower-only. The
+  budget therefore sees, and reports as `requested`, the capped count.
+* **Reported** (additive): `GET /api/resources` → `whisperThreadCap: { mode, scope, rule, cappedJobs,
+  lastTranscription: { requested, threads, capped, reason, logicalCpus, at } }`, numbers and fixed words only, and
+  one `[threads]` log line per capped job. The transcription response (also the saved transcript), `limits` and
+  `scheduler` are unchanged. Saved speech settings keep the user's value.
+* **Rollback:** `USAP_WHISPER_THREAD_CAP=off`, `app/config/scheduler.json {"whisperThreadCap": "off"}` (the environment
+  wins), or `USAP_SCHEDULER=off`: the previous behaviour exactly, including requests above the CPU count, and no
+  `whisperThreadCap` key.
+* **Not changed:** llama.cpp and sd.cpp thread counts (including the macOS Intel image cap), Kokoro, the 9.9e budget
+  (default off), the chat queue, memory check, P3/P4 defaults, admission, and engine restarts.
+* **Limits:** `os.cpus()` does not see Linux CPU affinity masks or container CPU quotas, so a process restricted to
+  fewer CPUs is still capped at the host's count. Hybrid (performance/efficiency) cores are counted as logical CPUs.
+  Benefit measured only on 3–4-vCPU hosted runners; on machines with more CPUs a request rarely exceeds the count, and
+  the cap is not presented as a speed-up for hardware that wasn't measured.
+* **Tests:** `scripts/tests/whisper-thread-cap.test.cjs` (rule for 1–128 CPUs and 1–32 requests, invalid inputs,
+  settings, composition with the budget, snapshot shape, real server: `-t` recorded by a whisper-cli stand-in,
+  saved setting, rollbacks, response and engine compatibility). Native: `Speech thread cap (oversized request)` asks
+  for logical CPUs + 1 with the real model and checks the report, the logged `-t` and whisper.cpp's `n_threads`.

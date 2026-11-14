@@ -74,7 +74,7 @@ const queue = (pending) => (pending === null
 // (services/memory-check.cjs). Both are optional; without them the snapshot is exactly the 9.9c one.
 // Step 9.9e: `threads` is the thread-budget setting and `threadBudget()` its latest decision (services/thread-budget.cjs).
 // Optional; without them (or with threads off) the snapshot is exactly the 9.9d one.
-function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null }) {
+function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null }) {
   for (const [name, value] of Object.entries({ budget, cpu, engines })) {
     if (!value) throw new Error(`scheduler: missing dependency ${name}`);
   }
@@ -140,6 +140,13 @@ function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { m
       // Every limit in the plan is off in this stage; nothing is refused or delayed.
       limits: { chatQueue: chatQueue.mode === "on" ? "on" : "off", memoryCheck: memoryWarn ? "warn" : "off", threads: threadsOn ? "on" : "off", queueTimeouts: chatQueue.mode === "on" ? "chat" : "off" },
     };
+    // Additive (only when the whisper logical-CPU cap is on, its default): requested and used counts of the latest
+    // transcription, numbers only. Absent when off, so the snapshot is then exactly the previous one.
+    if (whisperThreadCap) {
+      let capReport = null;
+      try { capReport = whisperThreadCap(); } catch (_) { capReport = null; }
+      if (capReport) out.whisperThreadCap = capReport;
+    }
     if (!threadsOn) return out;
     // Additive (9.9e, only when on): the budget's scope and its latest transcription decision (a report; the
     // scheduler itself still sets no thread count).
