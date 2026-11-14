@@ -114,9 +114,29 @@ const quiet = (m) => m && m.requests_processing === 0 && m.requests_deferred ===
 const counters = (m) => m && [m.n_decode_total, m.tokens_predicted_total, m.prompt_tokens_total].join("/");
 const lastEvent = (text) => { const ev = String(text || "").split("\n\n").filter(Boolean).at(-1) || ""; return parseJson(ev.replace(/^data: /, "")); };
 
-// A prompt long enough that prompt evaluation takes a while on a CPU; a fresh prefix each time defeats the cache.
+// A prompt long enough that prompt evaluation takes a while on a CPU, but sized with the engine's own /tokenize to
+// fit the 4096-token context with room for the answer (an oversized prompt is refused at once and proves nothing).
+// A fresh prefix each time defeats the prompt cache.
 let promptSeq = 0;
-const longPrompt = (words = 2200) => `[${Date.now()}-${++promptSeq}] ` + Array.from({ length: words }, (_, i) => `item${(i * 7919) % 10007}`).join(" ") + "\nSummarise the list above in one sentence.";
+let wordsFor3000 = null;
+const promptOf = (words) => `[${Date.now()}-${++promptSeq}] ` + Array.from({ length: words }, (_, i) => `item${(i * 7919) % 10007}`).join(" ") + "\nSummarise the list above in one sentence.";
+async function tokens(enginePort, text) {
+  const r = await call(enginePort, "POST", "/tokenize", { content: text }, { timeoutMs: 30000 }).promise;
+  const j = parseJson(r.text);
+  return r.status === 200 && j && Array.isArray(j.tokens) ? j.tokens.length : null;
+}
+async function longPrompt(enginePort, target = 3000) {
+  if (!wordsFor3000) {
+    const probeWords = 200;
+    const n = await tokens(enginePort, promptOf(probeWords));
+    if (!n) throw new Error("the engine's /tokenize did not answer; can't size the prompt");
+    wordsFor3000 = Math.max(50, Math.floor((probeWords * target) / n));
+  }
+  const text = promptOf(wordsFor3000);
+  const n = await tokens(enginePort, text);
+  if (!n || n > 3600) throw new Error(`prompt sizing failed (${n} tokens for ${wordsFor3000} words)`);
+  return { text, tokens: n };
+}
 const COUNT = () => ({ messages: [{ role: "user", content: `[${++promptSeq}] Count from 1 to 3000. Write each number on its own line and nothing else.` }], max_tokens: 1024, temperature: 0, stream: true });
 
 // ── Processes ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -227,7 +247,8 @@ async function signalChecks(srv) {
   record("engine idle before the checks: requests_processing 0", quiet(m0) ? "PASS" : "FAIL", `processing ${m0?.requests_processing}, deferred ${m0?.requests_deferred}`);
 
   await scenario("abort during prompt evaluation stops computation", async () => {
-    const h = call(ep, "POST", "/v1/chat/completions", { messages: [{ role: "user", content: longPrompt() }], max_tokens: 64, temperature: 0, stream: true });
+    const lp = await longPrompt(ep);
+    const h = call(ep, "POST", "/v1/chat/completions", { messages: [{ role: "user", content: lp.text }], max_tokens: 64, temperature: 0, stream: true });
     // Wait until the engine reports the request processing while no output has been produced yet.
     let seen = null;
     const until = Date.now() + 30000;
@@ -236,8 +257,15 @@ async function signalChecks(srv) {
       if (m && m.requests_processing >= 1 && !h.marks.firstContentAt) { seen = m; break; }
       await sleep(50);
     }
-    if (!seen) { h.abort(); record("/metrics answers during prompt evaluation (requests_processing 1)", "SKIP", "prompt evaluation ended before a reading could be taken"); return; }
-    record("/metrics answers during prompt evaluation (requests_processing 1)", "PASS", `processing ${seen.requests_processing} before any output; headers ${h.marks.headersAt ? "received" : "not yet received"}`);
+    if (!seen) {
+      h.abort();
+      const r = await h.promise;
+      // An engine refusal is a failure of this check, never a skip.
+      if (r.status !== 200 && r.status !== 0) throw new Error(`the engine answered ${r.status} to a ${lp.tokens}-token prompt: ${r.text.slice(0, 160)}`);
+      record("/metrics answers during prompt evaluation (requests_processing 1)", "SKIP", `prompt evaluation of ${lp.tokens} tokens ended before a reading could be taken`);
+      return;
+    }
+    record("/metrics answers during prompt evaluation (requests_processing 1)", "PASS", `${lp.tokens}-token prompt: processing ${seen.requests_processing} before any output; engine status line ${h.marks.headersAt ? `after ${h.marks.headersAt - h.t0} ms` : "not yet"}, body ${h.marks.firstDataAt ? "started" : "not started"}`);
     const abortAt = Date.now();
     h.abort();
     const r = await h.promise;
@@ -265,11 +293,13 @@ async function signalChecks(srv) {
     const s = await observeStop(ep, Date.now());
     record("after a normal completion the engine is quiet", r.status === 200 && s.stopped ? "PASS" : "FAIL", `status ${r.status}; ${s.detail}`);
     // B: status line vs first body chunk.
-    const h2 = call(ep, "POST", "/v1/chat/completions", { messages: [{ role: "user", content: longPrompt(1500) }], max_tokens: 4, temperature: 0, stream: true });
-    await h2.promise;
+    const lp2 = await longPrompt(ep);
+    const h2 = call(ep, "POST", "/v1/chat/completions", { messages: [{ role: "user", content: lp2.text }], max_tokens: 4, temperature: 0, stream: true });
+    const r2 = await h2.promise;
     const { headersAt, firstDataAt } = h2.marks;
-    record("engine status line vs first body chunk (long prompt, measured)", headersAt && firstDataAt ? "PASS" : "FAIL",
-      `status line after ${headersAt - h2.t0} ms, first body chunk after ${firstDataAt - h2.t0} ms (the first-byte limit runs to the body chunk)`);
+    const first = (r2.text.split("\n\n")[0] || "").slice(0, 120);
+    record("engine status line vs first body chunk (long prompt, measured)", r2.status === 200 && headersAt && firstDataAt && r2.text.includes("[DONE]") ? "PASS" : "FAIL",
+      `${lp2.tokens}-token prompt: status ${r2.status}, status line after ${headersAt - h2.t0} ms, first body chunk after ${firstDataAt - h2.t0} ms (${first}); the first-byte limit runs to the body chunk`);
     await observeStop(ep, Date.now());
   });
 }
@@ -282,8 +312,10 @@ async function studioChecks(srv) {
   record("on (environment only): /api/resources reports the limits", r0 && r0.mode === "on" && r0.idleSeconds === 10 && r0.firstByteSeconds === 30 && r0.nonStreamTotalSeconds === 300 && r0.engine === "ready" ? "PASS" : "FAIL", JSON.stringify(r0 || null).slice(0, 300));
 
   await scenario("studio: client cancel during prompt evaluation is confirmed by /metrics", async () => {
-    const h = call(PORT, "POST", "/api/llm/chat", { messages: [{ role: "user", content: longPrompt() }], max_tokens: 64, temperature: 0, stream: true });
-    await waitUntil(async () => (await metrics(ep))?.requests_processing >= 1, 30000, 50);
+    const lp = await longPrompt(ep);
+    const h = call(PORT, "POST", "/api/llm/chat", { messages: [{ role: "user", content: lp.text }], max_tokens: 64, temperature: 0, stream: true });
+    const busy = await waitUntil(async () => (await metrics(ep))?.requests_processing >= 1, 30000, 50);
+    if (!busy) { const r = await h.promise; throw new Error(`the request never reached the engine (studio answered ${r.status}: ${r.text.slice(0, 160)})`); }
     h.abort();
     const confirming = await waitUntil(async () => ["confirming", "ready"].includes((await timeoutsReport())?.engine) && (await timeoutsReport()).counts.clientCancelled >= 1, 5000, 50);
     const ready = await waitUntil(async () => (await timeoutsReport())?.engine === "ready" && (await timeoutsReport()).counts.cancelConfirmed >= 1, 30000, 200);

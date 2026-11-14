@@ -383,6 +383,12 @@ Where this section differs from §2–§7, this section is what the code does.
   The next waiting request (FIFO) is then granted, and still passes the gate. Without the queue, each chat passes
   the same gate before anything is sent. While CONFIRMING it waits there (bounded by the window); while
   UNRESPONSIVE it is refused at once.
+* **Status line vs first body chunk** (b11418 source). When prompt evaluation starts, a streaming request gets a
+  "begin" result (`send_partial_response(…, is_begin = true)`), which only makes the HTTP handler send the status
+  line and headers: its `to_json()` is null, so no body is written. The first body chunk carries the first generated
+  token, with the OpenAI-style role delta. So the status line arrives before prompt evaluation, and the first body
+  chunk after it. That is why the first-byte deadline runs to the first body chunk and covers prompt evaluation.
+  The studio doesn't request `return_progress`, which would send progress chunks during prompt evaluation.
 * **Keep-alives.** An engine body chunk made only of SSE comment lines (`: …`) or blank lines is passed through,
   but doesn't re-arm the idle deadline and doesn't end the first-byte deadline. llama.cpp `b11418` sends no such
   keep-alives; this only keeps a future one from hiding a stall.

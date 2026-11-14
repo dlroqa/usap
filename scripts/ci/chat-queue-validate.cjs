@@ -361,7 +361,7 @@ async function queueOnScenarios(srv) {
     record("crash: chat and queue work again", after.status === 200 && clean ? "PASS" : "FAIL", `status ${after.status}; queue idle ${Boolean(clean)}`);
   });
 
-  record("timeout for a running request", "UNSUPPORTED", "no engine-side stream timeout: a running request holds the queue until it ends or is cancelled (tracked in STEP9_9_SCHEDULING.md)");
+  record("timeout for a running request", "UNSUPPORTED", "not with these servers: Step 9.9f-1 chat timeouts are off by default and off here, so a running request holds the queue until it ends or is cancelled; with chatTimeouts on they are checked by chat-timeouts-validate.cjs");
 }
 
 async function shutdownScenario(srv) {
