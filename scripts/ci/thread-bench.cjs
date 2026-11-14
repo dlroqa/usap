@@ -282,6 +282,7 @@ async function mainWhisperSet() {
 // warm-up and is not counted. Every job is checked against the studio log: the `-t` the studio passed and
 // whisper.cpp's own `n_threads = N / M` line (M = the hardware concurrency whisper sees) and total time.
 const SWEEP = String(arg("threads-list", "2,3,4,default")).split(",").map((s) => s.trim()).filter(Boolean);
+const SWEEP_BASE = SWEEP.includes("3") ? "3" : "default"; // the ratio column compares with this configuration
 function cpuFacts() {
   const run = (cmd, args) => { try { const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 10000 }); return r.status === 0 ? String(r.stdout).trim() : null; } catch (_) { return null; } };
   const f = { osCpusLength: os.cpus().length, availableParallelism: typeof os.availableParallelism === "function" ? os.availableParallelism() : null, cpuModel: (os.cpus()[0] || {}).model || null, totalRamMb: Math.round(os.totalmem() / 1048576) };
@@ -360,18 +361,18 @@ function sweepReport() {
     (process.platform === "darwin" ? `; hw.ncpu ${hw["hw.ncpu"]}, activecpu ${hw["hw.activecpu"]}, physicalcpu ${hw["hw.physicalcpu"]}, perflevel0/1 logical ${hw["hw.perflevel0.logicalcpu"]}/${hw["hw.perflevel1.logicalcpu"]}, VM ${hw["kern.hv_vmm_present"]}` : "") +
     (process.platform === "linux" ? `; nproc ${hw.nproc} (all ${hw.nprocAll}); cgroup cpu.max ${hw.cgroupCpuMax}` : "") +
     (WIN ? `; NUMBER_OF_PROCESSORS ${hw.NUMBER_OF_PROCESSORS}; ${hw.win32Processor}` : ""),
-    "", `Rounds: ${REPS}; order rotates each round; one warm-up per configuration not counted. Wall = HTTP request to the studio; whisper = whisper.cpp's own total time.`];
+    "", `Studio environment: ${JSON.stringify(STUDIO_ENV)}. Rounds: ${REPS}; order rotates each round; one warm-up per configuration not counted. Wall = HTTP request to the studio; whisper = whisper.cpp's own total time.`];
   for (const b of blocks) {
     const bj = jobs.filter((j) => j.block === b);
-    lines.push("", `### ${b}`, "", "| threads requested | -t passed | whisper n_threads / hw | n ok (failed) | Wall median (min–max, CV) | whisper total median (CV) | CPU busy median | vs 3 threads (wall, 95% CI) |", "|---|---|---|---|---|---|---|---|");
+    lines.push("", `### ${b}`, "", `| threads requested | -t passed | whisper n_threads / hw | n ok (failed) | Wall median (min–max, CV) | whisper total median (CV) | CPU busy median | vs ${SWEEP_BASE} (wall, 95% CI) |`, "|---|---|---|---|---|---|---|---|");
     const wallOf = (c) => bj.filter((j) => j.config === c && j.ok).map((j) => j.ms);
     for (const c of SWEEP) {
       const cj = bj.filter((j) => j.config === c);
       const ok = cj.filter((j) => j.ok);
       const uniq = (k) => [...new Set(ok.map((j) => j[k]))].join("/");
       const ws = stats(ok.map((j) => j.whisperTotalMs));
-      const bs = bootRatio(wallOf("3"), wallOf(c));
-      lines.push(`| ${c} | ${uniq("passedT")} | ${uniq("whisperThreads")} / ${uniq("whisperHwThreads")} | ${ok.length} (${cj.length - ok.length}) | ${fmtS(stats(ok.map((j) => j.ms)))} | ${ws ? `${(ws.median / 1000).toFixed(2)} s (${ws.cv})` : "n/a"} | ${stats(ok.map((j) => j.cpuBusyPct))?.median ?? "?"}% | ${c === "3" || !bs ? "" : `×${bs.ratio} (${bs.lo}–${bs.hi})`} |`);
+      const bs = bootRatio(wallOf(SWEEP_BASE), wallOf(c));
+      lines.push(`| ${c} | ${uniq("passedT")} | ${uniq("whisperThreads")} / ${uniq("whisperHwThreads")} | ${ok.length} (${cj.length - ok.length}) | ${fmtS(stats(ok.map((j) => j.ms)))} | ${ws ? `${(ws.median / 1000).toFixed(2)} s (${ws.cv})` : "n/a"} | ${stats(ok.map((j) => j.cpuBusyPct))?.median ?? "?"}% | ${c === SWEEP_BASE || !bs ? "" : `×${bs.ratio} (${bs.lo}–${bs.hi})`} |`);
     }
     // Position check: median wall per position for each configuration (ordering bias would show here).
     lines.push("", "Median wall time by position in the round (s):", "", `| threads | ${SWEEP.map((_, p) => `pos ${p}`).join(" | ")} |`, `|---|${SWEEP.map(() => "---").join("|")}|`);

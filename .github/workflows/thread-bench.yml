@@ -24,6 +24,9 @@ on:
       threads_list:
         description: "whisper-sweep only: comma-separated thread requests (default = no threads value, the server default)"
         default: "2,3,4,default"
+      studio_env:
+        description: "whisper-sweep only: extra environment for the measurement studio, K=V[,K=V] (e.g. OMP_WAIT_POLICY=PASSIVE); empty = none"
+        default: ""
 
 permissions:
   contents: read
@@ -86,9 +89,10 @@ jobs:
           REPS: ${{ inputs.reps || '5' }}
           IMAGE_REPS: ${{ inputs.image_reps || '3' }}
           THREADS_LIST: ${{ inputs.threads_list || '2,3,4,default' }}
+          SWEEP_ENV: ${{ inputs.studio_env || '' }}
         run: |
           if [ "$BENCH_SET" = whisper-sweep ]; then
-            node scripts/ci/thread-bench.cjs --set whisper-sweep --label whisper-sweep --threads-list "$THREADS_LIST" \
+            node scripts/ci/thread-bench.cjs --set whisper-sweep --label whisper-sweep --threads-list "$THREADS_LIST" --studio-env "$SWEEP_ENV" \
               --jfk .ci-model-cache/jfk.wav --out ci-logs/thread-bench --reps "$REPS"
             cat ci-logs/thread-bench/whisper-sweep.md >> "$GITHUB_STEP_SUMMARY"
             ! grep -q '"kind":"error"' ci-logs/thread-bench/thread-bench.jsonl
