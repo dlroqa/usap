@@ -427,3 +427,6 @@ Where this section differs from §2–§7, this section is what the code does.
   longer than the 120 s confirmation window. Chats are then refused (`503 ENGINE_UNRESPONSIVE`) until the
   15-second probe sees it idle. That is bounded and safe, but visible to the user. The window is a setting
   (10–600 s); `observe` measurements should inform it before any default-on.
+
+The measurements needed before any default activation are listed in
+[STEP9_9F_MEMORY_ADMISSION.md §11](STEP9_9F_MEMORY_ADMISSION.md#11-related-measurements-before-99f-1-chat-timeouts-can-be-turned-on-by-default).
