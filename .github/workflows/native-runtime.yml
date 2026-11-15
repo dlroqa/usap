@@ -43,18 +43,18 @@ jobs:
   setup-validate:
     name: native-runtime (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 100
+    timeout-minutes: 160
     strategy:
       fail-fast: false
       matrix:
         include:
           # image: backends exercised for image generation. "cpu" must pass; GPU backends are
           # attempted and recorded as UNSUPPORTED/UNAVAILABLE on hosted runners (no usable GPU).
-          - { label: macos-arm64,  runner: macos-15,       arch: arm64,  launcher: ./mac.sh,   image: "cpu metal" }
+          # bench #120: Windows only # - { label: macos-arm64,  runner: macos-15,       arch: arm64,  launcher: ./mac.sh,   image: "cpu metal" }
           # Intel: upstream's universal sd has an SSE3-only x86_64 slice (no AVX/AVX2/FMA); CPU image
           # generation is slower than on Linux x64 but fits the timeout (docs/ci/MACOS_COMPATIBILITY.md).
-          - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, launcher: ./mac.sh,   image: "cpu metal" }
-          - { label: linux-x64,    runner: ubuntu-24.04,   arch: x86_64, launcher: ./linux.sh, image: "cpu vulkan" }
+          # bench #120: Windows only # - { label: macos-x86_64, runner: macos-15-intel, arch: x86_64, launcher: ./mac.sh,   image: "cpu metal" }
+          # bench #120: Windows only # - { label: linux-x64,    runner: ubuntu-24.04,   arch: x86_64, launcher: ./linux.sh, image: "cpu vulkan" }
           # Git Bash drives windows.bat through cmd; piped empty lines answer its "press any key" prompts.
           - { label: windows-x64,  runner: windows-2025,   arch: x86_64, launcher: "cmd //c windows.bat", image: "cpu vulkan" }
     env:
@@ -175,6 +175,19 @@ jobs:
         if: always()
         env:
           FRONTEND_PORT: "14960"
+        run: bash scripts/ci/stop-app.sh
+
+      # Bench only (#120): R2 repeated with timestamps, PIDs and exit codes. Measurement; never fails the job.
+      - name: "Diagnosis #120: R2 three image loads at once, repeated"
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 45
+        run: node scripts/ci/r2-loop-diagnose.cjs --image stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf --runs 25 --logs ci-logs | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: "Stop #120 diagnosis server"
+        if: always()
+        env:
+          FRONTEND_PORT: "14990"
         run: bash scripts/ci/stop-app.sh
 
       # Step 9.9f-3 voice: a baseline of today's unbounded Kokoro chain with the real worker on the CPU (measurements
