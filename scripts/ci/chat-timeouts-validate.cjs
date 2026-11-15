@@ -118,7 +118,7 @@ const lastEvent = (text) => { const ev = String(text || "").split("\n\n").filter
 // fit the 4096-token context with room for the answer (an oversized prompt is refused at once and proves nothing).
 // A fresh prefix each time defeats the prompt cache.
 let promptSeq = 0;
-let wordsFor3000 = null;
+let tokensPerWord = null; // measured once with /tokenize; prompts of any target size are derived from it
 const promptOf = (words) => `[${Date.now()}-${++promptSeq}] ` + Array.from({ length: words }, (_, i) => `item${(i * 7919) % 10007}`).join(" ") + "\nSummarise the list above in one sentence.";
 async function tokens(enginePort, text) {
   const r = await call(enginePort, "POST", "/tokenize", { content: text }, { timeoutMs: 30000 }).promise;
@@ -126,15 +126,16 @@ async function tokens(enginePort, text) {
   return r.status === 200 && j && Array.isArray(j.tokens) ? j.tokens.length : null;
 }
 async function longPrompt(enginePort, target = 3000) {
-  if (!wordsFor3000) {
+  if (!tokensPerWord) {
     const probeWords = 200;
     const n = await tokens(enginePort, promptOf(probeWords));
     if (!n) throw new Error("the engine's /tokenize did not answer; can't size the prompt");
-    wordsFor3000 = Math.max(50, Math.floor((probeWords * target) / n));
+    tokensPerWord = n / probeWords;
   }
-  const text = promptOf(wordsFor3000);
+  const words = Math.max(50, Math.floor(target / tokensPerWord));
+  const text = promptOf(words);
   const n = await tokens(enginePort, text);
-  if (!n || n > 3600) throw new Error(`prompt sizing failed (${n} tokens for ${wordsFor3000} words)`);
+  if (!n || n > target * 1.2) throw new Error(`prompt sizing failed (${n} tokens for ${words} words, target ${target})`);
   return { text, tokens: n };
 }
 const COUNT = () => ({ messages: [{ role: "user", content: `[${++promptSeq}] Count from 1 to 3000. Write each number on its own line and nothing else.` }], max_tokens: 1024, temperature: 0, stream: true });
@@ -247,7 +248,12 @@ async function signalChecks(srv) {
   record("engine idle before the checks: requests_processing 0", quiet(m0) ? "PASS" : "FAIL", `processing ${m0?.requests_processing}, deferred ${m0?.requests_deferred}`);
 
   await scenario("abort during prompt evaluation stops computation", async () => {
-    const lp = await longPrompt(ep);
+    // #115: llama.cpp b11418 on Linux and macOS does not notice a client that disconnects after its status line until
+    // it writes the first token, so the time to quiet is the prompt's own evaluation time (measured on every OS:
+    // abort-to-quiet = unaborted prompt_ms). A 3000-token prompt takes 52-76 s on the macOS Intel runner, beyond the
+    // 60 s window; about 1000 tokens takes 10-27 s there and still runs for seconds on the fastest runner. The window
+    // and the stopped-computation assertion are unchanged; the abort must also stop the output at once (<= 2 tokens).
+    const lp = await longPrompt(ep, 1000);
     const before = await metrics(ep);
     const h = call(ep, "POST", "/v1/chat/completions", { messages: [{ role: "user", content: lp.text }], max_tokens: 64, temperature: 0, stream: true });
     // Wait until the engine reports the request processing while no output has been produced yet.
@@ -273,7 +279,8 @@ async function signalChecks(srv) {
     record("transport abort during prompt evaluation (HTTP only; not proof)", r.ended ? "FAIL" : "PASS", `connection closed by the client after ${abortAt - h.t0} ms`);
     const s = await observeStop(ep, abortAt);
     const end = await metrics(ep);
-    record("after that abort, computation stopped (metrics quiet, counters still for 3 s)", s.stopped ? "PASS" : "FAIL",
+    const generated = end.tokens_predicted_total - before.tokens_predicted_total;
+    record("after that abort, computation stopped (metrics quiet, counters still for 3 s, at most 2 tokens generated)", s.stopped && generated <= 2 ? "PASS" : "FAIL",
       `${s.detail}; after the abort the engine still evaluated prompt tokens up to ${end.prompt_tokens_total - before.prompt_tokens_total} of ${lp.tokens} and generated ${end.tokens_predicted_total - before.tokens_predicted_total} (an HTTP abort doesn't stop it at once)`);
   });
 
