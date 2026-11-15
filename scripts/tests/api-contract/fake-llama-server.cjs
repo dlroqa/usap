@@ -35,7 +35,7 @@
 //   oom-after-ready become ready, then after 3 s print a llama.cpp-style allocation failure and exit 1
 //   hold-start      don't listen until the file "<model path>.release" exists (issue #105 tests: a load held
 //                   after its spawn, released exactly when the test says)
-//   crash-once      become ready, then after 1 s exit with code 3 unless "<model path>.crashed" exists (it is
+//   crash-once      become ready, then after 3 s exit with code 3 unless "<model path>.crashed" exists (it is
 //                   created first), so an automatic restart succeeds (issue #105 tests)
 //   ignore-sigterm  ignore SIGTERM, so stopping needs SIGKILL (issue #105 tests)
 // and by flags (used when a test starts the fake directly):
@@ -242,7 +242,7 @@ if (model.includes("crash-once")) {
     require("node:fs").writeFileSync(flag, "1");
     console.error("fake engine: crash-once");
     process.exit(3);
-  }, 1000));
+  }, 3000));
 }
 if (model.includes("slow-start")) setTimeout(listen, 60000);
 else if (model.includes("hold-start")) { const t = setInterval(() => { if (require("node:fs").existsSync(`${modelPath}.release`)) { clearInterval(t); listen(); } }, 25); }

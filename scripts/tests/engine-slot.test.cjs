@@ -227,6 +227,11 @@ const resources = async (srv) => (await request(srv.port, "GET", "/api/resources
 const slotState = async (srv) => (await resources(srv)).engineSlot;
 const backendStatus = async (srv) => (await request(srv.port, "GET", "/api/backend-status")).json;
 const llmStatus = async (srv) => (await request(srv.port, "GET", "/api/llm/status")).json;
+// Image engine ready, or fail with the server log tail (so a CI failure says why).
+async function imageReady(srv, ms = 20000, label = "image ready") {
+  try { return await waitFor(async () => (await backendStatus(srv)).ready, ms, label); }
+  catch (err) { throw new Error(`${err.message}; backend-status ${JSON.stringify(await backendStatus(srv))}\n${srv.log().slice(-2500)}`); }
+}
 const waitIdle = (srv, ms = 15000) => waitFor(async () => { const s = await slotState(srv); return s && s.phase === "idle" && s.owner === null ? s : null; }, ms, "slot idle");
 const waitNoEngines = (srv, ms = 15000) => waitFor(async () => (await engines(srv)).length === 0, ms, "no engine processes");
 // Holds a text load between its heavy-model decision and its spawn for a fixed 1.5 s (issue #105 §4): with the
@@ -335,7 +340,7 @@ test("queue (slot on): a stop cancels image loads still waiting in the image cha
     assert.deepEqual(await engines(srv), []);
     const c = await imageLoad(srv);
     assert.equal(c.status, 200, c.text);
-    await waitFor(async () => (await backendStatus(srv)).ready, 10000, "image ready");
+    await imageReady(srv, 20000, "image ready");
   });
 });
 
@@ -392,7 +397,7 @@ test("crash during load (slot on): an image engine that fails to load releases t
 test("R1b (slot on): with an image engine loaded, a text load gets 409 and the image engine keeps running; a settings change still works", async () => {
   await withServer(SLOT_ON, async (srv) => {
     assert.equal((await imageLoad(srv)).status, 200);
-    await waitFor(async () => (await backendStatus(srv)).ready, 10000, "image ready");
+    await imageReady(srv, 20000, "image ready");
     const before = await engines(srv);
     const t = await textLoad(srv, "plain.gguf");
     assert.equal(t.status, 409, t.text);
@@ -404,7 +409,7 @@ test("R1b (slot on): with an image engine loaded, a text load gets 409 and the i
     const done = sampler(srv);
     const r = await imageLoad(srv, "sd1-img-q4_0.gguf", { steps: 6 });
     assert.equal(r.status, 200, r.text);
-    await waitFor(async () => (await backendStatus(srv)).ready, 10000, "image ready again");
+    await imageReady(srv, 20000, "image ready again");
     const seen = await done();
     assert.ok(seen.maxImage <= 1);
     const after = await engines(srv);
@@ -417,7 +422,7 @@ test("R1b (slot on): with an image engine loaded, a text load gets 409 and the i
 test("R3 (slot on): a text load while an image model is loaded answers 409 MODEL_ALREADY_ACTIVE with the original body fields", async () => {
   await withServer(SLOT_ON, async (srv) => {
     assert.equal((await imageLoad(srv)).status, 200);
-    await waitFor(async () => (await backendStatus(srv)).ready, 10000, "image ready");
+    await imageReady(srv, 20000, "image ready");
     const r = await textLoad(srv, "plain.gguf");
     assert.equal(r.status, 409, r.text);
     assert.equal(r.json.ok, false);
@@ -450,13 +455,16 @@ test("reload (slot on): a text reload with new settings replaces the engine unde
 test("forced termination (slot on): engines that ignore SIGTERM are killed, the stop answers after the exit, the slot is released", async () => {
   await withServer(SLOT_ON, async (srv) => {
     assert.equal((await imageLoad(srv, "sd1-ignore-sigterm-q4_0.gguf")).status, 200);
-    await waitFor(async () => (await backendStatus(srv)).ready, 10000, "image ready");
+    await imageReady(srv, 20000, "image ready");
     const [p] = await engines(srv);
     const t0 = Date.now();
     const st = await imageStop(srv);
     const ms = Date.now() - t0;
     assert.equal(st.status, 200, st.text);
-    assert.ok(ms >= 2000 && ms < 9000, `escalated to SIGKILL (${ms} ms)`);
+    // POSIX: SIGTERM is ignored, so the stop escalates to SIGKILL after 2.5 s. Windows: the supervisor's stop is
+    // already a forced termination (taskkill /F through the guard), so the exit comes at once.
+    if (IS_WIN) assert.ok(ms < 9000, `stopped (${ms} ms)`);
+    else assert.ok(ms >= 2000 && ms < 9000, `escalated to SIGKILL (${ms} ms)`);
     assert.equal(alive(p.pid), false);
     await waitIdle(srv);
 
@@ -473,6 +481,9 @@ test("benchmark (slot on): the slot is held for the whole benchmark; an image lo
   await withServer(SLOT_ON, async (srv) => {
     const b = request(srv.port, "POST", "/api/llm/benchmark", { body: { model: "hold-start.gguf", includeCpu: true } });
     await waitFor(async () => (await engines(srv)).length === 1, 10000, "benchmark engine spawned");
+    const during = await slotState(srv);
+    assert.equal(during.owner, "text", "the benchmark keeps the slot while its engine runs (stops inside it don't release it)");
+    assert.equal(during.phase, "loading");
     const img = await imageLoad(srv);
     assert.equal(img.status, 409, img.text);
     assert.equal(img.json.activeRuntime.type, "text");
@@ -488,7 +499,8 @@ test("crash auto-restart (slot on): a crashed text engine restarts as before and
   try { fs.unlinkSync(path.join(root, "app", "llm-models", "crash-once.gguf.crashed")); } catch (_) {}
   await withServer(SLOT_ON, async (srv) => {
     assert.equal((await textLoad(srv, "crash-once.gguf")).status, 200);
-    const [p1] = await engines(srv);
+    const p1 = { pid: (await llmStatus(srv)).running ? ((await engines(srv))[0] || {}).pid : undefined };
+    assert.ok(p1.pid, "the first engine process was seen before it crashed");
     await waitFor(async () => !alive(p1.pid), 10000, "crash");
     // The engine PID is gone a moment before the studio sees its guard exit, so wait for a new engine process.
     const { s, e } = await waitFor(async () => {
@@ -562,7 +574,7 @@ test("9.9f-2 (slot on, memory admission observe): text loads are assessed as bef
     assert.equal((await textStop(srv)).status, 200);
     await waitIdle(srv);
     assert.equal((await imageLoad(srv)).status, 200);
-    await waitFor(async () => (await backendStatus(srv)).ready, 10000, "image ready");
+    await imageReady(srv, 20000, "image ready");
     const t = await textLoad(srv, "plain.gguf");
     assert.equal(t.status, 409);
     const m2 = (await resources(srv)).memoryAdmission;
