@@ -344,8 +344,14 @@ test("server, observe: same outcomes as off (status, settings, spawn arguments, 
   assert.ok(off.args.includes("--load-mode") && off.args[off.args.indexOf("--load-mode") + 1] === "none", "the fake was started with --load-mode none");
   // Without inflation the 9.9d result is the same apart from the additive admission object.
   const { admission, ...rest } = obs.r.json.memoryCheck;
-  const strip = (m) => ({ ...m, at: null, available: null });
+  // `at`, `available` and the reading-source reason depend on the reading each server got, not on the mode: on macOS
+  // a server's first vm_stat answer can arrive before or after this load (issue #116). Only that reason is set aside;
+  // it never occurs off macOS, so there the comparison is the full one. Everything else (verdict included) is exact.
+  const SOURCE_REASON = "macos-available-memory-pessimistic";
+  if (process.platform !== "darwin") for (const m of [rest, off.r.json.memoryCheck]) assert.ok(!m.reasons.includes(SOURCE_REASON), "not on this platform");
+  const strip = (m) => ({ ...m, at: null, available: null, reasons: m.reasons.filter((x) => x !== SOURCE_REASON) });
   assert.deepEqual(strip(rest), strip(off.r.json.memoryCheck));
+  if (rest.reasons.includes(SOURCE_REASON) !== off.r.json.memoryCheck.reasons.includes(SOURCE_REASON)) t.diagnostic("the two servers' memory readings came from different macOS sources (first vm_stat answer before/after the load)");
   assert.equal(admission.mode, "observe");
   assert.equal(admission.path, "start");
   assert.equal(admission.release, "confirmed");
