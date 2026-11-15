@@ -42,7 +42,7 @@ jobs:
   setup-validate:
     name: native-runtime (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 100
+    timeout-minutes: 200 # bench branch only (measurement steps below); main keeps 100
     strategy:
       fail-fast: false
       matrix:
@@ -144,6 +144,22 @@ jobs:
           if [ "$RUNNER_OS" != "Windows" ]; then pkill -CONT -f "llama-server" || true; fi
           bash scripts/ci/stop-app.sh
 
+      # BENCH BRANCH ONLY (never merged): measurement of the macOS Intel chat-abort failure. Observes only.
+      - name: "Measurement: chat abort during prompt evaluation (diagnosis)"
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          node scripts/ci/chat-abort-diagnose.cjs --model qwen2.5-0.5b-instruct-q4_k_m.gguf --logs ci-logs | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop chat abort measurement servers
+        if: always()
+        env:
+          FRONTEND_PORT: "14980"
+        run: |
+          if [ "$RUNNER_OS" != "Windows" ]; then pkill -CONT -f "llama-server" || true; fi
+          bash scripts/ci/stop-app.sh
+          if [ "$RUNNER_OS" != "Windows" ]; then pkill -f "llama-server.*--port 14981" || true; else taskkill //F //IM llama-server.exe || true; fi
+
       # Step 9.9f-2 memory admission, real model, opt-in: switched on only in the environment of the test servers this
       # script starts (port 14950); the installed default stays off (its first check). It never exhausts the runner's
       # memory: a test-only setting inflates the estimated need. Linux can refuse; Windows and macOS readings aren't
@@ -186,6 +202,20 @@ jobs:
           fi
           echo "Second launch started without setup." | tee -a "$GITHUB_STEP_SUMMARY"
           bash scripts/ci/stop-app.sh
+
+      # BENCH BRANCH ONLY (never merged): Step 9.9f-3 image queue design measurements, real CPU sd-server. Observes only.
+      - name: "Measurement: sd-server concurrency and disconnects (CPU)"
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 75
+        run: |
+          node scripts/ci/image-queue-measure.cjs --logs ci-logs | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop image measurement server
+        if: always()
+        env:
+          FRONTEND_PORT: "14985"
+        run: bash scripts/ci/stop-app.sh
 
       - name: Upload logs and results (no models)
         if: always()
