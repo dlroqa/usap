@@ -199,6 +199,26 @@ test("macos-arm64: Apple GPU with unified memory; high tier at 16 GB; RAM from v
   assert.deepEqual(m.f.getCoreMLNpuInfo(), { supported: true, ready: false, reason: "CoreML Python environment is not set up. Run scripts/setup/setup-coreml-npu.sh first." });
 });
 
+// Issue #116: start() asks vm_stat asynchronously. Until its first answer the source is "os-free-pages" and a memory
+// check made then reports macos-available-memory-pessimistic; after it, "vm-stat" and no such reason. A server that
+// loads a model right after it starts can be in either window, so two otherwise equal runs can differ in this reason.
+test("macos: the memory source is os-free-pages until the first vm_stat answer, then vm-stat; the memory check follows", () => {
+  const { assessModelLoad } = require("../server/services/memory-check.cjs");
+  const reasons = (hw) => assessModelLoad({ kind: "text", info: { contextSize: 2048, gpuLayers: 0, backendMode: "CPU" }, budget: hw.budget,
+    inspectModel: () => null, platform: "darwin", arch: "x64", now: () => 0 }).reasons;
+  const m = machine({ platform: "darwin", arch: "x64", totalGb: 16, freeGb: 1, exec: { vm_stat: VM_STAT } });
+  m.hw.start();
+  assert.ok(m.calls.some(([kind, cmd]) => kind === "exec" && cmd === "vm_stat"), "start() asked vm_stat");
+  assert.equal(m.hw.budget.freeRamSource(), "os-free-pages", "before the answer");
+  assert.equal(m.hw.budget.freeRamBytes(), 1 * GB, "before the answer: free pages only (os.freemem)");
+  assert.ok(reasons(m.hw).includes("macos-available-memory-pessimistic"));
+  m.flush();
+  assert.equal(m.hw.budget.freeRamSource(), "vm-stat", "after the answer");
+  assert.equal(m.hw.budget.freeRamBytes(), 4 * GB);
+  assert.ok(!reasons(m.hw).includes("macos-available-memory-pessimistic"));
+  m.hw.stop();
+});
+
 test("macos-arm64: system_profiler failing falls back to 'Apple Metal GPU' with unified memory", () => {
   const m = machine({ platform: "darwin", arch: "arm64", totalGb: 8 });
   assert.deepEqual(m.f.getGpuInfo(), { name: "Apple Metal GPU", vram_gb: 8 });
