@@ -40,6 +40,7 @@ const { chatTimeoutSetting, createChatTimeouts, httpMetricsFetcher } = require("
 const { createMemoryAdvisor, memoryCheckSetting } = require("./services/memory-check.cjs");
 const { createMemoryAdmission, memoryAdmissionSetting } = require("./services/memory-admission.cjs");
 const { createEngineSlot, engineSlotSetting } = require("./services/engine-slot.cjs");
+const { createJobQueue, jobQueueSetting } = require("./services/job-queue.cjs");
 const { createThreadBudget, threadsSetting } = require("./services/thread-budget.cjs");
 const { createWhisperThreadCap, whisperThreadCapSetting } = require("./services/whisper-thread-cap.cjs");
 const { inspectModel } = require("./model-metadata.cjs");
@@ -1720,7 +1721,17 @@ const webSearch = createWebSearchService({
 const router = createRouter();
 // Status responses carry shortened paths for every client (issue #52); internal callers keep absolute ones.
 router.use(systemRoutes({ json, getHealth: async () => publicPaths(await getHealth()), getDiagnostics: async () => publicPaths(await getDiagnostics()), getCleanupCandidates, getHardwareSpecs, getBackendOptions: () => publicPaths(getBackendOptions()), getTelemetry }));
-router.use(ttsRoutes({ tts, json, readJsonBody, jsonErrorStatus, errorStatus, errorBody, streamModelUpload, pathInside, fs, path, MIME, TTS_MODELS, TTS_OUTPUTS }));
+// Step 9.9f-3: bounded voice job queue (services/job-queue.cjs). Off by default (USAP_VOICE_QUEUE=on or scheduler.json
+// "voiceQueue": "on"; USAP_SCHEDULER=off forces it off). Off: not created, and /api/tts/speak and /api/tts/stop are the
+// handlers from before. 1 running + 4 waiting; the longest wait is USAP_VOICE_QUEUE_MAX_WAIT_MS / "voiceQueueMaxWaitMs".
+// 10 minutes: measured jobs take 3-26 s (STEP9_9F_WORKLOAD_QUEUES.md §11.2), so 4 typical waiting jobs drain well inside it.
+const VOICE_QUEUE_DEFAULT_WAIT_MS = 10 * 60 * 1000;
+const VOICE_QUEUE = jobQueueSetting({ configDir: LLM_CONFIG_DIR, schedulerMode: schedulerMode({ configDir: LLM_CONFIG_DIR }), name: "voiceQueue", envName: "USAP_VOICE_QUEUE", waitName: "voiceQueueMaxWaitMs", waitEnvName: "USAP_VOICE_QUEUE_MAX_WAIT_MS", defaultWaitMs: VOICE_QUEUE_DEFAULT_WAIT_MS });
+for (const x of VOICE_QUEUE.ignored) console.warn(`  [scheduler] ignored ${x.name} from ${x.source} (${x.reason}); using the next setting or the default`);
+if (VOICE_QUEUE.forcedOffBy) console.warn(`  [scheduler] voice queue "${VOICE_QUEUE.requested}" is off because USAP_SCHEDULER=off.`);
+const voiceQueue = VOICE_QUEUE.mode === "on" ? createJobQueue({ engineLabel: "voice engine", limit: VOICE_QUEUE.limit, maxWaitMs: VOICE_QUEUE.maxWaitMs }) : null;
+if (voiceQueue) console.log(`  [scheduler] Voice queue on: ${VOICE_QUEUE.limit} waiting at most, ${Math.round(VOICE_QUEUE.maxWaitMs / 1000)} s longest wait.`);
+router.use(ttsRoutes({ tts, json, readJsonBody, jsonErrorStatus, errorStatus, errorBody, streamModelUpload, pathInside, fs, path, MIME, TTS_MODELS, TTS_OUTPUTS, voiceQueue }));
 router.use(speechRoutes({ speech, SPEECH_MODELS, TRANSCRIPTIONS, downloadBlockReason, getDownloadState: () => downloads.getState(), errorBody, errorStatus, fs, json, jsonErrorStatus, path, pathInside, readBinaryBody, readJsonBody, startModelDownload, streamModelUpload }));
 router.use(searchRoutes({ webSearch, json, readJsonBody, errorStatus, errorBody }));
 router.use(imageRoutes({
@@ -1793,6 +1804,7 @@ if (SCHEDULER_MODE !== "off") {
     chatQueue: CHAT_QUEUE,
     chatTimeouts: chatTimeouts ? () => chatTimeouts.snapshot() : null,
     memoryAdmission: memoryAdmissionEngine ? () => memoryAdmissionEngine.snapshot() : null,
+    voiceQueue: voiceQueue ? () => ({ mode: "on", ...voiceQueue.stats(), maxWaitSeconds: Math.round(voiceQueue.maxWaitMs / 1000), counts: voiceQueue.counts() }) : null,
     engineSlot: engineSlot ? () => ({ ...engineSlot.snapshot(), imageOperations: imageEngine.lifecycle.pendingOperations() }) : null,
     memoryCheck: MEMORY_CHECK,
     memoryChecks: memoryAdvisor ? () => memoryAdvisor.snapshot() : null,

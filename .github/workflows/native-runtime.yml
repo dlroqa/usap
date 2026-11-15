@@ -22,6 +22,7 @@ on:
       - "scripts/ci/chat-timeouts-validate.cjs"
       - "scripts/ci/memory-admission-validate.cjs"
       - "scripts/ci/engine-lifecycle-validate.cjs"
+      - "scripts/ci/voice-queue-validate.cjs"
       - "scripts/ci/p4-token-check.cjs"
       - "scripts/ci/p4-fixed-document-id.cjs"
       - "scripts/ci/memory-check-report.cjs"
@@ -174,6 +175,24 @@ jobs:
         if: always()
         env:
           FRONTEND_PORT: "14960"
+        run: bash scripts/ci/stop-app.sh
+
+      # Step 9.9f-3 voice: a baseline of today's unbounded Kokoro chain with the real worker on the CPU (measurements
+      # and observed legacy behaviour), then, when the voice queue exists in this checkout, the queue checks with
+      # voiceQueue on only for the script's own test server (port 14970); the installed default stays off.
+      - name: Voice queue with the real Kokoro worker (voiceQueue on for test servers only)
+        # Independent of the steps before it (it starts its own servers): it still runs, and the job still fails,
+        # when an earlier check failed, so its evidence isn't lost to an unrelated failure.
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          node scripts/ci/voice-queue-validate.cjs --model kokoro-onnx-q8.json \
+            --results ci-logs/voice-queue-results.jsonl --logs ci-logs | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop voice queue test servers
+        if: always()
+        env:
+          FRONTEND_PORT: "14970"
         run: bash scripts/ci/stop-app.sh
 
       - name: Second launch must not re-run setup

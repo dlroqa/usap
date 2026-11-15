@@ -184,6 +184,14 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   image model can both end up loaded: turning it off restores compatibility, not the guarantee. CI checks it on all
   4 OS with the real CPU engines; GPU and NPU paths are not checked
   ([details](docs/roadmap/STEP9_9F_ENGINE_LIFECYCLE.md)).
+  A bounded voice queue (Step 9.9f-3, **Experimental**, off by default; `USAP_VOICE_QUEUE=on` turns it on,
+  `USAP_SCHEDULER=off` turns it off) keeps today's one-at-a-time Kokoro synthesis but limits the wait: at most 4
+  requests wait behind the running one (then `429 QUEUE_FULL` with `Retry-After`), none waits longer than 10 minutes
+  (`503 QUEUE_TIMEOUT`; `USAP_VOICE_QUEUE_MAX_WAIT_MS` changes it), and a request whose client disconnects while
+  waiting leaves the queue and is never synthesized or saved. A job that is already running finishes as before even
+  if its client leaves, and `/api/tts/stop` refuses the jobs still waiting (`409 ENGINE_NOT_READY`). Off (the
+  default), voice requests behave as before: they all wait, without a limit. CI checks it on all 4 OS with the real
+  Kokoro worker on the CPU ([details](docs/roadmap/STEP9_9F_WORKLOAD_QUEUES.md#11-as-built-voice-queue)).
   [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).

@@ -14,7 +14,38 @@ function ttsRoutes(deps) {
   for (const name of REQUIRED) {
     if (deps[name] === undefined || deps[name] === null) throw new Error(`routes/tts: missing dependency ${name}`);
   }
+  // Optional (Step 9.9f-3, only when voiceQueue is on): the bounded voice job queue (services/job-queue.cjs).
+  // Without it, /api/tts/speak and /api/tts/stop are exactly the handlers from before.
+  const voiceQueue = deps.voiceQueue || null;
   const { tts, json, readJsonBody, jsonErrorStatus, errorStatus, errorBody, streamModelUpload, pathInside, fs, path, MIME, TTS_MODELS, TTS_OUTPUTS } = deps;
+  // Step 9.9f-3: /api/tts/speak with the voice queue. The job's turn is taken before anything else; the model start
+  // (a lifecycle step) and the synthesis then run in the TTS chain exactly as before. The turn is released exactly
+  // once, when the job has settled. A client that disconnects while waiting leaves the queue and its job never runs;
+  // one that disconnects while its job runs doesn't stop the job's Kokoro worker: the job finishes (its output is
+  // saved, as before) and only then is the turn released, so the next job never overlaps it.
+  async function speakQueued(req, res, body) {
+    const turn = await voiceQueue.admit((cb) => res.once("close", () => { if (!res.writableEnded) cb(); }));
+    if (!turn.ok) {
+      if (turn.code === "CLIENT_GONE") return undefined;
+      if (turn.retryAfterSeconds) res.setHeader("Retry-After", String(turn.retryAfterSeconds));
+      return json(res, turn.status, { ok: false, error: turn.error, code: turn.code });
+    }
+    try {
+      if (!tts.isReady() || (body.model && tts.getSettings().model !== body.model)) {
+        await tts.runExclusiveTtsOperation(() => tts.startTts(body));
+      }
+      const output = await tts.runExclusiveTtsOperation(() => tts.synthesizeTts(body.text, body));
+      if (res.writableEnded || res.destroyed) return undefined;
+      return json(res, 200, { ok: true, output });
+    } catch (err) {
+      tts.setError(err.message || String(err));
+      if (res.writableEnded || res.destroyed) return undefined;
+      return json(res, jsonErrorStatus(err), errorBody(err, { error: tts.getError(), code: err.code || "", activeRuntime: err.activeRuntime || null }));
+    } finally {
+      turn.release();
+    }
+  }
+
   return (r) => {
     r.get("/api/tts/status", async (req, res) => {
     const runtime = tts.getTtsRuntimeStatus();
@@ -54,12 +85,15 @@ function ttsRoutes(deps) {
 
     r.post("/api/tts/stop", async (req, res) => {
     await tts.stopTts();
+    // Queue on: jobs still waiting are refused (the running job is not touched, as before: its worker finishes).
+    if (voiceQueue) voiceQueue.refuseWaiting({ status: 409, code: "ENGINE_NOT_READY", error: "The voice engine was stopped while this request waited. Start it again and retry." });
     return json(res, 200, { ok: true });
     });
 
     r.post("/api/tts/speak", async (req, res) => {
     const body = await readJsonBody(req, res, 512 * 1024);
     if (!body) return;
+    if (voiceQueue) return speakQueued(req, res, body);
     try {
       if (!tts.isReady() || (body.model && tts.getSettings().model !== body.model)) {
         await tts.runExclusiveTtsOperation(() => tts.startTts(body));

@@ -74,7 +74,7 @@ const queue = (pending) => (pending === null
 // (services/memory-check.cjs). Both are optional; without them the snapshot is exactly the 9.9c one.
 // Step 9.9e: `threads` is the thread-budget setting and `threadBudget()` its latest decision (services/thread-budget.cjs).
 // Optional; without them (or with threads off) the snapshot is exactly the 9.9d one.
-function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null, chatTimeouts = null, memoryAdmission = null, engineSlot = null }) {
+function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null, chatTimeouts = null, memoryAdmission = null, engineSlot = null, voiceQueue = null }) {
   for (const [name, value] of Object.entries({ budget, cpu, engines })) {
     if (!value) throw new Error(`scheduler: missing dependency ${name}`);
   }
@@ -163,6 +163,18 @@ function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { m
         out.limits.memoryAdmission = m.mode;
         out.memoryAdmission = m;
         if (m.mode === "enforce") out.scheduler.decisions = true; // a refusal is a decision; observe makes none
+      }
+    }
+    // Additive (Step 9.9f-3, only when voiceQueue is on): running/waiting/limit on the voice engine, the longest wait
+    // and counts; numbers and fixed words only (no text, voices or file names). Absent when off (the default).
+    if (voiceQueue) {
+      let v = null;
+      try { v = voiceQueue(); } catch (_) { v = null; }
+      if (v) {
+        out.limits.voiceQueue = "on";
+        out.engines.voice.queue = { running: v.running, waiting: v.waiting, known: true, limit: v.limit };
+        out.voiceQueue = { mode: "on", limit: v.limit, maxWaitSeconds: v.maxWaitSeconds, counts: v.counts };
+        out.scheduler.decisions = true; // a refusal is a decision
       }
     }
     // Additive (issue #105, only when engineSlot is on): owner kind, phase, epoch, counts and unconfirmed exits;
