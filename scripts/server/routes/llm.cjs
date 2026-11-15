@@ -113,6 +113,11 @@ function llmRoutes(deps) {
     r.post("/api/llm/stop", async (req, res) => {
     await stopLlmNow(); // cancels a start in progress immediately
     await runExclusiveLlmOperation(() => killLlm());
+    // Issue #105 (slot on): say so when the engine did not exit after SIGKILL; capacity stays reserved until it does.
+    if (deps.engineSlot && deps.engineSlot.hasStuck("text")) {
+      const err = deps.engineSlot.unconfirmedError("text");
+      return json(res, 503, errorBody(err, { error: err.message, code: err.code }));
+    }
     return json(res, 200, { ok: true });
     });
 

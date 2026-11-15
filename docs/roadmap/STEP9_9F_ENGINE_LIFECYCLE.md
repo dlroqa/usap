@@ -1,8 +1,9 @@
 # Issue #105: cross-engine model-load coordination (design)
 
-Status: **design proposal only.** Nothing here is implemented. The fix, its default, and every open decision in §12
-need separate owner approval. It comes before the Step 9.9f-3 workload queues (see
-[STEP9_9_SCHEDULING.md](STEP9_9_SCHEDULING.md), stage 9.9f).
+Status: design merged (#111). **Implemented, off by default** (`engineSlot: "off"`), with the choices in §13
+("As built"), which take precedence over §6–§12 where they differ. Turning it on by default needs separate owner
+approval and four-platform validation. Turning it off restores compatibility, not the exclusivity guarantee: with
+the slot off, the race in §4 is still there.
 
 Scope: how text-model and image-model **load, reload and unload** are coordinated so that two lifecycle operations
 can't conflict. It doesn't cover inference scheduling (chat, image generation, Whisper, Kokoro), GPU/VRAM
@@ -403,3 +404,89 @@ not evidence for GPU or NPU paths.
 * `startLlm` reads `llmStartToken` when its turn in the chain comes, so a stop sent while a start is still waiting
   in the chain doesn't cancel that start. Pre-existing, unchanged here.
 * #107 (sticky mlock/mmap settings) is independent: the slot neither fixes nor depends on it.
+
+## 13. As built
+
+Implementation: `scripts/server/services/engine-slot.cjs` (setting, slot, process stop), with call sites in
+`services/llm-engine.cjs`, `services/image-engine.cjs`, `routes/image.cjs`, `routes/llm.cjs` and `serve.cjs`. Every
+change is behind `engineSlot`. With it off, the slot isn't created and each call site takes its previous code path.
+
+### 13.1 Settings
+
+* `engineSlot: off | on`: `USAP_ENGINE_SLOT` (environment, wins) or `app/config/scheduler.json`. Read at start-up.
+  Invalid values are ignored and logged. Default `off`.
+* `USAP_SCHEDULER=off` forces it off, with a log line (decision 2).
+* `GET /api/resources` gains `engineSlot` and `limits.engineSlot: "on"` only when on. The report holds fixed words
+  and numbers only: owner kind, phase, epoch, operations in progress, tracked processes, unconfirmed exits, counts
+  and the last refusal. No model names, PIDs or paths.
+
+### 13.2 The open decisions (§12.2), as implemented
+
+| # | Decision | As built |
+|---|---|---|
+| 1 | Default | `off` (owner decision). Enabling it by default needs separate approval and four-platform validation |
+| 2 | `USAP_SCHEDULER=off` | Forces it off |
+| 3 | Concurrent image loads | FIFO in the image chain |
+| 4 | Error code | `409 MODEL_ALREADY_ACTIVE`, the existing message and `activeRuntime`, plus additive `activeRuntime.phase`. When the other kind isn't simply loaded, the message gains a note in brackets (`still loading`, `still stopping`, `restarting after a crash`) and keeps the prefix the WebUI matches |
+| 5 | Unconfirmed exit | Refused until the exit is seen. Stop requests answer `503 ENGINE_EXIT_UNCONFIRMED`, later loads of either kind get the same `503`, and `/api/resources` lists the process in `unconfirmedExits`. A late exit releases the slot |
+| 6 | Fixed waits | The route's 500 ms pause is kept. `killBackend` and `killOpenVinoWorker` wait for the exit instead of 2 s / 0.8 s (SIGTERM, 2.5 s, SIGKILL, 2.5 s) |
+| 7 | Image load during a text `restart-pending` | The image request cancels the restart through the text chain, then claims the slot |
+| 8 | Client disconnect during a load | Unchanged: the load continues |
+
+### 13.3 Ownership and synchronization details
+
+* **Claim points.** Text: the first statement of `startLlm` and of `benchmarkLlmModel` (after its input
+  validation), inside the text chain. Image: in the image chain, after the existing early answers ("already running",
+  "generation in progress", the Apple NPU settings update) and before `killBackend()`. All claims are synchronous.
+* **Nesting.** The slot counts operations per kind. A stop or crash report for a kind is ignored while an
+  operation of that kind runs, because the operation settles the slot when it ends (from whether its engine process
+  exists and answers). A benchmark that restores the previous model is one outer operation with an inner one.
+* **Same-kind decisions are unchanged.** The slot decides only cross-kind conflicts. The process-based rule in
+  `assertNoOtherActiveRuntime` still decides same-kind cases, including the existing behaviour when a different text
+  model is requested while one is loaded. It also refuses if a process of the other kind exists while this kind owns
+  the slot (an invariant violation).
+* **Neither engine stops the other.** With the slot on, `startLlmWithBackend` doesn't call `killBackend()` or
+  `killOpenVinoWorker()`, and `startBackend` doesn't call `killLlm()`.
+* **Exit confirmation.** For a supervised engine (llama-server, sd-server, Core ML), the guard's `exit` event, then
+  the engine PID reported by the guard gone (polled up to 2 s; still alive → reported as unconfirmed, kept reserved,
+  re-checked). For the OpenVINO worker (not supervised), its own `exit` event. Before spawning, a load of the same kind
+  waits up to 5 s for every earlier process of that kind to be confirmed gone, otherwise `503 ENGINE_EXIT_UNCONFIRMED`.
+* **Cancellation.** `/api/stop-backend` bumps the image start token and stops both image processes at once, outside
+  the chain (like `stopLlmNow` for text). It then runs once more in the chain for anything spawned meanwhile, and
+  answers after the exits. A load captures the token when its request arrives and checks it after every await before
+  its spawn, so a stop also cancels loads still waiting in the chain. A cancelled load answers
+  `409 ENGINE_START_CANCELLED` and leaves no `backendError`.
+* **Stale callbacks.** Every spawn is tagged with its epoch. `markLoaded`, `markRestartPending` and `stopped` from an
+  older epoch are ignored. With the slot on, the image ready poll and the "listening on" log line mark only the current
+  process ready. The OpenVINO worker's exit handler no longer clears a newer worker. The NPU background start's error
+  handler doesn't write state after its load was cancelled.
+* **Delete model.** With the slot on, deleting the loaded text model stops its engine through the text chain.
+
+### 13.4 Tests and evidence
+
+* `scripts/tests/engine-slot.test.cjs` covers:
+  * unit tests: the setting, the slot, epochs, PID confirmation, SIGKILL escalation and a process that never exits;
+  * R1, R5, R2 (four loads at once), R4, R1b and R3, through the real server with the fake engines, each sampling
+    the live engine processes;
+  * cancellation while waiting in the chain, after spawn and before ready, and a stop racing the start at seven
+    offsets;
+  * a crash during load, a reload under a new epoch, forced termination of SIGTERM-ignoring engines, and a
+    benchmark holding the slot;
+  * crash auto-restart, an image load during `restart-pending`, and the out-of-memory retry;
+  * 9.9f-1 (chat timeouts on) and 9.9f-2 (memory admission observe);
+  * delete model, server shutdown, default off (the legacy race still reproduces), `USAP_SCHEDULER=off`, and the
+    report shape.
+* New test-only fake markers: `hold-start`, `crash-once` and `ignore-sigterm` (text); `hold-load` and
+  `ignore-sigterm` (image).
+* With the slot on for every test server, the existing suite differs only where intended: a test that asserts the
+  legacy R3 `500` (`memory-admission.test.cjs`), and a test that compares `limits` exactly
+  (`whisper-thread-cap.test.cjs`, now with the additive `engineSlot`).
+* Native: `scripts/ci/engine-lifecycle-validate.cjs` in `native-runtime` (§11.2), on port 14960.
+
+### 13.5 The image load-progress side finding (§12.3)
+
+Not confirmed with real engines. In the native CI logs of all four platforms (sd.cpp builds in use), the model-load
+progress lines end in `GB/s`, `MB/s` or are `#` bars without a rate (`|====| 1131/1131 - 3.63GB/s`). The
+generation-progress pattern requires `it/s` or `s/it`, so a real load doesn't set `generationState.active`. Only the
+fake engine's load line (`2/2 - 1.00it/s`) does. That is a test-fixture inaccuracy, left as it is here, so existing
+image tests are unaffected. A later test-only change can make the fake print a byte rate.

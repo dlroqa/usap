@@ -28,6 +28,36 @@ function createImageEngine(deps) {
 
   let backendProcSeq = 0;
 
+  // Issue #105 (optional, only when engineSlot is on): the shared heavy-engine slot, an image lifecycle chain and an
+  // image start token. Null slot: the code paths from before, including the known race.
+  const slot = deps.engineSlot || null;
+  const waitForChildExit = deps.waitForChildExit || null;
+  if (slot && typeof waitForChildExit !== "function") throw new Error("image-engine: engineSlot needs waitForChildExit");
+  let imageStartToken = 0;      // bumped by a stop request; a load that sees a new value ends before its spawn
+  let backendEpoch = 0;         // slot epoch of the current backendProc / openvinoProc
+  let imageOperationQueue = Promise.resolve();
+  let pendingImageOperations = 0;
+  function runExclusiveImageOperation(operation) {
+    const run = imageOperationQueue.catch(() => {}).then(operation);
+    imageOperationQueue = run.catch(() => {});
+    pendingImageOperations += 1;
+    imageOperationQueue.then(() => { pendingImageOperations -= 1; });
+    return run;
+  }
+  function imageStartCancelledError() {
+    return Object.assign(new Error("Loading the image model was stopped."), { code: "ENGINE_START_CANCELLED", statusCode: 409 });
+  }
+  function checkImageToken(token) {
+    if (slot && token !== undefined && token !== null && token !== imageStartToken) throw imageStartCancelledError();
+  }
+  // Slot on: SIGTERM, wait for the exit, SIGKILL, wait again. Never treats a timer as an exit.
+  async function stopImageProcess(proc) {
+    const { stopProcess } = require("./engine-slot.cjs");
+    const r = await stopProcess(proc, { waitForChildExit });
+    if (!r.exited) slot.noteStopUnconfirmed("image", proc);
+    return r.exited;
+  }
+
   let backendReady = false;
 
   let backendError = null;
@@ -409,6 +439,7 @@ function createImageEngine(deps) {
 
   function markBackendReady() {
     if (backendReady) return;
+    if (slot) slot.markLoaded("image", backendEpoch);
     backendReady = true;
     backendLoadState = {
       ...backendLoadState,
@@ -480,6 +511,15 @@ function createImageEngine(deps) {
   }
 
   async function killOpenVinoWorker() {
+    if (slot) {
+      const proc = openvinoProc;
+      openvinoReady = false;
+      if (!proc) return true;
+      console.log("  [openvino-npu] Stopping worker...");
+      const exited = await stopImageProcess(proc);
+      if (openvinoProc === proc) openvinoProc = null;
+      return exited;
+    }
     if (!openvinoProc) {
       openvinoReady = false;
       return;
@@ -502,7 +542,7 @@ function createImageEngine(deps) {
     return { width, height };
   }
 
-  async function startOpenVinoWorker(settings = {}) {
+  async function startOpenVinoWorker(settings = {}, { token = null } = {}) {
     const npuInfo = getOpenVinoNpuInfo();
     if (!npuInfo.supported) throw new Error(npuInfo.reason || "OpenVINO NPU is not available.");
     const requestedModel = settings.model ? findOpenVinoModel(settings.model) : null;
@@ -523,12 +563,14 @@ function createImageEngine(deps) {
 
     await killBackend();
     await killOpenVinoWorker();
+    if (slot && !(await slot.waitForExits("image", 5000))) throw slot.unconfirmedError("image");
     openvinoError = null;
     openvinoReady = false;
     openvinoModel = model.id;
     openvinoWidth = 512;
     openvinoHeight = 512;
     openvinoPort = await findAvailableBackendPort();
+    checkImageToken(token); // last await before the spawn
     PORT_BACKEND = openvinoPort;
 
     currentSettings = { ...currentSettings, ...settings };
@@ -566,6 +608,8 @@ function createImageEngine(deps) {
       "--height", "512",
       "--cache-dir", cacheDir,
     ], { stdio: "pipe" });
+    const ovProc = openvinoProc;
+    if (slot) { backendEpoch = slot.current().epoch; slot.track("image", ovProc, backendEpoch); }
 
     let openvinoStdoutBuffer = "";
     openvinoProc.stdout.on("data", (data) => {
@@ -576,6 +620,8 @@ function createImageEngine(deps) {
       openvinoStdoutBuffer = lines.pop() || "";
       for (const line of lines) {
         if (line.includes("READY")) {
+          if (slot && openvinoProc !== ovProc) continue; // a stale worker
+          if (slot) slot.markLoaded("image", ovProc.usapEpoch);
           openvinoReady = true;
           backendReady = true;
           backendLoadState = { ...backendLoadState, active: false, phase: "OpenVINO NPU model ready", progress: 100 };
@@ -605,6 +651,8 @@ function createImageEngine(deps) {
     });
     openvinoProc.on("exit", (code) => {
       console.log("  [openvino-npu] worker exited with code", code);
+      if (slot && openvinoProc !== ovProc) return; // a stale worker must not clear the current one
+      if (slot) slot.stopped("image", ovProc.usapEpoch);
       openvinoProc = null;
       openvinoReady = false;
       backendReady = false;
@@ -614,6 +662,7 @@ function createImageEngine(deps) {
 
     const startedAt = Date.now();
     while (Date.now() - startedAt < 360000) {
+      if (slot && token !== null && token !== imageStartToken) { await killOpenVinoWorker(); throw imageStartCancelledError(); }
       if (openvinoReady) return;
       if (backendError) throw new Error(backendError);
       if (!openvinoProc) throw new Error("OpenVINO NPU worker exited during startup.");
@@ -647,17 +696,18 @@ function createImageEngine(deps) {
     }
   }
 
-  function startBackendReadyPoll() {
+  function startBackendReadyPoll(pollProc = null) {
     let attempts = 0;
     const isNpu = currentSettings.backendType === "apple-npu" || currentSettings.backendType === "openvino-npu";
     const maxAttempts = isNpu ? 1200 : 240;
     const interval = setInterval(async () => {
       attempts += 1;
-      if (!backendProc || backendReady || attempts > maxAttempts) {
+      if (!backendProc || backendReady || attempts > maxAttempts || (slot && pollProc && backendProc !== pollProc)) {
         clearInterval(interval);
         return;
       }
       if (await pingBackendReady()) {
+        if (slot && pollProc && backendProc !== pollProc) { clearInterval(interval); return; }
         markBackendReady();
         clearInterval(interval);
       }
@@ -687,6 +737,7 @@ function createImageEngine(deps) {
   }
 
   function killBackend() {
+    if (slot) return killBackendConfirmed();
     return new Promise(resolve => {
       resetGenerationState();
       const proc = backendProc;
@@ -708,14 +759,43 @@ function createImageEngine(deps) {
     });
   }
 
-  async function startBackend(settings = {}) {
+  // Slot on: the same stop, but resolved only after the exit is seen (or reported as unconfirmed after SIGKILL).
+  async function killBackendConfirmed() {
+    resetGenerationState();
+    const proc = backendProc;
+    if (!proc) {
+      backendUnloadState = { active: false, phase: "", progress: 0 };
+      return true;
+    }
+    backendUnloadState = { active: true, phase: "Stopping backend process...", progress: 10 };
+    backendReady = false;
+    backendUnloadState = { active: true, phase: "Waiting for process exit...", progress: 50 };
+    const exited = await stopImageProcess(proc);
+    if (backendProc === proc) backendProc = null;
+    backendUnloadState = exited
+      ? { active: false, phase: "Backend unloaded", progress: 100 }
+      : { active: false, phase: "Backend did not exit", progress: 100 };
+    return exited;
+  }
+
+  // Slot on: a stop request. Ends a load in progress (start token) and stops both image processes, outside the
+  // image chain, like stopLlmNow for text. Resolves true when every image process exit was seen.
+  async function stopImageNow() {
+    imageStartToken += 1;
+    const a = await killBackend();
+    const b = await killOpenVinoWorker();
+    return a !== false && b !== false;
+  }
+
+  async function startBackend(settings = {}, { token = null } = {}) {
     const requestedSettings = { ...currentSettings, ...settings };
     if (!requestedSettings.model) requestedSettings.model = getDefaultModel();
     assertNoOtherActiveRuntime("image", requestedSettings.model);
 
-    await killLlm();
+    // Slot on: the image operation owns the slot; the text engine is never stopped from here (issue #105).
+    if (!slot) await killLlm();
     if (settings.backendType === "openvino-npu") {
-      await startOpenVinoWorker(settings);
+      await startOpenVinoWorker(settings, { token });
       return;
     }
     await killOpenVinoWorker();
@@ -745,6 +825,8 @@ function createImageEngine(deps) {
     }
 
     PORT_BACKEND = Number(settings.backendPort) > 0 ? Number(settings.backendPort) : await findAvailableBackendPort();
+    if (slot && !(await slot.waitForExits("image", 5000))) throw slot.unconfirmedError("image");
+    checkImageToken(token); // the last await before the spawn is above
 
     const resolvedBackendType = resolveBackendType(currentSettings.useGpu, currentSettings.backendType, currentSettings.model);
     currentSettings.backendType = resolvedBackendType;
@@ -894,7 +976,8 @@ function createImageEngine(deps) {
     const procSeq = ++backendProcSeq;
     const proc = supervisor.spawnSupervised(backendPath, args, { stdio: "pipe", env: spawnEnv }, { label: "image" });
     backendProc = proc;
-    startBackendReadyPoll();
+    if (slot) { backendEpoch = slot.current().epoch; slot.track("image", proc, backendEpoch); }
+    startBackendReadyPoll(proc);
     const coremlLoadHeartbeat = startCoreMLLoadHeartbeat(proc);
 
     proc.stdout.on("data", d => {
@@ -902,7 +985,7 @@ function createImageEngine(deps) {
       process.stdout.write("  [sd] " + output);
       updateCoreMLLoadProgress(output);
       const cleanOutput = stripAnsi(output);
-      if (cleanOutput.includes("listening on")) {
+      if (cleanOutput.includes("listening on") && !(slot && backendProc !== proc)) {
         markBackendReady();
       }
       
@@ -1035,6 +1118,7 @@ function createImageEngine(deps) {
       backendReady = false;
       backendProc = null;
       backendLoadState.active = false;
+      if (slot) slot.stopped("image", proc.usapEpoch);
     });
     proc.on("exit", (code, signal) => {
       if (coremlLoadHeartbeat) clearInterval(coremlLoadHeartbeat);
@@ -1044,6 +1128,7 @@ function createImageEngine(deps) {
       }
       backendReady = false;
       backendProc  = null;
+      if (slot) slot.stopped("image", proc.usapEpoch);
       console.log("  [backend] exited with code", code, signal ? `(signal ${signal})` : "", `(process ${procSeq})`);
       if (code !== null && code !== 0) {
         if (!backendError) {
@@ -1285,6 +1370,13 @@ function createImageEngine(deps) {
       set PORT_BACKEND(value) { PORT_BACKEND = value; },
     }),
     activeGenerations: () => generationsInFlight, // Step 9.9e (read-only)
+    // Issue #105 (used only when engineSlot is on).
+    lifecycle: Object.freeze({
+      runExclusive: runExclusiveImageOperation,
+      startToken: () => imageStartToken,
+      stopNow: stopImageNow,
+      pendingOperations: () => pendingImageOperations,
+    }),
     fns: { backendSupportsFlags, BACKEND_RESTART_SETTING_KEYS, normalizeBackendSettingValue, backendSettingsMatch, setBackendLoadStage, updateCoreMLLoadProgress, findAvailableBackendPort, getCoreMLPythonPath, backendAccepts, selectBackendPath, resolveBackendType, getBackendMode, markBackendReady, pingBackendReady, proxyImageBackendRequest, killOpenVinoWorker, getOpenVinoResolution, startOpenVinoWorker, generateWithOpenVino, startBackendReadyPoll, startCoreMLLoadHeartbeat, killBackend, startBackend, resetGenerationState, describeBackendError, describeBackendExitCode, saveGeneratedOutput, listGeneratedOutputs, deleteGeneratedOutputs },
   };
 }

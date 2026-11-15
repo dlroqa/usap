@@ -74,7 +74,7 @@ const queue = (pending) => (pending === null
 // (services/memory-check.cjs). Both are optional; without them the snapshot is exactly the 9.9c one.
 // Step 9.9e: `threads` is the thread-budget setting and `threadBudget()` its latest decision (services/thread-budget.cjs).
 // Optional; without them (or with threads off) the snapshot is exactly the 9.9d one.
-function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null, chatTimeouts = null, memoryAdmission = null }) {
+function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null, chatTimeouts = null, memoryAdmission = null, engineSlot = null }) {
   for (const [name, value] of Object.entries({ budget, cpu, engines })) {
     if (!value) throw new Error(`scheduler: missing dependency ${name}`);
   }
@@ -164,6 +164,13 @@ function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { m
         out.memoryAdmission = m;
         if (m.mode === "enforce") out.scheduler.decisions = true; // a refusal is a decision; observe makes none
       }
+    }
+    // Additive (issue #105, only when engineSlot is on): owner kind, phase, epoch, counts and unconfirmed exits;
+    // fixed words and numbers only (no model names, PIDs or paths). Absent when off (the default).
+    if (engineSlot) {
+      let e = null;
+      try { e = engineSlot(); } catch (_) { e = null; }
+      if (e) { out.limits.engineSlot = "on"; out.engineSlot = e; }
     }
     if (!threadsOn) return out;
     // Additive (9.9e, only when on): the budget's scope and its latest transcription decision (a report; the

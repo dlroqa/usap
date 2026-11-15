@@ -39,6 +39,7 @@ const { createScheduler, schedulerMode, chatQueueSetting } = require("./services
 const { chatTimeoutSetting, createChatTimeouts, httpMetricsFetcher } = require("./services/chat-timeouts.cjs");
 const { createMemoryAdvisor, memoryCheckSetting } = require("./services/memory-check.cjs");
 const { createMemoryAdmission, memoryAdmissionSetting } = require("./services/memory-admission.cjs");
+const { createEngineSlot, engineSlotSetting } = require("./services/engine-slot.cjs");
 const { createThreadBudget, threadsSetting } = require("./services/thread-budget.cjs");
 const { createWhisperThreadCap, whisperThreadCapSetting } = require("./services/whisper-thread-cap.cjs");
 const { inspectModel } = require("./model-metadata.cjs");
@@ -253,11 +254,21 @@ const threadBudget = THREADS.mode === "on" ? createThreadBudget({
 const WHISPER_CAP = whisperThreadCapSetting({ configDir: LLM_CONFIG_DIR, schedulerMode: schedulerMode({ configDir: LLM_CONFIG_DIR }) });
 const whisperThreadCap = WHISPER_CAP.mode === "on" ? createWhisperThreadCap({ setting: WHISPER_CAP, logicalCpus: () => os.cpus().length }) : null;
 
+// Issue #105: cross-engine model-load coordination (services/engine-slot.cjs). Off by default (USAP_ENGINE_SLOT=on or
+// scheduler.json "engineSlot": "on"; USAP_SCHEDULER=off forces it off). Off: not created, and both engines take the
+// code paths from before, which restores compatibility but NOT the exclusivity guarantee (the known race remains).
+const ENGINE_SLOT = engineSlotSetting({ configDir: LLM_CONFIG_DIR, schedulerMode: schedulerMode({ configDir: LLM_CONFIG_DIR }) });
+for (const x of ENGINE_SLOT.ignored) console.warn(`  [engine-slot] ignored ${x.name} from ${x.source} (${x.reason}); using the next setting or the default`);
+if (ENGINE_SLOT.forcedOffBy) console.warn(`  [engine-slot] engine slot "${ENGINE_SLOT.requested}" is off because USAP_SCHEDULER=off.`);
+const engineSlot = ENGINE_SLOT.mode === "on" ? createEngineSlot() : null;
+if (engineSlot) console.log("  [engine-slot] Engine slot on: one heavy model load at a time across text and image, released on confirmed exit.");
+
 // ── Backend process state ─────────────────────────────────────────────────────
 // Image generation (stable-diffusion.cpp, OpenVINO NPU, Core ML) lives in services/image-engine.cjs (Step 9.8g).
 // Functions bound later in this file are passed as wrappers, resolved when called.
 const imageEngine = createImageEngine({
   BACKEND_PATHS, IS_MAC_INTEL, MAC_INTEL_IMAGE_MESSAGE, MODELS, OUTPUTS, PREFERRED_BACKEND_PORT, ROOT, assertNoOtherActiveRuntime, backendValidationErrors, badRequest, checkPort, conflict, describeLinuxRuntimeLinkerError, findOpenVinoModel: (...args) => findOpenVinoModel(...args), fs, getBackendOptions, getDefaultModel, getModelLoadIssue, getOpenVinoModelInfo: (...args) => getOpenVinoModelInfo(...args), getOpenVinoNpuInfo: (...args) => getOpenVinoNpuInfo(...args), getPreferredVulkanBackendName: (...args) => getPreferredVulkanBackendName(...args), http, json, killLlm: (...args) => killLlm(...args), os, osPlatform, path, pollNvidiaVram: (...args) => pollNvidiaVram(...args), readdirVisible: (...args) => readdirVisible(...args), requestJson, safeOutputName, spawn, spawnSync, stripAnsi, supervisor, withoutAuthHeaders, withoutCorsHeaders,
+  engineSlot, waitForChildExit: (...args) => waitForChildExit(...args), // optional (issue #105)
   getBackendPath: () => BACKEND_PATH,
   memoryAdvisor, // optional (Step 9.9d)
 });
@@ -271,6 +282,7 @@ const {
 const llmEngine = createLlmEngine({
   ApiError, LLM_BACKEND_PATHS, LLM_BENCHMARK_PATH, LLM_MODELS, LLM_MODEL_SETTINGS_PATH, PREFERRED_LLM_PORT, assertNoOtherActiveRuntime, badRequest, checkPort, decideRestart, fs, getGpuInfo: (...args) => getGpuInfo(...args), getStableSyclGpuLayers, http, isVisionModelFilename, killBackend, killOpenVinoWorker, notFound, notInstalled, os, osPlatform, path, pathInside, readJsonFile, readdirVisible: (...args) => readdirVisible(...args), requestJson, spawnSync, supervisor, waitForChildExit, waitForPortAvailable, writeJsonFile,
   memoryAdvisor, // optional (Step 9.9d)
+  engineSlot, // optional (issue #105)
   // Optional (Step 9.9f-2), only when memory admission is not off. Read at each text load decision.
   memoryAdmission: MEMORY_ADMISSION.mode === "off" ? null : {
     admission: memoryAdmissionEngine,
@@ -303,6 +315,16 @@ function modelName(value) {
 }
 
 function getActiveHeavyRuntime() {
+  // Issue #105 (slot on): the slot's owner, including a load before its spawn, a restart pending or a stop not yet
+  // confirmed. Otherwise (and when nothing owns it) the process-based answer from before.
+  if (engineSlot) {
+    const owned = engineSlot.runtime();
+    if (owned) return owned;
+  }
+  return processHeavyRuntime();
+}
+
+function processHeavyRuntime() {
   if ((imageEngine.state.backendReady || imageEngine.state.backendProc || imageEngine.state.openvinoReady || imageEngine.state.openvinoProc) && imageEngine.state.currentSettings.model) {
     return { type: "image", label: "Image", model: modelName(imageEngine.state.currentSettings.model) };
   }
@@ -315,8 +337,12 @@ function getActiveHeavyRuntime() {
 function assertNoOtherActiveRuntime(targetType, targetModel) {
   if (targetType !== "image" && targetType !== "text") return;
 
-  const runtime = getActiveHeavyRuntime();
   const targetName = modelName(targetModel);
+  // Issue #105 (slot on): the other kind owning the slot, in any phase, is a conflict (same code and wording, plus
+  // `phase`). Same-kind decisions keep the process-based rule below, unchanged; it also refuses if a process of the
+  // other kind exists while this kind owns the slot (an invariant violation).
+  if (engineSlot) engineSlot.assertNotOther(targetType, targetName);
+  const runtime = processHeavyRuntime();
   if (!runtime || (runtime.type === targetType && runtime.model === targetName)) return;
 
   const err = new Error(`"${runtime.model}" is already loaded as a ${runtime.label} model. Unload it before loading "${targetName}".`);
@@ -1703,6 +1729,7 @@ router.use(imageRoutes({
   getCoreMLPythonPath, getDefaultModel, json, jsonErrorStatus, killBackend, killOpenVinoWorker, listGeneratedOutputs, path,
   proxyImageBackendRequest, readJsonBody, saveGeneratedOutput, startBackend,
   memoryCheck: memoryAdvisor ? () => memoryAdvisor.last("image") : null, // optional (Step 9.9d)
+  imageLifecycle: engineSlot ? createImageLifecycle() : null, // optional (issue #105)
 }));
 router.use(modelRoutes({
   IMAGE_BACKEND_DOWNLOADS, LLM_MODELS, MODELS, OPENVINO_MODELS, SPEECH_MODELS, addHuggingFaceFileSize, cancelModelDownload,
@@ -1710,9 +1737,35 @@ router.use(modelRoutes({
   getBackendProc: () => imageEngine.state.backendProc, getCurrentSettings: () => imageEngine.state.currentSettings, getDownloadProgress: downloads.getDownloadProgress,
   getDownloadState: downloads.getState, getLlmModels, getLlmProc: () => llmEngine.state.llmProc, getLlmSettings: () => llmEngine.state.llmSettings,
   getModelDownloadUrlIssue, getModelInfo, getOpenVinoModelInfo, getOpenVinoNpuInfo, invalidateBackendOptions, isModelFile, json,
-  killLlm, modelFolderFor, os, path, pathInside, publicMessage, readJsonBody, readdirVisible, resolveHuggingFaceProjector,
+  // Issue #105 (slot on): deleting the loaded text model stops its engine through the text chain, not beside it.
+  killLlm: engineSlot ? () => runExclusiveLlmOperation(() => killLlm()) : killLlm, modelFolderFor, os, path, pathInside, publicMessage, readJsonBody, readdirVisible, resolveHuggingFaceProjector,
   searchHuggingFaceModels, speech, startImageBackendDownload, startModelDownload, startOpenVinoModelDownload, streamModelUpload,
 }));
+// Issue #105 (slot on): what routes/image.cjs needs for its lifecycle chain.
+function createImageLifecycle() {
+  const img = imageEngine.state;
+  return Object.freeze({
+    runExclusive: imageEngine.lifecycle.runExclusive,
+    startToken: imageEngine.lifecycle.startToken,
+    stopNow: imageEngine.lifecycle.stopNow,
+    cancelledError: () => Object.assign(new Error("Loading the image model was stopped."), { code: "ENGINE_START_CANCELLED", statusCode: 409 }),
+    prepare: async () => {
+      const st = engineSlot.current();
+      if (st.owner === "text" && st.phase === "restart-pending" && st.ops.text === 0) {
+        console.log("  [engine-slot] Image load requested while the text engine waits for its automatic restart: cancelling that restart.");
+        await runExclusiveLlmOperation(async () => {
+          const again = engineSlot.current();
+          if (again.owner === "text" && again.phase === "restart-pending") await killLlm();
+        });
+      }
+    },
+    reserve: (model) => engineSlot.begin("image", model),
+    end: () => engineSlot.end("image", { live: Boolean(img.backendProc || img.openvinoProc), ready: Boolean((img.backendReady && img.backendProc) || (img.openvinoReady && img.openvinoProc)) }),
+    stopped: () => engineSlot.stopped("image"),
+    hasStuck: () => engineSlot.hasStuck("image"),
+    unconfirmedError: () => engineSlot.unconfirmedError("image"),
+  });
+}
 // Chat requests and saved conversations (Step 9.8h): services/chat.cjs and services/conversations.cjs.
 // Step 9.9c: bounded chat queue, off unless turned on (USAP_CHAT_QUEUE=on or app/config/scheduler.json).
 const CHAT_QUEUE = chatQueueSetting({ configDir: LLM_CONFIG_DIR });
@@ -1730,6 +1783,7 @@ const conversations = createConversationStore({ CHAT_HISTORY, badRequest, format
 router.use(llmRoutes({
   state: llmEngine.routeState, PREFERRED_LLM_PORT, benchmarkLlmModel, deleteChatConversation: conversations.deleteChatConversation, doLlmChat: chatService.doLlmChat, errorBody, errorStatus, getLlmBackend, getLlmBackendProbe, getLlmRuntimeStats, getLlmfitRecommendations: (...args) => createLlmfitLookup({ ROOT, fs, getGpuInfo, os, osPlatform, path, spawnSync }).getLlmfitRecommendations(...args), getPersistedLlmModelSettings, json, jsonErrorStatus, killLlm, listChatConversations: conversations.listChatConversations, llmEngineState, llmLifecycleSnapshot, path, publicPaths, readJsonBody, runExclusiveLlmOperation, saveChatConversation: conversations.saveChatConversation, startLlm, stopLlmNow, updateLlmModelSettings,
   memoryCheck: memoryAdvisor ? () => memoryAdvisor.last("text") : null, // optional (Step 9.9d)
+  engineSlot, // optional (issue #105): /api/llm/stop reports an engine that did not exit
 }));
 // Resource accounting (Step 9.9b): read-only, no scheduling decisions. USAP_SCHEDULER=off leaves the route out.
 const SCHEDULER_MODE = schedulerMode({ configDir: LLM_CONFIG_DIR });
@@ -1739,6 +1793,7 @@ if (SCHEDULER_MODE !== "off") {
     chatQueue: CHAT_QUEUE,
     chatTimeouts: chatTimeouts ? () => chatTimeouts.snapshot() : null,
     memoryAdmission: memoryAdmissionEngine ? () => memoryAdmissionEngine.snapshot() : null,
+    engineSlot: engineSlot ? () => ({ ...engineSlot.snapshot(), imageOperations: imageEngine.lifecycle.pendingOperations() }) : null,
     memoryCheck: MEMORY_CHECK,
     memoryChecks: memoryAdvisor ? () => memoryAdvisor.snapshot() : null,
     threads: THREADS,
