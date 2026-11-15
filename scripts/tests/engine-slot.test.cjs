@@ -253,7 +253,9 @@ test("R1 (slot on): text load, image load 100 ms later while text is before its 
     const free = await holdTextPort(srv);
     const done = sampler(srv);
     const pText = textLoad(srv, "plain.gguf");
-    await sleep(100);
+    // Order by state, not by a delay: under load the text request may not have claimed the slot 100 ms later.
+    await waitFor(async () => { const s = await slotState(srv); return s.owner === "text" && s.phase === "loading"; }, 10000, "text owns the slot before its spawn");
+    assert.equal((await engines(srv)).length, 0, "the text load is still before its spawn (port held)");
     const img = await imageLoad(srv);
     const txt = await pText;
     await sleep(800);
@@ -277,7 +279,7 @@ test("R5 (slot on): image load, text load 100 ms later: text 409 (image loading)
     const free = await holdTextPort(srv);
     const done = sampler(srv);
     const pImg = imageLoad(srv);
-    await sleep(100);
+    await waitFor(async () => (await slotState(srv)).owner === "image", 10000, "image owns the slot");
     const txt = await textLoad(srv, "plain.gguf");
     const img = await pImg;
     await sleep(800);
