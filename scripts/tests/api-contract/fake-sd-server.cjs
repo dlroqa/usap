@@ -9,6 +9,8 @@
 //   fail-load         print a stable-diffusion.cpp [ERROR] line and exit 1 before listening
 //   crash-on-generate become ready; the first txt2img request kills the process (SIGSEGV-like exit 139)
 //   slow-generate     each txt2img takes 3 s, with step lines (concurrency and cancellation tests)
+//   hold-load         don't listen until the file "<model path>.release" exists (issue #105 tests)
+//   ignore-sigterm    ignore SIGTERM, so stopping needs SIGKILL (issue #105 tests)
 // GET /fake/stats reports {requests, completed, aborted, pid, args}.
 "use strict";
 const http = require("node:http");
@@ -82,4 +84,8 @@ const server = http.createServer((req, res) => {
   return res.end(JSON.stringify({ error: "not found" }));
 });
 const port = Number(arg("--listen-port", "8080"));
-server.listen(port, "127.0.0.1", () => console.log(`[INFO ] main.cpp:500 - listening on: 127.0.0.1:${port}`));
+if (model.includes("ignore-sigterm")) process.on("SIGTERM", () => console.error("[WARN ] fake: ignoring SIGTERM"));
+const listenNow = () => server.listen(port, "127.0.0.1", () => console.log(`[INFO ] main.cpp:500 - listening on: 127.0.0.1:${port}`));
+if (model.includes("hold-load")) {
+  const t = setInterval(() => { if (require("node:fs").existsSync(`${arg("--model", "")}.release`)) { clearInterval(t); listenNow(); } }, 25);
+} else listenNow();

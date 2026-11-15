@@ -16,7 +16,98 @@ function imageRoutes(deps) {
   // Optional (Step 9.9d): the warn-only memory check's latest image result. Without it, responses are unchanged.
   const memoryCheck = typeof deps.memoryCheck === "function" ? deps.memoryCheck : () => null;
   const withMemoryCheck = (body, before) => { let after = null; try { after = memoryCheck(); } catch (_) { after = null; } return after && after !== before ? { ...body, memoryCheck: after } : body; };
+  // Optional (issue #105, only when engineSlot is on): image lifecycle chain, start token and the heavy-engine slot.
+  // Without it, /api/restart-backend and /api/stop-backend are exactly the handlers from before.
+  const lifecycle = deps.imageLifecycle || null;
   const { state, MIME, MODELS, OUTPUTS, PREFERRED_BACKEND_PORT, SERVER_BUILD, appleNpuRuntimeMatches, assertNoOtherActiveRuntime, backendSettingsMatch, deleteGeneratedOutputs, errorBody, errorStatus, findAvailableBackendPort, fs, generateWithOpenVino, getCoreMLPythonPath, getDefaultModel, json, jsonErrorStatus, killBackend, killOpenVinoWorker, listGeneratedOutputs, path, proxyImageBackendRequest, readJsonBody, saveGeneratedOutput, startBackend } = deps;
+  // Issue #105: /api/restart-backend with the heavy-engine slot. Same checks, answers and order as the handler below,
+  // but inside the image chain; the slot is claimed before the first await, so a text load can't start in between,
+  // and a request that will be refused no longer stops the working image engine first.
+  function restartWithSlot(res, newSettings, memoryBefore) {
+    const token = lifecycle.startToken(); // a stop request after this point cancels this load, even while it waits
+    const answer = (status, body) => json(res, status, withMemoryCheck(body, memoryBefore));
+    const fail = (err) => {
+      state.backendError = err.message || String(err);
+      return answer(jsonErrorStatus(err), errorBody(err, { error: state.backendError, code: err.code || "", activeRuntime: err.activeRuntime || null, port: state.PORT_BACKEND }));
+    };
+    return lifecycle.runExclusive(async () => {
+      let owned = false;
+      try {
+        if (token !== lifecycle.startToken()) throw lifecycle.cancelledError();
+        // A crashed text engine waiting for its automatic restart owns the slot without a process: cancel that
+        // restart through the text chain (today's behaviour: an image load after a text crash works).
+        await lifecycle.prepare();
+        if (token !== lifecycle.startToken()) throw lifecycle.cancelledError();
+        const targetModel = newSettings.model || state.currentSettings.model || getDefaultModel();
+        assertNoOtherActiveRuntime("image", targetModel);
+        const requestedSettings = { ...state.currentSettings, ...newSettings, model: targetModel };
+        const imageBackendReady = (state.backendReady && state.backendProc) || (state.openvinoReady && state.openvinoProc);
+        if (imageBackendReady && backendSettingsMatch(state.currentSettings, requestedSettings)) {
+          return json(res, 200, { ok: true, message: "Backend already running with requested settings.", settings: state.currentSettings, port: state.PORT_BACKEND });
+        }
+        if (state.generationState.active) {
+          return json(res, 409, {
+            ok: false,
+            error: "Image generation is in progress. Wait for it to finish or cancel it before changing backend settings.",
+          });
+        }
+        if (state.backendReady && state.backendProc && appleNpuRuntimeMatches(state.currentSettings, requestedSettings)) {
+          state.currentSettings = requestedSettings;
+          return json(res, 200, { ok: true, message: "Apple NPU backend already running; updated generation defaults.", settings: state.currentSettings, port: state.PORT_BACKEND });
+        }
+        lifecycle.reserve(targetModel); // synchronous claim, before the first await below; throws 409 if text owns it
+        owned = true;
+        await killBackend();
+        await new Promise(r => setTimeout(r, 500));
+        if (token !== lifecycle.startToken()) throw lifecycle.cancelledError();
+        if (newSettings.backendType === "openvino-npu") {
+          const start = startBackend(newSettings, { token });
+          answer(200, { ok: true, message: "OpenVINO NPU backend starting...", settings: state.currentSettings, port: state.PORT_BACKEND });
+          try { await start; } catch (err) {
+            if (token === lifecycle.startToken()) {
+              state.backendError = err.message || String(err);
+              state.backendLoadState = { ...state.backendLoadState, active: false, phase: "OpenVINO NPU model load failed" };
+              console.error("  [openvino-npu] Startup failed:", state.backendError);
+            }
+          }
+          return undefined;
+        }
+        if (newSettings.backendType === "apple-npu") {
+          const backendPort = await findAvailableBackendPort();
+          if (token !== lifecycle.startToken()) throw lifecycle.cancelledError();
+          state.PORT_BACKEND = backendPort;
+          newSettings.backendPort = backendPort;
+          state.currentSettings = { ...state.currentSettings, ...newSettings };
+          state.backendLoadState = {
+            active: true, phase: "Starting Apple NPU backend...", progress: 1, current: 0, total: 0, speed: "",
+            model: path.basename(newSettings.model || targetModel), backendMode: "Apple NPU",
+            backendBinary: path.basename(getCoreMLPythonPath()), device: "",
+          };
+          const start = startBackend(newSettings, { token });
+          answer(200, { ok: true, message: "Apple NPU backend starting...", settings: { ...state.currentSettings, ...newSettings }, port: backendPort });
+          try { await start; } catch (err) {
+            if (token === lifecycle.startToken()) {
+              state.backendError = err.message || String(err);
+              state.backendLoadState = { ...state.backendLoadState, active: false, phase: "Apple NPU model load failed" };
+              console.error("  [coreml-npu] Startup failed:", state.backendError);
+            }
+          }
+          return undefined;
+        }
+        await startBackend(newSettings, { token });
+        return answer(200, { ok: true, message: "Backend restarting...", settings: state.currentSettings, port: state.PORT_BACKEND });
+      } catch (err) {
+        if (err.code === "ENGINE_START_CANCELLED") {
+          // Stopped by the user: the stop request answers for the engine; don't leave a load error behind.
+          return answer(409, errorBody(err, { error: err.message, code: err.code, port: state.PORT_BACKEND }));
+        }
+        return fail(err);
+      } finally {
+        if (owned) lifecycle.end();
+      }
+    });
+  }
+
   return (r) => {
     // Original condition: (req.url.startsWith("/v1/") || req.url.startsWith("/sdapi/")) && GET or POST
     const proxyRoute = async (req, res) => {
@@ -65,6 +156,7 @@ function imageRoutes(deps) {
     if (typeof body.flash_attn === "boolean") newSettings.flashAttn = body.flash_attn;
     let memoryBefore = null;
     try { memoryBefore = memoryCheck(); } catch (_) { memoryBefore = null; }
+    if (lifecycle) return restartWithSlot(res, newSettings, memoryBefore);
     try {
       const targetModel = newSettings.model || state.currentSettings.model || getDefaultModel();
       assertNoOtherActiveRuntime("image", targetModel);
@@ -135,6 +227,22 @@ function imageRoutes(deps) {
 
   // POST /api/stop-backend
     r.post("/api/stop-backend", async (req, res) => {
+    if (lifecycle) {
+      // Ends a load in progress at once (start token) and stops the processes outside the chain, then once more in
+      // the chain for anything a load spawned meanwhile. Answers only after every exit was seen.
+      let exited = await lifecycle.stopNow();
+      exited = (await lifecycle.runExclusive(async () => {
+        const a = await killBackend();
+        const b = await killOpenVinoWorker();
+        lifecycle.stopped();
+        return a !== false && b !== false;
+      })) && exited;
+      if (!exited || lifecycle.hasStuck()) {
+        const err = lifecycle.unconfirmedError();
+        return json(res, 503, errorBody(err, { error: err.message, code: err.code }));
+      }
+      return json(res, 200, { ok: true });
+    }
     await killBackend();
     await killOpenVinoWorker();
     return json(res, 200, { ok: true });

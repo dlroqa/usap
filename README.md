@@ -173,6 +173,17 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   refused, nor is anything "tight" or "unknown", a GPU load, an automatic restart or the out-of-memory retry. Only
   Linux readings count for now; on Windows and macOS it only records. There is no "load anyway" request
   option yet ([details](docs/roadmap/STEP9_9F_MEMORY_ADMISSION.md)).
+  One heavy model load at a time across text and image (issue #105, **Experimental**, off by default;
+  `USAP_ENGINE_SLOT=on` turns it on, `USAP_SCHEDULER=off` turns it off). When on, a text or image model load claims
+  one shared slot before it starts. A load of the other kind, while one is loading, loaded, restarting after a crash
+  or not yet stopped, is refused at once with `409 MODEL_ALREADY_ACTIVE` (the same message as today, plus a `phase`
+  field). Image loads run one at a time, and stopping the image engine also cancels an image load in progress. The
+  slot is given back only after the engine process is seen to exit. An engine that can't be stopped is reported
+  (`503 ENGINE_EXIT_UNCONFIRMED`) and keeps the slot until it exits. Chat, image generation, transcription and voice
+  never wait for it. When off (the default), loads behave as before, including the known race where a text and an
+  image model can both end up loaded: turning it off restores compatibility, not the guarantee. CI checks it on all
+  4 OS with the real CPU engines; GPU and NPU paths are not checked
+  ([details](docs/roadmap/STEP9_9F_ENGINE_LIFECYCLE.md)).
   [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).

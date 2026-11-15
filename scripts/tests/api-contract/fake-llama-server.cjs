@@ -33,6 +33,11 @@
 //   slow-start      wait 60 s before listening (an interrupted or cancelled startup)
 //   never-ready     listen, but /v1/models answers 503 forever (a startup timeout)
 //   oom-after-ready become ready, then after 3 s print a llama.cpp-style allocation failure and exit 1
+//   hold-start      don't listen until the file "<model path>.release" exists (issue #105 tests: a load held
+//                   after its spawn, released exactly when the test says)
+//   crash-once      become ready, then after 1 s exit with code 3 unless "<model path>.crashed" exists (it is
+//                   created first), so an automatic restart succeeds (issue #105 tests)
+//   ignore-sigterm  ignore SIGTERM, so stopping needs SIGKILL (issue #105 tests)
 // and by flags (used when a test starts the fake directly):
 //   --fake-ignore-sigterm         ignore SIGTERM (forces the forced-termination path)
 //   --fake-exit-after-ms N        exit after N ms with --fake-exit-code (default 3)
@@ -59,7 +64,7 @@ const held = new Set(); // end functions of requests in MODE:hold
 let lastBody = null;
 if (model.includes("oom-after-ready")) setTimeout(() => { console.error("ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 4294967296"); process.exit(1); }, 3000);
 if (model.includes("fail-start")) { console.error("fake engine: failed to load model (fail-start)"); process.exit(3); }
-if (args.includes("--fake-ignore-sigterm")) process.on("SIGTERM", () => { console.error("fake engine: ignoring SIGTERM"); });
+if (args.includes("--fake-ignore-sigterm") || model.includes("ignore-sigterm")) process.on("SIGTERM", () => { console.error("fake engine: ignoring SIGTERM"); });
 if (args.includes("--fake-exit-after-ms")) setTimeout(() => process.exit(Number(arg("--fake-exit-code", "3"))), Number(arg("--fake-exit-after-ms", "0")));
 if (args.includes("--fake-abort-after-ms")) setTimeout(() => process.abort(), Number(arg("--fake-abort-after-ms", "0")));
 
@@ -229,4 +234,16 @@ const server = http.createServer((req, res) => {
   res.writeHead(404); res.end();
 });
 const listen = () => server.listen(Number(arg("--port", "10086")), arg("--host", "127.0.0.1"));
-if (model.includes("slow-start")) setTimeout(listen, 60000); else listen();
+const modelPath = arg("--model", "");
+if (model.includes("crash-once")) {
+  server.once("listening", () => setTimeout(() => {
+    const flag = `${modelPath}.crashed`;
+    if (require("node:fs").existsSync(flag)) return;
+    require("node:fs").writeFileSync(flag, "1");
+    console.error("fake engine: crash-once");
+    process.exit(3);
+  }, 1000));
+}
+if (model.includes("slow-start")) setTimeout(listen, 60000);
+else if (model.includes("hold-start")) { const t = setInterval(() => { if (require("node:fs").existsSync(`${modelPath}.release`)) { clearInterval(t); listen(); } }, 25); }
+else listen();

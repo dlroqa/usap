@@ -27,6 +27,10 @@ function createLlmEngine(deps) {
 
   let llmProcSeq = 0;
 
+  // Issue #105 (optional, only when engineSlot is on): the shared heavy-engine slot. Null: the code paths from before.
+  const slot = deps.engineSlot || null;
+  let llmSlotEpoch = 0; // the slot epoch of the text operation in progress (or of the last one)
+
   let llmReady = false;
 
   let llmError = null;
@@ -398,6 +402,7 @@ function createLlmEngine(deps) {
     llmSettings.mmproj = null;
     if (!llmProc) {
       await waitForPortAvailable(PORT_LLM, 1500);
+      if (slot) slot.stopped("text"); // ignored while a text operation is in progress (it settles the slot itself)
       return;
     }
 
@@ -405,6 +410,7 @@ function createLlmEngine(deps) {
     const procPort = PORT_LLM;
     llmProc = null;
     await terminateLlmProc(proc, procPort);
+    if (slot) slot.stopped("text");
   }
 
   // Polite stop, then forced, then wait until the port is free again.
@@ -413,7 +419,8 @@ function createLlmEngine(deps) {
     const exitedAfterTerm = await waitForChildExit(proc, 2500);
     if (!exitedAfterTerm) {
       try { proc.kill("SIGKILL"); } catch (_) {}
-      await waitForChildExit(proc, 2500);
+      const exitedAfterKill = await waitForChildExit(proc, 2500);
+      if (!exitedAfterKill && slot) slot.noteStopUnconfirmed("text", proc);
     }
 
     const released = await waitForPortAvailable(procPort, 5000);
@@ -468,6 +475,7 @@ function createLlmEngine(deps) {
       })
       : { restart: false, reason: "no-settings", message: "There are no settings to restart it with." };
     if (!decision.restart) {
+      if (slot) slot.stopped("text", llmSlotEpoch);
       llmCrash = { code, signal: signal || null, at: llmLastExit.at, restarts: llmRestartAttempts.length, reason: decision.reason };
       llmError = `${what}. ${decision.message} Load the model again to retry.${llmError ? `\n${llmError}` : ""}`.slice(0, 1600);
       console.warn(`  [llm] ${what}; not restarting (${decision.reason}).`);
@@ -475,6 +483,7 @@ function createLlmEngine(deps) {
     }
     const delay = decision.delayMs;
     const token = llmStartToken;
+    if (slot) slot.markRestartPending("text", llmSlotEpoch); // still owned by text; an image load cancels it through the chain
     console.warn(`  [llm] ${what}; restarting in ${delay / 1000} s.`);
     llmRestartTimer = setTimeout(async () => {
       llmRestartTimer = null;
@@ -642,6 +651,8 @@ function createLlmEngine(deps) {
   // "benchmark-restore"); it is never read from a request body. A request's `memoryOverride` field is ignored: it is
   // only reported, and never kept in llmLastStartRequest, so an automatic restart can't inherit it.
   async function startLlm(settings = {}, { restart = false, admissionPath = null } = {}) {
+    // Issue #105: claim the heavy-engine slot before anything else (synchronous; throws 409 if the image engine owns it).
+    if (slot) llmSlotEpoch = slot.begin("text", settings && settings.model);
     const token = llmStartToken;
     if (!restart) cancelLlmRestart();
     llmStarting = true;
@@ -659,6 +670,7 @@ function createLlmEngine(deps) {
     } finally {
       llmStarting = false;
       llmRestarting = false;
+      if (slot) slot.end("text", { live: Boolean(llmProc), ready: Boolean(llmReady && llmProc) });
     }
   }
 
@@ -732,6 +744,11 @@ function createLlmEngine(deps) {
           // backend is tried (the files are the same size for every one).
           if (err.code === "MEMORY_INSUFFICIENT") {
             await killLlm();
+            throw err;
+          }
+          // Issue #105 (slot on): the image engine is loaded or loading, or an earlier engine hasn't exited. That
+          // ends the start as 409/503; other profiles would meet the same answer. Nothing of ours was spawned.
+          if (slot && ((err.code === "MODEL_ALREADY_ACTIVE" && err.activeRuntime && err.activeRuntime.type !== "text") || err.code === "ENGINE_EXIT_UNCONFIRMED")) {
             throw err;
           }
           const message = err.message || String(err);
@@ -809,9 +826,14 @@ function createLlmEngine(deps) {
     if (ma) {
       try { heldBefore = [llmProc, ...(ma.otherProcesses() || [])].filter(Boolean); } catch (_) { heldBefore = null; }
     }
-    await killBackend();
-    await killOpenVinoWorker();
+    if (!slot) {
+      await killBackend();
+      await killOpenVinoWorker();
+    }
+    // Slot on: the text engine owns the slot, so there is no image engine to stop; assertNoOtherActiveRuntime above
+    // refused if one exists anyway. Text never stops the image engine (issue #105).
     await killLlm();
+    if (slot && !(await slot.waitForExits("text", 5000))) throw slot.unconfirmedError("text");
     const releasedAt = ma ? Date.now() : null;
     // A refused attempt must leave no setting behind (llmSettings keeps mlock/mmap from earlier starts), so a
     // refused memory-mapping-off request can't turn the next ordinary load into another refusal.
@@ -1058,6 +1080,7 @@ function createLlmEngine(deps) {
     const proc = supervisor.spawnSupervised(backend.path, args, { stdio: "pipe", env: spawnEnv }, { label: "llm" });
     const procSeq = ++llmProcSeq;
     llmProc = proc;
+    if (slot) slot.track("text", proc, llmSlotEpoch);
     proc.stdout.on("data", (data) => {
       if (llmProc !== proc) return;
       process.stdout.write("  [llm] " + data.toString());
@@ -1172,6 +1195,16 @@ function createLlmEngine(deps) {
       throw notFound("MODEL_NOT_FOUND", "Select a downloaded GGUF text model before benchmarking.");
     }
 
+    // Issue #105: the benchmark starts and stops text engines; it holds the slot for its whole run, restore included.
+    if (slot) {
+      llmSlotEpoch = slot.begin("text", filename);
+      try { return await benchmarkLlmModelOwned(settings, filename); }
+      finally { slot.end("text", { live: Boolean(llmProc), ready: Boolean(llmReady && llmProc) }); }
+    }
+    return benchmarkLlmModelOwned(settings, filename);
+  }
+
+  async function benchmarkLlmModelOwned(settings, filename) {
     const previous = {
       ready: llmReady,
       model: llmSettings.model,
