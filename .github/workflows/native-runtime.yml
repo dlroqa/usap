@@ -181,6 +181,9 @@ jobs:
       # and observed legacy behaviour), then, when the voice queue exists in this checkout, the queue checks with
       # voiceQueue on only for the script's own test server (port 14970); the installed default stays off.
       - name: Voice queue with the real Kokoro worker (voiceQueue on for test servers only)
+        # Independent of the steps before it (it starts its own servers): it still runs, and the job still fails,
+        # when an earlier check failed, so its evidence isn't lost to an unrelated failure.
+        if: ${{ !cancelled() }}
         run: |
           set -o pipefail
           node scripts/ci/voice-queue-validate.cjs --model kokoro-onnx-q8.json \

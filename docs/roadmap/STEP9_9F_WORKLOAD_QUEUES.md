@@ -1,6 +1,7 @@
 # Step 9.9f, third substage: voice, transcription and image-generation job queues (design)
 
-Status: **design proposal only.** Nothing here is implemented. Each queue, its limits and its default need separate
+Status: design merged (#113). The **voice queue is implemented, off by default** (§11, "As built"). The transcription
+and image queues are design only. Nothing here was turned on by default. Each queue, its limits and its default need separate
 owner approval, and each lands in its own implementation PR. Part of [STEP9_9_SCHEDULING.md](STEP9_9_SCHEDULING.md)
 stage 9.9f. It follows the engine lifecycle coordination of #105 ([STEP9_9F_ENGINE_LIFECYCLE.md](STEP9_9F_ENGINE_LIFECYCLE.md)).
 
@@ -211,3 +212,89 @@ Rules between the two:
 6. Share one primitive with the chat queue (recommended), or leave the chat queue untouched.
 7. A new code `ENGINE_STOPPED` for waiting jobs refused by a stop, or reuse `ENGINE_NOT_READY`.
 8. Whether CI flake issues #108–#110 should be explained before more native queue checks are added.
+
+## 11. As built: voice queue
+
+Implementation: `scripts/server/services/job-queue.cjs` (setting and queue), with the call sites in
+`routes/tts.cjs`, `serve.cjs` and `services/scheduler.cjs`. The chat queue (`services/chat-queue.cjs`) is
+**unchanged**: the voice queue uses a new module with the same policy, so the merged chat queue isn't touched
+(decision 6 deferred).
+
+### 11.1 Baseline (today's voice chain, real Kokoro worker, CPU)
+
+Measured with `scripts/ci/voice-queue-validate.cjs` in `native-runtime` before the queue existed (run 43668281325,
+linux-x64, windows-x64, macos-arm64; macOS Intel: see §11.5):
+
+| | linux-x64 | windows-x64 | macos-arm64 |
+|---|---|---|---|
+| Short job (45 chars), median | 3.5 s | 4.7 s | 3.3 s |
+| Long job (359 chars) | 22.4 s | 26.3 s | 22.3 s |
+| Peak worker RSS | 418–429 MB | 375–384 MB | 463 MB |
+| 6 concurrent requests | all 200, in order, 1 worker at a time, 29.6 s | 35.9 s | 29.3 s |
+
+Observed legacy behaviour, the same on all three:
+
+* the chain is unbounded (no 429, no deadline);
+* a client that disconnects while waiting still gets its job run and saved;
+* a running job is never cancelled (its worker finishes);
+* `/api/tts/stop` only resets state;
+* server shutdown leaves no worker.
+
+One worker process runs per job, and only one at a time: the chain already serializes, so the queue adds a bound, a
+deadline and disconnect handling, not new exclusion.
+
+### 11.2 Policy and limits
+
+* Setting `voiceQueue: off | on` (`USAP_VOICE_QUEUE` wins over `scheduler.json`), default `off`. `USAP_SCHEDULER=off`
+  forces it off, with a log line.
+* 1 running + **4 waiting**, FIFO. Full: `429 { ok:false, code:"QUEUE_FULL", error }` with `Retry-After`
+  (1–120 s, from the observed average job time).
+* Longest wait: **10 minutes** by default (`USAP_VOICE_QUEUE_MAX_WAIT_MS` / `voiceQueueMaxWaitMs`, 1 s to 1 h), then
+  `503 QUEUE_TIMEOUT` with `Retry-After`.
+  * Why 10 minutes: a typical job measured 3–26 s, so 4 waiting jobs of that size drain in under 2 minutes, well
+    inside the limit.
+  * The API allows texts up to 5,000 characters, about 14× the long job. Scaling linearly (an estimate, not
+    measured), that is roughly 5–6 minutes per job on these runners.
+  * So a queue of very long jobs is exactly what the bound refuses, instead of leaving clients waiting indefinitely.
+* Only the synthesis is queued. The model start before it (a lifecycle step) stays in the TTS chain, as before.
+
+### 11.3 Cancellation and cleanup
+
+* **Waiting client disconnects:** it leaves the queue at once. Its job never reaches Kokoro and nothing is saved.
+* **Running client disconnects:** not cancelled. Each job has its own Kokoro worker process, so job-specific
+  cancellation would be possible, but it isn't added in this PR (decision 3: finish and discard first). The job
+  finishes, its output is saved as before, and only then is the turn released, so the next job never overlaps it.
+* **`/api/tts/stop`:** waiting jobs are refused with `409 ENGINE_NOT_READY` (decision 7: the existing code). The
+  running job finishes, as before.
+* **Exactly once:** the turn is released in one `finally` per job (success, error, worker crash, disconnect).
+  `release()` is idempotent. A disconnect after the grant, a timeout and a refusal can't settle a job twice.
+* **Shutdown:** unchanged. The supervisor stops the worker, and waiting requests end with the server.
+* No running-job timeout, no retry, no restart.
+
+### 11.4 Reporting and compatibility
+
+* Only when on, `GET /api/resources` gains:
+  * `engines.voice.queue { running, waiting, known, limit }`;
+  * `limits.voiceQueue: "on"`;
+  * `voiceQueue { mode, limit, maxWaitSeconds, counts }`;
+  * `scheduler.decisions: true`.
+
+  Numbers and fixed words only, no text, voices or file names.
+* Success (`{ ok, output }`) and error bodies are unchanged. The original WebUI is unchanged and shows the new
+  codes as errors.
+* With the queue off, every response is as before.
+
+### 11.5 Tests and evidence
+
+* `scripts/tests/voice-queue.test.cjs` covers:
+  * unit tests with fake timers: empty, partial and full queues, FIFO, the deadline, waiting disconnect, exactly-once
+    settlement (disconnect, timeout, refusal and grant racing), and `refuseWaiting`;
+  * the real server with a stand-in Kokoro worker that holds, fails or crashes on request: 429 and `Retry-After`, FIFO
+    at the worker, the deadline, waiting and running disconnects, crash and failure, stop with waiting jobs,
+    completion racing a disconnect, shutdown, default off (legacy unbounded behaviour) and `USAP_SCHEDULER=off`.
+* Mutation checks (locally): 8 of 8 deliberate breaks caught: no bound, LIFO, waiting disconnect ignored, no release
+  on failure, release not idempotent, no deadline, stop not refusing, release at client close.
+* Native: the same script, with the queue checks on the queue's own test server.
+* macOS Intel: the baseline step didn't run in run 43668281325, because an earlier, unrelated check failed
+  (`chat-timeouts-validate`: "after that abort, computation stopped", twice). The voice step now runs regardless
+  (`if: !cancelled()`).
