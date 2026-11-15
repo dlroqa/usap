@@ -291,6 +291,9 @@ test("server (queue on): a client that disconnects while its job runs doesn't ki
     const before = await outputsCount(srv);
     const running = speak(srv, `A HOLD:${id}`, { abortAfterMs: 400 });
     await waitFor(async () => (await workers(srv)).length === 1, 10000, "worker");
+    // The worker process exists before it has read its job and logged it; on a slow runner that takes longer than
+    // the abort below. Wait for A in the log, so the check below is about B only.
+    await waitFor(async () => jobsLog().length === 1, 10000, "A started");
     const [pid] = await workers(srv);
     assert.equal((await running).aborted, true);
     await sleep(300);
