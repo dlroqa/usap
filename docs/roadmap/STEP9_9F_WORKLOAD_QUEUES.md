@@ -108,6 +108,10 @@ Rules between the two:
 
 ### 5.2 Whisper transcription (second)
 
+Detailed design (planned, not implemented): [STEP9_9F_WHISPER_QUEUE.md](STEP9_9F_WHISPER_QUEUE.md). It replaces the
+buffer-then-admit flow with admission at arrival, streaming to a dedicated upload folder, storage reservations and
+upload deadlines.
+
 * Wraps the transcription step. **Admission happens before the audio body is read**, so a refused request costs
   nothing. A `429` before reading the body means the client may get the answer while still uploading. The route
   then drains or destroys the request (the HTTP-correct way is answering and closing).
