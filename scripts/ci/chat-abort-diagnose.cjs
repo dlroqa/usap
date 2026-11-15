@@ -43,7 +43,7 @@ const summary = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ── HTTP ────────────────────────────────────────────────────────────────────────────────────────────────
-function call(port, method, p, body, { timeoutMs = 600000 } = {}) {
+function call(port, method, p, body, { timeoutMs = 600000, agent = false } = {}) {
   let req;
   const t0 = Date.now();
   const marks = { sentAt: null, headersAt: null, firstDataAt: null, firstChunk: null, firstContentAt: null };
@@ -51,7 +51,7 @@ function call(port, method, p, body, { timeoutMs = 600000 } = {}) {
     let settled = false;
     const done = (v) => { if (!settled) { settled = true; resolve({ ...v, ms: Date.now() - t0, marks }); } };
     const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
-    req = http.request({ host: "127.0.0.1", port, path: p, method, agent: false, timeout: timeoutMs,
+    req = http.request({ host: "127.0.0.1", port, path: p, method, agent, timeout: timeoutMs,
       headers: data ? { "content-type": "application/json", "content-length": data.length } : {} }, (res) => {
       marks.headersAt = Date.now();
       let text = "";
@@ -146,15 +146,19 @@ function listenerPids(port) {
 // ── One measured request ───────────────────────────────────────────────────────────────────────────────
 // mode: "unaborted" (non-streaming, max_tokens 1: timings), "abort-after-status" (the failing check), "abort-before-status",
 //       "abort-nonstream" (stream false, aborted once requests_processing is 1).
-async function measure({ phase, label, port, pid, target, mode, logOffset }) {
+// `client`: "agent-false" (a new connection, Connection: close; what chat-timeouts-validate does), "keepalive"
+// (a keep-alive agent, as the studio uses for llama-server), or "studio" (POST /api/llm/chat; the studio aborts).
+const KEEPALIVE = new http.Agent({ keepAlive: true, maxSockets: 4, keepAliveMsecs: 30000 });
+async function measure({ phase, label, port, pid, target, mode, logOffset, client = "agent-false" }) {
   const lp = await promptFor(port, target);
   const before = await metrics(port);
   const cpu0 = await cpuSeconds(pid);
   const stream = mode !== "unaborted" && mode !== "abort-nonstream";
   const body = { messages: [{ role: "user", content: lp.text }], max_tokens: mode === "unaborted" ? 1 : 64, temperature: 0, stream };
-  const h = call(port, "POST", "/v1/chat/completions", body);
+  const h = client === "studio" ? call(PORT, "POST", "/api/llm/chat", body)
+    : call(port, "POST", "/v1/chat/completions", body, { agent: client === "keepalive" ? KEEPALIVE : false });
   const t0 = h.t0;
-  const row = { phase, label, mode, platform: PLATFORM, promptTokens: lp.tokens, enginePid: pid };
+  const row = { phase, label, mode, client, platform: PLATFORM, promptTokens: lp.tokens, enginePid: pid };
   if (mode === "unaborted") {
     const r = await h.promise;
     const j = parseJson(r.text);
@@ -291,6 +295,11 @@ function table() {
     for (let k = 1; k <= 3; k += 1) await measure({ ...A, label: `check-repeat-${k}`, target: 3000, mode: "abort-after-status" });
     for (let k = 1; k <= 2; k += 1) await measure({ ...A, label: `unaborted-${k}`, target: 3000, mode: "unaborted" });
     await measure({ ...A, label: "check-repeat-4-warm", target: 3000, mode: "abort-after-status" });
+    // Phase C (#115): the same abort from three clients, interleaved, on the same engine: is the difference between
+    // the validator's direct abort (whole prompt evaluated on POSIX) and the studio's cancel (512 tokens) the client?
+    for (let k = 1; k <= 2; k += 1) {
+      for (const client of ["agent-false", "keepalive", "studio"]) await measure({ ...A, phase: "C", label: `${client}-${k}`, target: 3000, mode: "abort-after-status", client });
+    }
     envInfo.enginePidAfterA = listenerPids(studio.enginePort)[0] ?? null;
     await stopStudio(studio); studio = null;
     }
