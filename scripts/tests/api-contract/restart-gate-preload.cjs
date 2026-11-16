@@ -2,7 +2,8 @@
 // USAP_TEST_RESTART_GATE=<file>. It replaces the WAIT of the text engine's automatic restart with a file gate:
 // the restart stays pending until <file> exists. Nothing else changes: the same decision, the same callback, the same
 // cancellation (clearTimeout). No production file is edited; without the variable, or in any other process (engine
-// guard, fake engines), this file does nothing.
+// guard, fake engines), this file does nothing. It records what happened to the held restart, so a test can assert it
+// without timing: "<file>.cancelled" when the product cancels it, "<file>.fired" when it runs.
 //
 // Why injection: the product waits a fixed 1 s (restart-policy.cjs) before restarting a crashed text engine. A test
 // that must act "while the restart is pending" then has to win a 1 s window, which a slow runner loses (#125). The
@@ -25,12 +26,16 @@ if (gate && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
     handle.poll = setInterval(() => {
       if (!fs.existsSync(gate)) return;
       clearInterval(handle.poll); handle.poll = null;
+      fs.writeFileSync(`${gate}.fired`, "1");
       fn(...rest);
     }, 25);
     return handle;
   };
   global.clearTimeout = function (handle) {
-    if (handle && handle.usapRestartGate) { if (handle.poll) clearInterval(handle.poll); handle.poll = null; return; }
+    if (handle && handle.usapRestartGate) {
+      if (handle.poll) { clearInterval(handle.poll); handle.poll = null; fs.writeFileSync(`${gate}.cancelled`, "1"); }
+      return;
+    }
     return realClear(handle);
   };
 }
