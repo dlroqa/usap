@@ -1,6 +1,6 @@
 # Step 9.9f-3: Whisper transcription queue (design)
 
-Status: **implementation in review, off by default** (§13, "As built"). Default activation is not approved. The
+Status: **implemented in #130, off by default** (§13, "As built"). Default activation is not approved. The
 design below was merged in #122; §13 records what was built and measured. This expands §5.2 of
 [STEP9_9F_WORKLOAD_QUEUES.md](STEP9_9F_WORKLOAD_QUEUES.md). The voice queue (§11 there) is its model, and
 `services/job-queue.cjs` is the primitive it reuses.
