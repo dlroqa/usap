@@ -123,7 +123,8 @@ upload deadlines.
 
 Detailed design (not implemented): [STEP9_9F_IMAGE_QUEUE.md](STEP9_9F_IMAGE_QUEUE.md). It updates the points below
 with the CPU sd-server measurements. Waiting jobs are held in the studio, and a forwarded job keeps its place until
-the engine answers, not until the client leaves. It also recommends answers to decisions 2, 4 and 5 of §10.2.
+the engine answers, not until the client leaves. The owner's image decisions D1–D6 (2026-11-16) are recorded there
+(§10). They narrow the points below: sd-server only, four generation routes, no OpenVINO or Core ML.
 
 * Wraps `POST /sdapi/v1/txt2img|img2img` and `/v1/images/*` in the proxy, plus `POST /api/openvino-generate`.
   Model listing (`GET /v1/models`) and other read-only calls are never queued. Whether Core ML paths are included
