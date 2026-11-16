@@ -54,6 +54,14 @@ function stop(force = false) {
   forceTimer = setTimeout(() => signalEngine(true), GRACE_MS);
 }
 
+// Stop requests are handled from the very start (#136). Before the engine is started, a signal would otherwise
+// use the OS default action and end the guard at once, leaving the engine it had just started running with no guard
+// (re-parented, outside the server's process tree). A stop that arrives before the engine exists ends the guard
+// without starting it (stop() exits when there is no engine).
+for (const s of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(s, () => stop(false));
+process.on("message", (m) => { if (m && m.type === "stop") stop(Boolean(m.force)); });
+process.on("disconnect", () => stop(false));
+
 if (!command) {
   process.stderr.write("[engine-guard] no engine command given\n");
   process.exit(2);
@@ -90,9 +98,6 @@ engine.on("exit", (code, signal) => {
   process.exit(code === null ? 1 : code);
 });
 
-for (const s of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(s, () => stop(false));
-process.on("message", (m) => { if (m && m.type === "stop") stop(Boolean(m.force)); });
-process.on("disconnect", () => stop(false));
 
 // Second safety net: the parent process no longer exists.
 setInterval(() => {

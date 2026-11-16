@@ -449,7 +449,20 @@ change is behind `engineSlot`. With it off, the slot isn't created and each call
   `killOpenVinoWorker()`, and `startBackend` doesn't call `killLlm()`.
 * **Exit confirmation.** For a supervised engine (llama-server, sd-server, Core ML), the guard's `exit` event, then
   the engine PID reported by the guard gone (polled up to 2 s; still alive → reported as unconfirmed, kept reserved,
-  re-checked). For the OpenVINO worker (not supervised), its own `exit` event. Before spawning, a load of the same kind
+  re-checked).
+  * **An engine that outlived its guard (#136).** The guard once installed its stop handlers only after starting its
+    engine. A stop that arrived in between ended the guard by the OS default action, and the engine kept running,
+    re-parented and outside the server's process list. A stop sent the moment the guard reported its engine started
+    always hit this window.
+  * **Fix, three parts:**
+    * The guard now handles stops from its very start; a stop before the engine exists ends the guard without
+      starting it.
+    * The server stops such a still-running engine through the guard's process group (POSIX: the guard runs in its
+      own group and the engine inherits it). This happens only while the engine is still in that group, and a group
+      ID is not reused while the group exists. The slot is released only after the engine's exit is seen.
+    * `stopProcess` waits the guard's own grace (3 s) plus 1.5 s before forcing, so a slow engine is stopped by its
+      guard first.
+  * Windows: the guard stops engines with `taskkill /T`, and this case doesn't arise. For the OpenVINO worker (not supervised), its own `exit` event. Before spawning, a load of the same kind
   waits up to 5 s for every earlier process of that kind to be confirmed gone, otherwise `503 ENGINE_EXIT_UNCONFIRMED`.
 * **Cancellation.** `/api/stop-backend` bumps the image start token and stops both image processes at once, outside
   the chain (like `stopLlmNow` for text). It then runs once more in the chain for anything spawned meanwhile, and
