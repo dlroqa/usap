@@ -351,28 +351,40 @@ async function studioChecks(srv) {
     if (!busy) { const r = await h.promise; throw new Error(`the request never reached the engine (studio answered ${r.status}: ${r.text.slice(0, 160)})`); }
     h.abort();
     const abortAt = Date.now();
-    // Follow the studio and the engine together until the engine is quiet and the studio is ready (bounded).
+    // Follow the studio and the engine until the engine is quiet and the studio is ready (bounded).
+    // The studio is read every 200 ms (its report doesn't call the engine). The engine's /metrics is read only every
+    // 2 s: llama-server (b11418) checks for a closed client connection only after a full second without any result
+    // for any task, so polling it faster than once a second would itself delay the cancellation being measured.
     const samples = [];
-    let falseQuiet = null, firstUnresponsive = null, refusal = null, lastDecodeAt = abortAt, prev = null, cancelSeenAt = null;
+    let falseQuiet = null, firstUnresponsive = null, refusal = null, cancelSeenAt = null, readyChecked = false;
+    let lastEngine = null, lastEngineAt = 0, lastDecodeAt = abortAt;
     const end = abortAt + 180000;
     while (Date.now() < end) {
-      const [rep, m] = await Promise.all([timeoutsReport(), metrics(ep)]);
+      const rep = await timeoutsReport();
       const t = Date.now() - abortAt;
-      if (m && prev && m.n_decode_total !== prev.n_decode_total) lastDecodeAt = Date.now();
-      const computing = !m || !quiet(m) || (prev && counters(m) !== counters(prev));
       const cancelSeen = (rep?.counts?.clientCancelled || 0) > (c0.clientCancelled || 0);
       if (cancelSeen && cancelSeenAt === null) cancelSeenAt = t;
-      samples.push({ t, studio: rep?.engine, cancelSeen, processing: m?.requests_processing, decode: m?.n_decode_total });
-      // Only after the studio registered the cancel: before that it has no reason to call the engine busy.
-      if (cancelSeen && rep?.engine === "ready" && computing && !falseQuiet) falseQuiet = { t, studio: rep.engine, processing: m?.requests_processing, decode: `${prev?.n_decode_total}→${m?.n_decode_total}` };
-      if (rep?.engine === "unresponsive" && !firstUnresponsive) {
+      samples.push({ t, studio: rep?.engine, cancelSeen });
+      // Only after the studio registered the cancel (before that it has no reason to call the engine busy): the
+      // first time it reports ready, the engine must be quiet with counters unchanged since the previous reading.
+      const firstReady = cancelSeen && rep?.engine === "ready" && !readyChecked;
+      if (firstReady || Date.now() - lastEngineAt >= 2000) {
+        const m = await metrics(ep);
+        if (firstReady) {
+          readyChecked = true;
+          const moved = lastEngine && m && counters(m) !== counters(lastEngine);
+          if (!m || !quiet(m) || moved) falseQuiet = { t, processing: m?.requests_processing, decode: `${lastEngine?.n_decode_total}→${m?.n_decode_total}` };
+        }
+        if (m && lastEngine && m.n_decode_total !== lastEngine.n_decode_total) lastDecodeAt = Date.now();
+        if (m) { lastEngine = m; lastEngineAt = Date.now(); }
+      }
+      if (cancelSeen && rep?.engine === "unresponsive" && firstUnresponsive === null) {
         firstUnresponsive = t;
         const r = await call(PORT, "POST", "/api/llm/chat", { messages: [{ role: "user", content: "hi" }], max_tokens: 4, stream: false }, { timeoutMs: 15000 }).promise;
         const body = parseJson(r.text) || {};
         refusal = { status: r.status, code: body.code, retryAfter: r.headers?.["retry-after"], ms: r.ms };
       }
-      prev = m;
-      if (cancelSeen && rep?.engine === "ready" && m && quiet(m) && Date.now() - lastDecodeAt >= 3000) break;
+      if (readyChecked && rep?.engine === "ready" && lastEngine && quiet(lastEngine) && Date.now() - lastDecodeAt >= 3000) break;
       await sleep(200);
     }
     const rep = await timeoutsReport();
@@ -382,7 +394,7 @@ async function studioChecks(srv) {
     const stateText = states.map((x) => `${x.s}@${Math.round(x.t / 100) / 10}s`).join(" → ");
     // A. safety (fails the step on every platform)
     record("studio safety: after a client cancel the engine is never reported idle while it still computes", !falseQuiet ? "PASS" : "FAIL",
-      falseQuiet ? `reported ${falseQuiet.studio} at ${falseQuiet.t} ms while processing ${falseQuiet.processing}, decodes ${falseQuiet.decode}` : `states ${stateText}; ${samples.length} readings`);
+      falseQuiet ? `reported ready at ${falseQuiet.t} ms while processing ${falseQuiet.processing}, decodes ${falseQuiet.decode}` : `states ${stateText}; checked at the first ready`);
     record("studio safety: the client cancel is registered", cancelSeenAt !== null && cancelSeenAt < 5000 ? "PASS" : "FAIL", `clientCancelled seen ${cancelSeenAt} ms after the abort`);
     record("studio safety: CONFIRMING after the cancel, then confirmed or UNRESPONSIVE (never anything else)", states.length >= 2 && states[0].s === "confirming" && states.every((x) => ["ready", "confirming", "unresponsive"].includes(x.s)) ? "PASS" : "FAIL", stateText);
     if (firstUnresponsive !== null) {
@@ -401,7 +413,7 @@ async function studioChecks(srv) {
     const quietMs = lastDecodeAt - abortAt;
     const decodesAfter = m ? m.n_decode_total - busyBase.n_decode_total : null;
     record("engine responsiveness: abort → last engine batch, batches after the abort, compared with the full prompt", "DIAG",
-      `last batch ${quietMs} ms after the abort; ${decodesAfter} decode steps; prompt tokens evaluated ${m ? m.prompt_tokens_total - busyBase.prompt_tokens_total : "?"} of ${lp.tokens}; full ${fullPrompt ? `${fullPrompt.tokens}-token request ${fullPrompt.ms} ms` : "not measured"}; studio ${stateText}`);
+      `last batch ≤${quietMs} ms after the abort (engine read every 2 s); ${decodesAfter} decode steps; prompt tokens evaluated ${m ? m.prompt_tokens_total - busyBase.prompt_tokens_total : "?"} of ${lp.tokens}; full ${fullPrompt ? `${fullPrompt.tokens}-token request ${fullPrompt.ms} ms` : "not measured"}; studio ${stateText}`);
     const confirmedInWindow = (rep?.counts?.cancelConfirmed || 0) > (c0.cancelConfirmed || 0) && firstUnresponsive === null;
     const windowRow = "studio: client cancel confirmed within the 20 s window (USAP_CHAT_CANCEL_CONFIRM_SECONDS=20)";
     const windowDetail = `${confirmedInWindow ? "met" : "not met"}; states ${stateText}; last engine batch ${quietMs} ms after the abort`;
