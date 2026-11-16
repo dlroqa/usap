@@ -192,6 +192,17 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   if its client leaves, and `/api/tts/stop` refuses the jobs still waiting (`409 ENGINE_NOT_READY`). Off (the
   default), voice requests behave as before: they all wait, without a limit. CI checks it on all 4 OS with the real
   Kokoro worker on the CPU ([details](docs/roadmap/STEP9_9F_WORKLOAD_QUEUES.md#11-as-built-voice-queue)).
+  A bounded transcription queue (Step 9.9f-3, **Experimental**, off by default; `USAP_TRANSCRIPTION_QUEUE=on` turns
+  it on, `USAP_SCHEDULER=off` turns it off) keeps one Whisper transcription at a time and limits what waits: at most
+  4 requests behind the running one (then `429 QUEUE_FULL` with `Retry-After`), none longer than 10 minutes
+  (`503 QUEUE_TIMEOUT`). Uploads are checked before they are read (`413 UPLOAD_TOO_LARGE` over 1 GiB), then streamed
+  to a private folder on disk instead of being held in memory, within a 2 GiB total storage budget that also checks
+  free disk space (`507 INSUFFICIENT_STORAGE`). An upload with no data for 30 s, or longer than 240 s in total, is
+  ended (`408 UPLOAD_TIMEOUT`). Requests run in the order they arrived. A request whose client disconnects while it
+  uploads or waits never reaches Whisper and is not saved; a running transcription finishes as before, and
+  `/api/speech/stop` refuses the jobs still waiting (`409 ENGINE_NOT_READY`). The routes, parameters and answers are
+  otherwise unchanged. Off (the default), transcription behaves as before. Every limit can be changed within checked
+  ranges ([details](docs/roadmap/STEP9_9F_WHISPER_QUEUE.md#13-as-built)).
   [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).

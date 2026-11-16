@@ -295,9 +295,22 @@ function createSpeechService(deps) {
     }
   }
 
+  // Today's path: the whole WAV is in memory; it is written to a temporary file in TRANSCRIPTIONS, which is deleted when
+  // whisper-cli exits. Unchanged by Step 9.9f-3.
   function transcribeWavBuffer(buffer, options = {}) {
+    return runTranscription({ buffer }, options);
+  }
+
+  // Step 9.9f-3 (transcription queue, only when it is on): the WAV is already on disk, written and verified by the queue,
+  // which owns `wavPath` and `outBase` and deletes them. Otherwise exactly the same steps, settings and results as above.
+  function transcribeWavFile(wavPath, outBase, options = {}) {
+    return runTranscription({ wavPath, outBase }, options);
+  }
+
+  function runTranscription(input, options = {}) {
+    const fromBuffer = input.buffer !== undefined;
     return new Promise((resolve, reject) => {
-      if (!isWaveBuffer(buffer)) {
+      if (fromBuffer && !isWaveBuffer(input.buffer)) {
         reject(new Error("Speech transcription currently accepts WAV audio only."));
         return;
       }
@@ -312,9 +325,9 @@ function createSpeechService(deps) {
       const sourceFilename = safeOutputName(options.filename || "recording.wav") || "recording.wav";
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const tempBase = path.join(TRANSCRIPTIONS, `.speech-${stamp}-${sourceFilename.replace(/\.[^.]+$/, "")}`);
-      const wavPath = `${tempBase}.wav`;
-      const outBase = `${tempBase}-out`;
-      fs.writeFileSync(wavPath, buffer);
+      const wavPath = fromBuffer ? `${tempBase}.wav` : input.wavPath;
+      const outBase = fromBuffer ? `${tempBase}-out` : input.outBase;
+      if (fromBuffer) fs.writeFileSync(wavPath, input.buffer);
 
       speechTranscriptionState = {
         active: true,
@@ -368,13 +381,13 @@ function createSpeechService(deps) {
       proc.on("error", (err) => {
         if (!isLaunchFailure(proc)) { console.warn("  [speech] engine process error:", err.message); return; }
         console.error("  [speech] Could not start", backend.cli, "-", err.code || "", err.message);
-        try { fs.unlinkSync(wavPath); } catch (_) {}
+        if (fromBuffer) { try { fs.unlinkSync(wavPath); } catch (_) {} }
         speechTranscriptionState = { active: false, phase: "Failed", progress: 0, model: model.filename, filename: sourceFilename };
         speechError = describeSpawnError(err, "speech engine (whisper.cpp)");
         reject(new Error(speechError));
       });
       proc.on("exit", (code) => {
-        try { fs.unlinkSync(wavPath); } catch (_) {}
+        if (fromBuffer) { try { fs.unlinkSync(wavPath); } catch (_) {} }
         speechTranscriptionState = { active: false, phase: code === 0 ? "Complete" : "Failed", progress: code === 0 ? 100 : 0, model: model.filename, filename: sourceFilename };
         if (code !== 0) {
           const message = (stderr || stdout || `whisper.cpp exited with code ${code}`).trim().slice(-1200);
@@ -427,7 +440,7 @@ function createSpeechService(deps) {
     // operations
     getSpeechBackendCandidates, normalizeSpeechBackendPreference, getSpeechBackend, getSpeechModels, resolveSpeechModel,
     getPendingOperations: () => pendingOperations,
-    runExclusiveSpeechOperation, startSpeech, stopSpeech, saveTranscript, listTranscriptions, transcribeWavBuffer,
+    runExclusiveSpeechOperation, startSpeech, stopSpeech, saveTranscript, listTranscriptions, transcribeWavBuffer, transcribeWavFile,
   };
 }
 
