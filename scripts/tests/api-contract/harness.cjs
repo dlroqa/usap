@@ -128,6 +128,67 @@ function stopServer(srv) {
   else { try { process.kill(-srv.proc.pid, "SIGKILL"); } catch (_) { srv.proc.kill("SIGKILL"); } }
 }
 
+// Stop a test server and wait until its process has exited (issue #127). On Windows `stopServer` returns when taskkill
+// returns; the OS releases the killed processes' handles and working directories a little later. Bounded: a server
+// that doesn't exit is an error, never a silent pass.
+async function stopServerAndWait(srv, timeoutMs = 10000) {
+  if (!srv || !srv.proc) return;
+  stopServer(srv);
+  if (srv.proc.exitCode !== null || srv.proc.signalCode !== null) return;
+  await new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`test server ${srv.proc.pid} did not exit within ${timeoutMs} ms of being stopped`)), timeoutMs);
+    srv.proc.once("exit", () => { clearTimeout(t); resolve(); });
+  });
+}
+
+// Processes still running from inside `dir` (their command line names a path under it), excluding this process.
+function processesUnder(dir) {
+  const needle = path.resolve(dir).toLowerCase();
+  let rows = [];
+  if (IS_WIN) {
+    const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command",
+      "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"], { encoding: "utf8", windowsHide: true, timeout: 30000 });
+    rows = String(r.stdout || "").split(/\r?\n/);
+  } else {
+    const r = spawnSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" });
+    rows = String(r.stdout || "").split("\n").map((l) => l.trim().replace(/^(\d+)\s+/, "$1\t"));
+  }
+  return rows.map((l) => l.split("\t")).filter(([pid, cmd]) => pid && cmd && Number(pid) !== process.pid && cmd.toLowerCase().includes(needle))
+    .map(([pid, cmd]) => ({ pid: Number(pid), cmd: cmd.slice(0, 200) }));
+}
+
+// Codes Windows returns while a just-terminated process still holds a file or directory open.
+const TRANSIENT_RM_CODES = new Set(["EBUSY", "EPERM", "ENOTEMPTY"]);
+
+/**
+ * Remove a test root (issue #127). First waits (bounded) until no process runs from inside it; a process that stays
+ * is reported by PID and command line and fails the caller. Then removes it, retrying only Windows' transient lock
+ * codes, a bounded number of times; anything else, or a lock that persists, is thrown with the attempts made.
+ * `deps` exists for the unit test only.
+ */
+async function removeTestRoot(dir, { attempts = 20, delayMs = 100, waitProcessesMs = 10000, deps = {} } = {}) {
+  const rm = deps.rm || ((d) => fs.rmSync(d, { recursive: true, force: true }));
+  const listUnder = deps.processesUnder || processesUnder;
+  const isWin = deps.isWin === undefined ? IS_WIN : deps.isWin;
+  const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const until = Date.now() + waitProcessesMs;
+  let left = listUnder(dir);
+  while (left.length && Date.now() < until) { await sleep(250); left = listUnder(dir); }
+  if (left.length) {
+    throw new Error(`test root still in use by ${left.length} process(es) after ${waitProcessesMs} ms: ${left.map((p) => `${p.pid} ${p.cmd}`).join(" | ")}`);
+  }
+  for (let i = 1; ; i += 1) {
+    try { rm(dir); return { attempts: i }; } catch (err) {
+      const transient = isWin && TRANSIENT_RM_CODES.has(err && err.code);
+      if (!transient || i >= attempts) {
+        err.message = `${err.message} (removing the test root, attempt ${i} of ${transient ? attempts : 1}${transient ? ", Windows lock persisted" : ""})`;
+        throw err;
+      }
+      await sleep(delayMs);
+    }
+  }
+}
+
 function request(port, method, urlPath, { body, headers = {}, raw = false } = {}) {
   return new Promise((resolve, reject) => {
     const data = body === undefined ? null : (typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body));
@@ -220,4 +281,4 @@ function installFakeSdServer(root) {
   return fake;
 }
 
-module.exports = { REPO, IS_WIN, makeRoot, startServer, stopServer, request, shapeOf, checkShape, fakeLlamaPath, fakeSdPath, installFakeSdServer };
+module.exports = { REPO, IS_WIN, makeRoot, startServer, stopServer, stopServerAndWait, removeTestRoot, processesUnder, request, shapeOf, checkShape, fakeLlamaPath, fakeSdPath, installFakeSdServer };

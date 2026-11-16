@@ -71,7 +71,8 @@ test("every test file that makes a temp root also removes it", () => {
   for (const f of fs.readdirSync(__dirname).filter((n) => n.endsWith(".test.cjs") && n !== path.basename(__filename))) {
     const src = fs.readFileSync(path.join(__dirname, f), "utf8");
     const made = (src.match(/\bmakeRoot\(\)/g) || []).length;
-    const removed = (src.match(/\brmSync\(/g) || []).length;
+    // removeTestRoot (harness, #127) removes a root too: it waits for processes, then calls rmSync with bounded retries.
+    const removed = (src.match(/\brmSync\(|\bremoveTestRoot\(/g) || []).length;
     if (made > removed) missing.push(`${f}: ${made} makeRoot(), ${removed} rmSync()`);
   }
   assert.deepEqual(missing, []);
