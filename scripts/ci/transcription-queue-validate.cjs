@@ -83,12 +83,15 @@ function post(p, body) {
 }
 /** Upload `body` to /api/speech/transcribe. `claim` overrides Content-Length; `stopAfterBytes` sends that much and
  *  leaves the request open; `abortAfterMs` disconnects. Resolves { status, json, headers, ms, at }. */
-function transcribe(body, query, { claim = body.length, stopAfterBytes = null, abortAfterMs = null, timeoutMs = 900000 } = {}) {
-  return new Promise((resolve) => {
+function transcribeCtl(body, query, { claim = body.length, stopAfterBytes = null, abortAfterMs = null, timeoutMs = 900000 } = {}) {
+  let req;
+  let finish = () => {};
+  const promise = new Promise((resolve) => {
     const t0 = Date.now();
     let done = false;
     const fin = (v) => { if (!done) { done = true; resolve({ ...v, ms: Date.now() - t0, at: Date.now() }); } };
-    const req = http.request({ host: "127.0.0.1", port: PORT, method: "POST", agent: false, path: `/api/speech/transcribe?model=${MODEL}&language=en${query}`,
+    finish = fin;
+    req = http.request({ host: "127.0.0.1", port: PORT, method: "POST", agent: false, path: `/api/speech/transcribe?model=${MODEL}&language=en${query}`,
       headers: { "content-type": "audio/wav", "content-length": claim } }, (res) => {
       let t = ""; res.setEncoding("utf8"); res.on("data", (c) => { t += c; });
       res.on("end", () => { let json = null; try { json = JSON.parse(t); } catch (_) { /* not json */ } fin({ status: res.statusCode, json, headers: res.headers }); });
@@ -99,7 +102,9 @@ function transcribe(body, query, { claim = body.length, stopAfterBytes = null, a
     if (abortAfterMs !== null) setTimeout(() => { req.destroy(); fin({ status: 0, aborted: true }); }, abortAfterMs);
     const t = setTimeout(() => { req.destroy(); fin({ status: 0, error: "client timeout" }); }, timeoutMs); if (t.unref) t.unref();
   });
+  return { promise, abort: () => { if (req) req.destroy(); finish({ status: 0, aborted: true }); } };
 }
+const transcribe = (body, query, opts) => transcribeCtl(body, query, opts).promise;
 
 // ── Audio ────────────────────────────────────────────────────────────────────
 // The JFK sample's PCM data, repeated `times` (a longer job for whisper-cli), or zero-padded to `bytes` (a large upload
@@ -219,19 +224,21 @@ const queue = async () => ((await resources()).engines || {}).speech?.queue || {
   } catch (err) { record("Rollback: USAP_SCHEDULER=off", "FAIL", err.message); }
 
   // ── Queue on ──
+  // Starts a long transcription and resolves once whisper-cli runs it. Returns { done } (the job's promise, wrapped:
+  // an async function returning a bare promise would make its caller wait for the whole job).
   const holdEngine = async (srv, tag) => {
     const before = starts(srv).length;
-    const p = transcribe(long, `&save=false&filename=${tag}.wav`);
+    const done = transcribe(long, `&save=false&filename=${tag}.wav`);
     const ok = await waitUntil(async () => starts(srv).length > before && (await queue()).running === 1, 60000, 100);
     if (!ok) throw new Error("the long job did not start");
-    return p;
+    return { done };
   };
   let srv = null;
   try {
     srv = await startServer("on", { USAP_TRANSCRIPTION_QUEUE: "on" });
     await scenario("Queue: capacity, 429 and FIFO", async () => {
       const startsBefore = starts(srv).length;
-      const held = await holdEngine(srv, "hold");
+      const held = (await holdEngine(srv, "hold")).done;
       const waiting = [];
       for (let i = 1; i <= 4; i += 1) { waiting.push(transcribe(sample, `&save=false&filename=w${i}.wav`)); await waitUntil(async () => (await queue()).waiting === i, 10000, 50); }
       const full = await transcribe(sample, "&save=false&filename=full.wav");
@@ -248,7 +255,7 @@ const queue = async () => ((await resources()).engines || {}).speech?.queue || {
     });
     await scenario("Queue: memory while 4 x 64 MB uploads wait", async () => {
       const startsBefore = starts(srv).length;
-      const held = await holdEngine(srv, "hold2");
+      const held = (await holdEngine(srv, "hold2")).done;
       const rssBefore = rssMb(srv.child.pid);
       const ws = [1, 2, 3, 4].map((i) => transcribeCtl(big, `&save=false&filename=big${i}.wav`));
       const allIn = await waitUntil(async () => { const q = await queue(); return q.waiting === 4 && q.uploading === 0; }, 90000, 200);
@@ -283,7 +290,7 @@ const queue = async () => ((await resources()).engines || {}).speech?.queue || {
         `aborted ${r.aborted}; whisper-cli alive after the disconnect ${w.length}; next waited ${Boolean(waited)} then ${n.status} in ${n.ms} ms; runs ${ran}`);
     });
     await scenario("Queue: /api/speech/stop refuses waiting jobs", async () => {
-      const held = await holdEngine(srv, "hold3");
+      const held = (await holdEngine(srv, "hold3")).done;
       const w = transcribe(sample, "&save=false&filename=refused.wav");
       await waitUntil(async () => (await queue()).waiting === 1, 10000, 100);
       const st = await post("/api/speech/stop", {});
@@ -314,10 +321,11 @@ const queue = async () => ((await resources()).engines || {}).speech?.queue || {
     const srv = await startServer("budget", { USAP_TRANSCRIPTION_QUEUE: "on", USAP_TRANSCRIPTION_QUEUE_STORAGE_BUDGET_BYTES: String(64 * MiB) });
     try {
       await scenario("Queue: 507 when the storage budget is booked", async () => {
-        const held = await holdEngine(srv, "hold4");
-        const a = transcribe(makeWav(fmt, Buffer.alloc(60 * MiB)), "&save=false&filename=a.wav", { stopAfterBytes: 1 * MiB, abortAfterMs: 15000 });
-        await waitUntil(async () => (await resources()).transcriptionQueue.storage.reservedBytes > 60 * MiB, 10000, 100);
-        const b = await transcribe(makeWav(fmt, Buffer.alloc(8 * MiB)), "&save=false&filename=b.wav", { timeoutMs: 30000 });
+        const held = (await holdEngine(srv, "hold4")).done;
+        // Booked: the held job (about 7 MB) + A (40 MB declared, sent slowly) = about 47 of 64 MiB; B (20 MB) can't fit.
+        const a = transcribe(makeWav(fmt, Buffer.alloc(40 * MiB)), "&save=false&filename=a.wav", { stopAfterBytes: 1 * MiB, abortAfterMs: 15000 });
+        await waitUntil(async () => (await resources()).transcriptionQueue.storage.reservedBytes > 45 * MiB, 10000, 100);
+        const b = await transcribe(makeWav(fmt, Buffer.alloc(20 * MiB)), "&save=false&filename=b.wav", { timeoutMs: 30000 });
         await a; await held;
         await waitUntil(async () => (await resources()).transcriptionQueue.storage.reservedBytes === 0, 30000, 250);
         record("Queue: 507 when the storage budget is booked", b.status === 507 && b.json && b.json.code === "INSUFFICIENT_STORAGE" && b.ms < 5000 ? "PASS" : "FAIL", `status ${b.status} ${b.json && b.json.code} in ${b.ms} ms`);

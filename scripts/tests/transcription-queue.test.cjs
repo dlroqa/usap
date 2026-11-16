@@ -429,7 +429,7 @@ test("server, on: files are private and generated (no client file name); the log
     assert.match(files[0], /^[0-9a-f]{16}-\d+-[0-9a-f]{16}\.wav$/, "generated name");
     if (!IS_WIN) assert.equal(fs.statSync(path.join(c.root, "app", "cache", "speech-uploads", files[0])).mode & 0o777, 0o600);
     const job = c.jobs()[0];
-    assert.equal(path.dirname(job.f), path.join(c.root, "app", "cache", "speech-uploads"));
+    assert.equal(fs.realpathSync(path.dirname(job.f)), fs.realpathSync(path.join(c.root, "app", "cache", "speech-uploads")), "inside the upload folder (real paths: macOS temp is a link)");
     assert.ok(job.t >= 1 && job.t <= os.cpus().length, `-t ${job.t} is capped at ${os.cpus().length} logical CPUs`);
     c.release();
     assert.equal((await r).status, 200);
@@ -474,6 +474,31 @@ async function withService(opts, fn) {
   try { return await fn({ port: srv.address().port, q, dir, runs, releaseHold: () => holdResolve && holdResolve() }); }
   finally { srv.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 }
+
+// Sends the whole body even after an early answer; resolves { status, json, sentAll, socketError }.
+function sendAll(port, body) {
+  return new Promise((resolve) => {
+    let answer = null; let socketError = null; let sentAll = false;
+    const req = http.request({ host: "127.0.0.1", port, method: "POST", path: "/api/speech/transcribe", agent: false, headers: { "Content-Type": "audio/wav", "Content-Length": body.length } }, (res) => {
+      let t = ""; res.on("data", (c) => { t += c; }); res.on("end", () => { answer = { status: res.statusCode, json: JSON.parse(t) }; });
+    });
+    req.on("error", (e) => { socketError = e.code || e.message; });
+    req.on("close", () => setTimeout(() => resolve({ ...(answer || { status: 0 }), sentAll, socketError }), 50));
+    req.end(body, () => { sentAll = true; });
+  });
+}
+
+test("service: an early refusal reads the rest of the body, so the connection ends normally (no reset) after the answer", async () => {
+  await withService({ setting: { budgetBytes: 64 * MiB } }, async (s) => {
+    const r = await sendAll(s.port, wav("big", 120 * MiB));
+    assert.equal(r.status, 507);
+    assert.equal(r.json.code, "INSUFFICIENT_STORAGE");
+    assert.equal(r.socketError, null, "the client could send its whole body: the server didn't reset the connection");
+    assert.equal(r.sentAll, true);
+    assert.deepEqual(s.runs, []);
+    assert.equal(fs.readdirSync(s.dir).length, 0, "nothing was written");
+  });
+});
 
 test("service: an upload over the ceiling while streaming (no Content-Length) gets 413; nothing is left", async () => {
   await withService({ maxUploadBytes: 1 * MiB }, async (s) => {

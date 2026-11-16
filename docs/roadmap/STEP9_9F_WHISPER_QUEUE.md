@@ -333,8 +333,10 @@ queue off. The 1 GiB per-upload ceiling is fixed.
 - **Clean-up.** A file is deleted only after its write stream has closed its descriptor, since Windows can't delete an
   open file. The reservation is released together with the deletion.
 - **Early answers** (413, 429, 507, and upload failures before the job runs) are sent with `Connection: close`. The
-  server then reads and discards at most 8 MiB or 2 s of the remaining body, so a client still sending sees the
-  answer, and then closes the connection.
+  server then reads and discards the rest of the body, so the connection ends normally after the client has the
+  answer. This is bounded like an upload: at most 1 GiB, 30 s without data, or 240 s in total. Closing a connection
+  with unread request data resets it, and on Windows the client then lost the answer; an earlier version that
+  discarded only 8 MiB failed this way in CI.
 - **Body checks.** The byte count, not `Content-Length`, is enforced against the declared length and the ceiling. The
   first 12 bytes must be `RIFF…WAVE` and the body must be longer than 44 bytes, which is today's check, with today's
   500 and message.
@@ -342,7 +344,7 @@ queue off. The 1 GiB per-upload ceiling is fixed.
   on whisper-cli's exit.
 
 ### 13.3 Tests
-**Deterministic:** `scripts/tests/transcription-queue.test.cjs`, 25 tests, on all four OS in `ci`.
+**Deterministic:** `scripts/tests/transcription-queue.test.cjs`, 26 tests, on all four OS in `ci`.
 - **Real server with a whisper-cli stand-in:**
   - off identical to today, and rollback;
   - FIFO by admission;
@@ -364,7 +366,9 @@ queue off. The 1 GiB per-upload ceiling is fixed.
   - low free disk;
   - the total upload deadline;
   - file and reservation held while running;
-  - exit clean-up.
+  - exit clean-up;
+  - an early refusal of a 120 MiB upload whose client keeps sending: the answer arrives and the connection ends
+    without a reset (the earlier 8 MiB rule failed this with `EPIPE`).
 
 **Mutations** (each caught by name, with CI's `--test-timeout`):
 - admission after the upload (FIFO by completion);

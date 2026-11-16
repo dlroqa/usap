@@ -27,8 +27,6 @@ const GiB = 1024 * MiB;
 const MAX_UPLOAD_BYTES = 1 * GiB;      // today's per-request ceiling (readBinaryBody); not raisable
 const RESERVE_STEP_BYTES = 64 * MiB;   // reservation growth for uploads without Content-Length
 const MARGIN_MAX_BYTES = 256 * MiB;    // free-space safety margin: 256 MiB or 2 % of the volume, the smaller
-const LINGER_MS = 2000;                // after an early answer, read and discard at most this long ...
-const LINGER_BYTES = 8 * MiB;          // ... or this much, so small clients still read the answer; then close
 const DEFAULT_WAIT_MS = 10 * 60 * 1000;
 const WAV_ONLY = "Speech transcription currently accepts WAV audio only."; // today's message, unchanged
 
@@ -151,20 +149,36 @@ function createTranscriptionQueue({ setting, dir, speech, json, fs = fsDefault, 
   const counts = { tooLarge: 0, insufficientStorage: 0, uploadTimedOut: 0, notWav: 0, uploadFailed: 0, disconnected: 0, transcribed: 0, failed: 0 };
   const O_NOFOLLOW = fs.constants && fs.constants.O_NOFOLLOW ? fs.constants.O_NOFOLLOW : 0;
 
-  // Answer before the body was read: say so (Connection: close), then read and discard a little so a client that is
-  // still sending sees the answer, then close the connection.
+  // Answer before the body was read. The whole answer is sent at once (status, headers and a body of known length, so
+  // the client can read it immediately), but the response is ended only after the rest of the request body has been
+  // read and discarded: Node closes the connection when a response ends, and closing while request data is still
+  // arriving resets the connection, which can make the client lose the answer (seen on Windows). The discarding is
+  // bounded like an upload (at most the per-upload ceiling, no data for the inactivity deadline, or the total upload
+  // time); past that, the connection is closed anyway.
   function answerEarly(req, res, status, body, retryAfterSeconds) {
     if (res.headersSent || res.writableEnded || res.destroyed) return;
-    res.setHeader("Connection", "close");
     if (retryAfterSeconds) res.setHeader("Retry-After", String(retryAfterSeconds));
-    json(res, status, body);
-    if (req.complete) return;
+    if (req.complete) { json(res, status, body); return; }
+    const text = JSON.stringify(body);
+    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text), Connection: "close" });
+    res.write(text);
     let discarded = 0;
-    const stop = setTimer(() => { try { req.destroy(); } catch (_) { /* gone */ } }, LINGER_MS);
-    if (stop && stop.unref) stop.unref();
-    req.on("data", (c) => { discarded += c.length; if (discarded > LINGER_BYTES) { clearTimer(stop); req.destroy(); } });
-    req.on("end", () => clearTimer(stop));
-    req.on("close", () => clearTimer(stop));
+    let idle = null;
+    let settled = false;
+    const done = (cut) => {
+      if (settled) return;
+      settled = true;
+      clearTimer(total); if (idle) clearTimer(idle);
+      try { res.end(); } catch (_) { /* gone */ }
+      if (cut) { try { req.destroy(); } catch (_) { /* gone */ } }
+    };
+    const total = setTimer(() => done(true), setting.uploadMaxMs);
+    if (total && total.unref) total.unref();
+    const touch = () => { if (idle) clearTimer(idle); idle = setTimer(() => done(true), setting.uploadIdleMs); if (idle && idle.unref) idle.unref(); };
+    touch();
+    req.on("data", (c) => { discarded += c.length; touch(); if (discarded > maxUploadBytes) done(true); });
+    req.on("end", () => done(false));
+    req.on("close", () => done(false));
     req.resume();
   }
 
