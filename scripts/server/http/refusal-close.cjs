@@ -11,8 +11,10 @@
 //      (silent, slow, or still sending) can't hold it.
 //
 // A request whose body has been received completely, that has no body, or whose declared Content-Length is small
-// (at most SMALL_BODY_BYTES) is not touched: Node's normal handling (including keep-alive) applies, and at most that
-// many bytes are read and discarded. Larger declared bodies and chunked bodies (unknown length) are closed. Accepted requests never call this. It only decides how the connection ends; the
+// (at most SMALL_BODY_BYTES) keeps Node's normal handling (including keep-alive): at most that many bytes are read
+// and discarded. If such a small body is still incomplete when the answer has been written, it gets the same grace
+// period to arrive; otherwise the connection is closed, so a client can't hold it until Node's request timeout.
+// Larger declared bodies and chunked bodies (unknown length) are closed as described above. Accepted requests never call this. It only decides how the connection ends; the
 // answer itself (status, headers, body) is unchanged, and no request is ever routed differently.
 //
 // Node detail (checked by scripts/tests/refusal-close.test.cjs): Node ends a `Connection: close` response by calling
@@ -48,6 +50,22 @@ function linger(socket, graceMs, setTimer, clearTimer) {
   timer = setTimer(() => socket.destroy(), graceMs);
 }
 
+// A small declared body still arriving after the answer: keep the connection if it completes within the grace period
+// (keep-alive as before), close it otherwise.
+function closeIfSmallBodyStalls(req, res, graceMs, setTimer, clearTimer) {
+  const socket = req.socket;
+  if (!socket || socket.destroyed || res.__usapSmallBodyDeadline) return;
+  res.__usapSmallBodyDeadline = true;
+  res.once("finish", () => {
+    if (req.complete || socket.destroyed) return;
+    let timer = null;
+    const clear = () => { if (timer) { clearTimer(timer); timer = null; } };
+    req.once("end", clear);
+    socket.once("close", clear);
+    timer = setTimer(() => { timer = null; if (!req.complete && !socket.destroyed) { socket.on("error", noop); socket.destroy(); } }, graceMs);
+  });
+}
+
 /**
  * Call before writing a refusal (before writeHead / res.end). Returns true when the connection will be closed.
  * @param {import("http").IncomingMessage} req
@@ -56,7 +74,11 @@ function linger(socket, graceMs, setTimer, clearTimer) {
  */
 function closeAfterAnswer(req, res, { graceMs = GRACE_MS, smallBodyBytes = SMALL_BODY_BYTES, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
   if (!req || !res || res.headersSent || res.__usapCloseAfterAnswer) return false;
-  if (!bodyMayRemain(req, smallBodyBytes)) return false;
+  if (!bodyMayRemain(req, smallBodyBytes)) {
+    const declared = Number((req.headers || {})["content-length"]);
+    if (!req.complete && Number.isFinite(declared) && declared > 0) closeIfSmallBodyStalls(req, res, graceMs, setTimer, clearTimer);
+    return false;
+  }
   const socket = req.socket;
   if (!socket || socket.destroyed) return false;
   res.__usapCloseAfterAnswer = true;

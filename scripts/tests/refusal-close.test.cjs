@@ -68,6 +68,10 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
         s.write(`${method} ${url} HTTP/1.1\r\n${host}${headers}Content-Type: ${contentType}\r\nContent-Length: ${body.length}\r\n\r\n`); s.write(body); st.sent = body.length;
         return;
       }
+      if (mode === "small-stalled") { // declares a small body, sends only part of it, then nothing
+        s.write(`${method} ${url} HTTP/1.1\r\n${host}${headers}Content-Type: ${contentType}\r\nContent-Length: 2048\r\n\r\n`); s.write(Buffer.alloc(100, 0x61)); st.sent = 100;
+        return;
+      }
       if (mode === "silent") { s.write(`${method} ${url} HTTP/1.1\r\n${host}${headers}Content-Type: ${contentType}\r\nContent-Length: ${10 * MiB}\r\n\r\n`); return; }
       s.write(`${method} ${url} HTTP/1.1\r\n${host}${headers}Content-Type: ${contentType}\r\nTransfer-Encoding: chunked\r\n\r\n`);
       const send = (b) => { const ok = s.write(b.length.toString(16) + "\r\n"); s.write(b); s.write("\r\n"); st.sent += b.length; return ok; };
@@ -228,6 +232,39 @@ test("refusal: a complete small body keeps today's behaviour (answered, keep-ali
       assert.notEqual(st.connectionHeader, "close", "keep-alive unchanged");
       assert.ok(st.clientGaveUp, "the server kept the connection open for the next request, as before");
     }
+  } finally { await srv.close(); }
+});
+
+test("refusal: a small declared body that stalls is closed within the grace period after the answer (not held until Node's request timeout)", async () => {
+  const srv = await startPipelineServer({ auth: "on" });
+  try {
+    for (const [label, opts, status] of [["Origin", { headers: "Origin: http://evil.example\r\n" }, 403], ["sign-in", {}, 401], ["sign-in 415", { url: "/api/auth/login", contentType: "text/plain" }, 415]]) {
+      const st = await rawRequest(srv.port, { ...opts, mode: "small-stalled", maxMs: GRACE_MS + 8000 });
+      assert.equal(st.status, status, label);
+      assert.ok(!st.clientGaveUp, `${label}: closed by the server (client gave up after ${st.closedAt} ms)`);
+      assert.ok(st.closedAt - st.answeredAt <= GRACE_MS + SLACK_MS, `${label}: closed within the grace period after the answer (answer ${st.answeredAt} ms, close ${st.closedAt} ms)`);
+    }
+    assert.equal(srv.routeHits.echo, 0);
+  } finally { await srv.close(); }
+});
+
+test("misleading framing: bytes past the declared Content-Length, or after a request that declared no body, never reach a route", async () => {
+  const srv = await startPipelineServer();
+  try {
+    const raw = (head, extra) => new Promise((resolve) => {
+      const s = net.connect(srv.port, "127.0.0.1"); let text = ""; s.on("error", () => {});
+      s.on("data", (d) => (text += d)); s.on("close", () => resolve(text));
+      s.on("connect", () => { s.write(head); s.write(extra); });
+      setTimeout(() => s.destroy(), GRACE_MS + 6000);
+    });
+    const junk = "x".repeat(4096) + "\r\n\r\n";
+    const a = await raw("POST /api/echo HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}", junk);
+    const b = await raw("POST /api/echo HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\n\r\n", junk);
+    for (const [label, text] of [["past the declared length", a], ["no length declared", b]]) {
+      assert.match(text, /^HTTP\/1\.1 403/, `${label}: refused`);
+      assert.ok(!/HTTP\/1\.1 200/.test(text), `${label}: nothing accepted`);
+    }
+    assert.equal(srv.routeHits.echo, 0, "the extra bytes were never routed");
   } finally { await srv.close(); }
 });
 
