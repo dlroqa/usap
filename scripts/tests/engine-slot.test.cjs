@@ -183,7 +183,7 @@ function imageModel(dir, name) {
   fs.truncateSync(file, 130 * 1024 * 1024);
 }
 const IMAGE_MODELS = ["sd1-img-q4_0.gguf", "sd1-hold-load-q4_0.gguf", "sd1-ignore-sigterm-q4_0.gguf", "sd1-fail-load-q4_0.gguf"];
-const TEXT_MODELS = ["plain.gguf", "other.gguf", "hold-start.gguf", "crash-once.gguf", "ignore-sigterm.gguf"];
+const TEXT_MODELS = ["plain.gguf", "other.gguf", "hold-start.gguf", "crash-once.gguf", "crash-once-hold-start.gguf", "ignore-sigterm.gguf"];
 
 let root;
 test.before(() => {
@@ -225,6 +225,9 @@ async function engines(srv) {
     .filter((r) => r.pid && alive(r.pid));
 }
 // Samples every ~40 ms until stopped: the most heavy engine processes seen alive at once.
+// #125: every sampler is also stopped by withServer's `finally`, so a failed assertion can't leave its loop running
+// (a leaked loop keeps the test process alive and hangs the whole run).
+const samplers = new Set();
 function sampler(srv) {
   const seen = { max: 0, maxImage: 0, maxText: 0, samples: 0 };
   let running = true;
@@ -240,7 +243,9 @@ function sampler(srv) {
       await sleep(40);
     }
   })();
-  return async () => { running = false; await loop; return seen; };
+  const stop = async () => { running = false; samplers.delete(stop); await loop; return seen; };
+  samplers.add(stop);
+  return stop;
 }
 const textLoad = (srv, model, extra = {}) => request(srv.port, "POST", "/api/llm/start", { body: { model, contextSize: 512, gpuLayers: 0, ...extra } });
 const imageLoad = (srv, model = "sd1-img-q4_0.gguf", extra = {}) => request(srv.port, "POST", "/api/restart-backend", { body: { model, backend_type: "cpu", use_gpu: false, width: 64, height: 64, steps: 4, ...extra } });
@@ -266,8 +271,22 @@ async function holdTextPort(srv) {
 }
 async function withServer(env, fn) {
   const srv = await startServer(root, env);
-  try { return await fn(srv); } finally { stopServer(srv); await sleep(200); }
+  try { return await fn(srv); }
+  finally {
+    for (const stop of [...samplers]) await stop();
+    stopServer(srv); await sleep(200);
+  }
 }
+// #125: test servers whose automatic text restart waits for a file instead of the product's fixed 1 s
+// (scripts/tests/api-contract/restart-gate-preload.cjs, test-only). The restart stays pending until openGate().
+const gatePath = () => path.join(root, "restart.gate");
+const openGate = () => fs.writeFileSync(gatePath(), "1");
+const closeGate = () => { for (const f of [gatePath(), `${gatePath()}.cancelled`, `${gatePath()}.fired`]) { try { fs.unlinkSync(f); } catch (_) {} } };
+const gateCancelled = () => fs.existsSync(`${gatePath()}.cancelled`);
+const gateFired = () => fs.existsSync(`${gatePath()}.fired`);
+const gatedEnv = () => ({ ...SLOT_ON, USAP_TEST_RESTART_GATE: gatePath(),
+  NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require "${path.join(root, "scripts", "tests", "api-contract", "restart-gate-preload.cjs").replace(/\\/g, "/")}"`.trim() });
+const uncrash = (model) => { try { fs.unlinkSync(path.join(root, "app", "llm-models", `${model}.crashed`)); } catch (_) {} };
 const release = (dir, name) => fs.writeFileSync(path.join(root, "app", dir, `${name}.release`), "1");
 const unrelease = (dir, name) => { try { fs.unlinkSync(path.join(root, "app", dir, `${name}.release`)); } catch (_) {} };
 
@@ -542,21 +561,80 @@ test("crash auto-restart (slot on): a crashed text engine restarts as before and
   });
 });
 
+// The three tests below hold the automatic restart at a file gate (see gatedEnv), so "while the restart is pending"
+// and "after the restart has started" are states the test controls, not a 1 s window it has to win (#125). The real
+// 1 s wait is covered by the test above, which doesn't use the gate.
 test("crash auto-restart (slot on): an image load while the restart is pending cancels it through the text chain, then loads", async () => {
-  try { fs.unlinkSync(path.join(root, "app", "llm-models", "crash-once.gguf.crashed")); } catch (_) {}
-  await withServer(SLOT_ON, async (srv) => {
+  uncrash("crash-once.gguf"); closeGate();
+  await withServer(gatedEnv(), async (srv) => {
     assert.equal((await textLoad(srv, "crash-once.gguf")).status, 200);
-    await waitFor(async () => (await slotState(srv)).phase === "restart-pending", 10000, "restart pending");
+    await waitFor(async () => (await slotState(srv)).phase === "restart-pending", 15000, "restart pending");
+    await sleep(1500); // well past the product's 1 s: the restart is held at the gate
+    const held = await slotState(srv);
+    assert.deepEqual([held.owner, held.phase], ["text", "restart-pending"], "still pending, still owned by text");
+    assert.deepEqual(await engines(srv), [], "no engine process while the restart is pending");
     const done = sampler(srv);
     const img = await imageLoad(srv);
     assert.equal(img.status, 200, img.text);
-    await sleep(2500); // past the 1 s restart delay
+    // The image load cancels the held restart through the text chain; the gate records it (no timing involved).
+    await waitFor(async () => gateCancelled(), 15000, "the pending restart was cancelled");
+    assert.equal(gateFired(), false, "the restart never ran before it was cancelled");
+    openGate(); // a restart that was not cancelled would be released now
+    await waitFor(async () => (await engines(srv)).some((e) => e.label === "image"), 30000, "the image engine is running");
+    assert.equal(gateFired(), false, "the cancelled restart never ran, even with its gate open");
     const seen = await done();
+    assert.equal(seen.maxText, 0, "no text engine process was started after the image load");
     assert.ok(seen.max <= 1, `at most one heavy engine (saw ${seen.max})`);
     assert.deepEqual((await engines(srv)).map((e) => e.label), ["image"]);
     assert.equal((await llmStatus(srv)).running, false, "the restart did not happen");
+    // A restart whose wait was not cancelled is refused by the slot, but leaves "restarting it failed" behind.
+    assert.doesNotMatch(String((await llmStatus(srv)).error || ""), /restarting it failed/, "the cancelled restart was never attempted");
     assert.equal((await slotState(srv)).owner, "image");
   });
+});
+
+test("crash auto-restart (slot on, control): with no image load, the pending restart runs when its wait ends", async () => {
+  uncrash("crash-once.gguf"); closeGate();
+  await withServer(gatedEnv(), async (srv) => {
+    assert.equal((await textLoad(srv, "crash-once.gguf")).status, 200);
+    await waitFor(async () => (await slotState(srv)).phase === "restart-pending", 15000, "restart pending");
+    await sleep(1500);
+    assert.equal((await slotState(srv)).phase, "restart-pending", "held at the gate");
+    assert.deepEqual(await engines(srv), []);
+    openGate(); // the same moment at which the test above expects nothing to happen
+    await waitFor(async () => gateFired(), 15000, "the held restart was released and ran");
+    assert.equal(gateCancelled(), false, "nothing cancelled it");
+    const s = await waitFor(async () => { const st = await slotState(srv); return st.phase === "loaded" && (await llmStatus(srv)).ready ? st : null; }, 15000, "restarted");
+    assert.equal(s.owner, "text");
+    assert.deepEqual((await engines(srv)).map((e) => e.label), ["llm"]);
+  });
+});
+
+test("crash auto-restart (slot on): an image load after the restart has started gets 409 (text loading); the restart completes", async () => {
+  const model = "crash-once-hold-start.gguf";
+  uncrash(model); closeGate(); release("llm-models", model);
+  try {
+    await withServer(gatedEnv(), async (srv) => {
+      assert.equal((await textLoad(srv, model)).status, 200);
+      await waitFor(async () => (await llmStatus(srv)).ready, 15000, "first engine ready");
+      unrelease("llm-models", model); // the restarted engine will be held before it listens
+      await waitFor(async () => (await slotState(srv)).phase === "restart-pending", 15000, "restart pending");
+      openGate();
+      await waitFor(async () => { const st = await slotState(srv); return st.owner === "text" && st.phase === "loading" && (await engines(srv)).length === 1; }, 15000, "restart started (loading)");
+      const done = sampler(srv);
+      const img = await imageLoad(srv);
+      assert.equal(img.status, 409, img.text);
+      assert.equal(img.json.code, "MODEL_ALREADY_ACTIVE");
+      assert.deepEqual([img.json.activeRuntime.type, img.json.activeRuntime.phase], ["text", "loading"], "refused because the restart is loading, not pending");
+      assert.deepEqual((await engines(srv)).map((e) => e.label), ["llm"], "the image load started nothing and stopped nothing");
+      release("llm-models", model);
+      await waitFor(async () => { const st = await slotState(srv); return st.phase === "loaded" && (await llmStatus(srv)).ready; }, 15000, "restart completed");
+      const seen = await done();
+      assert.equal(seen.maxImage, 0, "no image engine process was ever started");
+      assert.ok(seen.max <= 1, `at most one heavy engine (saw ${seen.max})`);
+      assert.equal((await slotState(srv)).owner, "text");
+    });
+  } finally { unrelease("llm-models", model); }
 });
 
 test("out-of-memory retry (slot on): a chat that runs out of memory is retried with a smaller context, unchanged", async () => {
