@@ -263,8 +263,13 @@ test("server, on: capacity is 1 running + 4 waiting; the next gets 429 QUEUE_FUL
     c.hold();
     const first = upload(c.srv.port, wav("H")).promise;
     await waitFor(() => c.started().length === 1, 10000, "running");
-    const waiting = [1, 2, 3, 4].map((i) => upload(c.srv.port, wav(`W${i}`)).promise);
-    await waitFor(async () => (await queueState(c)).waiting === 4, 5000, "4 waiting");
+    // One at a time: simultaneous connections have no guaranteed arrival order (seen on Windows CI, #135), and this
+    // test asserts the FIFO order of admission, so each upload starts only after the previous one was admitted.
+    const waiting = [];
+    for (const i of [1, 2, 3, 4]) {
+      waiting.push(upload(c.srv.port, wav(`W${i}`)).promise);
+      await waitFor(async () => (await queueState(c)).waiting === i, 5000, `${i} waiting`);
+    }
     const full = await upload(c.srv.port, wav("F", 4 * MiB)).promise;
     assert.equal(full.status, 429);
     assert.equal(full.json.code, "QUEUE_FULL");
