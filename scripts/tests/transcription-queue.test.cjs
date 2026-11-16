@@ -662,12 +662,16 @@ test("service: low free disk space gets 507 before the body is read, whatever th
 });
 
 test("service: the whole-upload deadline ends a slow upload (408, phase total) and releases everything", async () => {
+  // At the deadline the budget is spent, so the server answers and closes at once (STEP9_9F_WHISPER_QUEUE.md §13.2).
+  // A part arriving at that moment can make the client see a reset instead of the answer (Windows did, with parts
+  // 200 ms apart and a 600 ms deadline), so parts go out at 0, 400 and 800 ms: the deadline falls 200 ms from either.
   await withService({ setting: { uploadIdleMs: 5000, uploadMaxMs: 600 } }, async (s) => {
-    const r = await upload(s.port, wav("slow", 100000), { parts: 10, gapMs: 200 }).promise;
+    const r = await upload(s.port, wav("slow", 100000), { parts: 10, gapMs: 400 }).promise;
     assert.equal(r.status, 408);
     assert.deepEqual([r.json.code, r.json.phase], ["UPLOAD_TIMEOUT", "total"]);
     assert.deepEqual(s.runs, []);
-    await waitFor(() => s.q.storage().reservedBytes === 0 && fs.readdirSync(s.dir).length === 0, 5000, "released");
+    await assertSettled(s);
+    assert.ok(s.conns[0].closedMs < 1100, `the server closed the connection ${s.conns[0].closedMs} ms after arrival (deadline 600 ms)`);
   });
 });
 
