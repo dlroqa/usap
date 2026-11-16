@@ -31,7 +31,7 @@ const A_PORT = 14945;          // direct engine for A
 const WIN = process.platform === "win32";
 const ON_ENV = { USAP_CHAT_TIMEOUTS: "on", USAP_CHAT_FIRST_BYTE_SECONDS: "30", USAP_CHAT_IDLE_SECONDS: "10", USAP_CHAT_CANCEL_CONFIRM_SECONDS: "20", USAP_CHAT_UNRESPONSIVE_PROBE_SECONDS: "5" };
 const NODE = [path.join(APP, "tools", "node-win", "node.exe"), path.join(APP, "tools", "node-linux", "bin", "node"), path.join(APP, "tools", "node-mac", "bin", "node")].find((p) => fs.existsSync(p)) || process.execPath;
-const SCRIPT_DEADLINE = Date.now() + 45 * 60 * 1000;
+const SCRIPT_DEADLINE = Date.now() + 70 * 60 * 1000;
 const TRIAL_MS = 180000;
 fs.mkdirSync(OUT, { recursive: true });
 const RESULTS = path.join(OUT, "diag133.jsonl");
@@ -151,45 +151,72 @@ async function trial({ label, kind, enginePort, enginePid, viaStudio }) {
 }
 
 // ── main ───────────────────────────────────────────────────────────────────────────────────────────────────────
+// Run 2 (owner-authorized follow-up): compare the existing engine configuration with fewer inference threads and
+// with busy-polling disabled, same prompt and abort timing.
+//   B (studio, production arguments; threads set through /api/llm/start, --poll stays 30 as in production):
+//     B-t4 x2 aborts (existing configuration), B-t2 x2 aborts
+//   A (direct engine, studio command line with -lv 3; threads/poll replaced):
+//     t4/poll30, t2/poll30, t4/poll0: 1 complete + 3 aborts each
+async function startStudio(threads, studioLog) {
+  const studio = spawn(NODE, [SERVE], { cwd: ROOT, env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT), ...ON_ENV }, stdio: ["ignore", studioLog, studioLog], windowsHide: true });
+  if (!(await waitUntil(async () => (await getJson(PORT, "/api/health")).status === 200, 60000, 500))) throw new Error("studio did not start");
+  const st = await call(PORT, "POST", "/api/llm/start", { model: MODEL, contextSize: 4096, gpuLayers: 0, ...(threads ? { threads } : {}) }).promise;
+  if (st.status !== 200) throw new Error(`model start ${st.status}: ${String(st.text).slice(0, 200)}`);
+  if (!(await waitUntil(async () => (await getJson(PORT, "/api/llm/status")).json?.ready === true, 240000, 1000))) throw new Error("model not ready");
+  const port = (await getJson(PORT, "/api/llm/status")).json.port;
+  const pids = listenerPids(port).filter((p) => p !== studio.pid);
+  if (pids.length !== 1) throw new Error(`expected one engine on ${port}, found ${pids}`);
+  return { studio, port, pid: pids[0], info: procInfo(pids[0]) };
+}
+async function stopStudio(s) {
+  if (!s) return;
+  try { await call(PORT, "POST", "/api/llm/stop", {}, { timeoutMs: 30000 }).promise; } catch (_) {}
+  killPid(s.studio.pid);
+  await waitUntil(() => listenerPids(s.port).length === 0 && listenerPids(PORT).length === 0, 30000, 500);
+}
+const flag = (cmd, name) => { const m = String(cmd).match(new RegExp(`(?:^|\\s)${name}\\s+(\\S+)`)); return m ? m[1] : null; };
+
 (async () => {
-  let studio = null, aEngine = null;
+  let s = null, aEngine = null, baseCmd = null;
   const studioLog = fs.openSync(path.join(OUT, "studio.log"), "w");
   try {
-    // B: studio test server, chat timeouts on (test values), production engine arguments
-    studio = spawn(NODE, [SERVE], { cwd: ROOT, env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT), ...ON_ENV }, stdio: ["ignore", studioLog, studioLog], windowsHide: true });
-    if (!(await waitUntil(async () => (await getJson(PORT, "/api/health")).status === 200, 60000, 500))) throw new Error("studio did not start");
-    const st = await call(PORT, "POST", "/api/llm/start", { model: MODEL, contextSize: 4096, gpuLayers: 0 }).promise;
-    if (st.status !== 200) throw new Error(`model start ${st.status}`);
-    if (!(await waitUntil(async () => (await getJson(PORT, "/api/llm/status")).json?.ready === true, 240000, 1000))) throw new Error("model not ready");
-    const bPort = (await getJson(PORT, "/api/llm/status")).json.port;
-    const bPids = listenerPids(bPort).filter((p) => p !== studio.pid);
-    if (bPids.length !== 1) throw new Error(`expected one engine on ${bPort}, found ${bPids}`);
-    const bInfo = procInfo(bPids[0]);
-    out({ event: "engine", which: "B (studio)", pid: bPids[0], port: bPort, ...bInfo, studioPid: studio.pid });
-    await sizePrompt(bPort);
-    for (let i = 1; i <= 4 && Date.now() < SCRIPT_DEADLINE; i++) await trial({ label: `B${i}`, kind: "abort", enginePort: bPort, enginePid: bPids[0], viaStudio: true });
-    // stop the studio (and its engine) before A, so the two never compete for the CPU
-    await call(PORT, "POST", "/api/llm/stop", {}, { timeoutMs: 30000 }).promise;
-    killPid(studio.pid); await waitUntil(() => listenerPids(bPort).length === 0 && listenerPids(PORT).length === 0, 30000, 500); studio = null;
-
-    // A: direct engine with the studio engine's exact arguments, except the port and -lv 3
-    const argv = (bInfo && bInfo.cmd ? bInfo.cmd : "").match(/"[^"]*"|\S+/g).map((s) => s.replace(/^"|"$/g, ""));
-    const exe = argv.shift();
-    for (let i = 0; i < argv.length; i++) { if (argv[i] === "--port") argv[i + 1] = String(A_PORT); if (argv[i] === "-lv") argv[i + 1] = "3"; }
-    const engLog = fs.openSync(path.join(OUT, "engine-A.log"), "w");
-    const spawnAt = Date.now();
-    aEngine = spawn(exe, argv, { stdio: ["ignore", engLog, engLog], windowsHide: true });
-    if (!(await waitUntil(async () => (await getJson(A_PORT, "/health", 3000)).status === 200, 240000, 500))) throw new Error("engine A not ready");
-    const aPids = listenerPids(A_PORT);
-    out({ event: "engine", which: "A (direct)", pid: aEngine.pid, listenerPids: aPids, port: A_PORT, spawnAtMs: spawnAt, ...procInfo(aEngine.pid), argv: [exe, ...argv].join(" ") });
-    if (aPids.length !== 1 || aPids[0] !== aEngine.pid) throw new Error(`port ${A_PORT} owner ${aPids} is not engine A ${aEngine.pid}`);
-    for (let i = 1; i <= 2 && Date.now() < SCRIPT_DEADLINE; i++) await trial({ label: `A-complete${i}`, kind: "complete", enginePort: A_PORT, enginePid: aEngine.pid, viaStudio: false });
-    for (let i = 1; i <= 4 && Date.now() < SCRIPT_DEADLINE; i++) await trial({ label: `A-abort${i}`, kind: "abort", enginePort: A_PORT, enginePid: aEngine.pid, viaStudio: false });
+    for (const threads of [null, 2]) {
+      if (Date.now() > SCRIPT_DEADLINE) break;
+      s = await startStudio(threads, studioLog);
+      baseCmd = baseCmd || s.info.cmd;
+      const label = `B-t${flag(s.info.cmd, "--threads")}-p${flag(s.info.cmd, "--poll")}`;
+      out({ event: "engine", which: label, pid: s.pid, port: s.port, threads: flag(s.info.cmd, "--threads"), poll: flag(s.info.cmd, "--poll"), ...s.info, studioPid: s.studio.pid });
+      await sizePrompt(s.port);
+      for (let i = 1; i <= 2 && Date.now() < SCRIPT_DEADLINE; i++) await trial({ label: `${label}-abort${i}`, kind: "abort", enginePort: s.port, enginePid: s.pid, viaStudio: true });
+      await stopStudio(s); s = null;
+    }
+    const argv0 = baseCmd.match(/"[^"]*"|\S+/g).map((x) => x.replace(/^"|"$/g, ""));
+    for (const [threads, poll] of [["4", "30"], ["2", "30"], ["4", "0"]]) {
+      if (Date.now() > SCRIPT_DEADLINE) break;
+      const argv = argv0.slice(1);
+      for (let i = 0; i < argv.length; i++) {
+        if (argv[i] === "--port") argv[i + 1] = String(A_PORT);
+        if (argv[i] === "-lv") argv[i + 1] = "3";
+        if (argv[i] === "--threads") argv[i + 1] = threads;
+        if (argv[i] === "--poll") argv[i + 1] = poll;
+      }
+      const label = `A-t${threads}-p${poll}`;
+      const engLog = fs.openSync(path.join(OUT, `engine-${label}.log`), "w");
+      const spawnAt = Date.now();
+      aEngine = spawn(argv0[0], argv, { stdio: ["ignore", engLog, engLog], windowsHide: true });
+      if (!(await waitUntil(async () => (await getJson(A_PORT, "/health", 3000)).status === 200, 240000, 500))) throw new Error(`engine ${label} not ready`);
+      const aPids = listenerPids(A_PORT);
+      out({ event: "engine", which: label, pid: aEngine.pid, listenerPids: aPids, port: A_PORT, threads, poll, spawnAtMs: spawnAt, ...procInfo(aEngine.pid), argv: [argv0[0], ...argv].join(" ") });
+      if (aPids.length !== 1 || aPids[0] !== aEngine.pid) throw new Error(`port ${A_PORT} owner ${aPids} is not engine ${aEngine.pid}`);
+      await trial({ label: `${label}-complete`, kind: "complete", enginePort: A_PORT, enginePid: aEngine.pid, viaStudio: false });
+      for (let i = 1; i <= 3 && Date.now() < SCRIPT_DEADLINE; i++) await trial({ label: `${label}-abort${i}`, kind: "abort", enginePort: A_PORT, enginePid: aEngine.pid, viaStudio: false });
+      killPid(aEngine.pid); await waitUntil(() => listenerPids(A_PORT).length === 0, 30000, 500); aEngine = null;
+    }
   } catch (err) {
     out({ event: "error", error: String(err && err.stack || err) }); process.exitCode = 1;
   } finally {
     if (aEngine) killPid(aEngine.pid);
-    if (studio) { try { await call(PORT, "POST", "/api/llm/stop", {}, { timeoutMs: 15000 }).promise; } catch (_) {} killPid(studio.pid); }
+    if (s) await stopStudio(s);
     await sleep(1000);
     out({ event: "cleanup", studioPortListeners: listenerPids(PORT), enginePortAListeners: listenerPids(A_PORT) });
   }

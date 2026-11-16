@@ -19,7 +19,7 @@ jobs:
   diag:
     name: bench-133 (windows-x64)
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 110
     env:
       FRONTEND_PORT: "14900"
       USAP_SKIP_COREML: "1"
@@ -59,7 +59,7 @@ jobs:
           app/llm-backend/win/cpu/llama-server.exe --version 2>&1 | tee -a ci-logs/runner.txt || true
 
       - name: Diagnostic (bounded; cleans up its own processes)
-        timeout-minutes: 50
+        timeout-minutes: 75
         run: node bench/133-cancel-diag/diag.cjs ci-logs/diag133
 
       - name: Stop anything left on the diagnostic ports
