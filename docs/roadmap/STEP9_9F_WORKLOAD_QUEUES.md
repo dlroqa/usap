@@ -1,7 +1,8 @@
 # Step 9.9f, third substage: voice, transcription and image-generation job queues (design)
 
 Status: design merged (#113). The **voice queue is implemented, off by default** (§11, "As built"). The transcription
-and image queues are design only. Nothing here was turned on by default. Each queue, its limits and its default need separate
+queue is implemented, off by default (#130, [STEP9_9F_WHISPER_QUEUE.md](STEP9_9F_WHISPER_QUEUE.md) §13). The image
+queue is design only ([STEP9_9F_IMAGE_QUEUE.md](STEP9_9F_IMAGE_QUEUE.md)). Nothing here was turned on by default. Each queue, its limits and its default need separate
 owner approval, and each lands in its own implementation PR. Part of [STEP9_9_SCHEDULING.md](STEP9_9_SCHEDULING.md)
 stage 9.9f. It follows the engine lifecycle coordination of #105 ([STEP9_9F_ENGINE_LIFECYCLE.md](STEP9_9F_ENGINE_LIFECYCLE.md)).
 
@@ -108,7 +109,7 @@ Rules between the two:
 
 ### 5.2 Whisper transcription (second)
 
-Detailed design (planned, not implemented): [STEP9_9F_WHISPER_QUEUE.md](STEP9_9F_WHISPER_QUEUE.md). It replaces the
+Detailed design (implemented in #130, off by default): [STEP9_9F_WHISPER_QUEUE.md](STEP9_9F_WHISPER_QUEUE.md). It replaces the
 buffer-then-admit flow with admission at arrival, streaming to a dedicated upload folder, storage reservations and
 upload deadlines.
 
@@ -119,6 +120,11 @@ upload deadlines.
 * The 9.9e thread budget (off) and the logical-CPU cap (on) don't change. They read "transcribing" as today.
 
 ### 5.3 Image generation (last)
+
+Detailed design (not implemented): [STEP9_9F_IMAGE_QUEUE.md](STEP9_9F_IMAGE_QUEUE.md). It updates the points below
+with the CPU sd-server measurements. Waiting jobs are held in the studio, and a forwarded job keeps its place until
+the engine answers, not until the client leaves. The owner's image decisions D1–D6 (2026-11-16) are recorded there
+(§10). They narrow the points below: sd-server only, four generation routes, no OpenVINO or Core ML.
 
 * Wraps `POST /sdapi/v1/txt2img|img2img` and `/v1/images/*` in the proxy, plus `POST /api/openvino-generate`.
   Model listing (`GET /v1/models`) and other read-only calls are never queued. Whether Core ML paths are included
