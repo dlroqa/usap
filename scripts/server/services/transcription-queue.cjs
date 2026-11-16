@@ -149,52 +149,82 @@ function createTranscriptionQueue({ setting, dir, speech, json, fs = fsDefault, 
   const counts = { tooLarge: 0, insufficientStorage: 0, uploadTimedOut: 0, notWav: 0, uploadFailed: 0, disconnected: 0, transcribed: 0, failed: 0 };
   const O_NOFOLLOW = fs.constants && fs.constants.O_NOFOLLOW ? fs.constants.O_NOFOLLOW : 0;
 
-  // Answer before the body was read. The whole answer is sent at once (status, headers and a body of known length, so
-  // the client can read it immediately), but the response is ended only after the rest of the request body has been
-  // read and discarded: Node closes the connection when a response ends, and closing while request data is still
-  // arriving resets the connection, which can make the client lose the answer (seen on Windows). The discarding is
-  // bounded like an upload (at most the per-upload ceiling, no data for the inactivity deadline, or the total upload
-  // time); past that, the connection is closed anyway.
-  function answerEarly(req, res, status, body, retryAfterSeconds) {
+  // One account per request, opened at arrival and shared by the upload and by any discarding after a refusal: every
+  // body byte received counts against one ceiling (the per-upload limit), one absolute deadline runs from arrival
+  // (the whole-upload time), and inactivity is measured from the last byte actually received. A refusal never opens a
+  // new budget. The counting listener is attached first and never removed, so bytes that arrive between a refusal and
+  // its answer are counted too (and dropped: nothing keeps them).
+  function openAccount(req) {
+    const t = now();
+    const acct = { startedAt: t, lastDataAt: t, bytes: 0 };
+    req.on("data", (c) => { acct.bytes += c.length; acct.lastDataAt = now(); });
+    return acct;
+  }
+
+  // Answer before the body was read in full. The whole answer is sent at once (status, headers and a body of known
+  // length, so the client can read it immediately). Node closes the connection when a response ends, and closing while
+  // request data is still arriving resets it, which can make a client that is still sending lose the answer (seen on
+  // Windows). So while the request's own budgets allow, the rest of the body is read and discarded and the response
+  // ends after it; when a budget is spent (bytes over the ceiling, the absolute deadline, or no data for the inactivity
+  // time), or the declared size can never fit the ceiling, the connection is closed at once after the answer is
+  // written. Bounded resource use comes first: a client still sending at that point may see a reset instead.
+  function answerEarly(req, res, status, body, retryAfterSeconds, acct, declared) {
     if (res.headersSent || res.writableEnded || res.destroyed) return;
     if (retryAfterSeconds) res.setHeader("Retry-After", String(retryAfterSeconds));
     if (req.complete) { json(res, status, body); return; }
     const text = JSON.stringify(body);
     res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text), Connection: "close" });
     res.write(text);
-    let discarded = 0;
     let idle = null;
+    let total = null;
     let settled = false;
     const done = (cut) => {
       if (settled) return;
       settled = true;
-      clearTimer(total); if (idle) clearTimer(idle);
+      if (total) clearTimer(total);
+      if (idle) clearTimer(idle);
+      req.removeListener("data", onDiscard); req.removeListener("end", onEnd); req.removeListener("close", onEnd);
       try { res.end(); } catch (_) { /* gone */ }
       if (cut) { try { req.destroy(); } catch (_) { /* gone */ } }
     };
-    const total = setTimer(() => done(true), setting.uploadMaxMs);
+    function onDiscard() { if (acct.bytes > maxUploadBytes) return done(true); armIdle(); }
+    function onEnd() { done(false); }
+    const armIdle = () => {
+      if (idle) clearTimer(idle);
+      const left = acct.lastDataAt + setting.uploadIdleMs - now();
+      if (left <= 0) return done(true);
+      idle = setTimer(() => done(true), left);
+      if (idle && idle.unref) idle.unref();
+    };
+    // Already over: nothing left to wait for, or a body that can't complete within the ceiling.
+    const totalLeft = acct.startedAt + setting.uploadMaxMs - now();
+    if (req.destroyed || req.readableEnded || acct.bytes > maxUploadBytes || totalLeft <= 0
+      || (declared !== null && declared > maxUploadBytes)) return done(true);
+    // Our own pause (write backpressure) is not the client's silence: inactivity counts from here in that case.
+    if (req.isPaused()) acct.lastDataAt = now();
+    total = setTimer(() => done(true), totalLeft);
     if (total && total.unref) total.unref();
-    const touch = () => { if (idle) clearTimer(idle); idle = setTimer(() => done(true), setting.uploadIdleMs); if (idle && idle.unref) idle.unref(); };
-    touch();
-    req.on("data", (c) => { discarded += c.length; touch(); if (discarded > maxUploadBytes) done(true); });
-    req.on("end", () => done(false));
-    req.on("close", () => done(false));
-    req.resume();
+    req.on("data", onDiscard);
+    req.on("end", onEnd);
+    req.on("close", onEnd);
+    armIdle();
+    if (!settled) req.resume();
   }
 
   async function handle(req, res, options) {
     const declaredRaw = req.headers["content-length"];
     const declared = declaredRaw === undefined ? null : Number(declaredRaw);
+    const acct = openAccount(req);
     // 1. Size, before anything is read or reserved.
     if (declared !== null && declared > maxUploadBytes) {
       counts.tooLarge += 1;
-      return answerEarly(req, res, 413, { ok: false, code: "UPLOAD_TOO_LARGE", error: `Audio file is too large. Limit is ${Math.round(maxUploadBytes / MiB)} MB.` });
+      return answerEarly(req, res, 413, { ok: false, code: "UPLOAD_TOO_LARGE", error: `Audio file is too large. Limit is ${Math.round(maxUploadBytes / MiB)} MB.` }, undefined, acct, declared);
     }
     // 2. Capacity. The queue answers 429 itself (and counts it) when running + waiting is at its limit.
     const st = queue.stats();
     if (st.running + st.waiting >= 1 + st.limit) {
       const r = await queue.admit(() => {});
-      return answerEarly(req, res, r.status, { ok: false, code: r.code, error: r.error }, r.retryAfterSeconds);
+      return answerEarly(req, res, r.status, { ok: false, code: r.code, error: r.error }, r.retryAfterSeconds, acct, declared);
     }
     // 3. Storage, booked atomically (no await between here and the admission below).
     const first = declared !== null ? Math.max(declared, 1) : Math.min(RESERVE_STEP_BYTES, maxUploadBytes);
@@ -204,14 +234,14 @@ function createTranscriptionQueue({ setting, dir, speech, json, fs = fsDefault, 
       return answerEarly(req, res, 507, { ok: false, code: "INSUFFICIENT_STORAGE",
         error: booked.reason === "budget"
           ? "Not enough room for this upload now: other transcriptions hold the temporary storage. Try again later."
-          : "Not enough free disk space to receive this audio file." }, booked.reason === "budget" ? 30 : undefined);
+          : "Not enough free disk space to receive this audio file." }, booked.reason === "budget" ? 30 : undefined, acct, declared);
     }
     // 4. Admission: the FIFO position is taken here, synchronously.
     const job = { id: ++seq, reservation: booked.reservation, file: null, outBase: null, fd: null, out: null, bytes: 0, header: Buffer.alloc(0),
       uploadDone: false, uploadError: null, running: false, settled: false, withdraw: null, timers: [] };
     live.add(job);
     const turnP = queue.admit((cb) => { job.withdraw = cb; });
-    return runJob(req, res, options, job, declared, turnP);
+    return runJob(req, res, options, job, declared, turnP, acct);
   }
 
   // Delete the job's files and release its reservation, once. The file is deleted only after its write stream has
@@ -234,13 +264,13 @@ function createTranscriptionQueue({ setting, dir, speech, json, fs = fsDefault, 
     try { out.destroy(); } catch (_) { removeFiles(); }
   }
 
-  function runJob(req, res, options, job, declared, turnP) {
+  function runJob(req, res, options, job, declared, turnP, acct) {
     return new Promise((resolveJob) => {
       let release = null;
       let clientGone = false;
       const respond = (status, body, retryAfterSeconds) => {
         if (clientGone || res.headersSent || res.writableEnded || res.destroyed) return;
-        if (!job.uploadDone) return answerEarly(req, res, status, body, retryAfterSeconds);
+        if (!job.uploadDone) return answerEarly(req, res, status, body, retryAfterSeconds, acct, declared);
         if (retryAfterSeconds) res.setHeader("Retry-After", String(retryAfterSeconds));
         json(res, status, body);
       };
@@ -262,7 +292,8 @@ function createTranscriptionQueue({ setting, dir, speech, json, fs = fsDefault, 
         return t;
       };
       let idleTimer = idle();
-      job.timers.push(setTimer(() => failUpload("UPLOAD_TIMEOUT", { phase: "total" }), setting.uploadMaxMs));
+      // The absolute deadline runs from arrival (the request's account), the same one any later discarding obeys.
+      job.timers.push(setTimer(() => failUpload("UPLOAD_TIMEOUT", { phase: "total" }), Math.max(0, acct.startedAt + setting.uploadMaxMs - now())));
 
       const name = `${instanceId}-${job.id}-${crypto.randomBytes(8).toString("hex")}`;
       try {
@@ -281,7 +312,7 @@ function createTranscriptionQueue({ setting, dir, speech, json, fs = fsDefault, 
       function onData(chunk) {
         if (job.uploadDone || job.uploadError) return;
         clearTimer(idleTimer); idleTimer = idle();
-        job.bytes += chunk.length;
+        job.bytes = acct.bytes; // every body byte of this request so far (counted by its account)
         if (job.bytes > maxUploadBytes || (declared !== null && job.bytes > declared)) return failUpload("UPLOAD_TOO_LARGE");
         if (job.header.length < 12) {
           job.header = Buffer.concat([job.header, chunk.subarray(0, 12 - job.header.length)]);

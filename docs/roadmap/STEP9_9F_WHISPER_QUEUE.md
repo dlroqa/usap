@@ -130,8 +130,9 @@ any partial file, and lets the next job proceed:
 
 - **Streaming:** `stream.pipeline(req, byteCounter, fileWriteStream)`. Backpressure is native: a slow disk pauses
   `req`, and TCP slows the client. No body is ever concatenated.
-- **Deadlines.** The inactivity timer resets on each received chunk. The whole-upload timer runs from admission. Both
-  end the request with `req.destroy()` after answering.
+- **Deadlines.** The inactivity timer resets on each received chunk. The whole-upload timer runs from arrival (the
+  same moment as admission). Both end the request with `req.destroy()` after answering. They are the request's only
+  deadlines: a refusal never starts new ones (§13.2).
 - **No multipart.** The route keeps today's raw-WAV contract. A `multipart/*` body is refused early with today's
   "WAV only" error, not parsed.
 - **Directory.** A **dedicated, USAP-owned upload directory**, `<data root>/cache/speech-uploads/`, which is
@@ -332,11 +333,34 @@ queue off. The 1 GiB per-upload ceiling is fixed.
   `<same>.out.txt` and `<same>.out.json`.
 - **Clean-up.** A file is deleted only after its write stream has closed its descriptor, since Windows can't delete an
   open file. The reservation is released together with the deletion.
-- **Early answers** (413, 429, 507, and upload failures before the job runs) are sent with `Connection: close`. The
-  server then reads and discards the rest of the body, so the connection ends normally after the client has the
-  answer. This is bounded like an upload: at most 1 GiB, 30 s without data, or 240 s in total. Closing a connection
-  with unread request data resets it, and on Windows the client then lost the answer; an earlier version that
-  discarded only 8 MiB failed this way in CI.
+- **One account per request.** Each request gets one account at arrival, before any check. It applies through the
+  upload and through any discarding after a refusal:
+  - every body byte received counts against **one 1 GiB ceiling**;
+  - **one absolute deadline**, 240 s from arrival, covers upload and discarding together;
+  - inactivity is measured from the **last byte actually received**.
+
+  A refusal never resets these budgets. Bytes that arrive between a refusal and its answer are counted and dropped:
+  they are never kept in memory or written to a file.
+- **Early answers** (413, 429, 507, and upload failures before the job runs) are sent at once, complete, with
+  `Content-Length` and `Connection: close`. Closing a connection while request data is still arriving resets it, and
+  on Windows the client then lost the answer (an earlier version that discarded only 8 MiB failed this way in CI).
+  So, while the request's own budgets allow, the server reads and discards the rest of the body and ends the
+  connection after it. The connection is closed **at once** after the answer, with nothing more read, when:
+  - the declared `Content-Length` is over the ceiling, so the body could never finish;
+  - the ceiling is already spent, as for a 413 mid-stream;
+  - the absolute deadline has passed (408 `total`);
+  - nothing has arrived for the inactivity time (408 `idle`).
+
+  In all cases a request's connection ends no later than 240 s after arrival. It ends sooner if no data arrives for
+  30 s; when the server itself had paused the upload, for disk backpressure, that 30 s counts from the refusal. At
+  most 1 GiB of body is read, plus the one network read that crosses the ceiling (up to 64 KiB). Node's own 300 s
+  request timeout stays as a further limit.
+- **Tradeoff.** Bounded resource use comes first. A client that is still sending when its connection is closed at
+  once may see a connection reset instead of the JSON answer, depending on the OS and on whether it reads while
+  sending. A client that sends a body within the ceiling and the deadlines, such as the WebUI with its recorded WAV,
+  gets the answer and a normal close. A hostile client can make the server discard at most 1 GiB per connection within
+  240 s. It can never force more reading to receive an answer, and discarded bytes use no disk and no lasting memory.
+  The number of connections is not limited by this service.
 - **Body checks.** The byte count, not `Content-Length`, is enforced against the declared length and the ceiling. The
   first 12 bytes must be `RIFF…WAVE` and the body must be longer than 44 bytes, which is today's check, with today's
   500 and message.
@@ -344,7 +368,7 @@ queue off. The 1 GiB per-upload ceiling is fixed.
   on whisper-cli's exit.
 
 ### 13.3 Tests
-**Deterministic:** `scripts/tests/transcription-queue.test.cjs`, 26 tests, on all four OS in `ci`.
+**Deterministic:** `scripts/tests/transcription-queue.test.cjs`, 31 tests, on all four OS in `ci`.
 - **Real server with a whisper-cli stand-in:**
   - off identical to today, and rollback;
   - FIFO by admission;
@@ -368,7 +392,13 @@ queue off. The 1 GiB per-upload ceiling is fixed.
   - file and reservation held while running;
   - exit clean-up;
   - an early refusal of a 120 MiB upload whose client keeps sending: the answer arrives and the connection ends
-    without a reset (the earlier 8 MiB rule failed this with `EPIPE`).
+    without a reset (the earlier 8 MiB rule failed this with `EPIPE`);
+  - one account per request, checked against server-side byte counts and close times: a refusal after part of the
+    upload discards only up to the same ceiling; one deadline from arrival covers upload and discarding; a 408 for
+    silence closes at once; a declared size over the ceiling is not discarded; a 429 for a chunked body that never
+    ends stops at the ceiling and leaves the queue untouched. Every service test also checks that all of the
+    service's timers were cleared. The first four failed on the first implementation (`120c048`), which gave the
+    discarding a fresh ceiling and fresh deadlines.
 
 **Mutations** (each caught by name, with CI's `--test-timeout`):
 - admission after the upload (FIFO by completion);

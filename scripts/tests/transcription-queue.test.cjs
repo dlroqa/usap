@@ -10,6 +10,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const http = require("node:http");
+const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { makeRoot, startServer, stopServer, request, IS_WIN, fakeLlamaPath } = require("./api-contract/harness.cjs");
@@ -468,12 +469,61 @@ async function withService(opts, fn) {
     getSettings: () => ({}), setError: () => {}, getError: () => "error",
   };
   const json = (res, status, body) => { res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(body)); };
-  const q = createTranscriptionQueue({ setting, dir, speech, json, statfs: opts.statfs, maxUploadBytes: opts.maxUploadBytes });
+  // The service's own timers, counted so a test can check that every one was cleared or fired (exactly-once settling).
+  const pending = new Set();
+  const setTimer = (f, ms) => { const t = setTimeout(() => { pending.delete(t); f(); }, ms); pending.add(t); return t; };
+  const clearTimer = (t) => { pending.delete(t); clearTimeout(t); };
+  const q = createTranscriptionQueue({ setting, dir, speech, json, statfs: opts.statfs, maxUploadBytes: opts.maxUploadBytes, setTimer, clearTimer });
   const srv = http.createServer((req, res) => q.handle(req, res, {}));
+  const conns = []; // server side, per connection: body+header bytes read and when the server saw it close
+  srv.on("connection", (sock) => { const c = { t0: Date.now(), bytesRead: 0, closedMs: null }; conns.push(c); sock.on("close", () => { c.bytesRead = sock.bytesRead; c.closedMs = Date.now() - c.t0; }); });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-  try { return await fn({ port: srv.address().port, q, dir, runs, releaseHold: () => holdResolve && holdResolve() }); }
-  finally { srv.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  try { return await fn({ port: srv.address().port, q, dir, runs, conns, pendingTimers: () => pending.size, releaseHold: () => holdResolve && holdResolve() }); }
+  finally { srv.closeAllConnections(); srv.close(); for (const t of pending) clearTimeout(t); fs.rmSync(dir, { recursive: true, force: true }); }
 }
+
+/**
+ * A raw-socket client for refusal tests: sends the request head, then `steps` ({ data } or { waitMs }), then `tail`:
+ * "fast" (64 KiB writes as fast as the socket takes them), "drip" (1 byte every `dripMs`) or "silent". `chunked` frames
+ * every write. It never stops by itself before `timeoutMs` (the client-side bound), so the server must end it.
+ * Resolves { status, json, closedMs, answerMs, sent, error }: `status` 0 means no complete answer arrived.
+ */
+function rawUpload(port, { claim = null, chunked = claim === null, steps = [], tail = "silent", dripMs = 200, timeoutMs = 20000 } = {}) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const sock = net.connect(port, "127.0.0.1");
+    let raw = Buffer.alloc(0); let sent = 0; let error = null; let answerMs = null; let closed = false;
+    const frame = (b) => (chunked ? Buffer.concat([Buffer.from(`${b.length.toString(16)}\r\n`), b, Buffer.from("\r\n")]) : b);
+    const send = (b) => { if (closed || sock.destroyed) return false; sent += b.length; return sock.write(frame(b)); };
+    const limit = setTimeout(() => sock.destroy(), timeoutMs);
+    sock.on("data", (d) => { raw = Buffer.concat([raw, d]); if (answerMs === null && raw.includes("\r\n\r\n")) answerMs = Date.now() - t0; });
+    sock.on("error", (e) => { error = e.code || e.message; });
+    sock.on("close", () => {
+      closed = true; clearTimeout(limit);
+      const text = raw.toString("latin1"); const cut = text.indexOf("\r\n\r\n");
+      const m = /^HTTP\/1\.1 (\d{3})/.exec(text); const len = /content-length: (\d+)/i.exec(text.slice(0, cut));
+      const bodyText = cut >= 0 ? text.slice(cut + 4) : "";
+      let json = null; try { json = JSON.parse(bodyText); } catch (_) { /* incomplete */ }
+      const complete = m && len && Buffer.byteLength(bodyText, "latin1") >= Number(len[1]);
+      resolve({ status: complete ? Number(m[1]) : 0, json, closedMs: Date.now() - t0, answerMs, sent, error });
+    });
+    sock.on("connect", async () => {
+      const head = ["POST /api/speech/transcribe HTTP/1.1", "Host: 127.0.0.1", "Content-Type: audio/wav", claim === null ? "Transfer-Encoding: chunked" : `Content-Length: ${claim}`];
+      sock.write(`${head.join("\r\n")}\r\n\r\n`);
+      for (const st of steps) { if (st.waitMs) await sleep(st.waitMs); else send(st.data); }
+      if (tail === "fast") {
+        const filler = Buffer.alloc(64 * 1024, 7);
+        const pump = () => { while (!closed && !sock.destroyed) { if (!send(filler)) return sock.once("drain", pump); } };
+        pump();
+      } else if (tail === "drip") {
+        const one = Buffer.from([7]);
+        const tick = () => { if (!closed && !sock.destroyed) { send(one); setTimeout(tick, dripMs); } };
+        tick();
+      }
+    });
+  });
+}
+const riffHead = () => wav("R", 0).subarray(0, 44); // a valid 44-byte WAV header (no data yet)
 
 // Sends the whole body even after an early answer; resolves { status, json, sentAll, socketError }.
 function sendAll(port, body) {
@@ -502,11 +552,88 @@ test("service: an early refusal reads the rest of the body, so the connection en
 
 test("service: an upload over the ceiling while streaming (no Content-Length) gets 413; nothing is left", async () => {
   await withService({ maxUploadBytes: 1 * MiB }, async (s) => {
-    const r = await upload(s.port, wav("C", 2 * MiB), { claim: null, parts: 8 }).promise;
+    // Two parts of 1 MiB + 1 byte, 300 ms apart: the limit is crossed by the last byte of the first part, so no data is
+    // in flight when the server closes the connection after its answer (the ceiling is spent: nothing is discarded).
+    const r = await upload(s.port, wav("C", 2 * MiB + 2 - 44), { claim: null, parts: 2, gapMs: 300 }).promise;
     assert.equal(r.status, 413);
     assert.equal(r.json.code, "UPLOAD_TOO_LARGE");
     assert.deepEqual(s.runs, []);
-    await waitFor(() => s.q.storage().reservedBytes === 0 && fs.readdirSync(s.dir).length === 0, 5000, "released");
+    await waitFor(() => s.q.storage().reservedBytes === 0 && fs.readdirSync(s.dir).length === 0 && s.pendingTimers() === 0, 5000, "released");
+    await waitFor(() => s.conns.length === 1 && s.conns[0].closedMs !== null, 5000, "connection closed");
+    assert.ok(s.conns[0].bytesRead < 1 * MiB + 64 * 1024, `the second part was never read (${s.conns[0].bytesRead} bytes)`);
+  });
+});
+
+// ── One account per request: a refusal never opens a new byte budget or deadline ──
+// Each of these failed on the first implementation, which gave the discarding after a refusal a fresh ceiling, a
+// fresh whole-upload deadline and a fresh inactivity period.
+async function assertSettled(s) {
+  await waitFor(() => s.conns.length >= 1 && s.conns.every((c) => c.closedMs !== null), 10000, "the server closed the connection");
+  await waitFor(() => s.q.storage().reservedBytes === 0 && fs.readdirSync(s.dir).length === 0 && s.pendingTimers() === 0, 5000, "files, reservations and timers released");
+  const st = s.q.stats();
+  assert.deepEqual([st.running, st.waiting, st.uploading], [0, 0, 0], "no job left in the queue");
+}
+
+test("service: bytes count once per request: a refusal after part of the upload discards only up to the same ceiling", async () => {
+  // 64 MiB budget: the first 64 MiB are booked, growth is refused (507) after 64 MiB; ceiling 96 MiB for the request.
+  await withService({ maxUploadBytes: 96 * MiB, setting: { budgetBytes: 64 * MiB } }, async (s) => {
+    const r = await rawUpload(s.port, { steps: [{ data: riffHead() }], tail: "fast" });
+    await assertSettled(s);
+    const read = s.conns[0].bytesRead;
+    assert.ok(read <= 96 * MiB + 4 * MiB, `server read ${(read / MiB).toFixed(1)} MiB in all (ceiling 96 MiB, not 64 + 96)`);
+    assert.ok(r.status === 507 || r.status === 0, `507, or a reset after it (client still sending): ${r.status} ${r.error}`);
+    assert.equal(s.q.counts().insufficientStorage, 1, "the server refused it for storage (not a crash)");
+    assert.deepEqual(s.runs, []);
+  });
+});
+
+test("service: one absolute deadline from arrival covers the upload and any discarding after a refusal", async () => {
+  await withService({ setting: { uploadIdleMs: 1500, uploadMaxMs: 2000 } }, async (s) => {
+    // "RIFF" + 2 bytes, 1 s later 6 bytes that aren't "WAVE": refused at about 1 s; then 1 byte every 200 ms.
+    const r = await rawUpload(s.port, { steps: [{ data: Buffer.from("RIFF\0\0") }, { waitMs: 1000 }, { data: Buffer.from("\0\0NOPE") }], tail: "drip" });
+    assert.equal(r.status, 500);
+    assert.equal(r.json.error, "Speech transcription currently accepts WAV audio only.");
+    await assertSettled(s);
+    assert.ok(s.conns[0].closedMs < 2700, `closed ${s.conns[0].closedMs} ms after arrival (deadline 2000 ms from arrival, not from the refusal)`);
+    assert.deepEqual(s.runs, []);
+  });
+});
+
+test("service: inactivity counts from the last byte received; a refusal for silence closes at once", async () => {
+  await withService({ setting: { uploadIdleMs: 1000, uploadMaxMs: 20000 } }, async (s) => {
+    const r = await rawUpload(s.port, { claim: 1 * MiB, steps: [{ data: riffHead() }], tail: "silent" });
+    assert.equal(r.status, 408);
+    assert.deepEqual([r.json.code, r.json.phase], ["UPLOAD_TIMEOUT", "idle"]);
+    await assertSettled(s);
+    assert.ok(s.conns[0].closedMs < 1700, `closed ${s.conns[0].closedMs} ms after arrival (idle 1000 ms, not twice)`);
+  });
+});
+
+test("service: a declared size over the ceiling is answered and closed; its body is not discarded", async () => {
+  await withService({ maxUploadBytes: 16 * MiB }, async (s) => {
+    const r = await rawUpload(s.port, { claim: 100 * 1024 * MiB, tail: "fast" });
+    await assertSettled(s);
+    assert.ok(r.status === 413 || r.status === 0, `413, or a reset after it: ${r.status} ${r.error}`);
+    assert.ok(s.conns[0].bytesRead < 4 * MiB, `server read ${(s.conns[0].bytesRead / MiB).toFixed(2)} MiB of a 100 GiB claim`);
+    assert.equal(s.q.counts().tooLarge, 1);
+    assert.deepEqual(s.runs, []);
+  });
+});
+
+test("service: an early refusal (429) of a chunked body that never ends stops at the ceiling; the queue is untouched", async () => {
+  await withService({ maxUploadBytes: 16 * MiB, hold: true, setting: { limit: 1 } }, async (s) => {
+    const a = upload(s.port, wav("A")).promise;
+    await waitFor(() => s.runs.length === 1, 5000, "A running");
+    const b = upload(s.port, wav("B")).promise;
+    await waitFor(() => s.q.stats().waiting === 1, 5000, "B waiting");
+    const r = await rawUpload(s.port, { steps: [{ data: riffHead() }], tail: "fast" });
+    assert.ok(r.status === 429 || r.status === 0, `429, or a reset after it: ${r.status} ${r.error}`);
+    await waitFor(() => s.conns[2].closedMs !== null, 5000, "closed");
+    assert.ok(s.conns[2].bytesRead <= 16 * MiB + 4 * MiB, `read ${(s.conns[2].bytesRead / MiB).toFixed(1)} MiB`);
+    assert.deepEqual([s.q.stats().running, s.q.stats().waiting], [1, 1], "the refusal took no place in the queue");
+    s.releaseHold(); await waitFor(() => s.runs.length === 2, 5000, "B running"); s.releaseHold();
+    assert.deepEqual((await Promise.all([a, b])).map((x) => x.status), [200, 200]);
+    await assertSettled(s);
   });
 });
 
