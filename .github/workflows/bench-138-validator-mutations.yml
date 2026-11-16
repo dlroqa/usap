@@ -1,0 +1,110 @@
+# #138 negative controls. Bench branch only (bench/138-validator-mutations): never merged, never a required check.
+# Runs the real-model chat-timeouts validator (PR #138 head) against the studio as it is (control) and against two
+# deliberately broken chat-timeouts guards, and checks that the safety rows fail exactly where they must.
+# The mutations exist only in this job's checkout; nothing is pushed.
+name: bench-138-validator-mutations
+
+on:
+  push:
+    branches: [bench/138-validator-mutations]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-138-validator-mutations
+  cancel-in-progress: false
+
+jobs:
+  mutation:
+    name: bench-138 (${{ matrix.mutation }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mutation: [control, premature-ready, no-gate]
+    env:
+      FRONTEND_PORT: "14900"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: First launch via the launcher (installs the pinned engines)
+        run: |
+          mkdir -p ci-logs
+          ( yes '' | ./linux.sh > ci-logs/first-launch.log 2>&1 & )
+          for i in $(seq 1 270); do
+            if curl -fs "http://127.0.0.1:$FRONTEND_PORT/api/health" >/dev/null; then echo "server up after $((i*10))s"; break; fi
+            if grep -q "Setup failed" ci-logs/first-launch.log; then break; fi
+            sleep 10
+          done
+          curl -fs "http://127.0.0.1:$FRONTEND_PORT/api/health" >/dev/null || { echo "::error::server did not start after setup"; tail -60 ci-logs/first-launch.log; exit 1; }
+
+      - name: Install the pinned model (same revision and SHA-256 as scripts/ci/runtime-validate.sh)
+        run: |
+          Q=qwen2.5-0.5b-instruct-q4_k_m.gguf
+          curl -fL --retry 3 -o "app/llm-models/$Q" "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/$Q"
+          echo "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db  app/llm-models/$Q" | sha256sum -c -
+
+      - name: Stop first launch
+        if: always()
+        run: bash scripts/ci/stop-app.sh
+
+      - name: Apply the mutation (this job's checkout only)
+        run: |
+          F=scripts/server/services/chat-timeouts.cjs
+          case "${{ matrix.mutation }}" in
+            control) echo "no change" ;;
+            premature-ready)
+              # confirm on the first usable probe, ignoring "processing" and the 3 s quiet gap
+              sed -i 's/if (usable \&\& reading.processing === 0 \&\& reading.deferred === 0) {/if (usable) {/' "$F"
+              sed -i 's/if (same \&\& reading.sentAt - c.sentAt >= QUIESCE_GAP_MS) {/if (true) {/' "$F"
+              grep -c "if (usable) {" "$F"; grep -c "if (true) {" "$F" ;;
+            no-gate)
+              # admit chats at once while CONFIRMING
+              sed -i 's/^    if (g.state === "unresponsive") { counts.refusedUnresponsive++; return Promise.resolve(refusal()); }$/&\n    return Promise.resolve({ ok: true });/' "$F"
+              grep -n -A1 'refusedUnresponsive++; return Promise.resolve(refusal()); }$' "$F" | head -4 ;;
+          esac
+          git diff --stat
+
+      - name: Chat timeouts validator (real model; failures are recorded, then judged below)
+        timeout-minutes: 40
+        run: |
+          node scripts/ci/chat-timeouts-validate.cjs --model qwen2.5-0.5b-instruct-q4_k_m.gguf \
+            --results ci-logs/chat-timeouts-results.jsonl --logs ci-logs | tee ci-logs/validator.txt || true
+
+      - name: Stop test servers
+        if: always()
+        env:
+          FRONTEND_PORT: "14930"
+        run: bash scripts/ci/stop-app.sh
+
+      - name: Judge the expected outcome
+        run: |
+          node -e '
+            const fs = require("fs");
+            const rows = fs.readFileSync("ci-logs/chat-timeouts-results.jsonl", "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+            const fails = rows.filter((r) => r.status === "FAIL").map((r) => r.check);
+            const m = process.argv[1];
+            console.log("FAIL rows:", JSON.stringify(fails, null, 1));
+            const has = (re) => fails.some((c) => re.test(c));
+            let ok;
+            if (m === "control") ok = fails.length === 0;
+            if (m === "premature-ready") ok = has(/never reported idle while it still computes/) || has(/no engine computation after the studio.s confirmation/);
+            if (m === "no-gate") ok = has(/held at the gate/);
+            console.log(`mutation ${m}: expected outcome ${ok ? "MET" : "NOT MET"}`);
+            if (!ok) process.exit(1);
+          ' "${{ matrix.mutation }}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-138-${{ matrix.mutation }}
+          path: ci-logs/
+          retention-days: 30
