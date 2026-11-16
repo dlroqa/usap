@@ -89,7 +89,9 @@ Non-goals:
   `{ "imageQueue": "on" }`; the environment wins. `USAP_SCHEDULER=off` forces it off, and the reason is reported
   (`forcedOffBy: "scheduler-off"`).
 * It turns on **only together with `engineSlot: on`** (#105). Otherwise it stays off and the server logs why, so the
-  queue can rely on knowing which engine owns the slot.
+  queue can rely on knowing which engine owns the slot. The image queue therefore inherits every blocker on turning
+  `engineSlot` on. Today #120 (sd-server exiting after it reported ready, seen on Windows CI) blocks that, and #105
+  stays open.
 * `imageQueueLimit`: 1–2 waiting, default **2**.
 * `imageQueueMaxWaitMs`: default **10 min**, configurable from 1 s up to **60 min**, which is the shared primitive's
   maximum (D2).
@@ -304,5 +306,6 @@ nothing changes (today's "unknown" stays). `generationsInFlight` keeps its 9.9e 
 1. This design is reviewed and merged (docs only).
 2. The implementation goes in a separate PR, off by default, requiring `engineSlot` on, with the tests in §11 on all
    four OS. It needs separate approval.
-3. Turning it on by default is a later decision, after the aggregate connection admission (#131), #120, and GPU/NPU
+3. Turning it on, even only for testing outside CI, requires `engineSlot` to be cleared for activation first
+   (#120). Turning it on by default is a later decision, after the aggregate connection admission (#131) and GPU/NPU
    measurements.
