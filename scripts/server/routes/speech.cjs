@@ -16,6 +16,9 @@ function speechRoutes(deps) {
     if (deps[name] === undefined || deps[name] === null) throw new Error(`routes/speech: missing dependency ${name}`);
   }
   const { speech, SPEECH_MODELS, TRANSCRIPTIONS, downloadBlockReason, getDownloadState, errorBody, errorStatus, fs, json, jsonErrorStatus, path, pathInside, readBinaryBody, readJsonBody, startModelDownload, streamModelUpload } = deps;
+  // Optional (Step 9.9f-3, only when transcriptionQueue is on): services/transcription-queue.cjs. Off: absent, and the
+  // transcribe and stop routes are exactly the handlers from before.
+  const transcriptionQueue = deps.transcriptionQueue || null;
   return (r) => {
     r.get("/api/speech/status", async (req, res) => {
     const backend = speech.getSpeechBackend();
@@ -55,11 +58,24 @@ function speechRoutes(deps) {
 
     r.post("/api/speech/stop", async (req, res) => {
     await speech.stopSpeech();
+    // Queue on: transcriptions still waiting (or uploading) are refused; the running one is not touched, as before.
+    if (transcriptionQueue) transcriptionQueue.refuseWaiting({ status: 409, code: "ENGINE_NOT_READY", error: "The speech engine was stopped while this request waited. Start it again and retry." });
     return json(res, 200, { ok: true });
     });
 
     r.postPrefix("/api/speech/transcribe", async (req, res) => {
     const parsed = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    if (transcriptionQueue) {
+      return transcriptionQueue.handle(req, res, {
+        model: parsed.searchParams.get("model") || speech.getSettings().model,
+        language: parsed.searchParams.get("language") || "auto",
+        filename: parsed.searchParams.get("filename") || req.headers["x-filename"] || "recording.wav",
+        threads: parsed.searchParams.get("threads") || speech.getSettings().threads,
+        backendPreference: parsed.searchParams.get("backendPreference") || speech.getSettings().backendPreference,
+        translate: parsed.searchParams.get("translate") === "true",
+        save: parsed.searchParams.get("save") !== "false",
+      });
+    }
     try {
       const audio = await readBinaryBody(req);
       const result = await speech.runExclusiveSpeechOperation(() => speech.transcribeWavBuffer(audio, {

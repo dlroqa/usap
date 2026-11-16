@@ -74,7 +74,7 @@ const queue = (pending) => (pending === null
 // (services/memory-check.cjs). Both are optional; without them the snapshot is exactly the 9.9c one.
 // Step 9.9e: `threads` is the thread-budget setting and `threadBudget()` its latest decision (services/thread-budget.cjs).
 // Optional; without them (or with threads off) the snapshot is exactly the 9.9d one.
-function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null, chatTimeouts = null, memoryAdmission = null, engineSlot = null, voiceQueue = null }) {
+function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null, chatTimeouts = null, memoryAdmission = null, engineSlot = null, voiceQueue = null, transcriptionQueue = null }) {
   for (const [name, value] of Object.entries({ budget, cpu, engines })) {
     if (!value) throw new Error(`scheduler: missing dependency ${name}`);
   }
@@ -174,6 +174,19 @@ function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { m
         out.limits.voiceQueue = "on";
         out.engines.voice.queue = { running: v.running, waiting: v.waiting, known: true, limit: v.limit };
         out.voiceQueue = { mode: "on", limit: v.limit, maxWaitSeconds: v.maxWaitSeconds, counts: v.counts };
+        out.scheduler.decisions = true; // a refusal is a decision
+      }
+    }
+    // Additive (Step 9.9f-3, only when transcriptionQueue is on): running/waiting/uploading/limit on the speech engine, the
+    // longest wait, the storage budget and what is booked, and counts; numbers and fixed words only (no names, paths,
+    // text or languages). Absent when off (the default).
+    if (transcriptionQueue) {
+      let q = null;
+      try { q = transcriptionQueue(); } catch (_) { q = null; }
+      if (q) {
+        out.limits.transcriptionQueue = "on";
+        out.engines.speech.queue = { running: q.running, waiting: q.waiting, uploading: q.uploading, known: true, limit: q.limit };
+        out.transcriptionQueue = { mode: "on", limit: q.limit, maxWaitSeconds: q.maxWaitSeconds, storage: q.storage, counts: q.counts };
         out.scheduler.decisions = true; // a refusal is a decision
       }
     }
