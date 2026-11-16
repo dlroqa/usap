@@ -331,6 +331,8 @@ error message.
     * CONFIRMING, then confirmed or UNRESPONSIVE;
     * the engine is never reported idle while its counters still move;
     * while UNRESPONSIVE, chats get `503 ENGINE_UNRESPONSIVE` with `Retry-After`;
+    * a chat sent while the cancel is unconfirmed is held at the gate: sent only after confirmation, or refused with
+      `503` if UNRESPONSIVE comes first (its own cancel scenario);
     * recovery uses the same engine PID;
     * no computation after the confirmation;
     * the next chat works.

@@ -423,6 +423,35 @@ async function studioChecks(srv) {
     else record(windowRow, confirmedInWindow ? "PASS" : "FAIL", windowDetail);
   });
 
+  await scenario("studio: a chat sent while a cancel is unconfirmed is held at the gate", async () => {
+    const lp = await longPrompt(ep);
+    const c0 = (await timeoutsReport())?.counts || {};
+    const h = call(PORT, "POST", "/api/llm/chat", { messages: [{ role: "user", content: lp.text }], max_tokens: 64, temperature: 0, stream: true });
+    const busy = await waitUntil(async () => (await metrics(ep))?.requests_processing >= 1, 30000, 50);
+    if (!busy) { const r = await h.promise; throw new Error(`the request never reached the engine (studio answered ${r.status})`); }
+    h.abort();
+    const abortAt = Date.now();
+    const confirming = await waitUntil(async () => { const r = await timeoutsReport(); return (r?.counts?.clientCancelled || 0) > (c0.clientCancelled || 0) && r?.engine === "confirming"; }, 5000, 50);
+    const held = call(PORT, "POST", "/api/llm/chat", { messages: [{ role: "user", content: `[${++promptSeq}] Say ok.` }], max_tokens: 4, temperature: 0, stream: true }, { timeoutMs: 240000 });
+    // Follow the studio's state (no engine polling) until it leaves CONFIRMING.
+    let leftAt = null, leftTo = null;
+    const end = abortAt + 180000;
+    while (Date.now() < end) {
+      const r = await timeoutsReport();
+      if (r?.engine && r.engine !== "confirming") { leftAt = Date.now(); leftTo = r.engine; break; }
+      await sleep(100);
+    }
+    const r = await held.promise;
+    const firstByteAt = held.marks.firstDataAt;
+    const ok = confirming && leftAt !== null && (
+      (leftTo === "ready" && r.status === 200 && firstByteAt && firstByteAt >= leftAt - 300) ||
+      (leftTo === "unresponsive" && r.status === 503));
+    record("studio safety: a chat sent while a cancel is unconfirmed is held at the gate (sent only after confirmation; 503 if UNRESPONSIVE)", ok ? "PASS" : "FAIL",
+      `CONFIRMING ${Boolean(confirming)}; studio left CONFIRMING for ${leftTo} ${leftAt ? leftAt - abortAt : "?"} ms after the abort; held chat ${r.status}, first byte ${firstByteAt ? firstByteAt - abortAt : "none"} ms after the abort`);
+    // Leave the engine idle and the studio ready for the next scenario (bounded).
+    await waitUntil(async () => { const m = await metrics(ep); return quiet(m) && (await timeoutsReport())?.engine === "ready"; }, 180000, 2000);
+  });
+
   // Suspension. Set it up once, honestly: UNSUPPORTED only if it can't be done at all.
   const probe = suspend(pid);
   if (!probe.ok) { resumeAll(); record("process suspension available", "UNSUPPORTED", probe.detail); return; }
