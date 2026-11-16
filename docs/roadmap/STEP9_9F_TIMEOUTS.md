@@ -205,7 +205,7 @@ The studio-wide **text-engine state**, which only exists in `on` mode:
 
 ```
  READY ──(abort sent: timeout or client cancel)──▶ CONFIRMING
-   ▲                                                  │ probe GET /metrics every 1 s, each probe bounded to 5 s
+   ▲                                                  │ probe GET /metrics every 2 s, each probe bounded to 5 s
    │◀── requests_processing == 0 ─────────────────────┤
    │                                                  │ no confirmation within the 120 s confirmation window
    │                                                  ▼
@@ -240,7 +240,7 @@ The studio-wide **text-engine state**, which only exists in `on` mode:
   parallel inside the engine. It would queue behind the still-running work and likely stall in turn. The gate
   prevents that, and keeps the slot accounting honest.
 * Other engines (image, speech, voice) are not gated or changed.
-* **Constants** (fixed in this substage, documented, not settings): probe interval 1 s, probe limit 5 s,
+* **Constants** (fixed in this substage, documented, not settings): probe interval 2 s (was 1 s; #133), probe limit 5 s,
   confirmation window 120 s, background probe 15 s, Retry-After 30 s. They can become settings later if
   measurements show a need.
 * **Architecture.** This fits inside `services/chat.cjs`, plus a new `services/chat-timeouts.cjs` and the
@@ -352,7 +352,10 @@ Where this section differs from §2–§7, this section is what the code does.
   1. two `/metrics` readings, each from a probe **sent after the latest abort**;
   2. both show `requests_processing 0` and `requests_deferred 0`;
   3. they are at least 3 s apart (more than twice llama-server's 1 s `HTTP_POLLING_SECONDS`, the interval at which
-     its handler notices a closed connection and posts the `CANCEL`);
+     its handler notices a closed connection and posts the `CANCEL`). llama-server (b11418) checks that only after a
+     full second without any result for any task, and each `/metrics` answer is such a result. So the probe runs
+     every 2 s, leaving the engine a quiet second between probes (#133). With 1 s probes it could keep evaluating
+     the whole prompt after a cancel;
   4. `n_decode_total`, `tokens_predicted_total` and `prompt_tokens_total` didn't change between them, so no decode
      ran in between;
   5. both carry the same `Process-Start-Time-Unix` header;
@@ -376,7 +379,7 @@ Where this section differs from §2–§7, this section is what the code does.
   * `chatUnresponsiveProbeSeconds` / `USAP_CHAT_UNRESPONSIVE_PROBE_SECONDS`: 5–300 s, default 15.
 
   They are validated like the two limits: whole seconds only; anything else is ignored and logged, never
-  clamped. Fixed constants: probe interval while CONFIRMING 1 s, per-probe limit 5 s, quiet gap 3 s,
+  clamped. Fixed constants: probe interval while CONFIRMING 2 s (#133), per-probe limit 5 s, quiet gap 3 s,
   Retry-After 30 s.
 * **Queue-slot hand-over.** With the queue on, a request whose engine work was aborted hands its slot to the
   confirmation: the queue's `release()` runs when CONFIRMING ends, either confirmed or on entering UNRESPONSIVE.
