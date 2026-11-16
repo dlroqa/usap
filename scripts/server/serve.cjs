@@ -41,6 +41,7 @@ const { createMemoryAdvisor, memoryCheckSetting } = require("./services/memory-c
 const { createMemoryAdmission, memoryAdmissionSetting } = require("./services/memory-admission.cjs");
 const { createEngineSlot, engineSlotSetting } = require("./services/engine-slot.cjs");
 const { createJobQueue, jobQueueSetting } = require("./services/job-queue.cjs");
+const { transcriptionQueueSetting, prepareUploadDir, createTranscriptionQueue } = require("./services/transcription-queue.cjs");
 const { createThreadBudget, threadsSetting } = require("./services/thread-budget.cjs");
 const { createWhisperThreadCap, whisperThreadCapSetting } = require("./services/whisper-thread-cap.cjs");
 const { inspectModel } = require("./model-metadata.cjs");
@@ -1732,7 +1733,24 @@ if (VOICE_QUEUE.forcedOffBy) console.warn(`  [scheduler] voice queue "${VOICE_QU
 const voiceQueue = VOICE_QUEUE.mode === "on" ? createJobQueue({ engineLabel: "voice engine", limit: VOICE_QUEUE.limit, maxWaitMs: VOICE_QUEUE.maxWaitMs }) : null;
 if (voiceQueue) console.log(`  [scheduler] Voice queue on: ${VOICE_QUEUE.limit} waiting at most, ${Math.round(VOICE_QUEUE.maxWaitMs / 1000)} s longest wait.`);
 router.use(ttsRoutes({ tts, json, readJsonBody, jsonErrorStatus, errorStatus, errorBody, streamModelUpload, pathInside, fs, path, MIME, TTS_MODELS, TTS_OUTPUTS, voiceQueue }));
-router.use(speechRoutes({ speech, SPEECH_MODELS, TRANSCRIPTIONS, downloadBlockReason, getDownloadState: () => downloads.getState(), errorBody, errorStatus, fs, json, jsonErrorStatus, path, pathInside, readBinaryBody, readJsonBody, startModelDownload, streamModelUpload }));
+// Step 9.9f-3: bounded transcription queue (services/transcription-queue.cjs, docs/roadmap/STEP9_9F_WHISPER_QUEUE.md).
+// Off by default (USAP_TRANSCRIPTION_QUEUE=on or scheduler.json "transcriptionQueue": "on"; USAP_SCHEDULER=off forces it
+// off). Off: not created, no upload folder, and /api/speech/transcribe and /api/speech/stop are the handlers from before.
+const TRANSCRIPTION_QUEUE = transcriptionQueueSetting({ configDir: LLM_CONFIG_DIR, schedulerMode: schedulerMode({ configDir: LLM_CONFIG_DIR }) });
+for (const x of TRANSCRIPTION_QUEUE.ignored) console.warn(`  [scheduler] ignored ${x.name} from ${x.source} (${x.reason}); using the next setting or the default`);
+if (TRANSCRIPTION_QUEUE.forcedOffBy) console.warn(`  [scheduler] transcription queue "${TRANSCRIPTION_QUEUE.requested}" is off because USAP_SCHEDULER=off.`);
+let transcriptionQueue = null;
+if (TRANSCRIPTION_QUEUE.mode === "on") {
+  try {
+    const uploadDir = prepareUploadDir({ dataRoot: LAYOUT.dataRoot });
+    transcriptionQueue = createTranscriptionQueue({ setting: TRANSCRIPTION_QUEUE, dir: uploadDir, speech, json });
+    process.on("exit", () => transcriptionQueue.cleanupSync()); // this instance's temporary uploads go with it
+    console.log(`  [scheduler] Transcription queue on: ${TRANSCRIPTION_QUEUE.limit} waiting at most, ${Math.round(TRANSCRIPTION_QUEUE.maxWaitMs / 1000)} s longest wait, ${Math.round(TRANSCRIPTION_QUEUE.budgetBytes / (1024 * 1024))} MB upload storage.`);
+  } catch (err) {
+    console.warn(`  [scheduler] transcription queue stays off: ${err.message}`);
+  }
+}
+router.use(speechRoutes({ speech, SPEECH_MODELS, TRANSCRIPTIONS, downloadBlockReason, getDownloadState: () => downloads.getState(), errorBody, errorStatus, fs, json, jsonErrorStatus, path, pathInside, readBinaryBody, readJsonBody, startModelDownload, streamModelUpload, transcriptionQueue }));
 router.use(searchRoutes({ webSearch, json, readJsonBody, errorStatus, errorBody }));
 router.use(imageRoutes({
   state: imageEngine.routeState, MIME, MODELS, OUTPUTS, PREFERRED_BACKEND_PORT, SERVER_BUILD, appleNpuRuntimeMatches, assertNoOtherActiveRuntime,
@@ -1805,6 +1823,7 @@ if (SCHEDULER_MODE !== "off") {
     chatTimeouts: chatTimeouts ? () => chatTimeouts.snapshot() : null,
     memoryAdmission: memoryAdmissionEngine ? () => memoryAdmissionEngine.snapshot() : null,
     voiceQueue: voiceQueue ? () => ({ mode: "on", ...voiceQueue.stats(), maxWaitSeconds: Math.round(voiceQueue.maxWaitMs / 1000), counts: voiceQueue.counts() }) : null,
+    transcriptionQueue: transcriptionQueue ? () => ({ ...transcriptionQueue.stats(), maxWaitSeconds: Math.round(transcriptionQueue.maxWaitMs / 1000), storage: transcriptionQueue.storage(), counts: transcriptionQueue.counts() }) : null,
     engineSlot: engineSlot ? () => ({ ...engineSlot.snapshot(), imageOperations: imageEngine.lifecycle.pendingOperations() }) : null,
     memoryCheck: MEMORY_CHECK,
     memoryChecks: memoryAdvisor ? () => memoryAdvisor.snapshot() : null,

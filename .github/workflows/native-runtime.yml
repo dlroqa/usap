@@ -23,6 +23,7 @@ on:
       - "scripts/ci/memory-admission-validate.cjs"
       - "scripts/ci/engine-lifecycle-validate.cjs"
       - "scripts/ci/voice-queue-validate.cjs"
+      - "scripts/ci/transcription-queue-validate.cjs"
       - "scripts/ci/p4-token-check.cjs"
       - "scripts/ci/p4-fixed-document-id.cjs"
       - "scripts/ci/memory-check-report.cjs"
@@ -193,6 +194,24 @@ jobs:
         if: always()
         env:
           FRONTEND_PORT: "14970"
+        run: bash scripts/ci/stop-app.sh
+
+      # Step 9.9f-3 transcription: a baseline of today's unbounded Whisper chain with the real whisper-cli on the CPU,
+      # then the transcription queue checks with transcriptionQueue on only for the script's own test servers (port
+      # 14975); the installed default stays off. Uses the model and sample installed by the runtime validation above.
+      - name: Transcription queue with the real whisper-cli (transcriptionQueue on for test servers only)
+        # Independent of the steps before it (it starts its own servers): it still runs, and the job still fails,
+        # when an earlier check failed, so its evidence isn't lost to an unrelated failure.
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          node scripts/ci/transcription-queue-validate.cjs --model ggml-tiny.en.bin --wav .ci-model-cache/jfk.wav \
+            --results ci-logs/transcription-queue-results.jsonl --logs ci-logs | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop transcription queue test servers
+        if: always()
+        env:
+          FRONTEND_PORT: "14975"
         run: bash scripts/ci/stop-app.sh
 
       - name: Second launch must not re-run setup

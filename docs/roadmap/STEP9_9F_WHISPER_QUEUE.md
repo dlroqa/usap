@@ -1,7 +1,7 @@
 # Step 9.9f-3: Whisper transcription queue (design)
 
-Status: **design only, planned.** Nothing here is implemented. The transcription queue will be **off by default**, and
-neither implementation nor default activation is approved. This expands §5.2 of
+Status: **implementation in review, off by default** (§13, "As built"). Default activation is not approved. The
+design below was merged in #122; §13 records what was built and measured. This expands §5.2 of
 [STEP9_9F_WORKLOAD_QUEUES.md](STEP9_9F_WORKLOAD_QUEUES.md). The voice queue (§11 there) is its model, and
 `services/job-queue.cjs` is the primitive it reuses.
 
@@ -130,8 +130,9 @@ any partial file, and lets the next job proceed:
 
 - **Streaming:** `stream.pipeline(req, byteCounter, fileWriteStream)`. Backpressure is native: a slow disk pauses
   `req`, and TCP slows the client. No body is ever concatenated.
-- **Deadlines.** The inactivity timer resets on each received chunk. The whole-upload timer runs from admission. Both
-  end the request with `req.destroy()` after answering.
+- **Deadlines.** The inactivity timer resets on each received chunk. The whole-upload timer runs from arrival (the
+  same moment as admission). Both end the request with `req.destroy()` after answering. They are the request's only
+  deadlines: a refusal never starts new ones (§13.2).
 - **No multipart.** The route keeps today's raw-WAV contract. A `multipart/*` body is refused early with today's
   "WAV only" error, not parsed.
 - **Directory.** A **dedicated, USAP-owned upload directory**, `<data root>/cache/speech-uploads/`, which is
@@ -287,3 +288,147 @@ only there. It uses the real whisper-cli and the already pinned `ggml-tiny.en.bi
 2. Approve the stale-file sweep (§7) as its own PR, including the narrow legacy `.speech-*` pattern.
 3. Approve the implementation PR (default off) after this design.
 4. Any future running-job cancellation for whisper-cli (not proposed).
+
+## 13. As built
+
+The settings are those of §2:
+
+| Variable | `scheduler.json` key |
+|---|---|
+| `USAP_TRANSCRIPTION_QUEUE` | `transcriptionQueue` |
+| `USAP_TRANSCRIPTION_QUEUE_LIMIT` | `transcriptionQueueLimit` |
+| `USAP_TRANSCRIPTION_QUEUE_MAX_WAIT_MS` | `transcriptionQueueMaxWaitMs` |
+| `USAP_TRANSCRIPTION_QUEUE_STORAGE_BUDGET_BYTES` | `transcriptionQueueStorageBudgetBytes` |
+| `USAP_TRANSCRIPTION_QUEUE_UPLOAD_IDLE_MS` | `transcriptionQueueUploadIdleMs` |
+| `USAP_TRANSCRIPTION_QUEUE_UPLOAD_MAX_MS` | `transcriptionQueueUploadMaxMs` |
+
+The environment wins. A value outside its range is ignored and logged, never clamped. `USAP_SCHEDULER=off` forces the
+queue off. The 1 GiB per-upload ceiling is fixed.
+
+### 13.1 Code
+- **`services/transcription-queue.cjs`** (new):
+  - settings;
+  - the storage ledger: `reserve`, `grow` and `release`, booked synchronously, checked against the budget and against
+    free space minus a margin of `min(256 MiB, 2 % of the volume)`;
+  - the upload folder: `<data root>/cache/speech-uploads`, mode `0700`, refused if it is a link or resolves outside
+    the data root;
+  - the request handler.
+- **`services/job-queue.cjs`:** unchanged. The voice queue's primitive gives the FIFO position synchronously at
+  admission.
+- **`services/speech-engine.cjs`:** `transcribeWavFile(wavPath, outBase, options)` shares one code path with
+  `transcribeWavBuffer`. The buffer path is unchanged (same temporary file in `transcriptions/`, same clean-up). The
+  file path takes the queue's file and leaves its deletion to the queue.
+- **`routes/speech.cjs`:** with the queue on, `POST /api/speech/transcribe` goes through the queue and
+  `/api/speech/stop` refuses waiting jobs. Off, both handlers are exactly as before.
+- **`serve.cjs`:**
+  - creates the queue only when it is on;
+  - if the upload folder fails its checks, the queue stays off with a warning;
+  - deletes this instance's files at process exit.
+- **`services/scheduler.cjs`:** reports `engines.speech.queue`, `limits.transcriptionQueue` and
+  `transcriptionQueue` (numbers and fixed words only), only when on.
+
+### 13.2 Behaviour details
+- **Files.** Each upload gets a generated name, `<instance>-<seq>-<random>.wav`, never the client's file name. It is
+  opened `O_CREAT|O_EXCL|O_NOFOLLOW` (where the platform has it) with mode `0600`. whisper-cli's outputs are
+  `<same>.out.txt` and `<same>.out.json`.
+- **Clean-up.** A file is deleted only after its write stream has closed its descriptor, since Windows can't delete an
+  open file. The reservation is released together with the deletion.
+- **One account per request.** Each request gets one account at arrival, before any check. It applies through the
+  upload and through any discarding after a refusal:
+  - every body byte received counts against **one 1 GiB ceiling**;
+  - **one absolute deadline**, 240 s from arrival, covers upload and discarding together;
+  - inactivity is measured from the **last byte actually received**.
+
+  A refusal never resets these budgets. Bytes that arrive between a refusal and its answer are counted and dropped:
+  they are never kept in memory or written to a file.
+- **Early answers** (413, 429, 507, and upload failures before the job runs) are sent at once, complete, with
+  `Content-Length` and `Connection: close`. Closing a connection while request data is still arriving resets it, and
+  on Windows the client then lost the answer (an earlier version that discarded only 8 MiB failed this way in CI).
+  So, while the request's own budgets allow, the server reads and discards the rest of the body and ends the
+  connection after it. The connection is closed **at once** after the answer, with nothing more read, when:
+  - the declared `Content-Length` is over the ceiling, so the body could never finish;
+  - the ceiling is already spent, as for a 413 mid-stream;
+  - the absolute deadline has passed (408 `total`);
+  - nothing has arrived for the inactivity time (408 `idle`).
+
+  In all cases a request's connection ends no later than 240 s after arrival. It ends sooner if no data arrives for
+  30 s; when the server itself had paused the upload, for disk backpressure, that 30 s counts from the refusal. At
+  most 1 GiB of body is read, plus the one network read that crosses the ceiling (up to 64 KiB). Node's own 300 s
+  request timeout stays as a further limit.
+- **Tradeoff.** Bounded resource use comes first. A client that is still sending when its connection is closed at
+  once may see a connection reset instead of the JSON answer, depending on the OS and on whether it reads while
+  sending. A client that sends a body within the ceiling and the deadlines, such as the WebUI with its recorded WAV,
+  gets the answer and a normal close. A hostile client can make the server discard at most 1 GiB per connection within
+  240 s. It can never force more reading to receive an answer, and discarded bytes use no disk and no lasting memory.
+  The number of connections is not limited by this service.
+- **Body checks.** The byte count, not `Content-Length`, is enforced against the declared length and the ceiling. The
+  first 12 bytes must be `RIFF…WAVE` and the body must be longer than 44 bytes, which is today's check, with today's
+  500 and message.
+- **Running jobs.** A running job keeps its turn, file and reservation until `transcribeWavFile` settles, which happens
+  on whisper-cli's exit.
+
+### 13.3 Tests
+**Deterministic:** `scripts/tests/transcription-queue.test.cjs`, 31 tests, on all four OS in `ci`.
+- **Real server with a whisper-cli stand-in:**
+  - off identical to today, and rollback;
+  - FIFO by admission;
+  - capacity and 429;
+  - 413 before reading;
+  - 507 from the budget;
+  - 503 queue timeout;
+  - 408 idle at the head of the queue;
+  - non-WAV with today's answer;
+  - waiting and running disconnects;
+  - stop refusing waiting jobs;
+  - failure handling;
+  - private, generated files;
+  - the logical-CPU cap;
+  - flat server memory with 4 × 64 MB waiting (Linux).
+- **The service on a real HTTP server** (fake speech service, injected `statfs`, small limits):
+  - 413 mid-stream without `Content-Length`;
+  - reservation growth and 507;
+  - low free disk;
+  - the total upload deadline;
+  - file and reservation held while running;
+  - exit clean-up;
+  - an early refusal of a 120 MiB upload whose client keeps sending: the answer arrives and the connection ends
+    without a reset (the earlier 8 MiB rule failed this with `EPIPE`);
+  - one account per request, checked against server-side byte counts and close times: a refusal after part of the
+    upload discards only up to the same ceiling; one deadline from arrival covers upload and discarding; a 408 for
+    silence closes at once; a declared size over the ceiling is not discarded; a 429 for a chunked body that never
+    ends stops at the ceiling and leaves the queue untouched. Every service test also checks that all of the
+    service's timers were cleared. The first four failed on the first implementation (`120c048`), which gave the
+    discarding a fresh ceiling and fresh deadlines.
+
+**Mutations** (each caught by name, with CI's `--test-timeout`):
+- admission after the upload (FIFO by completion);
+- a leaked reservation;
+- a waiting disconnect not withdrawn;
+- the turn released before the worker exits;
+- the whole body buffered in memory;
+- no WAV check;
+- no declared-size check;
+- no idle deadline.
+
+**Native:** `scripts/ci/transcription-queue-validate.cjs` in `native-runtime`, with the real whisper-cli,
+`ggml-tiny.en` and the JFK sample, on its own test servers (port 14975). It runs:
+- a baseline;
+- off by default (no keys, no upload folder);
+- rollback;
+- capacity, 429 and FIFO;
+- 413;
+- memory with 4 × 64 MB waiting;
+- waiting disconnects never reaching whisper-cli;
+- a running disconnect not stopping it;
+- stop refusing waiting jobs;
+- the logical-CPU cap;
+- nothing left behind;
+- 507 from a small budget.
+
+GPU and NPU paths are recorded as UNAVAILABLE.
+
+### 13.4 Measured (local, Linux, whisper-cli stand-in)
+Server memory with four 64 MB uploads waiting grew by **under 64 MB**; it grew by 520 MB before. Everything returned to
+zero after each test: no booked storage, an empty upload folder, no running or waiting jobs. Native measurements on
+all four platforms are recorded in the PR.
+
