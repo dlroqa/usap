@@ -22,10 +22,12 @@
 // responsiveness, recorded, never a pass or a failure). A failure after suspension worked is FAIL.
 //
 // Client cancel (#133): the studio's safety is checked separately from how fast the engine stops. llama-server
-// applies a cancel only between prompt batches, and on Windows it notices a closed connection late and variably
-// (measured 3.8-60 s on the hosted runner, independent of thread count and busy-polling). Safety rows fail the step
-// on every platform; how fast the engine stopped is recorded as DIAG. The 20 s confirmation window stays a pass/fail
-// check on Linux and macOS, and is recorded as DIAG (met / not met, with the times) on Windows.
+// (b11418) applies a cancel only between prompt batches, and checks for a closed client connection only after a full
+// second without any result for any task. Other requests to it at about 1 Hz (the studio's own confirmation probes
+// included) can delay the cancel up to the end of prompt evaluation, on any OS; the Windows runner lost this race
+// most often (3.8-60 s measured). Safety rows fail the step on every platform; how fast the engine stopped is
+// recorded as DIAG. The 20 s confirmation window stays a pass/fail check on Linux and macOS, and is recorded as DIAG
+// (met / not met, with the times) on Windows.
 //
 //   node scripts/ci/chat-timeouts-validate.cjs --model qwen2.5-0.5b-instruct-q4_k_m.gguf --results out.jsonl
 "use strict";
@@ -417,7 +419,7 @@ async function studioChecks(srv) {
     const confirmedInWindow = (rep?.counts?.cancelConfirmed || 0) > (c0.cancelConfirmed || 0) && firstUnresponsive === null;
     const windowRow = "studio: client cancel confirmed within the 20 s window (USAP_CHAT_CANCEL_CONFIRM_SECONDS=20)";
     const windowDetail = `${confirmedInWindow ? "met" : "not met"}; states ${stateText}; last engine batch ${quietMs} ms after the abort`;
-    if (WIN) record(windowRow, "DIAG", `${windowDetail} (Windows: llama-server notices a closed connection late; #133)`);
+    if (WIN) record(windowRow, "DIAG", `${windowDetail} (Windows: llama-server's disconnect check can be delayed by other requests; #133)`);
     else record(windowRow, confirmedInWindow ? "PASS" : "FAIL", windowDetail);
   });
 
