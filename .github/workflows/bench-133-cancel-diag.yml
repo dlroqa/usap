@@ -1,0 +1,79 @@
+# Issue #133 diagnostic. Bench branch only (bench/133-windows-cancel-diag): never merged, never a required check.
+# Windows only. Same setup as native-runtime (launcher first launch installs the pinned llama.cpp b11418 engine;
+# the pinned Qwen2.5 0.5B Q4_K_M model is fetched with runtime-validate.sh's revision and SHA-256), then bench/133-cancel-diag/diag.cjs.
+name: bench-133-cancel-diag
+
+on:
+  push:
+    branches: [bench/133-windows-cancel-diag]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-133-cancel-diag
+  cancel-in-progress: false
+
+jobs:
+  diag:
+    name: bench-133 (windows-x64)
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      FRONTEND_PORT: "14900"
+      USAP_SKIP_COREML: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: First launch via the launcher (runs first-time setup)
+        run: |
+          mkdir -p ci-logs
+          ( yes '' | cmd //c windows.bat > ci-logs/first-launch.log 2>&1 & )
+          for i in $(seq 1 270); do
+            if curl -fs "http://127.0.0.1:$FRONTEND_PORT/api/health" >/dev/null; then echo "server up after $((i*10))s"; break; fi
+            if grep -q "Setup failed" ci-logs/first-launch.log; then break; fi
+            sleep 10
+          done
+          curl -fs "http://127.0.0.1:$FRONTEND_PORT/api/health" >/dev/null || { echo "::error::server did not start after setup"; tail -60 ci-logs/first-launch.log; exit 1; }
+
+      - name: Install the pinned model (same revision and SHA-256 as scripts/ci/runtime-validate.sh)
+        run: |
+          Q=qwen2.5-0.5b-instruct-q4_k_m.gguf
+          curl -fL --retry 3 -o "app/llm-models/$Q" "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/$Q"
+          echo "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db  app/llm-models/$Q" | sha256sum -c -
+          ls -la app/llm-backend/win/cpu/ | head -20
+
+      - name: Stop first launch
+        if: always()
+        run: bash scripts/ci/stop-app.sh
+
+      - name: CPU and runner facts
+        run: |
+          powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Format-List" | tee ci-logs/runner.txt
+          app/llm-backend/win/cpu/llama-server.exe --version 2>&1 | tee -a ci-logs/runner.txt || true
+
+      - name: Diagnostic (bounded; cleans up its own processes)
+        timeout-minutes: 50
+        run: node bench/133-cancel-diag/diag.cjs ci-logs/diag133
+
+      - name: Stop anything left on the diagnostic ports
+        if: always()
+        run: |
+          for p in 14940 14945; do
+            for pid in $(netstat -ano -p TCP | awk -v p=":$p" '$2 ~ p"$" && $4 ~ /LISTENING/ {print $5}' | sort -u); do
+              echo "stopping PID $pid on port $p"; taskkill //PID "$pid" //T //F || true
+            done
+          done
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-133-windows-x64
+          path: ci-logs/
+          retention-days: 30
