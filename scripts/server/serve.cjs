@@ -24,6 +24,7 @@ const { publicPaths } = require("./public-paths.cjs");
 // Step 9.8: request pipeline (security order + error boundary), router and route modules.
 const { createRouter } = require("./http/router.cjs");
 const { createPipeline } = require("./http/pipeline.cjs");
+const { closeAfterAnswer } = require("./http/refusal-close.cjs");
 const { systemRoutes } = require("./routes/system.cjs");
 const { createTtsService } = require("./services/tts-engine.cjs");
 const { ttsRoutes } = require("./routes/tts.cjs");
@@ -1584,16 +1585,20 @@ function readBody(req, { emptyOnly = false } = {}) {
   return new Promise((resolve, reject) => {
     let data = "";
     let bytes = 0;
+    let over = false;
     req.on("data", chunk => {
+      if (over) return; // past the limit: nothing more is kept; the 413 answer closes the connection
       bytes += chunk.length;
       if (bytes > MAX_JSON_BODY_BYTES) {
+        over = true;
+        data = "";
         reject(new Error(`Request body is too large. Limit is ${Math.round(MAX_JSON_BODY_BYTES / (1024 * 1024))} MB.`));
-        req.destroy();
         return;
       }
       data += chunk;
     });
     req.on("end",  () => {
+      if (over) return;
       if (emptyOnly && data.trim()) return reject(Object.assign(new Error(JSON_TYPE_ERROR), { status: 415 }));
       try { resolve(JSON.parse(data || "{}")); } catch(e) { reject(new Error("Invalid JSON request body")); }
     });
@@ -1607,7 +1612,7 @@ const JSON_TYPE_ERROR = "Request body must be JSON (Content-Type: application/js
 async function readJsonBody(req, res) {
   const type = jsonBodyType(req);
   if (type === "other") {
-    req.resume();
+    closeAfterAnswer(req, res); // refused before the body is read
     json(res, 415, { ok: false, error: JSON_TYPE_ERROR, code: "UNSUPPORTED_MEDIA_TYPE" });
     return null;
   }
@@ -1617,6 +1622,7 @@ async function readJsonBody(req, res) {
   } catch (err) {
     const status = err.status || (err.message.includes("too large") ? 413 : 400);
     const code = status === 415 ? "UNSUPPORTED_MEDIA_TYPE" : status === 413 ? "BODY_TOO_LARGE" : "INVALID_JSON";
+    closeAfterAnswer(req, res); // a body cut off at the limit is not read further
     json(res, status, { ok: false, error: err.message, code });
     return null;
   }
@@ -1869,10 +1875,12 @@ async function legacyRoutes(req, res) {
 
 
   if (req.url.startsWith("/api/")) {
+    closeAfterAnswer(req, res); // no route reads this body
     return json(res, 404, { ok: false, error: "Unknown API endpoint" });
   }
 
   // ── Static frontend files ─────────────────────────────────────────────────
+  closeAfterAnswer(req, res); // static files never read a request body (a no-op for bodiless GETs)
   let filePath = resolveStaticPath(DIST, req.url);
   if (!filePath) {
     res.writeHead(404); res.end("Not found"); return;

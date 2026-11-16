@@ -9,7 +9,10 @@
 //   6. Routes: the module router first, then the remaining legacy handler
 //   7. Error boundary: an unexpected error answers 400 (wrongly typed input) or a generic 500;
 //      details go to the server log only.
+// Every answer given here before a request body is read closes the connection after the answer instead of reading
+// the rest of the body (http/refusal-close.cjs).
 "use strict";
+const { closeAfterAnswer } = require("./refusal-close.cjs");
 
 /**
  * @param {object} deps
@@ -28,9 +31,11 @@ function createPipeline({ requestPolicy, lanAuth, router, fallback, json, errors
 
   async function handleRequest(req, res) {
     if (!requestPolicy.isAllowedHost(req)) {
+      closeAfterAnswer(req, res);
       return json(res, 403, { ok: false, error: "Host not allowed" });
     }
     if (!requestPolicy.isAllowedOrigin(req)) {
+      closeAfterAnswer(req, res);
       return json(res, 403, { ok: false, error: "Cross-origin request blocked" });
     }
     const corsHeaders = requestPolicy.corsHeadersFor(req);
@@ -38,6 +43,7 @@ function createPipeline({ requestPolicy, lanAuth, router, fallback, json, errors
       for (const [key, value] of Object.entries(corsHeaders)) res.setHeader(key, value);
     }
     if (req.method === "OPTIONS") {
+      closeAfterAnswer(req, res);
       res.writeHead(204);
       res.end();
       return;
@@ -53,6 +59,7 @@ function createPipeline({ requestPolicy, lanAuth, router, fallback, json, errors
       logError(`  [api] Unhandled error in ${req.method} ${String(req.url || "").split("?")[0]}:`, err && err.stack ? err.stack : err);
       if (res.headersSent) { try { res.destroy(); } catch (_) { /* already gone */ } return; }
       const status = errors.errorStatus(err) === 400 ? 400 : 500; // wrongly typed input is the caller's error
+      closeAfterAnswer(req, res);
       try {
         json(res, status, status === 400 ? errors.errorBody(err) : { ok: false, error: "Something went wrong in the local server.", code: "INTERNAL_ERROR" });
       } catch (_) { /* response already broken */ }
