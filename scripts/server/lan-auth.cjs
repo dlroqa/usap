@@ -25,6 +25,7 @@ const fs = require("fs");
 const net = require("net");
 const path = require("path");
 const { isLoopbackBind } = require("./request-policy.cjs");
+const { closeAfterAnswer } = require("./http/refusal-close.cjs");
 
 const TOKEN_FILE_NAME = "lan-access-token";
 const TOKEN_RE = /^usap_[A-Za-z0-9_-]{43}$/;
@@ -376,17 +377,24 @@ function createLanAuth({ tokenFile, listenHost = "127.0.0.1", env = process.env,
       ? (res.writeHead(status, { ...PAGE_HEADERS, ...extra }), res.end(signInPage(message)))
       : sendJson(res, status, { ok: false, error: message }, extra));
     const wait = retryAfter(key);
-    if (wait) return fail(429, "Too many failed sign-in attempts. Try again later.", { "Retry-After": String(wait) });
+    if (wait) {
+      closeAfterAnswer(req, res);
+      return fail(429, "Too many failed sign-in attempts. Try again later.", { "Retry-After": String(wait) });
+    }
     if (!isForm && type !== "application/json") {
-      req.resume();
+      closeAfterAnswer(req, res);
       return sendJson(res, 415, { ok: false, error: "Send the access token as a form or as JSON." });
+    }
+    if (Number(req.headers["content-length"]) > MAX_LOGIN_BODY_BYTES) { // too large as declared: refuse before reading
+      closeAfterAnswer(req, res);
+      return fail(413, "Request is too large.");
     }
     let text;
     try {
       text = await readSmallBody(req, MAX_LOGIN_BODY_BYTES);
     } catch (_) {
-      res.on("finish", () => req.socket && req.socket.destroy());
-      return fail(413, "Request is too large.", { Connection: "close" });
+      closeAfterAnswer(req, res); // the rest of the body is never read; the answer still reaches the client
+      return fail(413, "Request is too large.");
     }
     let token = "";
     if (isForm) token = new URLSearchParams(text).get("token") || "";
@@ -407,7 +415,7 @@ function createLanAuth({ tokenFile, listenHost = "127.0.0.1", env = process.env,
   }
 
   function logout(req, res) {
-    req.resume();
+    closeAfterAnswer(req, res); // the body is not used
     const sid = cookieValue(req, COOKIE_NAME);
     if (sid && SESSION_ID_RE.test(sid)) sessions.delete(sha256(sid).toString("hex"));
     const cookie = sessionCookie(req, "", 0);
@@ -430,15 +438,15 @@ function createLanAuth({ tokenFile, listenHost = "127.0.0.1", env = process.env,
       return true;
     }
     if (p === "/api/auth/login" || p === "/api/auth/logout") {
-      if (req.method !== "POST") { req.resume(); sendJson(res, 405, { ok: false, error: "Use POST." }, { Allow: "POST" }); return true; }
-      if (!mode.required) { req.resume(); sendJson(res, 404, { ok: false, error: "Sign-in is not enabled on this server." }); return true; }
+      if (req.method !== "POST") { closeAfterAnswer(req, res); sendJson(res, 405, { ok: false, error: "Use POST." }, { Allow: "POST" }); return true; }
+      if (!mode.required) { closeAfterAnswer(req, res); sendJson(res, 404, { ok: false, error: "Sign-in is not enabled on this server." }); return true; }
       await (p === "/api/auth/login" ? login(req, res) : logout(req, res));
       return true;
     }
     if (isExempt(req)) return false;
     const state = authenticate(req);
     if (state === "ok") return false;
-    req.resume();
+    closeAfterAnswer(req, res); // refused before the body is read: answer, then close without reading it
     if (state === "limited") {
       sendJson(res, 429, { ok: false, error: "Too many failed attempts. Try again later.", code: "auth_rate_limited" },
         { "Retry-After": String(retryAfter(clientKey(req))) });
