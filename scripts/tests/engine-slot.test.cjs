@@ -7,6 +7,7 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const net = require("node:net");
+const { spawnSync } = require("node:child_process");
 const path = require("node:path");
 const { EventEmitter } = require("node:events");
 const test = require("node:test");
@@ -194,6 +195,28 @@ test.before(() => {
 
 const SLOT_ON = { USAP_ENGINE_SLOT: "on" };
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) { return err.code === "EPERM"; } };
+// #121: `alive` is true for an exited process its parent hasn't reaped yet (a zombie, state Z), which can't compute.
+// `running` is false for a zombie too: Linux reads /proc, macOS `ps`; Windows has no zombies (same as `alive`).
+function running(pid) {
+  if (!alive(pid)) return false;
+  if (process.platform === "linux") {
+    try { return fs.readFileSync(`/proc/${pid}/stat`, "utf8").split(") ").pop().split(" ")[0] !== "Z"; } catch (_) { return false; }
+  }
+  if (process.platform === "darwin") {
+    const r = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" });
+    const st = (r.stdout || "").trim();
+    return st !== "" && !st.startsWith("Z");
+  }
+  return true;
+}
+// The real engine process of `label` (never its guard): waits until the guard has reported the engine PID.
+async function enginePidOf(srv, label) {
+  return waitFor(async () => {
+    const d = (await request(srv.port, "GET", "/api/diagnostics")).json;
+    const r = ((d && d.engines && d.engines.processes && d.engines.processes.supervised) || []).find((x) => x.label === label && x.enginePid);
+    return r ? r.enginePid : null;
+  }, 10000, `${label} engine PID reported`);
+}
 async function engines(srv) {
   const d = (await request(srv.port, "GET", "/api/diagnostics")).json;
   const sup = (d && d.engines && d.engines.processes && d.engines.processes.supervised) || [];
@@ -458,7 +481,7 @@ test("forced termination (slot on): engines that ignore SIGTERM are killed, the 
   await withServer(SLOT_ON, async (srv) => {
     assert.equal((await imageLoad(srv, "sd1-ignore-sigterm-q4_0.gguf")).status, 200);
     await imageReady(srv, 20000, "image ready");
-    const [p] = await engines(srv);
+    const p = { pid: await enginePidOf(srv, "image") };
     const t0 = Date.now();
     const st = await imageStop(srv);
     const ms = Date.now() - t0;
@@ -467,14 +490,18 @@ test("forced termination (slot on): engines that ignore SIGTERM are killed, the 
     // already a forced termination (taskkill /F through the guard), so the exit comes at once.
     if (IS_WIN) assert.ok(ms < 9000, `stopped (${ms} ms)`);
     else assert.ok(ms >= 2000 && ms < 9000, `escalated to SIGKILL (${ms} ms)`);
-    assert.equal(alive(p.pid), false);
+    // The stop answers after the guard's exit; the engine died with it (process-group SIGKILL) but may not be reaped
+    // yet. It must not be running; the slot is released only once its PID is gone, and then it must be gone (#121).
+    assert.equal(running(p.pid), false, "the image engine is not running when the stop answers");
     await waitIdle(srv);
+    assert.equal(alive(p.pid), false, "the image engine PID is gone once the slot is idle");
 
     assert.equal((await textLoad(srv, "ignore-sigterm.gguf")).status, 200);
-    const [q] = await engines(srv);
+    const q = { pid: await enginePidOf(srv, "llm") };
     assert.equal((await textStop(srv)).status, 200);
-    assert.equal(alive(q.pid), false);
+    assert.equal(running(q.pid), false, "the text engine is not running when the stop answers");
     await waitIdle(srv);
+    assert.equal(alive(q.pid), false, "the text engine PID is gone once the slot is idle");
   });
 });
 
