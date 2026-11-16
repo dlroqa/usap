@@ -58,10 +58,13 @@ function fakeClock(start = 1_700_000_000_000) {
         t = Math.max(t, due[1].at); timers.delete(due[0]); due[1].fn();
         await flush();
         await sleep(2); // real sockets: let the bytes travel
+        if (clock.settle) await clock.settle(); // #119: real I/O started by that timer (e.g. a /metrics probe) answers first
       }
       t = end;
       await flush();
+      if (clock.settle) await clock.settle();
     },
+    settle: null,
   };
   return clock;
 }
@@ -352,12 +355,26 @@ async function controlledEngine() {
 async function rig({ mode = "on", queue = false, setting = {}, startLlm } = {}) {
   const clock = fakeClock();
   const engine = await controlledEngine();
+  // #119: the guard's /metrics probes are real HTTP requests while time is fake. Fake time moves on only after every
+  // probe in flight has been answered, so a slow runner can't let the probe chain slip past a fake-time window. A
+  // /metrics that hangs on purpose (metricsMode "hang") is left to the guard's own fake-time probe limit.
+  let inFlight = 0;
+  const baseFetch = httpMetricsFetcher(http);
+  const countedFetch = (port) => {
+    const h = baseFetch(port);
+    inFlight += 1;
+    return { ...h, promise: Promise.resolve(h.promise).finally(() => { inFlight -= 1; }) };
+  };
+  clock.settle = async () => {
+    await waitFor(() => inFlight === 0 || engine.metricsMode === "hang", 5000, "the /metrics probes in flight answered");
+    await flush();
+  };
   const state = { PORT_LLM: engine.port, llmProcSeq: 1, llmReady: true, llmProc: {}, llmSettings: { model: "m", contextSize: 4096, threads: 2, gpuLayers: 0 } };
   const logs = [];
   const T = mode === "off" ? null : createChatTimeouts({
     setting: { ...chatTimeoutSetting({ env: { USAP_CHAT_TIMEOUTS: mode } }), ...setting },
     engine: () => ({ seq: state.llmProcSeq, ready: state.llmReady, port: state.PORT_LLM }),
-    fetchMetrics: httpMetricsFetcher(http), ...clock, log: (l) => logs.push(l),
+    fetchMetrics: countedFetch, ...clock, log: (l) => logs.push(l),
   });
   let releases = 0;
   const q = queue ? createChatQueue({ limit: 4, maxWaitMs: 600000, now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer }) : null;
