@@ -11,7 +11,7 @@ const path = require("node:path");
 const test = require("node:test");
 const { spawn, spawnSync } = require("node:child_process");
 
-const { makeRoot, startServer, stopServer, request, fakeLlamaPath } = require("./api-contract/harness.cjs");
+const { makeRoot, startServer, stopServer, stopServerAndWait, removeTestRoot, request, fakeLlamaPath } = require("./api-contract/harness.cjs");
 const supervisor = require("../server/supervisor.cjs");
 const { decideRestart, isOutOfMemory } = require("../server/restart-policy.cjs");
 
@@ -70,7 +70,8 @@ function exitOf(proc) {
 let root;
 let engine;
 test.before(() => { root = makeRoot(); engine = fakeLlamaPath(root); });
-test.after(() => { fs.rmSync(root, { recursive: true, force: true }); });
+// #127: every server is stopped and waited for in its test; the root is removed only once nothing runs from it.
+test.after(async () => { await removeTestRoot(root); });
 
 const engineEnv = () => ({ ...process.env, USAP_TEST_NODE: process.execPath });
 
@@ -243,7 +244,7 @@ test("server: killing the server outright stops its text engine (no orphan, port
     await exitOf(srv.proc);
     await waitFor(async () => !(await engineUp(port)), 10000, "engine stops with the server");
     await waitFor(() => !pidAlive(pid), 10000, "engine process gone");
-  } finally { stopServer(srv); }
+  } finally { await stopServerAndWait(srv); }
 });
 
 if (!IS_WIN) {
@@ -255,7 +256,7 @@ if (!IS_WIN) {
       process.kill(srv.proc.pid, "SIGTERM");
       await exitOf(srv.proc);
       assert.equal(await engineUp(port), false);
-    } finally { stopServer(srv); }
+    } finally { await stopServerAndWait(srv); }
   });
 }
 
@@ -294,7 +295,7 @@ test("server: an engine crash after loading is detected and restarted with backo
     st = await llmStatus(srv);
     assert.equal(st.engine.state, "ready");
     assert.equal(st.engine.crash, null);
-  } finally { stopServer(srv); }
+  } finally { await stopServerAndWait(srv); }
 });
 
 test("server: an engine that runs out of memory is not restarted, and says why", async () => {
@@ -310,7 +311,7 @@ test("server: an engine that runs out of memory is not restarted, and says why",
     assert.deepEqual(await supervisedLlm(srv), []);
     const chat = await request(srv.port, "POST", "/api/llm/chat", { body: { messages: [{ role: "user", content: "hi" }] } });
     assert.equal(chat.json.code, "ENGINE_CRASHED");
-  } finally { stopServer(srv); }
+  } finally { await stopServerAndWait(srv); }
 });
 
 test("server: an intentional stop never triggers an automatic restart", async () => {
@@ -327,7 +328,7 @@ test("server: an intentional stop never triggers an automatic restart", async ()
     assert.equal(await engineUp(port), false);
     assert.deepEqual(await supervisedLlm(srv), []);
     assert.doesNotMatch(srv.log(), /restarting in/);
-  } finally { stopServer(srv); }
+  } finally { await stopServerAndWait(srv); }
 });
 
 test("server: stopping during a slow startup cancels it at once, without trying other profiles", async () => {
@@ -347,7 +348,7 @@ test("server: stopping during a slow startup cancels it at once, without trying 
     assert.equal((srv.log().slice(logStart).match(/\[llm\] Starting:/g) || []).length, 1, "no fallback attempts after a stop");
     assert.deepEqual(await supervisedLlm(srv), []);
     assert.equal((await llmStatus(srv)).engine.state, "stopped");
-  } finally { stopServer(srv); }
+  } finally { await stopServerAndWait(srv); }
 });
 
 test("server: a failed launch is reported, recorded and leaves nothing running", async () => {
@@ -363,7 +364,7 @@ test("server: a failed launch is reported, recorded and leaves nothing running",
     assert.equal(st.engine.lastExit.code, 3);
     assert.equal(st.engine.lastExit.unexpected, false, "a failed start is not a crash and is not restarted");
     assert.deepEqual(await supervisedLlm(srv), []);
-  } finally { stopServer(srv); }
+  } finally { await stopServerAndWait(srv); }
 });
 
 test("server: concurrent start and stop requests never leave two engines or an inconsistent state", async () => {
@@ -380,7 +381,7 @@ test("server: concurrent start and stop requests never leave two engines or an i
     assert.equal((await request(srv.port, "POST", "/api/llm/stop")).status, 200);
     assert.deepEqual(await supervisedLlm(srv), []);
     assert.equal(await engineUp(st.port), false);
-  } finally { stopServer(srv); }
+  } finally { await stopServerAndWait(srv); }
 });
 
 test("server: a startup that never becomes ready times out and its engine is stopped", async () => {
@@ -391,7 +392,7 @@ test("server: a startup that never becomes ready times out and its engine is sto
     assert.match(r.json.error, /did not become ready within 2 seconds/);
     assert.deepEqual(await supervisedLlm(srv), []);
     assert.equal((await llmStatus(srv)).running, false);
-  } finally { stopServer(srv); }
+  } finally { await stopServerAndWait(srv); }
 });
 
 test("server: diagnostics describe engines additively, without secrets", async () => {
@@ -416,5 +417,5 @@ test("server: diagnostics describe engines additively, without secrets", async (
     assert.ok(Array.isArray(d.engines.processes.supervised));
     assert.ok(Array.isArray(d.engines.processes.recentExits));
     for (const k of ["health", "download", "llm", "speech", "hardware"]) assert.ok(k in d, `existing field ${k} kept`);
-  } finally { stopServer(srv); }
+  } finally { await stopServerAndWait(srv); }
 });
