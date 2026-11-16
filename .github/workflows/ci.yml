@@ -94,7 +94,11 @@ jobs:
       - name: Unit, regression and security tests
         run: |
           mkdir -p test-results
-          node --test \
+          # A hung test file (e.g. a polling loop left running after a failed assertion, #125) fails by name after
+          # 10 minutes instead of silently using up the job's 20. The limit applies to each test and to each whole
+          # file (Node 22.12.0); the slowest file takes about 100 s on macOS Intel. No --test-force-exit: leaked
+          # handles must stay visible.
+          node --test --test-timeout=600000 \
             --test-reporter=spec --test-reporter-destination=stdout \
             --test-reporter=junit --test-reporter-destination=test-results/junit.xml \
             "scripts/tests/*.test.cjs"
