@@ -367,6 +367,19 @@ queue off. The 1 GiB per-upload ceiling is fixed.
 - **Running jobs.** A running job keeps its turn, file and reservation until `transcribeWavFile` settles, which happens
   on whisper-cli's exit.
 
+* **Upload connection gate (#131).** At most `limit + 2` transcription requests are open at once (6 with the default
+  limit of 4): the running job, the waiting ones, and one more, such as a request being answered early. The count
+  starts at arrival, before any body byte, and is the same for every client and address: there is no loopback
+  exemption and no per-address identity. It is released exactly once when the response closes (normal end, refusal,
+  disconnect or shutdown).
+  * Past it, the request is refused at once with `429 QUEUE_FULL` and `Retry-After: 5`, and its connection is closed
+    after the answer without reading its body (`http/refusal-close.cjs`, the same helper as other refusals). It
+    never reaches the queue, the storage ledger or the disk.
+  * `/api/resources` reports `transcriptionQueue.uploadConnections { open, limit }` and the count
+    `connectionsRefused`.
+  * Off by default with the queue; `USAP_SCHEDULER=off` turns it off.
+  * The queue's own early answers keep their bounded handling described above.
+
 ### 13.3 Tests
 **Deterministic:** `scripts/tests/transcription-queue.test.cjs`, 31 tests, on all four OS in `ci`.
 - **Real server with a whisper-cli stand-in:**

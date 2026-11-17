@@ -704,3 +704,56 @@ test("service: cleanupSync deletes this instance's files (process exit)", async 
     await r;
   });
 });
+
+// ── #131: upload connection gate ───────────────────────────────────────────────────────────────────────────────
+test("server, on (#131): at most limit + 2 upload connections are open at once; past it 429 QUEUE_FULL at once, the body unread and the connection closed; nothing reaches the queue or the disk; the count returns to 0", async () => {
+  const { rawRequest } = require("./fixtures/refusal-clients.cjs");
+  const { GRACE_MS } = require("../server/http/refusal-close.cjs");
+  const URL = "/api/speech/transcribe?model=ggml-test.bin";
+  const gateText = /Too many audio uploads are in progress/;
+  await withServer({ ...ON, USAP_TRANSCRIPTION_QUEUE_LIMIT: "1" }, async (c) => { // limit 1: gate = 1 + 1 + 1 = 3
+    const conns = async () => (await c.resources()).transcriptionQueue.uploadConnections;
+    assert.deepEqual(await conns(), { open: 0, limit: 3 });
+    c.hold();
+    const first = upload(c.srv.port, wav("H")).promise;
+    await waitFor(() => c.started().length === 1, 10000, "running");
+    const w = upload(c.srv.port, wav("W")).promise;
+    await waitFor(async () => (await queueState(c)).waiting === 1, 5000, "waiting");
+    // The third connection: refused by the full queue, but a raw client that keeps sending after the answer, so it
+    // stays open while the bounded discard runs (#130). (Node's own HTTP client closes on a "Connection: close" answer.)
+    const opts = { url: URL, contentType: "audio/wav", maxMs: GRACE_MS + 10000 };
+    const slowP = rawRequest(c.srv.port, { ...opts, mode: "drip", maxMs: 12000 });
+    await waitFor(async () => (await conns()).open === 3, 10000, "3 open connections");
+    const before = { counts: (await c.resources()).transcriptionQueue.counts, storage: (await c.resources()).transcriptionQueue.storage, files: c.uploads() };
+    // Past the gate: still sending (chunked, never ends), silent after its headers, and ten at once.
+    const streaming = await rawRequest(c.srv.port, { ...opts, mode: "stream", capBytes: 32 * MiB });
+    const silent = await rawRequest(c.srv.port, { ...opts, mode: "silent" });
+    const burst = await Promise.all(Array.from({ length: 10 }, () => rawRequest(c.srv.port, { ...opts, mode: "stream", capBytes: 4 * MiB })));
+    for (const [label, st] of [["streaming", streaming], ["silent", silent], ...burst.map((b, i) => [`burst ${i}`, b])]) {
+      assert.equal(st.status, 429, `${label}: refused`);
+      assert.match(st.body, gateText, `${label}: by the connection gate`);
+      assert.match(st.head, /\r\nretry-after: 5/i, `${label}: Retry-After`);
+      assert.equal(st.connectionHeader, "close", `${label}: Connection: close`);
+      assert.ok(!st.clientGaveUp && st.closedAt - st.answeredAt <= GRACE_MS + 2500, `${label}: closed within the grace period after the answer (answer ${st.answeredAt} ms, close ${st.closedAt} ms)`);
+    }
+    assert.ok(streaming.sent < 32 * MiB, `the server stopped reading the refused body (client sent ${streaming.sent})`);
+    const after = (await c.resources()).transcriptionQueue;
+    assert.equal(after.counts.connectionsRefused, 12, "every one counted once");
+    assert.deepEqual(after.storage, before.storage, "nothing booked");
+    assert.deepEqual(c.uploads(), before.files, "no file");
+    assert.equal(after.uploadConnections.open, 3, "the refused connections were never counted as open");
+    // Accounting: when the slow connection ends (its client stops at 12 s), its place is free again.
+    const slowSt = await slowP;
+    assert.equal(slowSt.status, 429, "the slow one was refused by the full queue");
+    await waitFor(async () => (await conns()).open === 2, 10000, "2 open after the slow client left");
+    const next = await upload(c.srv.port, wav("N")).promise;
+    assert.equal(next.status, 429);
+    assert.doesNotMatch(next.json.error, gateText, "past the gate again: refused by the full queue, not the gate");
+    c.release();
+    const rs = await Promise.all([first, w]);
+    assert.deepEqual(rs.map((x) => x.status), [200, 200]);
+    assert.deepEqual(c.started(), ["H", "W"], "no refused request ever reached whisper-cli");
+    await waitFor(async () => (await conns()).open === 0, 10000, "all connections released");
+    await assertDrained(c);
+  });
+});
