@@ -23,6 +23,7 @@ block = block.replace(
       };
       const rec = { ...globalThis.__r2, liveAtCheck: live.length, snaps: [await snap("at-check")] };
       if (live.length !== 1) {
+        rec.serverLogTail = typeof srv.log === "function" ? srv.log().slice(-6000) : null; // includes the engines' stderr
         const until = Date.now() + 10000;
         while (Date.now() < until) { await sleep(500); const x = await snap("after"); rec.snaps.push(x); if (x.engines.length === 1) break; }
       }
