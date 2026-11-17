@@ -1,0 +1,59 @@
+# Bench branch only (bench/f0-epipe-diagnostics): never merged, never a required check. Runs the whole CI test suite in
+# a loop on macOS Intel (the condition of the one F0 20-client EPIPE failure, PR #140 run 44077658546) with the
+# observation-only patch, so a failure records every client and server socket. Assertions unchanged; nothing pushed.
+name: bench-f0-suite
+
+on:
+  push:
+    branches: [bench/f0-epipe-diagnostics]
+    paths: [.github/workflows/bench-f0-suite.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: bench-f0-suite (shard ${{ matrix.shard }})
+    runs-on: macos-15-intel
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: bench-src
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: f0004584195015bcb28fd64d4a3ebb93a75b9c92
+          path: target
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.12.0"
+      - name: Install and build (as CI)
+        working-directory: target
+        run: npm ci --no-audit --no-fund && npm run build
+      - name: Observation-only patch (assertions unchanged)
+        run: node bench-src/bench/f0-epipe/patch.cjs target/scripts/tests/refusal-close.test.cjs target/scripts/tests/fixtures/refusal-clients.cjs
+      - name: Full suite in a loop
+        timeout-minutes: 85
+        run: |
+          mkdir -p out; pass=0; fail=0
+          for i in $(seq 1 12); do
+            ( cd target && DIAGF0="$PWD/../out/diagf0.jsonl" perl -e 'alarm shift; exec @ARGV' 900 node --test --test-timeout=600000 "scripts/tests/*.test.cjs" > "../out/suite-$i.txt" 2>&1 ); rc=$?
+            if [ $rc -eq 0 ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "suite $i FAILED (rc $rc)"; grep -E "^not ok|✖|AssertionError" "out/suite-$i.txt" | sort -u | head -8; fi
+          done
+          echo "{\"runs\": 12, \"pass\": $pass, \"fail\": $fail}" | tee out/summary.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-f0-suite-${{ matrix.shard }}
+          path: out/
+          retention-days: 30
