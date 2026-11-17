@@ -52,9 +52,20 @@ async function startPipelineServerIn(dir, auth) {
     json(res, 200, { ok: true, bytes: n });
   });
   const pipeline = createPipeline({ requestPolicy, lanAuth, router, fallback: async (req, res) => json(res, 404, { ok: false }), json, errors: { errorStatus: () => 500, errorBody: () => ({}) }, logError: () => {} });
+  // Per connection, what the server itself did (wall-clock Date.now() times): when it accepted the connection, the
+  // status of the answer and when that answer was handed to the OS ('finish'), and when the socket closed.
   const conns = new Set();
-  const server = http.createServer(pipeline);
-  server.on("connection", (s) => { const c = { s, bytesRead: 0 }; conns.add(c); s.on("close", () => { c.bytesRead = s.bytesRead; c.closed = true; }); });
+  const bySocket = new WeakMap();
+  const server = http.createServer((req, res) => {
+    const c = bySocket.get(req.socket);
+    if (c) res.once("finish", () => { c.status = res.statusCode; c.answeredAt = Date.now(); });
+    return pipeline(req, res);
+  });
+  server.on("connection", (s) => {
+    const c = { s, bytesRead: 0, remotePort: s.remotePort, acceptedAt: Date.now(), status: null, answeredAt: null, closedAt: null };
+    conns.add(c); bySocket.set(s, c);
+    s.on("close", () => { c.bytesRead = s.bytesRead; c.closed = true; c.closedAt = Date.now(); });
+  });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const readTotal = () => [...conns].reduce((a, c) => a + (c.closed ? c.bytesRead : c.s.bytesRead), 0);
   const close = async () => { for (const c of conns) c.s.destroy(); await new Promise((r) => server.close(r)); fs.rmSync(dir, { recursive: true, force: true }); };
@@ -69,6 +80,29 @@ function assertClosedRefusal(st, status, label) {
   // The grace period starts when the answer is written, so the close is measured from the answer.
   assert.ok(st.answeredAt <= ANSWER_MS, `${label}: answered promptly (${st.answeredAt} ms)`);
   assert.ok(st.closedAt - st.answeredAt <= GRACE_MS + SLACK_MS, `${label}: closed within the grace period after the answer (answer ${st.answeredAt} ms, close ${st.closedAt} ms)`);
+}
+
+// ── a refused client in a separate process, judged against what the server did on its connection ──────────────────
+// The server's side is checked directly (status, timing, close, bytes read). What the client saw is checked too: it
+// must have read the complete answer, with one documented exception. A client that keeps sending and does not read
+// for longer than the grace period may get a reset instead of the answer (refusal-close.cjs: the socket is destroyed
+// GRACE_MS after the answer). That exception is accepted only with evidence: the server kept the connection open for
+// the whole grace period after writing the answer, AND the client's process did not run at all in that window (no
+// event-loop tick between the server's answer and its close), AND the connection ended with a reset or nothing,
+// never a different answer. A server that closes early, never closes, or answers wrongly still fails.
+const GRACE_TOLERANCE_MS = 100; // timer granularity: the grace timer starts just before 'finish' is observed
+const TICK_MARGIN_MS = 5;       // loopback delivery time for the answer and for the reset
+function judgeRefusedClient(st, conn, ticks, status) {
+  if (!conn) return { ok: false, why: `no server connection for client port ${st.localPort}` };
+  if (st.status === status) return { ok: true, kind: "answered" };
+  if (st.status !== null) return { ok: false, why: `client read status ${st.status}, expected ${status}` };
+  if (conn.status !== status || conn.answeredAt === null || conn.closedAt === null) return { ok: false, why: `server status ${conn.status}, answered ${conn.answeredAt}, closed ${conn.closedAt}` };
+  const kept = conn.closedAt - conn.answeredAt;
+  if (kept < GRACE_MS - GRACE_TOLERANCE_MS) return { ok: false, why: `answer lost, and the server closed only ${kept} ms after answering (grace ${GRACE_MS} ms)` };
+  const ran = ticks.filter((t) => t > conn.answeredAt + TICK_MARGIN_MS && t < conn.closedAt - TICK_MARGIN_MS);
+  if (ran.length > 0) return { ok: false, why: `answer lost although the client process ran ${ran.length} times during the ${kept} ms the server kept the connection open` };
+  const before = ticks.filter((t) => t <= conn.answeredAt + TICK_MARGIN_MS).at(-1), after = ticks.find((t) => t >= conn.closedAt - TICK_MARGIN_MS);
+  return { ok: true, kind: "stalled", why: `client process did not run from ${before - conn.answeredAt} ms to ${after - conn.answeredAt} ms after the answer; server closed at ${kept} ms; client error ${st.error}` };
 }
 
 // ── Node behaviour this fix depends on (fails loudly after a runtime change) ─────────────────────────────────────
@@ -237,29 +271,73 @@ test("refusal: request text inside a refused request's unread body is never pars
   } finally { await srv.close(); }
 });
 
-test("refusal: 20 concurrent refused clients that keep sending all get the answer; all close in the grace period; reads stay bounded", async () => {
+test("refusal: 20 concurrent refused clients that keep sending get the answer (or were provably not running during the grace period); the server answers each promptly and closes it in the grace period; reads stay bounded", async (t) => {
   const srv = await startPipelineServer();
   const errors = []; const onErr = (e) => errors.push(e);
   process.on("uncaughtException", onErr);
   try {
-    const t0 = Date.now();
     // 8 MiB per client: more than a loopback receive buffer, so every client is still sending when refused. The 20
     // clients run in a separate process: writing as fast as they can, they would otherwise share this event loop with
     // the server and delay its answers on a slow runner (seen on macOS Intel CI), which would measure the test, not
     // the server.
+    // Timing is therefore asserted on the server's side; the client process's own timing is only diagnostic.
     const opts = { headers: "Origin: http://evil.example\r\n", capBytes: 8 * MiB, maxMs: GRACE_MS + 10000 };
-    const all = await new Promise((resolve, reject) => {
+    const { clients: all, ticks } = await new Promise((resolve, reject) => {
       execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify({ port: srv.port, n: 20, opts })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
         (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
     });
+    assert.equal(await noneLingering(), 0);
+    const conns = [...srv.conns];
+    const record = () => JSON.stringify({ server: conns.map(({ s, ...c }) => ({ ...c, answeredMs: c.answeredAt - c.acceptedAt, keptMs: c.closedAt - c.answeredAt })), clients: all });
     assert.equal(all.length, 20);
-    all.forEach((st, i) => assertClosedRefusal(st, 403, `client ${i}`));
+    // The server: 20 connections, each refused with 403 promptly, closed within the grace period, nothing routed.
+    assert.equal(conns.length, 20, `server saw ${conns.length} connections`);
+    for (const c of conns) {
+      assert.equal(c.status, 403, `server answered port ${c.remotePort} with ${c.status}: ${record()}`);
+      assert.ok(c.answeredAt - c.acceptedAt <= ANSWER_MS, `server answered port ${c.remotePort} ${c.answeredAt - c.acceptedAt} ms after accepting it`);
+      assert.ok(c.closedAt !== null && c.closedAt - c.answeredAt <= GRACE_MS + SLACK_MS, `server closed port ${c.remotePort} ${c.closedAt - c.answeredAt} ms after the answer`);
+    }
+    assert.equal(srv.routeHits.echo, 0, "no refused request reached the route");
     const read = srv.readTotal();
     assert.ok(read <= 20 * READ_BOUND, `server read ${read} bytes for 20 refused clients`);
-    assert.ok(Date.now() - t0 <= ANSWER_MS + GRACE_MS + SLACK_MS, `all done within answer + grace (${Date.now() - t0} ms)`);
-    assert.equal(await noneLingering(), 0);
+    // The clients: each read the complete answer, or provably was not running while the server held the connection.
+    const stalled = [];
+    all.forEach((st, i) => {
+      const v = judgeRefusedClient(st, conns.find((c) => c.remotePort === st.localPort), ticks, 403);
+      assert.ok(v.ok, `client ${i}: ${v.why}; client error ${st.error}: ${record()}`);
+      if (v.kind === "stalled") { stalled.push(`client ${i}: ${v.why}`); return; }
+      assert.doesNotThrow(() => JSON.parse(st.body), `client ${i}: complete JSON answer, got ${JSON.stringify(st.body.slice(0, 80))}`);
+      assert.equal(st.connectionHeader, "close", `client ${i}: Connection: close`);
+    });
+    if (stalled.length) t.diagnostic(`${stalled.length}/20 answers lost by a client process that was not running (documented reset tradeoff): ${stalled.join("; ")}`);
     assert.deepEqual(errors, [], "no uncaught socket errors");
   } finally { process.off("uncaughtException", onErr); await srv.close(); }
+});
+
+test("refusal judge: a lost answer is excused only when the server kept the grace period and the client was not running", () => {
+  const conn = { remotePort: 1, status: 403, acceptedAt: 1000, answeredAt: 1040, closedAt: 1040 + GRACE_MS + 10 };
+  const ticksEvery = (from, to) => Array.from({ length: Math.floor((to - from) / 10) + 1 }, (_, i) => from + i * 10);
+  const lost = { localPort: 1, status: null, error: "EPIPE" };
+  const asleep = [...ticksEvery(1000, 1030), ...ticksEvery(conn.closedAt + 200, conn.closedAt + 400)];
+  // answered: always fine
+  assert.equal(judgeRefusedClient({ localPort: 1, status: 403 }, conn, ticksEvery(1000, 4000), 403).kind, "answered");
+  // control: lost while the client process was not running and the server kept the full grace period → excused
+  assert.equal(judgeRefusedClient(lost, conn, asleep, 403).kind, "stalled");
+  // lost while the client process was running → server failure
+  assert.equal(judgeRefusedClient(lost, conn, ticksEvery(1000, 4000), 403).ok, false);
+  // one tick inside the window is enough to fail
+  assert.equal(judgeRefusedClient(lost, conn, [...asleep, conn.answeredAt + 1000].sort((a, b) => a - b), 403).ok, false);
+  // server closed at once (no grace period), even with the client asleep → failure
+  assert.equal(judgeRefusedClient(lost, { ...conn, closedAt: conn.answeredAt + 5 }, asleep, 403).ok, false);
+  // server closed early (half the grace period) → failure
+  assert.equal(judgeRefusedClient(lost, { ...conn, closedAt: conn.answeredAt + GRACE_MS / 2 }, asleep, 403).ok, false);
+  // server never answered, answered differently, or never closed → failure
+  assert.equal(judgeRefusedClient(lost, { ...conn, status: null, answeredAt: null }, asleep, 403).ok, false);
+  assert.equal(judgeRefusedClient(lost, { ...conn, status: 200 }, asleep, 403).ok, false);
+  assert.equal(judgeRefusedClient(lost, { ...conn, closedAt: null }, asleep, 403).ok, false);
+  // the client read a different answer → failure; no matching server connection → failure
+  assert.equal(judgeRefusedClient({ ...lost, status: 200 }, conn, asleep, 403).ok, false);
+  assert.equal(judgeRefusedClient(lost, undefined, asleep, 403).ok, false);
 });
 
 test("refusal: a client that resets the connection during the grace period leaves nothing behind", async () => {

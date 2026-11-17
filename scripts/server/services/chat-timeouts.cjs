@@ -40,7 +40,12 @@ const MODES = new Set(["off", "observe", "on"]);
 // The legacy non-streaming limit (requestJson(..., 300000) in services/chat.cjs). Not configurable.
 const NON_STREAM_TOTAL_SECONDS = 300;
 // Fixed in this substage (documented constants, not settings).
-const PROBE_INTERVAL_MS = 1000;
+const PROBE_INTERVAL_MS = 2000;
+// Why 2 s, not 1 s (#133): llama-server (b11418) checks whether a streaming client has gone only after a full second
+// without any result for any task. Each /metrics answer is such a result and restarts that second. Probing every
+// second (plus the probe's own latency) kept the engine from noticing the cancelled client, sometimes until the whole
+// prompt was evaluated. A 2 s cadence leaves it a quiet second between probes. The confirmation rule is unchanged:
+// two quiet readings at least QUIESCE_GAP_MS apart.
 const PROBE_LIMIT_MS = 5000;
 const QUIESCE_GAP_MS = 3000;
 const RETRY_AFTER_SECONDS = 30;
@@ -132,7 +137,7 @@ function parseMetrics(text) {
  * @param {() => {seq:number|null, ready:boolean, port:number}} o.engine  the current text engine (read-only)
  * @param {(port:number) => {promise: Promise<{status:number, startTime:string|undefined, text:string}>, abort: Function}} o.fetchMetrics
  */
-function createChatTimeouts({ setting, engine, fetchMetrics, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, log = (l) => console.log(l) } = {}) {
+function createChatTimeouts({ setting, engine, fetchMetrics, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, log = (l) => console.log(l), probeIntervalMs = PROBE_INTERVAL_MS } = {}) {
   const mode = setting.mode;
   const say = (line) => { try { log(`  [timeouts] ${line}`); } catch (_) { /* logging is optional */ } };
   const counts = { firstByte: 0, idle: 0, total: 0, clientCancelled: 0, cancelConfirmed: 0, cancelUnconfirmed: 0, recovered: 0, refusedUnresponsive: 0, engineReplaced: 0, probes: 0, probesRejected: 0 };
@@ -191,7 +196,7 @@ function createChatTimeouts({ setting, engine, fetchMetrics, now = Date.now, set
 
   function schedule() {
     const token = g.loopToken;
-    const delay = g.state === "unresponsive" ? setting.unresponsiveProbeSeconds * 1000 : PROBE_INTERVAL_MS;
+    const delay = g.state === "unresponsive" ? setting.unresponsiveProbeSeconds * 1000 : probeIntervalMs;
     g.timer = loopTimer(() => { g.timer = null; if (token === g.loopToken) probeOnce(token); }, delay);
   }
   function probeOnce(token) {
@@ -257,7 +262,7 @@ function createChatTimeouts({ setting, engine, fetchMetrics, now = Date.now, set
     return new Promise((resolve) => {
       const w = { resolve, timer: null };
       // Safety bound: the loop ends CONFIRMING within the window; this only guards against a bug there.
-      w.timer = setTimer(() => { if (waiters.delete(w)) { counts.refusedUnresponsive++; resolve(refusal()); } }, setting.cancelConfirmSeconds * 1000 + PROBE_LIMIT_MS + 2 * PROBE_INTERVAL_MS);
+      w.timer = setTimer(() => { if (waiters.delete(w)) { counts.refusedUnresponsive++; resolve(refusal()); } }, setting.cancelConfirmSeconds * 1000 + PROBE_LIMIT_MS + 2 * probeIntervalMs);
       waiters.add(w);
       if (typeof onClientGone === "function") onClientGone(() => { if (waiters.delete(w)) { clearTimer(w.timer); resolve({ ok: false, code: "CLIENT_GONE" }); } });
     });
