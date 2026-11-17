@@ -1,7 +1,10 @@
 // Raw HTTP clients for scripts/tests/refusal-close.test.cjs. Used in-process, and as a separate process for the
 // concurrency test, so twenty clients writing as fast as they can never share an event loop with the server they
 // measure (on a slow runner that load delayed the server's own answer).
-//   node refusal-clients.cjs '{"port":1234,"n":20,"opts":{...}}'  → prints one JSON array of client results
+//   node refusal-clients.cjs '{"port":1234,"n":20,"opts":{...}}'  → prints {"clients":[...],"ticks":[...]}
+// `ticks` are the wall-clock times (Date.now()) at which this process's event loop ran a 10 ms interval timer. A gap in
+// them is a time when the process did not run at all (seen for seconds under full-suite load on macOS Intel CI); the
+// test uses it to tell a client that was not running from a server that misbehaved.
 "use strict";
 const net = require("node:net");
 const MiB = 1024 * 1024;
@@ -40,6 +43,7 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
     const end = setTimeout(() => { stopped = true; st.clientGaveUp = true; s.destroy(); }, maxMs);
     s.on("close", () => clearTimeout(end));
     s.on("connect", () => {
+      st.localPort = s.localPort; // matches the server's remotePort for this connection
       const host = /\bHost:/i.test(headers) ? "" : "Host: 127.0.0.1\r\n";
       if (mode === "small") {
         const body = Buffer.alloc(2048, 0x61);
@@ -65,7 +69,10 @@ module.exports = { rawRequest, dechunk };
 
 if (require.main === module) {
   const { port, n, opts } = JSON.parse(process.argv[2]);
-  Promise.all(Array.from({ length: n }, () => rawRequest(port, opts))).then((all) => {
-    process.stdout.write(JSON.stringify(all));
+  const ticks = [Date.now()];
+  const tick = setInterval(() => ticks.push(Date.now()), 10);
+  Promise.all(Array.from({ length: n }, () => rawRequest(port, opts))).then((clients) => {
+    clearInterval(tick); ticks.push(Date.now());
+    process.stdout.write(JSON.stringify({ clients, ticks }));
   });
 }
