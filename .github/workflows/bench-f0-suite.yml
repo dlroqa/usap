@@ -20,7 +20,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        include:
+          - { shard: main-1, ref: f0004584195015bcb28fd64d4a3ebb93a75b9c92 }
+          - { shard: main-2, ref: f0004584195015bcb28fd64d4a3ebb93a75b9c92 }
+          - { shard: main-3, ref: f0004584195015bcb28fd64d4a3ebb93a75b9c92 }
+          - { shard: pr140-1, ref: 05c077ca405118662aa391bebf14bc99f03abe16 }
+          - { shard: pr140-2, ref: 05c077ca405118662aa391bebf14bc99f03abe16 }
+          - { shard: pr140-3, ref: 05c077ca405118662aa391bebf14bc99f03abe16 }
     defaults:
       run:
         shell: bash
@@ -32,7 +38,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: f0004584195015bcb28fd64d4a3ebb93a75b9c92
+          ref: ${{ matrix.ref }}
           path: target
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -45,7 +51,7 @@ jobs:
       - name: Full suite in a loop
         timeout-minutes: 85
         run: |
-          mkdir -p out; pass=0; fail=0
+          set +e; mkdir -p out; pass=0; fail=0
           for i in $(seq 1 12); do
             ( cd target && DIAGF0="$PWD/../out/diagf0.jsonl" perl -e 'alarm shift; exec @ARGV' 900 node --test --test-timeout=600000 "scripts/tests/*.test.cjs" > "../out/suite-$i.txt" 2>&1 ); rc=$?
             if [ $rc -eq 0 ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "suite $i FAILED (rc $rc)"; grep -E "^not ok|✖|AssertionError" "out/suite-$i.txt" | sort -u | head -8; fi
