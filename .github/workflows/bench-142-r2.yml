@@ -1,0 +1,63 @@
+# Issue #142 diagnostics. Bench branch only (bench/142-r2-diagnostics): never merged, never a required check.
+# macOS Intel (where R2 failed). Runs the R2 engine-slot test 30 times per job with an observation-only patch, on main
+# and on PR #141's head, without and with CPU load. Assertions are unchanged; nothing is pushed.
+name: bench-142-r2
+
+on:
+  push:
+    branches: [bench/142-r2-diagnostics]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  r2:
+    name: bench-142 (${{ matrix.name }}, load ${{ matrix.load }})
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: main-5a3af09, ref: 5a3af09a0ba4d017315ab3f7fa62f97510383558, load: none }
+          - { name: main-5a3af09, ref: 5a3af09a0ba4d017315ab3f7fa62f97510383558, load: cpu4 }
+          - { name: pr141-b3744dd, ref: b3744dd, load: none }
+          - { name: pr141-b3744dd, ref: b3744dd, load: cpu4 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: bench-src
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ matrix.ref }}
+          path: target
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.12.0"
+      - name: Runner facts
+        run: |
+          sysctl -n machdep.cpu.brand_string hw.ncpu; node -v; git -C target log --oneline -1
+      - name: Observation-only patch of R2 (assertions unchanged)
+        run: node bench-src/bench/142-r2/patch-r2.cjs target/scripts/tests/engine-slot.test.cjs
+      - name: Run R2 30 times
+        timeout-minutes: 45
+        run: |
+          if [ "${{ matrix.load }}" = cpu4 ]; then for k in 1 2 3 4; do ( timeout 2400 node -e "for(;;){}" & ); done; fi
+          bash bench-src/bench/142-r2/loop.sh 30
+          pkill -f "node -e for\(;;\)\{\}" || true
+      - name: Leftover engine processes at the end
+        if: always()
+        run: ps -axo pid=,ppid=,pgid=,etime=,args= | grep -E "usap-contract-|sd-server" | grep -v grep || echo none
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-142-${{ matrix.name }}-${{ matrix.load }}
+          path: out/
+          retention-days: 30
