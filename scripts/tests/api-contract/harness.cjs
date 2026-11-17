@@ -281,4 +281,12 @@ function installFakeSdServer(root) {
   return fake;
 }
 
-module.exports = { REPO, IS_WIN, makeRoot, startServer, stopServer, stopServerAndWait, removeTestRoot, processesUnder, request, shapeOf, checkShape, fakeLlamaPath, fakeSdPath, installFakeSdServer };
+// #142: the fake sd-server's own record of each start, listen result and exit (fake-sd-server.cjs), for failure messages.
+function fakeSdDiag(root) {
+  try {
+    return fs.readFileSync(path.join(path.dirname(fakeSdPath(root)), "fake-sd-diag.jsonl"), "utf8").split("\n").filter(Boolean)
+      .map((l) => { try { return JSON.parse(l); } catch (_) { return { unparsed: l }; } });
+  } catch (_) { return []; }
+}
+
+module.exports = { REPO, IS_WIN, makeRoot, startServer, stopServer, stopServerAndWait, removeTestRoot, processesUnder, request, shapeOf, checkShape, fakeLlamaPath, fakeSdPath, installFakeSdServer, fakeSdDiag };

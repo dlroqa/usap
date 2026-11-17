@@ -12,7 +12,9 @@ const path = require("node:path");
 const { EventEmitter } = require("node:events");
 const test = require("node:test");
 
-const { makeRoot, startServer, stopServer, request, installFakeSdServer, IS_WIN } = require("./api-contract/harness.cjs");
+const { makeRoot, startServer, stopServer, request, installFakeSdServer, fakeSdDiag, IS_WIN } = require("./api-contract/harness.cjs");
+// #142: the fake sd-server's last start / listen / exit records, appended to failure messages.
+const sdDiag = () => JSON.stringify(fakeSdDiag(root).slice(-12));
 const { engineSlotSetting, createEngineSlot, stopProcess } = require("../server/services/engine-slot.cjs");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -346,7 +348,7 @@ test("R2 (slot on): four image loads at once run one after another: never two im
     assert.ok(rs.filter((r) => r.status === 200).length >= 1);
     assert.equal(seen.maxImage, 1, `never two image processes alive (saw ${seen.maxImage})`);
     const live = await engines(srv);
-    assert.equal(live.length, 1);
+    assert.equal(live.length, 1, `one tracked image engine (#142: fake sd-server records ${sdDiag()}; backend ${JSON.stringify(await backendStatus(srv))})`);
     assert.equal((await backendStatus(srv)).running, true, "the live process is the tracked one");
     const st = await imageStop(srv);
     assert.equal(st.status, 200, st.text);
@@ -422,7 +424,7 @@ test("stop racing startup (slot on): at any offset the end state is consistent: 
       await sleep(300);
       const seen = await done();
       assert.ok(seen.maxImage <= 1, `offset ${offset}`);
-      assert.deepEqual(await engines(srv), [], `offset ${offset}: nothing left running`);
+      assert.deepEqual(await engines(srv), [], `offset ${offset}: nothing left running (#142: fake sd-server records ${sdDiag()})`);
       await waitIdle(srv, 5000);
     }
   });
