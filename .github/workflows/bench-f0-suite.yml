@@ -38,7 +38,7 @@ jobs:
         with:
           node-version: "22.12.0"
       - name: Install and build (as CI)
-        working-directory: target
+        working-directory: target/app/frontend
         run: npm ci --no-audit --no-fund && npm run build
       - name: Observation-only patch (assertions unchanged)
         run: node bench-src/bench/f0-epipe/patch.cjs target/scripts/tests/refusal-close.test.cjs target/scripts/tests/fixtures/refusal-clients.cjs
