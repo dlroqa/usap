@@ -325,6 +325,25 @@ error message.
 * assert that `/metrics` exposes `requests_processing`;
 * on mode, client cancel and short-limit timeout: `requests_processing` back to 0 and recorded as **confirmed**
   only because of that probe. A successful HTTP abort on its own is never counted as proof;
+* client cancel during prompt evaluation (#133). The studio's safety and the engine's speed are recorded separately:
+  * **Safety, failing on every platform:**
+    * the cancel is registered;
+    * CONFIRMING, then confirmed or UNRESPONSIVE;
+    * the engine is never reported idle while its counters still move;
+    * while UNRESPONSIVE, chats get `503 ENGINE_UNRESPONSIVE` with `Retry-After`;
+    * a chat sent while the cancel is unconfirmed is held at the gate: sent only after confirmation, or refused with
+      `503` if UNRESPONSIVE comes first (its own cancel scenario);
+    * recovery uses the same engine PID;
+    * no computation after the confirmation;
+    * the next chat works.
+  * **Engine responsiveness, `DIAG`:** recorded, never pass or fail. It covers the time from abort to the last
+    engine batch, the batches after the abort, and a comparison with a complete request of the same size.
+    llama-server (b11418) applies a cancel only between prompt batches. It checks for a closed client connection
+    only after a full second without any result for any task, so other requests to it at about 1 Hz can delay the
+    cancel until the prompt has been evaluated. That includes the studio's own confirmation probes, on any OS. The
+    Windows runner lost this race most often, at 3.8–60 s. The validator itself reads the engine only every 2 s.
+  * **The 20 s window:** confirmation within the validator's 20 s window stays a pass/fail check on Linux and macOS.
+    On Windows it is recorded as `DIAG` (met or not met, with the times);
 * **a suspended real engine**, found by the studio's own engine port (never by process name):
   * Linux and macOS: `SIGSTOP` mid-stream → idle timeout → CONFIRMING → UNRESPONSIVE (refusals) → `SIGCONT` →
     READY without a restart (same engine PID) → the next chat works.
