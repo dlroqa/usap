@@ -1,11 +1,11 @@
-# Issue #142 diagnostics. Bench branch only (bench/142-r2-diagnostics): never merged, never a required check.
-# macOS Intel (where R2 failed). Runs the R2 engine-slot test 30 times per job with an observation-only patch, on main
-# and on PR #141's head, without and with CPU load. Assertions are unchanged; nothing is pushed.
-name: bench-142-r2
+# Issue #142 round 3 (listen diagnostics). Bench branch only (bench/142-r3-listen-diag): never merged, never a required check.
+# macOS Intel (where R2 failed). Runs R2 60 times per job under CPU load with an observation-only patch and PR #144's
+# fake sd-server (start / listen / exit records, holders of a taken port), on main and on PR #141's head. Assertions are unchanged; nothing is pushed.
+name: bench-142-r3
 
 on:
   push:
-    branches: [bench/142-r2-diagnostics]
+    branches: [bench/142-r3-listen-diag]
   workflow_dispatch:
 
 permissions:
@@ -20,8 +20,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: main-5a3af09, ref: 5a3af09a0ba4d017315ab3f7fa62f97510383558, load: cpu4 }
-          - { name: pr141-b3744dd, ref: b3744dda756367bdd3d44a45ee40e11bd150c8b7, load: cpu4 }
+          - { name: main-d598f09, ref: d598f096d9a149de694dcc548b3e040778456c36, load: cpu4 }
+          - { name: pr141-e8158cf, ref: e8158cf3ceed4fd65090beb2dfd6a67532fea958, load: cpu4 }
     defaults:
       run:
         shell: bash
@@ -42,6 +42,13 @@ jobs:
       - name: Runner facts
         run: |
           sysctl -n machdep.cpu.brand_string hw.ncpu; node -v; git -C target log --oneline -1
+          sysctl net.inet.ip.portrange.first net.inet.ip.portrange.last net.inet.ip.portrange.hifirst net.inet.ip.portrange.hilast || true
+      - name: PR #144 fixture diagnostics (fake sd-server + harness reader; test files only)
+        run: |
+          git -C target fetch -q origin 63fbda564ce5fedaf109c286caf085a2500939fb 2>/dev/null || git -C target fetch -q origin test/fake-sd-listen-diagnostics-142
+          git -C target show 63fbda5:scripts/tests/api-contract/fake-sd-server.cjs > target/scripts/tests/api-contract/fake-sd-server.cjs
+          git -C target show 63fbda5:scripts/tests/api-contract/harness.cjs > target/scripts/tests/api-contract/harness.cjs
+          git -C target diff --stat
       - name: Observation-only patch of R2 (assertions unchanged)
         run: node bench-src/bench/142-r2/patch-r2.cjs target/scripts/tests/engine-slot.test.cjs
       - name: Run R2 30 times
@@ -56,6 +63,6 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: bench-142-${{ matrix.name }}-${{ matrix.load }}
+          name: bench-142-r3-${{ matrix.name }}-${{ matrix.load }}
           path: out/
           retention-days: 30

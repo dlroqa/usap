@@ -27,6 +27,7 @@ block = block.replace(
         const until = Date.now() + 10000;
         while (Date.now() < until) { await sleep(500); const x = await snap("after"); rec.snaps.push(x); if (x.engines.length === 1) break; }
       }
+      rec.fakeSd = require("./api-contract/harness.cjs").fakeSdDiag(root); // r3: every start / listen / exit record
       require("fs").appendFileSync(process.env.DIAG142 || "diag142.jsonl", JSON.stringify(rec) + "\\n");
     }
     assert.equal(live.length, 1);`);
