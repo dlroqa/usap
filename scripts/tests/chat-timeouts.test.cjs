@@ -17,7 +17,7 @@ const nodeTest = require("node:test");
 // Every test has a time limit, so a regression that leaves a request hanging fails instead of stalling the run.
 const test = (name, a, b) => (typeof a === "function" ? nodeTest(name, { timeout: 60000 }, a) : nodeTest(name, { timeout: 60000, ...a }, b));
 
-const { chatTimeoutSetting, createChatTimeouts, httpMetricsFetcher, parseMetrics, QUIESCE_GAP_MS } = require("../server/services/chat-timeouts.cjs");
+const { chatTimeoutSetting, createChatTimeouts, httpMetricsFetcher, parseMetrics, QUIESCE_GAP_MS, PROBE_INTERVAL_MS } = require("../server/services/chat-timeouts.cjs");
 const { createChatService } = require("../server/services/chat.cjs");
 const { createChatQueue } = require("../server/services/chat-queue.cjs");
 const { createScheduler } = require("../server/services/scheduler.cjs");
@@ -163,12 +163,12 @@ test("guard: an abort makes the engine CONFIRMING; two quiet readings >= 3 s apa
   T.afterConfirmation(() => { released++; });
   const waiter = T.admit(() => {});
   let admitted = null; waiter.then((r) => { admitted = r; });
-  await clock.advance(4000); // probes 1-3 busy, probe 4 quiet (first baseline)
+  await clock.advance(8000); // probes every 2 s (PROBE_INTERVAL_MS): 1-3 busy, probe 4 at 8 s quiet (first baseline)
   assert.equal(T.engineState(), "confirming", "one quiet reading is not enough");
   assert.equal(released, 0); assert.equal(admitted, null);
-  await clock.advance(2000); // probe 6 is only 2 s after the baseline
+  await clock.advance(2000); // probe 5 is only 2 s after the baseline
   assert.equal(T.engineState(), "confirming", "the second quiet reading must be >= 3 s after the first");
-  await clock.advance(1000);
+  await clock.advance(2000); // probe 6, 4 s after the baseline
   assert.equal(T.engineState(), "ready");
   assert.equal(released, 1, "the deferred queue release ran exactly once");
   assert.deepEqual(admitted, { ok: true });
@@ -202,11 +202,63 @@ test("guard: counters that move between quiet readings, a changed process start 
   }
 });
 
+// A llama.cpp-like engine (#133, llama-server b11418): a cancelled streaming client is noticed only after a full
+// second without any result for any task, and the cancel then takes effect at the next prompt batch boundary.
+// Each /metrics answer is such a result. Times are on the fake clock; the abort is at t0.
+function llamaLikeEngine(clock, { batchMs = 5000, batches = 6, silenceMs = 1000 } = {}) {
+  const e = { t0: clock.now(), lastResult: clock.now(), detectedAt: null, answers: [] };
+  e.observe = (t) => { // a /metrics answer at time t
+    if (e.detectedAt === null && t - e.lastResult > silenceMs) e.detectedAt = e.lastResult + silenceMs;
+    e.lastResult = t; e.answers.push(t);
+  };
+  e.stopAt = () => {
+    const end = e.t0 + batches * batchMs;
+    if (e.detectedAt === null) return end;
+    return Math.min(end, e.t0 + Math.max(1, Math.ceil((e.detectedAt - e.t0) / batchMs)) * batchMs);
+  };
+  e.reading = (t) => {
+    const stop = e.stopAt(), done = Math.floor((Math.min(t, stop) - e.t0) / batchMs);
+    return ok({ processing: t < stop ? 1 : 0, decodes: 100 + done, predicted: 50, prompt: 3 + done * 512 });
+  };
+  return e;
+}
+
+test("guard: confirmation probes leave llama-server a quiet second; a llama-like engine notices the cancel and stops at the next batch (1 s probing would starve it)", async () => {
+  assert.equal(PROBE_INTERVAL_MS, 2000);
+  for (const interval of [PROBE_INTERVAL_MS, 1000]) {
+    const clock = fakeClock();
+    const eng = { seq: 1, ready: true, port: 4242 };
+    const model = llamaLikeEngine(clock);
+    const metrics = scriptedMetrics(() => { const t = clock.now(); model.observe(t); return model.reading(t); });
+    const T = createChatTimeouts({ setting: chatTimeoutSetting({ env: { USAP_CHAT_TIMEOUTS: "on" } }), engine: () => eng, fetchMetrics: metrics.fetch, ...clock, log: () => {}, probeIntervalMs: interval });
+    T.noteAbort(1);
+    let readyAt = null, falseReady = null;
+    for (let i = 0; i < 90 && readyAt === null; i++) {
+      await clock.advance(1000);
+      if (T.engineState() === "ready") { readyAt = clock.now(); if (readyAt < model.stopAt()) falseReady = readyAt - model.t0; }
+    }
+    const gaps = model.answers.slice(1).map((t, i) => t - model.answers[i]);
+    assert.ok(readyAt !== null, `${interval} ms: confirmed eventually`);
+    assert.equal(falseReady, null, `${interval} ms: never ready while the engine still computes`);
+    assert.ok(readyAt >= model.stopAt(), `${interval} ms: confirmed only after the engine stopped`);
+    if (interval === PROBE_INTERVAL_MS) {
+      assert.ok(Math.min(...gaps) >= 1500, `probe answers at least 1.5 s apart (gaps ${gaps.join(", ")} ms)`);
+      assert.ok(model.detectedAt !== null && model.detectedAt - model.t0 <= 2000, `the engine noticed the cancel within 2 s (${model.detectedAt - model.t0} ms)`);
+      assert.equal(model.stopAt() - model.t0, 5000, "and stopped at the next batch boundary");
+    } else {
+      // Negative control: 1 s probing never leaves the engine a quiet second, so it computes the whole prompt.
+      assert.equal(model.detectedAt, null, "1 s probing: the engine never noticed the cancel");
+      assert.equal(model.stopAt() - model.t0, 30000, "1 s probing: the whole prompt was evaluated");
+    }
+    T.close();
+  }
+});
+
 test("guard: a reading from a probe sent before the latest abort is stale and rejected", async () => {
   // Probe 1 is held; a second abort happens; probe 1 then answers quiet. It must not count.
   const { T, clock, metrics } = guardWith({ next: (n) => (n === 1 ? "manual" : ok({ processing: 1 })) });
   T.noteAbort(1);
-  await clock.advance(1000); // probe 1 sent, pending
+  await clock.advance(2000); // probe 1 sent (after PROBE_INTERVAL_MS), pending
   assert.equal(metrics.handles.length, 1);
   await clock.advance(500);
   T.noteAbort(1); // e.g. a second request's abort on the same engine
@@ -222,7 +274,7 @@ test("guard: an engine reload (new process) ends CONFIRMING; a late answer about
   const eng = { seq: 1, ready: true, port: 4242 };
   const { T, clock, metrics } = guardWith({ engine: eng, next: () => "manual" });
   T.noteAbort(1);
-  await clock.advance(1000); // probe to engine 1 pending
+  await clock.advance(2000); // probe to engine 1 pending
   const old = metrics.handles[0];
   eng.seq = 2; eng.port = 4343; // a model reload: the old process exited, a new one is ready
   assert.equal(T.engineState(), "ready", "new engine process: the uncertain work died with the old one");
@@ -246,7 +298,7 @@ test("guard: UNRESPONSIVE refuses at once with 503 + Retry-After; recovers only 
   let released = 0;
   T.afterConfirmation(() => { released++; });
   const waiting = T.admit(() => {});
-  await clock.advance(121000);
+  await clock.advance(127000); // hung probes: one per 2 s + 5 s limit; the window is checked after each (126 s)
   assert.equal(T.engineState(), "unresponsive");
   assert.deepEqual(await waiting, { ok: false, status: 503, code: "ENGINE_UNRESPONSIVE", retryAfterSeconds: 30, error: (await waiting).error });
   assert.equal(released, 1, "the queue slot is released on entering UNRESPONSIVE (the gate keeps refusing)");
@@ -263,7 +315,7 @@ test("guard: UNRESPONSIVE refuses at once with 503 + Retry-After; recovers only 
   // Again, but recovery through a new engine process.
   quiet = false;
   T.noteAbort(1);
-  await clock.advance(126000);
+  await clock.advance(127000);
   assert.equal(T.engineState(), "unresponsive");
   eng.ready = false; // the user stops the model
   assert.equal(T.engineState(), "unresponsive");
@@ -522,7 +574,7 @@ test("stream, on: a client that disconnects before the first byte, or mid-stream
       const s = r.T.snapshot();
       assert.equal(s.counts.clientCancelled, 1, when);
       assert.equal(s.engine, "confirming", when);
-      await r.clock.advance(5000);
+      await r.clock.advance(7000); // quiet probes at 2, 4, 6 s: two readings >= 3 s apart
       assert.equal(r.T.engineState(), "ready", `${when}: confirmed by /metrics (no request open, counters still)`);
     } finally { await r.done(); }
   }
@@ -549,7 +601,7 @@ test("non-stream, on: a client disconnect aborts the engine request (new in on m
   c.abort();
   await waitFor(() => e.closed, 3000, "engine request destroyed");
   assert.equal(r.T.snapshot().counts.clientCancelled, 1);
-  await r.clock.advance(5000);
+  await r.clock.advance(7000); // quiet probes at 2, 4, 6 s: two readings >= 3 s apart
   assert.equal(r.T.engineState(), "ready");
   const c2 = r.send("again", { stream: false });
   const e2 = await r.engine.next();
@@ -659,7 +711,7 @@ test("queue off, on: while the engine is still computing after an abort, a new c
   assert.equal(r.engine.requests.length, 1, "b was not sent while the engine was busy");
   assert.equal(b.status, null);
   r.engine.busy = 0;
-  await r.clock.advance(5_000);
+  await r.clock.advance(7_000); // quiet probes every 2 s: confirmed at the third
   const eb = await r.engine.next();
   assert.equal(r.T.engineState(), "ready");
   eb.res.writeHead(200, SSE); eb.res.end(chunk("b") + DONE);
@@ -684,7 +736,7 @@ test("queue on, on: the slot stays owned until confirmation; three waiting chats
   r.engine.busy = 0;
   const order = [];
   for (let i = 0; i < 3; i++) {
-    await r.clock.advance(i === 0 ? 5_000 : 0);
+    await r.clock.advance(i === 0 ? 7_000 : 0);
     const e = await r.engine.next();
     order.push(e.body.messages.at(-1).content);
     e.res.writeHead(200, SSE); e.res.end(chunk("ok") + DONE);
