@@ -5,7 +5,7 @@ set -u
 N="${1:-30}"; OUT="$PWD/out"; mkdir -p "$OUT"
 pass=0; fail=0
 for i in $(seq 1 "$N"); do
-  ( cd target && DIAG142="$OUT/diag142.jsonl" timeout 180 node --test --test-timeout=600000 --test-name-pattern="^R2 \(slot on\)" scripts/tests/engine-slot.test.cjs > "$OUT/run-$i.txt" 2>&1 )
+  ( cd target && DIAG142="$OUT/diag142.jsonl" perl -e 'alarm shift; exec @ARGV' 180 node --test --test-timeout=600000 --test-name-pattern="^R2 \(slot on\)" scripts/tests/engine-slot.test.cjs > "$OUT/run-$i.txt" 2>&1 )
   if grep -q "^# fail 0" "$OUT/run-$i.txt"; then pass=$((pass+1)); else fail=$((fail+1)); echo "run $i FAILED"; fi
   sleep 1
   left=$(ps -axo pid=,ppid=,pgid=,etime=,args= | grep "usap-contract-" | grep "sd-server" | grep -v grep || true)

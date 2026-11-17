@@ -22,8 +22,8 @@ jobs:
         include:
           - { name: main-5a3af09, ref: 5a3af09a0ba4d017315ab3f7fa62f97510383558, load: none }
           - { name: main-5a3af09, ref: 5a3af09a0ba4d017315ab3f7fa62f97510383558, load: cpu4 }
-          - { name: pr141-b3744dd, ref: b3744dd, load: none }
-          - { name: pr141-b3744dd, ref: b3744dd, load: cpu4 }
+          - { name: pr141-b3744dd, ref: b3744dda756367bdd3d44a45ee40e11bd150c8b7, load: none }
+          - { name: pr141-b3744dd, ref: b3744dda756367bdd3d44a45ee40e11bd150c8b7, load: cpu4 }
     defaults:
       run:
         shell: bash
@@ -49,9 +49,9 @@ jobs:
       - name: Run R2 30 times
         timeout-minutes: 45
         run: |
-          if [ "${{ matrix.load }}" = cpu4 ]; then for k in 1 2 3 4; do ( timeout 2400 node -e "for(;;){}" & ); done; fi
+          if [ "${{ matrix.load }}" = cpu4 ]; then for k in 1 2 3 4; do ( node -e "const end = Date.now() + 2400000; while (Date.now() < end) {}" & ); done; fi
           bash bench-src/bench/142-r2/loop.sh 30
-          pkill -f "node -e for\(;;\)\{\}" || true
+          pkill -f "while \(Date.now\(\) < end\)" || true
       - name: Leftover engine processes at the end
         if: always()
         run: ps -axo pid=,ppid=,pgid=,etime=,args= | grep -E "usap-contract-|sd-server" | grep -v grep || echo none
