@@ -6,6 +6,7 @@ name: bench-f0-epipe
 on:
   push:
     branches: [bench/f0-epipe-diagnostics]
+    paths: [bench/f0-epipe/patch.cjs, bench/f0-epipe/loop.sh, .github/workflows/bench-f0-epipe.yml]
   workflow_dispatch:
 
 permissions:

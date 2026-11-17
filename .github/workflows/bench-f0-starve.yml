@@ -1,0 +1,40 @@
+# Bench branch only (bench/f0-epipe-diagnostics): never merged, never a required check. Does a refused, still-sending
+# client lose the answer when its own event loop is blocked longer than the 2 s grace period? Four OS, main f000458.
+name: bench-f0-starve
+
+on:
+  push:
+    branches: [bench/f0-epipe-diagnostics]
+    paths: [bench/f0-epipe/starve.cjs, .github/workflows/bench-f0-starve.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  starve:
+    name: bench-f0-starve (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15-intel, macos-15, ubuntu-24.04, windows-2025]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: bench-src
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: f0004584195015bcb28fd64d4a3ebb93a75b9c92
+          path: target
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.12.0"
+      - name: Blocked-client probe
+        run: node bench-src/bench/f0-epipe/starve.cjs "$PWD/target"
