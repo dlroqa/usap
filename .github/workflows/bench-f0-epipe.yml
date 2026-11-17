@@ -1,0 +1,58 @@
+# F0 20-client EPIPE diagnostics. Bench branch only (bench/f0-epipe-diagnostics): never merged, never a required check.
+# macOS Intel (where it failed on PR #140, run 44077658546). Runs the 20-client refusal test 60 times per job with an observation-only patch, on main
+# without and with CPU load. Assertions are unchanged; nothing is pushed.
+name: bench-f0-epipe
+
+on:
+  push:
+    branches: [bench/f0-epipe-diagnostics]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  f0:
+    name: bench-f0 (${{ matrix.name }}, load ${{ matrix.load }})
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: main-f000458, ref: f0004584195015bcb28fd64d4a3ebb93a75b9c92, load: none }
+          - { name: main-f000458, ref: f0004584195015bcb28fd64d4a3ebb93a75b9c92, load: cpu4 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: bench-src
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ matrix.ref }}
+          path: target
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.12.0"
+      - name: Runner facts
+        run: |
+          sysctl -n machdep.cpu.brand_string hw.ncpu; node -v; git -C target log --oneline -1
+      - name: Observation-only patch (assertions unchanged)
+        run: node bench-src/bench/f0-epipe/patch.cjs target/scripts/tests/refusal-close.test.cjs target/scripts/tests/fixtures/refusal-clients.cjs
+      - name: Run the 20-client test 60 times
+        timeout-minutes: 50
+        run: |
+          if [ "${{ matrix.load }}" = cpu4 ]; then for k in 1 2 3 4; do ( node -e "const end = Date.now() + 3000000; while (Date.now() < end) {}" & ); done; fi
+          bash bench-src/bench/f0-epipe/loop.sh 60
+          pkill -f "while \(Date.now\(\) < end\)" || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-f0-${{ matrix.name }}-${{ matrix.load }}
+          path: out/
+          retention-days: 30
