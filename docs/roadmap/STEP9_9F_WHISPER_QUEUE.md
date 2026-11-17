@@ -379,6 +379,8 @@ queue off. The 1 GiB per-upload ceiling is fixed.
     `connectionsRefused`.
   * Off by default with the queue; `USAP_SCHEDULER=off` turns it off.
   * The queue's own early answers keep their bounded handling described above.
+  * Tests: two deterministic server tests judged from server-side events (`connection-log-preload.cjs`) and six
+    native rows in `transcription-queue-validate.cjs` (default limit, real whisper-cli, all four OS).
 
 ### 13.3 Tests
 **Deterministic:** `scripts/tests/transcription-queue.test.cjs`, 31 tests, on all four OS in `ci`.

@@ -9,6 +9,11 @@
 //     disconnect never reaching whisper-cli; a running disconnect not stopping it; /api/speech/stop refusing waiting
 //     jobs; server memory while 4 x 64 MB uploads wait; the logical-CPU cap; nothing left behind (folder, booked
 //     storage, whisper-cli processes).
+//   * Upload connection gate (#131, queue on, default limit 4 -> gate 6): a burst of 12 while a job runs admits exactly
+//     5 more (running + waiting + uploading + draining = 6) and refuses 7 at once with the gate's 429; the open count
+//     never exceeds 6; disconnects, completions, early refusals and a shutdown release every place exactly once (never
+//     negative, nothing stale after a restart); refused requests never reach whisper-cli. Off by default and with
+//     USAP_SCHEDULER=off: no gate (8 open uploads, none refused).
 //
 //   node scripts/ci/transcription-queue-validate.cjs --model ggml-tiny.en.bin --wav .ci-model-cache/jfk.wav \
 //     --results ci-logs/transcription-queue-results.jsonl --logs ci-logs
@@ -173,6 +178,18 @@ const threadsOf = (line) => { const m = / -t (\d+)/.exec(line); return m ? Numbe
 async function scenario(name, fn) { try { await fn(); } catch (err) { record(name, "FAIL", err.message); } }
 const resources = async () => (await get("/api/resources")).json || {};
 const queue = async () => ((await resources()).engines || {}).speech?.queue || {};
+// #131 gate: the server's own counters (uploadConnections { open, limit } and counts.connectionsRefused).
+const GATE_TEXT = /Too many audio uploads are in progress/;
+const gate = async () => { const t = (await resources()).transcriptionQueue || {}; return { open: t.uploadConnections?.open, limit: t.uploadConnections?.limit, refused: t.counts?.connectionsRefused }; };
+// Uploads that declare `claim` bytes, send 64 KiB and then stay silent (bounded by the queue's 30 s inactivity limit).
+const openUploads = (body, n, tag) => Array.from({ length: n }, (_, i) => transcribeCtl(body, `&save=false&filename=${tag}${i}.wav`, { stopAfterBytes: 64 * 1024, timeoutMs: 60000 }));
+// Samples the open count every 50 ms while `p` is pending: { max, min } (a stale or negative count shows here).
+async function sampleOpen(p, ms = 3000) {
+  let max = -Infinity, min = Infinity, done = false; p.then(() => { done = true; }, () => { done = true; });
+  const end = Date.now() + ms;
+  while (!done && Date.now() < end) { const g = await gate(); if (typeof g.open === "number") { max = Math.max(max, g.open); min = Math.min(min, g.open); } await sleep(50); }
+  return { max, min };
+}
 
 (async () => {
   if (!fs.existsSync(path.join(APP, "speech-models", MODEL)) || !fs.existsSync(WAV)) {
@@ -183,6 +200,7 @@ const queue = async () => ((await resources()).engines || {}).speech?.queue || {
   const { fmt, data } = wavParts(sample);
   const long = makeWav(fmt, Buffer.concat(Array(20).fill(data))); // about 3.7 minutes of audio: holds the engine
   const big = makeWav(fmt, Buffer.alloc(64 * MiB));               // never transcribed (disconnected while waiting)
+  const gateBody = makeWav(fmt, Buffer.alloc(2 * MiB));           // #131: declared 2 MiB, only 64 KiB sent
   let single = null;
 
   // ── Baseline ──
@@ -212,6 +230,15 @@ const queue = async () => ((await resources()).engines || {}).speech?.queue || {
       await transcribe(sample, "&save=false&filename=d.wav");
       record("Default: transcriptionQueue off", !("transcriptionQueue" in r) && !("transcriptionQueue" in (r.limits || {})) && !fs.existsSync(UPLOAD_DIR) ? "PASS" : "FAIL",
         `limits ${JSON.stringify(r.limits)}; upload folder exists ${fs.existsSync(UPLOAD_DIR)}`);
+      await scenario("Gate: off by default (8 open uploads, none refused)", async () => {
+        const ups = openUploads(gateBody, 8, "dg");
+        await sleep(2000);
+        for (const u of ups) u.abort();
+        const rs = await Promise.all(ups.map((u) => u.promise));
+        const g = await resources();
+        record("Gate: off by default (8 open uploads, none refused)", rs.every((x) => x.status !== 429) && !("transcriptionQueue" in g) ? "PASS" : "FAIL",
+          `statuses ${rs.map((x) => x.status).join("/")} (0 = still uploading when the client left); report keys ${"transcriptionQueue" in g}`);
+      });
     } finally { await stopServer(srv); }
   } catch (err) { record("Default: transcriptionQueue off", "FAIL", err.message); }
   try {
@@ -220,6 +247,13 @@ const queue = async () => ((await resources()).engines || {}).speech?.queue || {
       const rs = await Promise.all(Array.from({ length: 6 }, (_, i) => transcribe(sample, `&save=false&filename=s${i}.wav`)));
       const r = await resources();
       record("Rollback: USAP_SCHEDULER=off", rs.every((x) => x.status === 200) && !("transcriptionQueue" in r) ? "PASS" : "FAIL", `6 concurrent -> ${rs.map((x) => x.status).join("/")} (legacy: no 429); report keys ${"transcriptionQueue" in r}`);
+      await scenario("Gate: USAP_SCHEDULER=off removes it (8 open uploads, none refused)", async () => {
+        const ups = openUploads(gateBody, 8, "rg");
+        await sleep(2000);
+        for (const u of ups) u.abort();
+        const us = await Promise.all(ups.map((u) => u.promise));
+        record("Gate: USAP_SCHEDULER=off removes it (8 open uploads, none refused)", us.every((x) => x.status !== 429) ? "PASS" : "FAIL", `statuses ${us.map((x) => x.status).join("/")}`);
+      });
     } finally { await stopServer(srv); }
   } catch (err) { record("Rollback: USAP_SCHEDULER=off", "FAIL", err.message); }
 
@@ -306,6 +340,52 @@ const queue = async () => ((await resources()).engines || {}).speech?.queue || {
       const t = threadsOf(line);
       record("Queue: logical-CPU cap still applies", r.status === 200 && t !== null && t >= 1 && t <= os.cpus().length ? "PASS" : "FAIL", `requested 999 -> -t ${t} (logical CPUs ${os.cpus().length})`);
     });
+    await scenario("Gate: at most 6 upload connections at the default limit; a burst is admitted atomically", async () => {
+      const startsBefore = starts(srv).length;
+      const g0 = await gate();
+      const held = (await holdEngine(srv, "hold-gate")).done;
+      // 12 at once while one job runs: 5 more fit (4 waiting/uploading + 1 refused by the full queue and drained), 7 don't.
+      const ups = openUploads(gateBody, 12, "g");
+      const answered = [];
+      for (const u of ups) u.promise.then((r) => answered.push(r));
+      const sampled = sampleOpen(Promise.all(ups.map((u) => u.promise)), 4000);
+      const settled = await waitUntil(async () => { const g = await gate(); return g.open === 6 && g.refused - g0.refused === 7; }, 20000, 100);
+      const { max } = await sampled; // the admitted ones are still open, so this samples the full 4 s
+      await waitUntil(() => answered.length >= 7, 10000, 100);
+      const gateRefusals = answered.filter((r) => r.status === 429 && r.json && GATE_TEXT.test(r.json.error || "") && Number(r.headers["retry-after"]) === 5);
+      const g1 = await gate();
+      record("Gate: at most 6 upload connections at the default limit; a burst is admitted atomically",
+        settled && g1.limit === 6 && max <= 6 && g1.refused - g0.refused === 7 && gateRefusals.length === 7 ? "PASS" : "FAIL",
+        `limit ${g1.limit}; reached exactly 6 open with 7 refused ${Boolean(settled)}; max sampled ${max}; open now ${g1.open} (the held job or the queue-refused client may have ended); refused by the gate ${g1.refused - g0.refused} (server) / ${gateRefusals.length} gate answers seen; answered while the admitted stay open ${answered.map((r) => r.status).join("/")}`);
+      // Release: the admitted clients leave (uploading, waiting and the drained early refusal alike), then the job ends.
+      for (const u of ups) u.abort();
+      await Promise.all(ups.map((u) => u.promise));
+      // At most the held job remains (it may already have ended on a fast runner).
+      const afterLeave = await waitUntil(async () => (await gate()).open === (await queue()).running, 20000, 100);
+      const h = await held;
+      const zero = await waitUntil(async () => (await gate()).open === 0, 20000, 100);
+      await sleep(1000);
+      const ran = starts(srv).length - startsBefore;
+      const g2 = await gate();
+      record("Gate: disconnects and completion release every place exactly once; refused requests never reach whisper-cli",
+        Boolean(afterLeave) && Boolean(zero) && g2.open === 0 && h.status === 200 && ran === 1 ? "PASS" : "FAIL",
+        `open after the 12 left = running jobs ${Boolean(afterLeave)}; after the job ${g2.open}; held job ${h.status}; whisper-cli runs ${ran} (1 = only the held job)`);
+    });
+    await scenario("Gate: early refusals and normal completions release exactly once (never negative)", async () => {
+      const checks = [];
+      const watch = { stop: false, min: Infinity };
+      const watcher = (async () => { while (!watch.stop) { const g = await gate(); if (typeof g.open === "number") watch.min = Math.min(watch.min, g.open); await sleep(50); } })();
+      const r413 = await transcribe(sample, "&save=false&filename=gate413.wav", { claim: 2 * 1024 * MiB, stopAfterBytes: 4096, timeoutMs: 30000 });
+      checks.push(["413", r413.status, await waitUntil(async () => (await gate()).open === 0, 10000, 100)]);
+      for (let i = 0; i < 3; i += 1) {
+        const r = await transcribe(sample, `&save=false&filename=gate-ok${i}.wav`);
+        checks.push([`job ${i}`, r.status, await waitUntil(async () => (await gate()).open === 0, 10000, 100)]);
+      }
+      watch.stop = true; await watcher;
+      record("Gate: early refusals and normal completions release exactly once (never negative)",
+        checks[0][1] === 413 && checks.slice(1).every((c) => c[1] === 200) && checks.every((c) => c[2]) && watch.min >= 0 ? "PASS" : "FAIL",
+        `${checks.map((c) => `${c[0]} ${c[1]} -> open 0 ${Boolean(c[2])}`).join("; ")}; lowest open seen ${watch.min}`);
+    });
     await scenario("Queue: nothing left behind", async () => {
       await waitUntil(async () => (await whispers()).length === 0, 60000, 250);
       const q = await resources();
@@ -316,6 +396,28 @@ const queue = async () => ((await resources()).engines || {}).speech?.queue || {
     });
   } catch (err) { record("Queue on", "FAIL", err.message); }
   finally { await stopServer(srv); }
+
+  // #131: a shutdown with places taken leaves nothing stale: the next server starts at 0 with no files.
+  try {
+    let sd = await startServer("gate-shutdown", { USAP_TRANSCRIPTION_QUEUE: "on" });
+    let ups = [];
+    try {
+      await holdEngine(sd, "hold-sd");
+      ups = openUploads(gateBody, 3, "sd");
+      await waitUntil(async () => (await gate()).open === 4, 20000, 100);
+      const before = await gate();
+      await stopServer(sd);
+      for (const u of ups) u.abort();
+      await Promise.all(ups.map((u) => u.promise));
+      const code = (await sd.exited);
+      sd = await startServer("gate-restart", { USAP_TRANSCRIPTION_QUEUE: "on" });
+      const after = await gate();
+      const files = fs.existsSync(UPLOAD_DIR) ? fs.readdirSync(UPLOAD_DIR).length : 0;
+      const live = (await whispers()).length;
+      record("Gate: a shutdown with places taken leaves nothing stale", before.open === 4 && after.open === 0 && after.refused === 0 && files === 0 && live === 0 ? "PASS" : "FAIL",
+        `open before shutdown ${before.open}; exit ${JSON.stringify(code)}; after restart open ${after.open}, refused ${after.refused}; files ${files}; whisper-cli alive ${live}`);
+    } finally { for (const u of ups) u.abort(); await stopServer(sd); }
+  } catch (err) { record("Gate: a shutdown with places taken leaves nothing stale", "FAIL", err.message); }
 
   try {
     const srv = await startServer("budget", { USAP_TRANSCRIPTION_QUEUE: "on", USAP_TRANSCRIPTION_QUEUE_STORAGE_BUDGET_BYTES: String(64 * MiB) });
