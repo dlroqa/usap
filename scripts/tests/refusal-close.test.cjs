@@ -19,6 +19,8 @@ const { createRequestPolicy } = require("../server/request-policy.cjs");
 const { createLanAuth, MAX_FAILURES } = require("../server/lan-auth.cjs");
 const { closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, lingeringCount } = require("../server/http/refusal-close.cjs");
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
+const { rawRequest } = require("./fixtures/refusal-clients.cjs");
+const { execFile } = require("node:child_process");
 
 const MiB = 1024 * 1024;
 const CHUNK = Buffer.alloc(64 * 1024, 0x61);
@@ -28,60 +30,6 @@ const READ_BOUND = 16 * MiB; // what a refused connection may read at most (kern
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // A refused socket stops reading, so it may not see the client's own close: it ends when its grace period does.
 async function noneLingering() { const end = Date.now() + GRACE_MS + SLACK_MS; while (lingeringCount() > 0 && Date.now() < end) await sleep(50); return lingeringCount(); }
-
-function dechunk(raw) { // decode a chunked body (complete chunks only)
-  let out = "", i = 0;
-  for (;;) {
-    const j = raw.indexOf("\r\n", i); if (j < 0) break;
-    const n = parseInt(raw.slice(i, j), 16); if (!Number.isFinite(n) || n === 0) break;
-    out += raw.slice(j + 2, j + 2 + n); i = j + 2 + n + 2;
-    if (i > raw.length) break;
-  }
-  return out;
-}
-
-// ── a raw HTTP client that keeps sending ─────────────────────────────────────────────────────────────────────────
-// mode: "stream" (chunked, as fast as allowed), "silent" (headers only, large Content-Length), "drip" (1 KiB every
-// 200 ms), "small" (complete 2 KiB body), "pipelined" (finished chunked body, then a second request).
-function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mode = "stream", capBytes = 32 * MiB, maxMs = 8000, contentType = "application/json", second = "" } = {}) {
-  return new Promise((resolve) => {
-    const s = net.connect(port, "127.0.0.1");
-    const st = { status: null, head: "", body: "", sent: 0, closedAt: null, answeredAt: null, error: null, t0: Date.now(), connectionHeader: null };
-    let buf = Buffer.alloc(0), stopped = false, timer = null;
-    const parse = () => {
-      const text = buf.toString("latin1"); const i = text.indexOf("\r\n\r\n");
-      if (i < 0) return;
-      st.head = text.slice(0, i); const m = st.head.match(/^HTTP\/1\.1 (\d{3})/); if (m && st.status === null) { st.status = Number(m[1]); st.answeredAt = Date.now() - st.t0; }
-      const c = st.head.match(/\r\nconnection: ([^\r]+)/i); st.connectionHeader = c ? c[1].toLowerCase() : null;
-      const raw = text.slice(i + 4);
-      st.body = /\r\ntransfer-encoding: chunked/i.test(st.head) ? dechunk(raw) : raw;
-    };
-    s.on("data", (d) => { buf = Buffer.concat([buf, d]); parse(); });
-    s.on("error", (e) => { st.error = e.code || e.message; });
-    s.on("close", () => { st.closedAt = Date.now() - st.t0; stopped = true; clearTimeout(timer); resolve(st); });
-    const end = setTimeout(() => { stopped = true; st.clientGaveUp = true; s.destroy(); }, maxMs);
-    s.on("close", () => clearTimeout(end));
-    s.on("connect", () => {
-      const host = /\bHost:/i.test(headers) ? "" : "Host: 127.0.0.1\r\n";
-      if (mode === "small") {
-        const body = Buffer.alloc(2048, 0x61);
-        s.write(`${method} ${url} HTTP/1.1\r\n${host}${headers}Content-Type: ${contentType}\r\nContent-Length: ${body.length}\r\n\r\n`); s.write(body); st.sent = body.length;
-        return;
-      }
-      if (mode === "small-stalled") { // declares a small body, sends only part of it, then nothing
-        s.write(`${method} ${url} HTTP/1.1\r\n${host}${headers}Content-Type: ${contentType}\r\nContent-Length: 2048\r\n\r\n`); s.write(Buffer.alloc(100, 0x61)); st.sent = 100;
-        return;
-      }
-      if (mode === "silent") { s.write(`${method} ${url} HTTP/1.1\r\n${host}${headers}Content-Type: ${contentType}\r\nContent-Length: ${10 * MiB}\r\n\r\n`); return; }
-      s.write(`${method} ${url} HTTP/1.1\r\n${host}${headers}Content-Type: ${contentType}\r\nTransfer-Encoding: chunked\r\n\r\n`);
-      const send = (b) => { const ok = s.write(b.length.toString(16) + "\r\n"); s.write(b); s.write("\r\n"); st.sent += b.length; return ok; };
-      if (mode === "pipelined") { send(Buffer.from("{}")); s.write("0\r\n\r\n"); s.write(second); return; }
-      if (mode === "drip") { const tick = () => { if (stopped || s.destroyed) return; send(CHUNK.subarray(0, 1024)); timer = setTimeout(tick, 200); }; tick(); return; }
-      const pump = () => { while (!stopped && !s.destroyed && st.sent < capBytes) { if (!send(CHUNK)) { s.once("drain", pump); return; } } };
-      pump();
-    });
-  });
-}
 
 // ── in-process server: real pipeline, request policy and sign-in ─────────────────────────────────────────────────
 async function startPipelineServer({ auth = "" } = {}) {
@@ -295,9 +243,16 @@ test("refusal: 20 concurrent refused clients that keep sending all get the answe
   process.on("uncaughtException", onErr);
   try {
     const t0 = Date.now();
-    // 8 MiB per client: more than a loopback receive buffer, so every client is still sending when refused; the
-    // clients run in this process next to the server, so a larger cap only adds event-loop load on slow runners
-    const all = await Promise.all(Array.from({ length: 20 }, () => rawRequest(srv.port, { headers: "Origin: http://evil.example\r\n", capBytes: 8 * MiB, maxMs: GRACE_MS + 10000 })));
+    // 8 MiB per client: more than a loopback receive buffer, so every client is still sending when refused. The 20
+    // clients run in a separate process: writing as fast as they can, they would otherwise share this event loop with
+    // the server and delay its answers on a slow runner (seen on macOS Intel CI), which would measure the test, not
+    // the server.
+    const opts = { headers: "Origin: http://evil.example\r\n", capBytes: 8 * MiB, maxMs: GRACE_MS + 10000 };
+    const all = await new Promise((resolve, reject) => {
+      execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify({ port: srv.port, n: 20, opts })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
+        (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
+    });
+    assert.equal(all.length, 20);
     all.forEach((st, i) => assertClosedRefusal(st, 403, `client ${i}`));
     const read = srv.readTotal();
     assert.ok(read <= 20 * READ_BOUND, `server read ${read} bytes for 20 refused clients`);
