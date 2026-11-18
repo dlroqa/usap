@@ -5,8 +5,8 @@
 // client keeps sending. Only Node's request timeout (300 s) would end it. For such requests this helper:
 //
 //   1. adds `Connection: close` to the answer, so the client knows the connection ends after it;
-//   2. once the answer is written, stops reading the socket and half-closes it (FIN), so the client still receives
-//      the complete answer while it is sending;
+//   2. once the answer is written, stops reading the socket (and keeps it stopped: see linger) and half-closes it
+//      (FIN), so the client still receives the complete answer while it is sending;
 //   3. destroys the socket after a short grace period (GRACE_MS), so a client that keeps the connection open
 //      (silent, slow, or still sending) can't hold it.
 //
@@ -45,7 +45,12 @@ function linger(socket, graceMs, setTimer, clearTimer) {
   socket.on("error", noop); // a reset from the client during the grace period is expected
   let timer = null;
   socket.once("close", () => { if (timer) clearTimer(timer); lingering -= 1; });
-  socket.pause();           // read nothing more
+  // Read nothing more. pause() alone is not enough: when the answer finishes, Node puts the unread body in discard
+  // mode (req._dump), and on the next tick its request stream calls socket.resume() unless socket._paused is set
+  // (node:_http_incoming readStart). Without the flag the socket would go on reading and discarding the client's body
+  // until the grace period ends. scripts/tests/refusal-close.test.cjs checks this Node behaviour.
+  socket._paused = true;
+  socket.pause();
   socket.end();             // FIN after the answer already queued
   timer = setTimer(() => socket.destroy(), graceMs);
 }
