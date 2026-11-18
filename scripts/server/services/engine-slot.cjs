@@ -48,6 +48,35 @@ function defaultIsAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (err) { return err && err.code === "EPERM"; }
 }
 
+// The engine guard's own grace (engine-guard.cjs): after SIGTERM it stops its engine politely, then by force after this.
+const GUARD_GRACE_MS = Math.max(100, Number(process.env.USAP_ENGINE_STOP_GRACE_MS) || 3000);
+
+/**
+ * An engine whose guard is gone but which is still running (#136) is stopped through the guard's process group
+ * (POSIX). The guard starts in its own group (supervisor.cjs, detached) and the engine inherits it. A process group ID
+ * is not reused while the group exists, and the engine must still be in that group, so nothing else is signalled.
+ * Windows: the guard stops engines with `taskkill /T`, and this case doesn't arise; nothing is done.
+ * Resolves true when the engine's group was signalled.
+ */
+function processGroupOf(pid) {
+  if (process.platform === "linux") {
+    try { const st = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); return Number(st.slice(st.lastIndexOf(")") + 2).split(" ")[2]); } catch (_) { return null; }
+  }
+  try {
+    const out = require("node:child_process").execFileSync("ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const n = Number(out.trim()); return Number.isInteger(n) && n > 0 ? n : null;
+  } catch (_) { return null; }
+}
+async function defaultReapOrphan({ guardPid, enginePid, isAlive, graceMs = GUARD_GRACE_MS }) {
+  if (process.platform === "win32" || !Number.isInteger(guardPid) || guardPid <= 1 || !isAlive(enginePid)) return false;
+  if (processGroupOf(enginePid) !== guardPid) return false; // not (or no longer) the engine this guard started
+  try { process.kill(-guardPid, "SIGTERM"); } catch (_) { return false; }
+  const end = Date.now() + graceMs;
+  while (Date.now() < end && isAlive(enginePid)) await new Promise((r) => setTimeout(r, 50));
+  if (isAlive(enginePid) && processGroupOf(enginePid) === guardPid) { try { process.kill(-guardPid, "SIGKILL"); } catch (_) { /* gone */ } }
+  return true;
+}
+
 function hasExited(proc) {
   return Boolean(proc) && (proc.exitCode !== null && proc.exitCode !== undefined || proc.signalCode !== null && proc.signalCode !== undefined);
 }
@@ -55,8 +84,10 @@ function hasExited(proc) {
 /**
  * Stop one process and wait for its exit: SIGTERM, wait, SIGKILL, wait. Resolves { exited } and never throws.
  * `exited: false` means no exit was seen after SIGKILL; the caller must report it, not treat the engine as stopped.
+ * The first wait is longer than the engine guard's own grace (#136), so a guarded engine that is slow to stop is
+ * stopped by its guard (politely, then by force) before the server forces anything.
  */
-async function stopProcess(proc, { termWaitMs = 2500, killWaitMs = 2500, waitForChildExit } = {}) {
+async function stopProcess(proc, { termWaitMs = GUARD_GRACE_MS + 1500, killWaitMs = 2500, waitForChildExit } = {}) {
   if (!proc) return { exited: true, forced: false };
   if (hasExited(proc)) return { exited: true, forced: false };
   try { proc.kill("SIGTERM"); } catch (_) { /* already gone */ }
@@ -73,12 +104,15 @@ async function stopProcess(proc, { termWaitMs = 2500, killWaitMs = 2500, waitFor
  * @param {number} [o.recheckMs]                  how often a stuck process is re-checked
  * @param {{warn:Function, log:Function}} [o.log]
  */
-function createEngineSlot({ now = Date.now, isAlive = defaultIsAlive, pidGoneTimeoutMs = 2000, recheckMs = 1000, log = console } = {}) {
+function createEngineSlot({ now = Date.now, isAlive = defaultIsAlive, pidGoneTimeoutMs = 2000, recheckMs = 1000, log = console, reapOrphan } = {}) {
+  // Real process handling only with real liveness: a slot driven by an injected isAlive (tests) never signals real
+  // processes unless the caller passes reapOrphan explicitly.
+  if (reapOrphan === undefined) reapOrphan = isAlive === defaultIsAlive ? defaultReapOrphan : null;
   const s = { owner: null, model: null, phase: "idle", epoch: 0, since: now() };
   const ops = { text: 0, image: 0 };
   const records = new Set(); // { kind, epoch, proc, guardPid, enginePid, exitSeen, stuck, reason }
   const waiters = new Set(); // { kind, resolve }
-  const counts = { reserved: 0, refused: 0, released: 0, unconfirmed: 0, staleIgnored: 0 };
+  const counts = { reserved: 0, refused: 0, released: 0, unconfirmed: 0, staleIgnored: 0, orphansStopped: 0 };
   let lastRefusal = null;
 
   function liveRecords(kind) {
@@ -198,6 +232,13 @@ function createEngineSlot({ now = Date.now, isAlive = defaultIsAlive, pidGoneTim
       if (!r.stuck && now() - started >= pidGoneTimeoutMs) {
         r.stuck = true; r.reason = "engine-pid-alive-after-guard-exit"; counts.unconfirmed += 1;
         log.warn(`  [engine-slot] ${r.kind} engine process ${pid} is still alive after its guard exited; capacity stays reserved.`);
+        // Stop it through its guard's process group (verified, POSIX). Capacity stays reserved until its exit is seen.
+        if (reapOrphan && !r.reaping && r.guardPid) {
+          r.reaping = true;
+          Promise.resolve().then(() => reapOrphan({ guardPid: r.guardPid, enginePid: pid, isAlive })).then((done) => {
+            if (done) { counts.orphansStopped += 1; log.warn(`  [engine-slot] stopped ${r.kind} engine process ${pid} through its guard's process group.`); }
+          }, () => { /* a failed attempt leaves the slot reserved, as before */ });
+        }
       }
     }, Math.min(50, recheckMs));
     if (timer.unref) timer.unref();
@@ -273,4 +314,5 @@ function createEngineSlot({ now = Date.now, isAlive = defaultIsAlive, pidGoneTim
   return { begin, end, assertNotOther, current: state, isCurrent: (kind, epoch) => s.owner === kind && s.epoch === epoch, markLoaded, markRestartPending, stopped, track, noteStopUnconfirmed, waitForExits, unconfirmedError, hasStuck, runtime: () => (s.owner ? runtimeOf() : null), snapshot };
 }
 
-module.exports = { engineSlotSetting, createEngineSlot, stopProcess, hasExited };
+module.exports = {
+  GUARD_GRACE_MS, defaultReapOrphan, processGroupOf, engineSlotSetting, createEngineSlot, stopProcess, hasExited };
