@@ -11,7 +11,9 @@
 //   - each port is claimed by creating a lock file exclusively (one per port, shared by all test processes on this
 //     machine), so two test processes never get the same port;
 //   - a port another process (not a test) is listening on, or that the OS refuses, is skipped (bind probe);
-//   - releasePort() and process exit remove the lock; a lock whose process is gone is reclaimed.
+//   - releasePort() and process exit remove the lock, only if it is still this process's; a lock whose process is
+//     gone is reclaimed, and so is an empty lock older than EMPTY_LOCK_STALE_MS (a process that crashed between
+//     creating it and writing its PID), so crashed test processes cannot exhaust the range.
 // It does not hide a real failure: a child that still cannot bind its port fails exactly as before.
 "use strict";
 const fs = require("node:fs");
@@ -21,6 +23,7 @@ const path = require("node:path");
 
 const RANGE = { first: 21000, last: 23999 };
 const LOCK_DIR = path.join(os.tmpdir(), "usap-test-ports");
+const EMPTY_LOCK_STALE_MS = 10000;
 const held = new Map(); // port -> lock file, for this process
 
 function pidAlive(pid) {
@@ -38,10 +41,11 @@ function claim(file) {
       return true;
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
-      let owner = NaN;
-      try { owner = Number(fs.readFileSync(file, "utf8")); } catch (_) { continue; } // removed meanwhile: retry
-      // An empty file is a lock being written right now: it belongs to a live process.
-      if (Number.isNaN(owner) || owner === 0 || pidAlive(owner)) return false;
+      let text = "", age = 0;
+      try { text = fs.readFileSync(file, "utf8"); age = Date.now() - fs.statSync(file).mtimeMs; } catch (_) { continue; } // removed meanwhile: retry
+      const owner = Number(text);
+      if (text === "") { if (age < EMPTY_LOCK_STALE_MS) return false; } // being written right now: a live owner
+      else if (!Number.isInteger(owner) || owner <= 0 || pidAlive(owner)) return false;
       try { fs.unlinkSync(file); } catch (_) { /* another process reclaimed it first */ }
     }
   }
@@ -82,9 +86,10 @@ function releasePort(port) {
   const file = held.get(port);
   if (!file) return;
   held.delete(port);
-  try { fs.unlinkSync(file); } catch (_) { /* already gone */ }
+  // Remove the lock only while it is still ours: never another process's newer lock for the same port.
+  try { if (fs.readFileSync(file, "utf8") === String(process.pid)) fs.unlinkSync(file); } catch (_) { /* already gone */ }
 }
 
 process.on("exit", () => { for (const port of [...held.keys()]) releasePort(port); });
 
-module.exports = { reservePort, releasePort, heldPorts: () => [...held.keys()], RANGE, LOCK_DIR };
+module.exports = { reservePort, releasePort, heldPorts: () => [...held.keys()], RANGE, LOCK_DIR, EMPTY_LOCK_STALE_MS };
