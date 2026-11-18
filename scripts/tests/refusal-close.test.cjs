@@ -17,7 +17,7 @@ const { createPipeline } = require("../server/http/pipeline.cjs");
 const { createRouter } = require("../server/http/router.cjs");
 const { createRequestPolicy } = require("../server/request-policy.cjs");
 const { createLanAuth, MAX_FAILURES } = require("../server/lan-auth.cjs");
-const { closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, lingeringCount } = require("../server/http/refusal-close.cjs");
+const { closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, WATCH_BYTES, WATCH_MS, lingeringCount, resumedCount, closedReadingCount } = require("../server/http/refusal-close.cjs");
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
 const { rawRequest } = require("./fixtures/refusal-clients.cjs");
 const { execFile } = require("node:child_process");
@@ -27,6 +27,7 @@ const CHUNK = Buffer.alloc(64 * 1024, 0x61);
 const SLACK_MS = 2500;     // scheduling slack on slow CI runners, on top of the grace period
 const ANSWER_MS = 5000;    // the answer itself must arrive promptly (it is sent before any body is read)
 const READ_BOUND = 16 * MiB; // what a refused connection may read at most (kernel buffers are a few MiB)
+const READ_SMALL = 8 * MiB;  // what a refused connection may read from a client that ignores the answer and keeps sending
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // A refused socket stops reading, so it may not see the client's own close: it ends when its grace period does.
 async function noneLingering() { const end = Date.now() + GRACE_MS + SLACK_MS; while (lingeringCount() > 0 && Date.now() < end) await sleep(50); return lingeringCount(); }
@@ -135,6 +136,97 @@ test("node: without this fix, an answer that leaves the body unread keeps the co
 });
 
 // ── the helper ───────────────────────────────────────────────────────────────────────────────────────────────────
+// A server that refuses every request through the helper and records, per connection, what it read and when.
+function refusingServer(before) {
+  const recs = [];
+  const server = http.createServer((req, res) => {
+    const s = req.socket; const rec = { read: 0, readAtAnswer: null, answeredAt: null, closedAt: null };
+    recs.push(rec);
+    if (before) before(s, res);
+    closeAfterAnswer(req, res);
+    res.once("finish", () => { rec.answeredAt = Date.now(); rec.readAtAnswer = s.bytesRead; });
+    s.once("close", () => { rec.read = s.bytesRead; rec.closedAt = Date.now(); });
+    res.writeHead(403, { "Content-Type": "application/json" }); res.end("{}");
+  });
+  return { server, recs };
+}
+async function floodRefusal(before) {
+  const { server, recs } = refusingServer(before);
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const st = await rawRequest(server.address().port, { mode: "stream", ignoreFin: true, capBytes: 4096 * MiB, maxMs: GRACE_MS + 6000 });
+    await sleep(50);
+    return { st, rec: recs[0] };
+  } finally { server.closeAllConnections(); await new Promise((r) => server.close(r)); }
+}
+
+test("node: after an answer that leaves the body unread, Node resumes reading a paused socket on the next tick; the helper pauses it again (refusal-close.cjs depends on this)", async () => {
+  // Without the helper: the same steps as its grace period (pause, FIN, close later), and nothing else.
+  const plain = await new Promise((resolve) => {
+    const rec = { resumedAfterPause: false, read: 0 };
+    const server = http.createServer((req, res) => {
+      const s = req.socket; let paused = false;
+      s.on("pause", () => { paused = true; }); s.on("resume", () => { if (paused) rec.resumedAfterPause = true; });
+      s.destroySoon = function () { s.pause(); s.end(); setTimeout(() => s.destroy(), 500); };
+      s.once("close", () => { rec.read = s.bytesRead; });
+      res.writeHead(403, { "Content-Type": "application/json", Connection: "close" }); res.end("{}");
+    });
+    server.listen(0, "127.0.0.1", async () => {
+      const st = await rawRequest(server.address().port, { mode: "stream", ignoreFin: true, capBytes: 4096 * MiB, maxMs: 5000 });
+      await sleep(50);
+      server.close(() => resolve({ ...rec, status: st.status }));
+    });
+  });
+  assert.equal(plain.status, 403);
+  // If this fails, Node no longer resumes a paused socket here: re-check what refusal-close.cjs needs on this runtime.
+  assert.equal(plain.resumedAfterPause, true, `Node resumes the paused socket after the answer (read ${plain.read} bytes)`);
+  // With the helper: Node still resumes it, and the helper pauses it again before anything is read.
+  const resumed0 = resumedCount(), failsafe0 = closedReadingCount();
+  const { st, rec } = await floodRefusal();
+  assert.equal(st.status, 403, `answer (client error ${st.error})`);
+  assert.ok(resumedCount() > resumed0, "Node resumed the socket and the helper paused it again");
+  assert.equal(closedReadingCount(), failsafe0, "the fail-closed check was not needed");
+  assert.ok(rec.read - rec.readAtAnswer <= WATCH_BYTES, `nothing more read after the answer (${rec.read - rec.readAtAnswer} bytes; without the helper ${plain.read})`);
+  assert.ok(rec.closedAt - rec.answeredAt >= GRACE_MS - 200, `the grace period was kept (${rec.closedAt - rec.answeredAt} ms)`);
+});
+
+test("helper fails closed: a socket that still reads during its grace period (a runtime where it cannot be stopped) is closed well before its grace period ends", async () => {
+  // Simulates a runtime on which the helper never sees Node resume the socket: the test (only) removes the helper's
+  // 'resume' listener as soon as the answer is written, so Node's discard mode reads the body as before the fix.
+  const failsafe0 = closedReadingCount();
+  const { st, rec } = await floodRefusal((s, res) => res.once("finish", () => {
+    const helperListener = s.listeners("resume").at(-1); // added last, by the helper's grace period
+    if (helperListener) s.removeListener("resume", helperListener);
+  }));
+  assert.equal(st.status, 403, `answer (client error ${st.error})`);
+  assert.equal(closedReadingCount(), failsafe0 + 1, "the fail-closed check closed the socket");
+  // closed within a few checks (WATCH_MS) instead of being read for the whole grace period
+  assert.ok(rec.closedAt - rec.answeredAt <= WATCH_MS * 5, `closed well before the grace period ended (${rec.closedAt - rec.answeredAt} ms; read ${rec.read - rec.readAtAnswer} bytes after the answer)`);
+});
+
+test("helper: Node's own drain handling after the answer does not restart reading", async () => {
+  // Node's server 'drain' handler resumes a socket it had paused itself (socket._paused); emitting 'drain' after the
+  // answer simulates it running late. A fix that relied on that internal flag read the whole grace period here.
+  const failsafe0 = closedReadingCount();
+  const { st, rec } = await floodRefusal((s, res) => res.once("finish", () => setTimeout(() => s.emit("drain"), 100)));
+  assert.equal(st.status, 403, `answer (client error ${st.error})`);
+  assert.equal(closedReadingCount(), failsafe0, "the fail-closed check was not needed");
+  assert.ok(rec.read - rec.readAtAnswer <= WATCH_BYTES, `nothing more read after the answer (${rec.read - rec.readAtAnswer} bytes)`);
+  assert.ok(rec.closedAt - rec.answeredAt >= GRACE_MS - 200, `the grace period was kept (${rec.closedAt - rec.answeredAt} ms)`);
+});
+
+test("runtime: CI runs the Node version the setup scripts package", () => {
+  // The Node behaviour checked above is verified on the CI runtime; it must be the one users get.
+  const root = path.join(__dirname, "..", "..");
+  const sh = fs.readFileSync(path.join(root, "scripts", "setup", "setup.sh"), "utf8").match(/^NODE_VERSION="([\d.]+)"/m);
+  const ps = fs.readFileSync(path.join(root, "scripts", "setup", "setup.ps1"), "utf8").match(/nodejs\.org\/dist\/v([\d.]+)\//);
+  const ci = fs.readFileSync(path.join(root, ".github", "workflows", "ci.yml"), "utf8").match(/NODE_VERSION: "([\d.]+)"/);
+  assert.ok(sh && ps && ci, "pins found");
+  assert.equal(ps[1], sh[1], "setup.ps1 and setup.sh package the same Node");
+  assert.equal(ci[1], sh[1], "ci.yml tests the packaged Node");
+  if (process.env.CI) assert.equal(process.version, `v${sh[1]}`, "this CI run uses the packaged Node");
+});
+
 test("helper: only chunked bodies or a declared Content-Length above the small-body limit count as unread", () => {
   const r = (headers, complete = false) => ({ headers, complete });
   assert.equal(bodyMayRemain(r({})), false, "no body");
@@ -183,6 +275,15 @@ for (const c of IN_PROCESS) {
         assert.ok(read <= READ_BOUND, `${c.label}/${mode}: server read ${read} bytes`);
         if (mode === "stream") assert.ok(st.sent < 32 * MiB, `${c.label}: the server stopped reading (client sent ${st.sent})`);
       }
+      // A client that ignores the answer and the server's FIN and keeps sending as fast as it can: the server reads little
+      // more than it had before the answer, for the whole grace period (it must not go on reading and discarding).
+      const before = srv.readTotal();
+      const st = await rawRequest(srv.port, { ...c.opts, mode: "stream", ignoreFin: true, capBytes: 4096 * MiB, maxMs: GRACE_MS + 6000 });
+      assert.equal(st.status, c.status, `${c.label}/ignores the answer: status (client error ${st.error})`);
+      assert.ok(!st.clientGaveUp, `${c.label}/ignores the answer: the server closed the connection (client gave up at ${st.closedAt} ms)`);
+      await sleep(50);
+      const read = srv.readTotal() - before;
+      assert.ok(read <= READ_SMALL, `${c.label}/ignores the answer: server read ${read} bytes while the client sent ${st.sent}`);
       assert.equal(srv.routeHits.echo, 0, "no refused request reached a route");
       assert.equal(await noneLingering(), 0, "no connection left after its grace period");
     } finally { await srv.close(); }
@@ -388,7 +489,15 @@ test("server (default configuration): JSON-only 415, JSON over the 64 MiB limit 
       const st = await rawRequest(srv.port, { ...c.opts, mode: "stream", maxMs: GRACE_MS + 15000 });
       assertClosedRefusal(st, c.status, c.label);
       if (c.status === 413) assert.match(st.body, /BODY_TOO_LARGE/);
-      else assert.ok(st.sent < 32 * MiB, `${c.label}: the server stopped reading (client sent ${st.sent})`);
+      else {
+        assert.ok(st.sent < 32 * MiB, `${c.label}: the server stopped reading (client sent ${st.sent})`);
+        // a client that ignores the answer and the server's FIN and keeps sending: what it gets to send is bounded by
+        // transport buffers, not by how fast the server can read and discard
+        const keep = await rawRequest(srv.port, { ...c.opts, mode: "stream", ignoreFin: true, capBytes: 4096 * MiB, maxMs: GRACE_MS + 15000 });
+        assert.equal(keep.status, c.status, `${c.label}/ignores the answer: status (client error ${keep.error})`);
+        assert.ok(!keep.clientGaveUp, `${c.label}/ignores the answer: the server closed the connection`);
+        assert.ok(keep.sent <= 2 * READ_SMALL, `${c.label}/ignores the answer: the client could send ${keep.sent} bytes after its answer`);
+      }
     }
     const page = await rawRequest(srv.port, { url: "/some/page", mode: "stream", contentType: "text/plain", maxMs: GRACE_MS + 6000 });
     assert.ok([200, 404].includes(page.status), `static answer (${page.status}; 404 when the test root has no built frontend)`); assert.equal(page.connectionHeader, "close"); assert.ok(!page.clientGaveUp && page.closedAt - page.answeredAt <= GRACE_MS + SLACK_MS, `static page closed (answer ${page.answeredAt} ms, close ${page.closedAt} ms)`);

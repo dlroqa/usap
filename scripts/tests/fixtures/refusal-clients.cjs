@@ -24,9 +24,10 @@ function dechunk(raw) { // decode a chunked body (complete chunks only)
 // ── a raw HTTP client that keeps sending ─────────────────────────────────────────────────────────────────────────
 // mode: "stream" (chunked, as fast as allowed), "silent" (headers only, large Content-Length), "drip" (1 KiB every
 // 200 ms), "small" (complete 2 KiB body), "pipelined" (finished chunked body, then a second request).
-function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mode = "stream", capBytes = 32 * MiB, maxMs = 8000, contentType = "application/json", second = "" } = {}) {
+function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mode = "stream", capBytes = 32 * MiB, maxMs = 8000, contentType = "application/json", second = "", ignoreFin = false } = {}) {
   return new Promise((resolve) => {
-    const s = net.connect(port, "127.0.0.1");
+    // ignoreFin: keep the sending side open after the server's FIN and go on sending (a client that ignores the answer)
+    const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: ignoreFin });
     const st = { status: null, head: "", body: "", sent: 0, closedAt: null, answeredAt: null, error: null, t0: Date.now(), connectionHeader: null };
     let buf = Buffer.alloc(0), stopped = false, timer = null;
     const parse = () => {
