@@ -23,6 +23,9 @@ function judgeRefusedClient(st, conn, ticks, status, bodyMatch = null) {
   // Running = one whole event-loop iteration inside the window: two consecutive ticks both in it. A single tick only
   // shows the timers phase ran; the process can be descheduled before the I/O phase that would read the answer (#145).
   const inWindow = (t) => t > conn.answeredAt + TICK_MARGIN_MS && t < conn.closedAt - TICK_MARGIN_MS;
+  // Direct evidence first: the client handled I/O on this very connection inside the window (#145).
+  const own = (st.drainsAt || []).filter(inWindow);
+  if (own.length > 0) return { ok: false, why: `answer lost although the client handled I/O on this connection ${own.length} time(s) while the server kept it open` };
   const sorted = [...ticks].sort((a, b) => a - b);
   let iterations = 0;
   for (let i = 1; i < sorted.length; i += 1) if (inWindow(sorted[i - 1]) && inWindow(sorted[i])) iterations += 1;
