@@ -21,8 +21,10 @@ const crypto = require("node:crypto");
 const fsDefault = require("node:fs");
 const pathDefault = require("node:path");
 const { jobQueueSetting, createJobQueue } = require("./job-queue.cjs");
+const { closeAfterAnswer } = require("../http/refusal-close.cjs");
 
 const MiB = 1024 * 1024;
+const CONNECTION_RETRY_AFTER_SECONDS = 5;
 const GiB = 1024 * MiB;
 const MAX_UPLOAD_BYTES = 1 * GiB;      // today's per-request ceiling (readBinaryBody); not raisable
 const RESERVE_STEP_BYTES = 64 * MiB;   // reservation growth for uploads without Content-Length
@@ -146,7 +148,15 @@ function createTranscriptionQueue({ setting, dir, speech, json, fs = fsDefault, 
   const instanceId = crypto.randomBytes(8).toString("hex");
   let seq = 0;
   const live = new Set(); // jobs with a file or a reservation (for shutdown and reporting)
-  const counts = { tooLarge: 0, insufficientStorage: 0, uploadTimedOut: 0, notWav: 0, uploadFailed: 0, disconnected: 0, transcribed: 0, failed: 0 };
+  const counts = { tooLarge: 0, insufficientStorage: 0, uploadTimedOut: 0, notWav: 0, uploadFailed: 0, disconnected: 0, transcribed: 0, failed: 0, connectionsRefused: 0 };
+  // Upload connection gate (#131). At most `connectionLimit` transcription requests are open at once: the running job,
+  // the waiting ones, and one more (a request being answered early, an upload in progress). It is counted at arrival,
+  // before any body byte, the same for every client and address (no loopback exemption, no per-address identity),
+  // and released exactly once when the response closes (normal end, refusal, disconnect or shutdown). Past it a
+  // request is refused at once with 429 QUEUE_FULL and its connection closed after the answer without reading its
+  // body (http/refusal-close.cjs); it never reaches the queue, the storage ledger or the disk.
+  const connectionLimit = 1 + setting.limit + 1;
+  let openConnections = 0;
   const O_NOFOLLOW = fs.constants && fs.constants.O_NOFOLLOW ? fs.constants.O_NOFOLLOW : 0;
 
   // One account per request, opened at arrival and shared by the upload and by any discarding after a refusal: every
@@ -211,7 +221,21 @@ function createTranscriptionQueue({ setting, dir, speech, json, fs = fsDefault, 
     if (!settled) req.resume();
   }
 
-  async function handle(req, res, options) {
+  function handle(req, res, options) {
+    if (openConnections >= connectionLimit) {
+      counts.connectionsRefused += 1;
+      closeAfterAnswer(req, res);
+      res.setHeader("Retry-After", String(CONNECTION_RETRY_AFTER_SECONDS));
+      json(res, 429, { ok: false, code: "QUEUE_FULL", error: "Too many audio uploads are in progress at once. Try again in a few seconds." });
+      return Promise.resolve();
+    }
+    openConnections += 1;
+    let released = false;
+    res.once("close", () => { if (!released) { released = true; openConnections -= 1; } });
+    return handleAdmitted(req, res, options);
+  }
+
+  async function handleAdmitted(req, res, options) {
     const declaredRaw = req.headers["content-length"];
     const declared = declaredRaw === undefined ? null : Number(declaredRaw);
     const acct = openAccount(req);
@@ -400,7 +424,8 @@ function createTranscriptionQueue({ setting, dir, speech, json, fs = fsDefault, 
   return {
     handle,
     refuseWaiting: (result) => queue.refuseWaiting(result),
-    stats: () => ({ ...queue.stats(), uploading: [...live].filter((j) => !j.uploadDone && !j.uploadError && !j.settled).length }),
+    stats: () => ({ ...queue.stats(), uploading: [...live].filter((j) => !j.uploadDone && !j.uploadError && !j.settled).length,
+      uploadConnections: { open: openConnections, limit: connectionLimit } }),
     storage: () => ({ budgetBytes: ledger.budgetBytes, reservedBytes: ledger.reservedBytes() }),
     counts: () => ({ ...queue.counts(), ...counts }),
     maxWaitMs: setting.maxWaitMs,

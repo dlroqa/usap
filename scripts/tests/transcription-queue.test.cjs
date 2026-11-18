@@ -704,3 +704,141 @@ test("service: cleanupSync deletes this instance's files (process exit)", async 
     await r;
   });
 });
+
+// ── #131: upload connection gate ───────────────────────────────────────────────────────────────────────────────
+// Judged from the server's own events (api-contract/connection-log-preload.cjs: arrival, answer, response close,
+// socket close, bytes read per request) and its /api/resources counters, never from client scheduling. The refused
+// clients run in a separate process (fixtures/refusal-clients.cjs) that records its event-loop ticks, so a client
+// that was simply not running can be told apart from a server that misbehaved (fixtures/refusal-judge.cjs, as #140).
+const { execFile } = require("node:child_process");
+const { GRACE_MS: REFUSAL_GRACE_MS } = require("../server/http/refusal-close.cjs");
+const { judgeRefusedClient } = require("./fixtures/refusal-judge.cjs");
+const GATE_TEXT = /Too many audio uploads are in progress/;
+const GATE_URL = "/api/speech/transcribe?model=ggml-test.bin";
+function gateEnv(root, extra = {}) {
+  const preload = path.join(__dirname, "api-contract", "connection-log-preload.cjs").replace(/\\/g, "/");
+  return { ...ON, ...extra, USAP_TEST_CONN_LOG: path.join(root, "conn-log.jsonl"),
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require "${preload}"`.trim() };
+}
+function connLog(file) { try { return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch (_) { return []; } }
+// Refused clients in a separate process: { clients, ticks } (each client has localPort = the server's remotePort).
+function refusedClients(port, n, opts) {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify({ port, n, opts })], { timeout: 60000, maxBuffer: 16 * MiB },
+      (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
+  });
+}
+// Largest number of admitted transcription requests (not refused by the gate) open at the same instant, from the log.
+function maxAdmittedAtOnce(records) {
+  const ev = [];
+  for (const r of records.filter((x) => !GATE_TEXT.test(x.body))) { ev.push([r.arrivedAt, 1]); ev.push([r.resCloseAt ?? r.sockCloseAt, -1]); }
+  ev.sort((a, b) => a[0] - b[0] || a[1] - b[1]); // a close at the same ms is counted before an arrival
+  let open = 0, max = 0; for (const [, d] of ev) { open += d; max = Math.max(max, open); }
+  return max;
+}
+// Server side of every gate refusal: 429 with the gate's text, answered at once, closed within the grace period, the
+// body left unread (bounded), counted once. Client side: each client read it, or provably was not running.
+function assertGateRefusals(records, run, label, expected) {
+  const refused = records.filter((r) => GATE_TEXT.test(r.body));
+  for (const st of run.clients) {
+    const r = records.find((x) => x.remotePort === st.localPort);
+    assert.ok(r, `${label}: a server record for client port ${st.localPort}`);
+    assert.ok(GATE_TEXT.test(r.body), `${label}: refused by the gate (server answered ${r.status} ${r.body.slice(0, 80)})`);
+    assert.equal(r.status, 429, `${label}: 429`);
+    assert.ok(r.finishAt - r.arrivedAt <= 5000, `${label}: answered ${r.finishAt - r.arrivedAt} ms after arrival`);
+    assert.ok(r.sockCloseAt - r.finishAt <= REFUSAL_GRACE_MS + 2500, `${label}: closed ${r.sockCloseAt - r.finishAt} ms after the answer`);
+    assert.ok(r.bytesRead <= 16 * MiB, `${label}: read ${r.bytesRead} bytes of a refused body`);
+    const v = judgeRefusedClient(st, { status: r.status, answeredAt: r.finishAt, closedAt: r.sockCloseAt }, run.ticks, 429, GATE_TEXT);
+    assert.ok(v.ok, `${label}: ${v.why}: ${JSON.stringify({ server: r, client: st })}`);
+    if (v.kind === "answered") {
+      assert.match(st.head, /\r\nretry-after: 5/i, `${label}: Retry-After`);
+      assert.equal(st.connectionHeader, "close", `${label}: Connection: close`);
+    }
+  }
+  if (expected !== undefined) assert.equal(refused.length, expected, `${label}: ${refused.length} gate refusals in the server log`);
+}
+
+test("server, on (#131): at most limit + 2 upload connections across running, waiting and draining; past it 429 QUEUE_FULL at once, the body unread and the connection closed; nothing reaches the queue or the disk; the count returns to 0", async () => {
+  const root0 = fs.mkdtempSync(path.join(os.tmpdir(), "usap-gate-log-"));
+  try {
+    const env = gateEnv(root0, { USAP_TRANSCRIPTION_QUEUE_LIMIT: "1" }); // limit 1: gate = 1 + 1 + 1 = 3
+    await withServer(env, async (c) => {
+      const conns = async () => (await c.resources()).transcriptionQueue.uploadConnections;
+      assert.deepEqual(await conns(), { open: 0, limit: 3 });
+      c.hold();
+      const first = upload(c.srv.port, wav("H")).promise;
+      await waitFor(() => c.started().length === 1, 10000, "running");
+      const w = upload(c.srv.port, wav("W")).promise;
+      await waitFor(async () => (await queueState(c)).waiting === 1, 5000, "waiting");
+      // The third connection: refused by the full queue, but a raw client that keeps sending after the answer, so it
+      // stays open while the bounded discard runs (#130). (Node's own HTTP client closes on a "Connection: close" answer.)
+      const { rawRequest } = require("./fixtures/refusal-clients.cjs");
+      const opts = { url: GATE_URL, contentType: "audio/wav", maxMs: REFUSAL_GRACE_MS + 10000 };
+      const slowP = rawRequest(c.srv.port, { ...opts, mode: "drip", maxMs: 12000 });
+      await waitFor(async () => (await conns()).open === 3, 10000, "3 open connections");
+      const before = { counts: (await c.resources()).transcriptionQueue.counts, storage: (await c.resources()).transcriptionQueue.storage, files: c.uploads() };
+      // Past the gate, while running, waiting and draining hold it: still sending (chunked, never ends), silent after its
+      // headers, and ten at once.
+      const streaming = await refusedClients(c.srv.port, 1, { ...opts, mode: "stream", capBytes: 32 * MiB });
+      const silent = await refusedClients(c.srv.port, 1, { ...opts, mode: "silent" });
+      const burst = await refusedClients(c.srv.port, 10, { ...opts, mode: "stream", capBytes: 4 * MiB });
+      assert.equal((await conns()).open, 3, "the refused connections were never counted as open");
+      const after = (await c.resources()).transcriptionQueue;
+      assert.equal(after.counts.connectionsRefused - (before.counts.connectionsRefused || 0), 12, "every refusal counted once");
+      assert.deepEqual(after.storage, before.storage, "nothing booked");
+      assert.deepEqual(c.uploads(), before.files, "no file");
+      // Accounting: when the slow connection ends (its client stops at 12 s), its place is free again.
+      const slowSt = await slowP;
+      assert.equal(slowSt.status, 429, "the slow one was refused by the full queue");
+      await waitFor(async () => (await conns()).open === 2, 10000, "2 open after the slow client left");
+      const next = await upload(c.srv.port, wav("N")).promise;
+      assert.equal(next.status, 429);
+      assert.doesNotMatch(next.json.error, GATE_TEXT, "past the gate again: refused by the full queue, not the gate");
+      c.release();
+      const rs = await Promise.all([first, w]);
+      assert.deepEqual(rs.map((x) => x.status), [200, 200]);
+      assert.deepEqual(c.started(), ["H", "W"], "no refused request ever reached whisper-cli");
+      await waitFor(async () => (await conns()).open === 0, 10000, "all connections released");
+      await assertDrained(c);
+      // The server's own record of every request.
+      await waitFor(() => connLog(env.USAP_TEST_CONN_LOG).length >= 16, 10000, "server records for every request");
+      const log = connLog(env.USAP_TEST_CONN_LOG);
+      assertGateRefusals(log, streaming, "streaming");
+      assert.ok(streaming.clients[0].sent < 32 * MiB, `the server stopped reading the refused body (client sent ${streaming.clients[0].sent})`);
+      assertGateRefusals(log, silent, "silent");
+      assertGateRefusals(log, burst, "burst", 12);
+      assert.ok(maxAdmittedAtOnce(log) <= 3, `admitted requests open at once never above the gate (max ${maxAdmittedAtOnce(log)})`);
+      assert.equal((await conns()).open, 0, "no stale or negative count");
+    });
+  } finally { fs.rmSync(root0, { recursive: true, force: true }); }
+});
+
+test("server, on (#131): admission is atomic: ten requests arriving together while the gate is empty admit exactly limit + 2; the rest are refused; disconnects release every place exactly once", async () => {
+  const root0 = fs.mkdtempSync(path.join(os.tmpdir(), "usap-gate-log-"));
+  try {
+    const env = gateEnv(root0, { USAP_TRANSCRIPTION_QUEUE_LIMIT: "1" }); // gate 3
+    await withServer(env, async (c) => {
+      const conns = async () => (await c.resources()).transcriptionQueue.uploadConnections;
+      assert.deepEqual(await conns(), { open: 0, limit: 3 });
+      // Ten clients that send their headers (10 MiB declared) and then nothing: admitted ones stay open (uploading, or
+      // refused by the full queue and held by its bounded discard) until the clients give up at 6 s.
+      const run = refusedClients(c.srv.port, 10, { url: GATE_URL, contentType: "audio/wav", mode: "silent", maxMs: 6000 });
+      await waitFor(async () => (await conns()).open === 3, 10000, "3 admitted");
+      await waitFor(async () => (await c.resources()).transcriptionQueue.counts.connectionsRefused === 7, 10000, "7 refused by the gate");
+      assert.equal((await conns()).open, 3, "never more than the gate");
+      const { clients, ticks } = await run;
+      await waitFor(async () => (await conns()).open === 0, 10000, "every admitted place released after the disconnects");
+      await waitFor(() => connLog(env.USAP_TEST_CONN_LOG).length >= 10, 10000, "server records for all ten");
+      const log = connLog(env.USAP_TEST_CONN_LOG);
+      const admitted = log.filter((r) => !GATE_TEXT.test(r.body));
+      assert.equal(admitted.length, 3, `exactly 3 admitted (server log: ${JSON.stringify(log.map((r) => [r.status, r.body.slice(0, 40)]))})`);
+      assert.equal(maxAdmittedAtOnce(log), 3);
+      const refusedRun = { clients: clients.filter((st) => !admitted.some((r) => r.remotePort === st.localPort)), ticks };
+      assertGateRefusals(log, refusedRun, "burst", 7);
+      assert.deepEqual(c.started(), [], "nothing reached whisper-cli");
+      assert.equal((await c.resources()).transcriptionQueue.counts.connectionsRefused, 7, "counted once each");
+      await assertDrained(c);
+      assert.equal((await conns()).open, 0, "no stale or negative count");
+    });
+  } finally { fs.rmSync(root0, { recursive: true, force: true }); }
+});

@@ -187,6 +187,7 @@ function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { m
         out.limits.transcriptionQueue = "on";
         out.engines.speech.queue = { running: q.running, waiting: q.waiting, uploading: q.uploading, known: true, limit: q.limit };
         out.transcriptionQueue = { mode: "on", limit: q.limit, maxWaitSeconds: q.maxWaitSeconds, storage: q.storage, counts: q.counts };
+        if (q.uploadConnections) out.transcriptionQueue.uploadConnections = q.uploadConnections; // #131
         out.scheduler.decisions = true; // a refusal is a decision
       }
     }
