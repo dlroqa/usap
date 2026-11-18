@@ -17,7 +17,7 @@ const { createPipeline } = require("../server/http/pipeline.cjs");
 const { createRouter } = require("../server/http/router.cjs");
 const { createRequestPolicy } = require("../server/request-policy.cjs");
 const { createLanAuth, MAX_FAILURES } = require("../server/lan-auth.cjs");
-const { closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, WATCH_BYTES, lingeringCount, resumedCount, closedReadingCount } = require("../server/http/refusal-close.cjs");
+const { closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, WATCH_BYTES, WATCH_MS, lingeringCount, resumedCount, closedReadingCount } = require("../server/http/refusal-close.cjs");
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
 const { rawRequest } = require("./fixtures/refusal-clients.cjs");
 const { execFile } = require("node:child_process");
@@ -190,16 +190,18 @@ test("node: after an answer that leaves the body unread, Node resumes reading a 
   assert.ok(rec.closedAt - rec.answeredAt >= GRACE_MS - 200, `the grace period was kept (${rec.closedAt - rec.answeredAt} ms)`);
 });
 
-test("helper fails closed: a socket that reads during its grace period without Node emitting 'resume' (a different runtime) is closed at once", async () => {
-  // Simulates a runtime that restarts reading some other way: the test (only) starts the socket's handle directly,
-  // which reads without any stream event.
+test("helper fails closed: a socket that still reads during its grace period (a runtime where it cannot be stopped) is closed at once", async () => {
+  // Simulates a runtime on which the helper never sees Node resume the socket: the test (only) removes the helper's
+  // 'resume' listener as soon as the answer is written, so Node's discard mode reads the body as before the fix.
   const failsafe0 = closedReadingCount();
-  const { st, rec } = await floodRefusal((s, res) => res.once("finish", () => setTimeout(() => { if (s._handle && !s.destroyed) { s._handle.reading = true; s._handle.readStart(); } }, 100)));
+  const { st, rec } = await floodRefusal((s, res) => res.once("finish", () => {
+    const helperListener = s.listeners("resume").at(-1); // added last, by the helper's grace period
+    if (helperListener) s.removeListener("resume", helperListener);
+  }));
   assert.equal(st.status, 403, `answer (client error ${st.error})`);
   assert.equal(closedReadingCount(), failsafe0 + 1, "the fail-closed check closed the socket");
-  assert.ok(rec.closedAt - rec.answeredAt < GRACE_MS - 500, `closed well before the grace period ended (${rec.closedAt - rec.answeredAt} ms)`);
-  // bounded by a few watch intervals at network speed, instead of the whole grace period (about 1 GiB on loopback)
-  assert.ok(rec.read - rec.readAtAnswer <= 64 * MiB, `read after the answer ${rec.read - rec.readAtAnswer} bytes`);
+  // closed within a few checks (WATCH_MS) instead of being read for the whole grace period
+  assert.ok(rec.closedAt - rec.answeredAt <= WATCH_MS * 5, `closed well before the grace period ended (${rec.closedAt - rec.answeredAt} ms; read ${rec.read - rec.readAtAnswer} bytes after the answer)`);
 });
 
 test("helper: Node's own drain handling after the answer does not restart reading", async () => {
