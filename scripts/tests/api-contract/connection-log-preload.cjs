@@ -2,7 +2,7 @@
 // USAP_TEST_CONN_LOG=<file>. It records, from inside the server, what happened to each transcription request, so tests
 // judge admission and refusal from the server's own events rather than from client timing:
 //   one JSON line per request to /api/speech/transcribe when its socket closes:
-//   { remotePort, arrivedAt, status, body (first 300 characters of the answer), finishAt (answer handed to the OS),
+//   { url (first 200 characters), remotePort, arrivedAt, status, body (first 300 characters of the answer), finishAt (answer handed to the OS),
 //     resCloseAt (the response closed: the gate's release point), sockCloseAt, bytesRead }
 // Times are wall-clock Date.now(). Nothing is changed: the listener runs first only to wrap res.write/res.end so the
 // answer's first bytes can be copied. Without the variable, or in any other process (engines, guards), it does nothing.
@@ -17,7 +17,7 @@ if (file && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
     const server = create.apply(this, args);
     server.prependListener("request", (req, res) => {
       if (!String(req.url || "").startsWith("/api/speech/transcribe")) return;
-      const rec = { remotePort: req.socket.remotePort, arrivedAt: Date.now(), status: null, body: "", finishAt: null, resCloseAt: null, sockCloseAt: null, bytesRead: null };
+      const rec = { url: String(req.url).slice(0, 200), remotePort: req.socket.remotePort, arrivedAt: Date.now(), status: null, body: "", finishAt: null, resCloseAt: null, sockCloseAt: null, bytesRead: null };
       const copy = (chunk) => { if (chunk && rec.body.length < 300 && typeof chunk !== "function") rec.body += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk); rec.body = rec.body.slice(0, 300); };
       const write = res.write, end = res.end;
       res.write = function (chunk, ...rest) { copy(chunk); return write.call(this, chunk, ...rest); };
