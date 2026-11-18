@@ -12,14 +12,8 @@ const { spawn, spawnSync } = require("node:child_process");
 const REPO = path.resolve(__dirname, "..", "..", "..");
 const IS_WIN = process.platform === "win32";
 
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const s = net.createServer();
-    s.unref();
-    s.on("error", reject);
-    s.listen(0, "127.0.0.1", () => { const { port } = s.address(); s.close(() => resolve(port)); });
-  });
-}
+// Ports a child process binds later come from the test-port allocator (owned, outside the ephemeral range; #142).
+const { reservePort, releasePort } = require("../fixtures/test-ports.cjs");
 
 // Where the server looks for a CPU llama-server on this OS (see LLM_BACKEND_PATHS in serve.cjs).
 function fakeLlamaPath(root) {
@@ -90,7 +84,8 @@ function makeRoot() {
 // readyPath: a route that answers 200 once the server is up (a sign-in-required server answers
 // /api/health with 401, so its tests wait on /api/auth/status instead).
 async function startServer(root, extraEnv = {}, { readyPath = "/api/health" } = {}) {
-  const [port, llm, sd, speech, tts] = await Promise.all([freePort(), freePort(), freePort(), freePort(), freePort()]);
+  const ports = await Promise.all([reservePort(), reservePort(), reservePort(), reservePort(), reservePort()]);
+  const [port, llm, sd, speech, tts] = ports;
   const env = {
     ...process.env,
     PORT: String(port), FRONTEND_PORT: String(port), LLM_PORT: String(llm), BACKEND_PORT: String(sd),
@@ -102,6 +97,7 @@ async function startServer(root, extraEnv = {}, { readyPath = "/api/health" } = 
   const proc = spawn(process.execPath, [path.join(root, "scripts", "server", "serve.cjs")], {
     cwd: root, env, stdio: ["ignore", "pipe", "pipe"], detached: !IS_WIN,
   });
+  proc.once("exit", () => { for (const p of ports) releasePort(p); }); // its engines are stopped with it
   let log = "";
   proc.stdout.on("data", (d) => { log += d; });
   proc.stderr.on("data", (d) => { log += d; });
