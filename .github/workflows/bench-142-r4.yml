@@ -1,0 +1,99 @@
+# Issue #142 round 4 (port race). Bench branch only (bench/142-r4-port-probe): never merged, never a required check.
+# probes: on all four OS, (1) does an outgoing connection using port P as its source port block a later listen(P);
+# (2) the harness pattern freePort() -> delay -> listen(port) in 4 parallel processes: how often the listen fails.
+# suite: macOS Intel, the full unit suite (main + PR #144 fixture, records copied to one file) 3 times under load.
+name: bench-142-r4
+
+on:
+  push:
+    branches: [bench/142-r4-port-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probes:
+    name: probes (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15, macos-15-intel]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.12.0"
+      - name: Port allocation facts
+        run: |
+          node -v
+          if [ "$RUNNER_OS" = macOS ]; then sysctl net.inet.ip.portrange.first net.inet.ip.portrange.last net.inet.ip.portrange.randomalloc 2>/dev/null || true; fi
+          if [ "$RUNNER_OS" = Linux ]; then cat /proc/sys/net/ipv4/ip_local_port_range; fi
+          if [ "$RUNNER_OS" = Windows ]; then netsh int ipv4 show dynamicport tcp || true; fi
+      - name: Source-port probe (x5)
+        run: for i in 1 2 3 4 5; do node bench/142-r4/collision-probe.cjs; done | tee -a probes.jsonl
+      - name: Parallel freePort -> listen race (4 x 1500, then 8 x 750)
+        run: |
+          node bench/142-r4/race-probe.cjs 4 1500 | tee -a probes.jsonl
+          node bench/142-r4/race-probe.cjs 8 750 | tee -a probes.jsonl
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-142-r4-probes-${{ matrix.os }}
+          path: probes.jsonl
+          retention-days: 30
+
+  suite:
+    name: full suite (macOS Intel, run ${{ matrix.run }})
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: bench-src
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: 806d7ada68420df2eb6fb11f09e1268ffef6efc4
+          path: target
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.12.0"
+      - name: PR #144 fixture (records also to one file) on main 806d7ad
+        run: |
+          for f in scripts/tests/api-contract/fake-sd-server.cjs scripts/tests/api-contract/harness.cjs scripts/tests/engine-slot.test.cjs scripts/tests/fake-sd-diag.test.cjs; do git -C target show d391c4a19df60c33a9e9d2f255b36429b4029626:$f > target/$f; done
+          node bench-src/bench/142-r4/global-diag.cjs target/scripts/tests/api-contract/fake-sd-server.cjs
+          cd target/app/frontend && npm ci --no-audit --no-fund && npm run build
+      - name: Full unit suite 3 times under load (assertions and timeouts unchanged)
+        timeout-minutes: 105
+        run: |
+          mkdir -p out; export SD_DIAG_GLOBAL="$PWD/out/sd-diag.jsonl"
+          for k in 1 2 3 4; do ( node -e "const end = Date.now() + 6000000; while (Date.now() < end) {}" & ); done
+          for i in 1 2 3; do
+            ( cd target && perl -e 'alarm shift; exec @ARGV' 1800 node --test --test-timeout=600000 "scripts/tests/*.test.cjs" > "../out/suite-$i.txt" 2>&1 ); echo "suite $i exit $?"
+            grep -E "^ℹ (tests|pass|fail|cancelled)" "out/suite-$i.txt" || true
+          done
+          pkill -f "while \(Date.now\(\) < end\)" || true
+          echo "fake sd-server records:"; node -e 'const l=require("fs").readFileSync("out/sd-diag.jsonl","utf8").trim().split("\n").map(JSON.parse);const c={};for(const r of l)c[r.e]=(c[r.e]||0)+1;console.log(JSON.stringify(c));for(const r of l)if(r.e==="listen-error")console.log(JSON.stringify(r))' || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-142-r4-suite-${{ matrix.run }}
+          path: out/
+          retention-days: 30
