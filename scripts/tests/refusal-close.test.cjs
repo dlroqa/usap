@@ -202,7 +202,7 @@ test("node: after an answer that leaves the body unread, Node resumes reading a 
   assert.ok(rec.closedAt - rec.answeredAt >= GRACE_MS - 200, `the grace period was kept (${rec.closedAt - rec.answeredAt} ms)`);
 });
 
-test("helper fails closed: a socket that still reads during its grace period (a runtime where it cannot be stopped) is closed at once", async () => {
+test("helper fails closed: a socket that still reads during its grace period (a runtime where it cannot be stopped) is closed well before its grace period ends", async () => {
   // Simulates a runtime on which the helper never sees Node resume the socket: the test (only) removes the helper's
   // 'resume' listener as soon as the answer is written, so Node's discard mode reads the body as before the fix.
   const failsafe0 = closedReadingCount();
