@@ -28,7 +28,7 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
   return new Promise((resolve) => {
     // ignoreFin: keep the sending side open after the server's FIN and go on sending (a client that ignores the answer)
     const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: ignoreFin });
-    const st = { status: null, head: "", body: "", sent: 0, closedAt: null, answeredAt: null, error: null, t0: Date.now(), connectionHeader: null };
+    const st = { status: null, head: "", body: "", sent: 0, closedAt: null, answeredAt: null, error: null, t0: Date.now(), connectionHeader: null, drainsAt: [] };
     let buf = Buffer.alloc(0), stopped = false, timer = null;
     const parse = () => {
       const text = buf.toString("latin1"); const i = text.indexOf("\r\n\r\n");
@@ -60,7 +60,9 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
       const send = (b) => { const ok = s.write(b.length.toString(16) + "\r\n"); s.write(b); s.write("\r\n"); st.sent += b.length; return ok; };
       if (mode === "pipelined") { send(Buffer.from("{}")); s.write("0\r\n\r\n"); s.write(second); return; }
       if (mode === "drip") { const tick = () => { if (stopped || s.destroyed) return; send(CHUNK.subarray(0, 1024)); timer = setTimeout(tick, 200); }; tick(); return; }
-      const pump = () => { while (!stopped && !s.destroyed && st.sent < capBytes) { if (!send(CHUNK)) { s.once("drain", pump); return; } } };
+      // drainsAt: wall-clock times this socket's I/O was processed after backpressure (evidence the client was running
+      // and handling this very connection; used by fixtures-based judges)
+      const pump = () => { while (!stopped && !s.destroyed && st.sent < capBytes) { if (!send(CHUNK)) { s.once("drain", () => { if (st.drainsAt.length < 500) st.drainsAt.push(Date.now()); pump(); }); return; } } };
       pump();
     });
   });
