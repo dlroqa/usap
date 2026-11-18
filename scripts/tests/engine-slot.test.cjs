@@ -12,7 +12,10 @@ const path = require("node:path");
 const { EventEmitter } = require("node:events");
 const test = require("node:test");
 
-const { makeRoot, startServer, stopServer, request, installFakeSdServer, IS_WIN } = require("./api-contract/harness.cjs");
+const { makeRoot, startServer, stopServer, request, installFakeSdServer, IS_WIN, processesUnder } = require("./api-contract/harness.cjs");
+// Engine processes running from a test root, wherever their parent is (#136: a re-parented engine is invisible to the
+// server's own process list).
+const enginesUnder = (root) => processesUnder(root).filter((p) => /sd-server|llama-server/i.test(p.cmd));
 const { engineSlotSetting, createEngineSlot, stopProcess } = require("../server/services/engine-slot.cjs");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -129,6 +132,104 @@ test("slot: a supervised engine counts as gone only when its engine PID is gone,
   enginePidAlive = false;
   await sleep(100);
   assert.equal(slot.current().phase, "idle");
+});
+
+// ── #136: an engine must never outlive its guard ──────────────────────────────────────────────────────────────
+const POSIX = process.platform !== "win32";
+const groupMembers = (pgid) => { const r = spawnSync("pgrep", ["-g", String(pgid)], { encoding: "utf8" }); return (r.stdout || "").trim().split("\n").filter(Boolean).map(Number); };
+function fakeEngineDir() {
+  const dir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "usap-guard136-"));
+  const engine = path.join(dir, "fake-engine.sh");
+  fs.writeFileSync(engine, "#!/bin/sh\nexec sleep 30\n"); fs.chmodSync(engine, 0o755);
+  return { dir, engine };
+}
+// Start a guard, send SIGTERM the moment it reports its engine started, and return the processes left in its group.
+async function stopRightAfterStart(guardFile, engine) {
+  const { spawn } = require("node:child_process");
+  const g = spawn(process.execPath, [guardFile, engine], { stdio: ["pipe", "ignore", "ignore", "ipc"], detached: true });
+  await new Promise((r) => { const t = setTimeout(r, 5000); g.on("message", (m) => { if (m && m.type === "started") { clearTimeout(t); r(); } }); });
+  try { process.kill(g.pid, "SIGTERM"); } catch (_) { /* gone */ }
+  await new Promise((r) => { const t = setTimeout(r, 5000); g.once("exit", () => { clearTimeout(t); r(); }); });
+  await sleep(50);
+  return groupMembers(g.pid);
+}
+
+test("guard (#136): a stop that arrives as soon as the guard reports its engine started never leaves the engine running", { skip: !POSIX && "Windows: the guard stops engines with taskkill /T; no signals" }, async () => {
+  const { GUARD } = require("../server/supervisor.cjs");
+  const { dir, engine } = fakeEngineDir();
+  const leftovers = [];
+  try {
+    for (let i = 0; i < 20; i++) leftovers.push(...await stopRightAfterStart(GUARD, engine));
+    assert.deepEqual(leftovers, [], "no engine outlived its guard");
+    // Negative control: the same guard with its stop handlers installed only after the engine starts (the order
+    // before #136) leaves engines running.
+    const src = fs.readFileSync(GUARD, "utf8");
+    const block = src.match(/for \(const s of \["SIGTERM", "SIGINT", "SIGHUP"\]\) process\.on\(s, \(\) => stop\(false\)\);\nprocess\.on\("message"[^\n]*\nprocess\.on\("disconnect"[^\n]*\n/);
+    assert.ok(block, "the handler block is found in engine-guard.cjs");
+    // Exactly where they were before #136: after the stdin pipe and the engine's exit handler.
+    const late = src.replace(block[0], "").replace("// Second safety net: the parent process no longer exists.", `${block[0]}\n// Second safety net: the parent process no longer exists.`);
+    assert.notEqual(late, src.replace(block[0], ""), "the old position is found");
+    const lateFile = path.join(dir, "engine-guard-late-handlers.cjs");
+    fs.writeFileSync(lateFile, late);
+    const lateLeft = [];
+    for (let i = 0; i < 20; i++) lateLeft.push(...await stopRightAfterStart(lateFile, engine));
+    leftovers.push(...lateLeft);
+    assert.ok(lateLeft.length > 0, "negative control: handlers installed after the start leave engines running");
+  } finally {
+    for (const p of leftovers) { try { process.kill(p, "SIGKILL"); } catch (_) { /* gone */ } }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("slot (#136): an engine still running after its guard died is stopped through the guard's process group; the slot stays reserved until its exit is seen", { skip: !POSIX && "Windows: the guard stops engines with taskkill /T; no process groups" }, async () => {
+  const { spawnSupervised } = require("../server/supervisor.cjs");
+  const { dir, engine } = fakeEngineDir();
+  const started = [];
+  const orphan = async () => {
+    const g = spawnSupervised(engine, [], { stdio: ["pipe", "ignore", "ignore"] }, { label: "fake" });
+    await new Promise((r) => { const t = setTimeout(r, 5000); g.on("message", (m) => { if (m && m.type === "started") { clearTimeout(t); r(); } }); });
+    started.push(g.pid);
+    process.kill(g.pid, "SIGKILL"); // the guard alone dies; its engine keeps running in the guard's process group
+    return g;
+  };
+  try {
+    for (const reaping of [true, false]) {
+      const opts = { log: quietLog, pidGoneTimeoutMs: 200, recheckMs: 50 };
+      if (!reaping) opts.reapOrphan = async () => false; // negative control: nothing stops the orphan
+      const slot = createEngineSlot(opts);
+      const e = slot.begin("image", "i.gguf");
+      const g = await orphan();
+      slot.track("image", g, e);
+      slot.end("image", { live: false });
+      await new Promise((r) => g.once("exit", r));
+      assert.ok(g.enginePid > 0, "the guard reported its engine");
+      await sleep(250);
+      assert.notEqual(slot.current().phase, "idle", `${reaping}: never idle while the engine runs`);
+      if (reaping) {
+        const end = Date.now() + 8000;
+        while (slot.current().phase !== "idle" && Date.now() < end) await sleep(50);
+        assert.equal(slot.current().phase, "idle", "released after the engine's exit was seen");
+        assert.deepEqual(groupMembers(g.pid), [], "the engine is gone");
+        assert.equal(slot.snapshot().counts.orphansStopped, 1);
+      } else {
+        await sleep(1500);
+        assert.notEqual(slot.current().phase, "idle", "negative control: still reserved");
+        assert.ok(groupMembers(g.pid).length > 0, "negative control: the engine is still running");
+      }
+    }
+  } finally {
+    for (const pgid of started) { try { process.kill(-pgid, "SIGKILL"); } catch (_) { /* gone */ } }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("process stop (#136): the server waits longer than the guard's own grace before forcing", async () => {
+  const { GUARD_GRACE_MS } = require("../server/services/engine-slot.cjs");
+  const p = fakeProc({ ignoreTerm: true });
+  const t0 = Date.now();
+  const r = await stopProcess(p, { killWaitMs: 200, waitForChildExit: fakeWait });
+  assert.deepEqual(r, { exited: true, forced: true });
+  assert.ok(Date.now() - t0 >= GUARD_GRACE_MS, `SIGKILL only after the guard's ${GUARD_GRACE_MS} ms grace (${Date.now() - t0} ms)`);
 });
 
 test("process stop: SIGTERM, then SIGKILL when ignored; an engine that never exits is reported, keeps the slot, and a late exit releases it", async () => {
@@ -423,6 +524,8 @@ test("stop racing startup (slot on): at any offset the end state is consistent: 
       const seen = await done();
       assert.ok(seen.maxImage <= 1, `offset ${offset}`);
       assert.deepEqual(await engines(srv), [], `offset ${offset}: nothing left running`);
+      const left = await waitFor(async () => (enginesUnder(srv.root).length === 0 ? [] : null), 5000, `offset ${offset}: no engine process left under the test root`).catch(() => enginesUnder(srv.root));
+      assert.deepEqual(left, [], `offset ${offset}: no engine process left under the test root (#136)`);
       await waitIdle(srv, 5000);
     }
   });
