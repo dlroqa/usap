@@ -12,12 +12,33 @@
 //   hold-load         don't listen until the file "<model path>.release" exists (issue #105 tests)
 //   ignore-sigterm    ignore SIGTERM, so stopping needs SIGKILL (issue #105 tests)
 // GET /fake/stats reports {requests, completed, aborted, pid, args}.
+//
+// Diagnostics (#142): every start, listen result and exit is appended as one JSON line to fake-sd-diag.jsonl next to
+// this file (inside the test's temporary root; harness fakeSdDiag(root) reads it). A failed listen is reported as an
+// "[ERROR] fake: listen ... failed: <code>" line and exits 1, as before (it used to be an uncaught exception, also
+// exit code 1); for EADDRINUSE the record names the port's holders (lsof / netstat), so the next occurrence of an
+// unexplained start-up exit says whether the port was taken.
 "use strict";
+const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 const args = process.argv.slice(2);
 const arg = (name, fallback) => { const i = args.indexOf(name); return i === -1 ? fallback : args[i + 1]; };
 const model = path.basename(arg("--model", "model.gguf"));
+const DIAG = path.join(__dirname, "fake-sd-diag.jsonl");
+const diag = (e, extra = {}) => { try { fs.appendFileSync(DIAG, JSON.stringify({ e, t: Date.now(), pid: process.pid, ...extra }) + "\n"); } catch (_) {} };
+diag("start", { ppid: process.ppid, port: Number(arg("--listen-port", "8080")), model });
+process.on("exit", (code) => diag("exit", { code }));
+function portHolders(port) { // diagnostics only: who has this port (bounded; never throws)
+  const { execFileSync } = require("node:child_process");
+  try {
+    if (process.platform === "win32") {
+      return execFileSync("netstat", ["-ano", "-p", "TCP"], { encoding: "utf8", timeout: 3000, windowsHide: true })
+        .split(/\r?\n/).filter((l) => l.includes(`:${port} `)).join("\n").slice(0, 2000);
+    }
+    return execFileSync("lsof", ["-nP", `-iTCP:${port}`], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).slice(0, 2000);
+  } catch (err) { return `unavailable: ${err.status === 1 ? "no process found" : (err.code || err.message)}`; }
+}
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 // The studio probes each backend with a missing model and expects stable-diffusion.cpp log output.
@@ -85,7 +106,16 @@ const server = http.createServer((req, res) => {
 });
 const port = Number(arg("--listen-port", "8080"));
 if (model.includes("ignore-sigterm")) process.on("SIGTERM", () => console.error("[WARN ] fake: ignoring SIGTERM"));
-const listenNow = () => server.listen(port, "127.0.0.1", () => console.log(`[INFO ] main.cpp:500 - listening on: 127.0.0.1:${port}`));
+server.on("error", (err) => {
+  const holders = err.code === "EADDRINUSE" ? portHolders(port) : "";
+  diag("listen-error", { code: err.code, message: err.message, port, holders });
+  console.error(`[ERROR] fake: listen on 127.0.0.1:${port} failed: ${err.code || err.message} (pid ${process.pid}, ppid ${process.ppid})`);
+  process.exit(1);
+});
+const listenNow = () => server.listen(port, "127.0.0.1", () => {
+  diag("listening", { address: server.address() });
+  console.log(`[INFO ] main.cpp:500 - listening on: 127.0.0.1:${port}`);
+});
 if (model.includes("hold-load")) {
   const t = setInterval(() => { if (require("node:fs").existsSync(`${arg("--model", "")}.release`)) { clearInterval(t); listenNow(); } }, 25);
 } else listenNow();
