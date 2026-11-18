@@ -1,5 +1,6 @@
 // Test-only preload (issue #131). Loaded with NODE_OPTIONS=--require into a test server started with
-// USAP_TEST_CONN_LOG=<file>. It records, from inside the server, what happened to each transcription request, so tests
+// USAP_TEST_CONN_LOG=<file>. It records, from inside the server, what happened to each transcription request (or, with
+// USAP_TEST_CONN_LOG_PREFIX=<path prefix>, to each request whose URL starts with that prefix), so tests
 // judge admission and refusal from the server's own events rather than from client timing:
 //   one JSON line per request to /api/speech/transcribe when its socket closes:
 //   { url (first 200 characters), remotePort, arrivedAt, status, body (first 300 characters of the answer), finishAt (answer handed to the OS),
@@ -9,6 +10,7 @@
 "use strict";
 
 const file = process.env.USAP_TEST_CONN_LOG;
+const prefix = process.env.USAP_TEST_CONN_LOG_PREFIX || "/api/speech/transcribe";
 if (file && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
   const fs = require("node:fs");
   const http = require("node:http");
@@ -16,7 +18,7 @@ if (file && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
   http.createServer = function (...args) {
     const server = create.apply(this, args);
     server.prependListener("request", (req, res) => {
-      if (!String(req.url || "").startsWith("/api/speech/transcribe")) return;
+      if (!String(req.url || "").startsWith(prefix)) return;
       const rec = { url: String(req.url).slice(0, 200), remotePort: req.socket.remotePort, arrivedAt: Date.now(), status: null, body: "", finishAt: null, resCloseAt: null, sockCloseAt: null, bytesRead: null };
       const copy = (chunk) => { if (chunk && rec.body.length < 300 && typeof chunk !== "function") rec.body += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk); rec.body = rec.body.slice(0, 300); };
       const write = res.write, end = res.end;
