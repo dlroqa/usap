@@ -2,6 +2,7 @@
 
 ## Unreleased
 ### Security
+* JSON routes now refuse a request whose declared `Content-Length` is over the 64 MB JSON limit before reading its body, as the sign-in route already does, instead of reading up to the limit first. The answer is unchanged: `413`, code `BODY_TOO_LARGE`, the same message, and the connection is closed as for other refusals. Chunked bodies, which declare no length, keep the streamed limit, and accepted requests are unchanged.
 * The local server now refuses requests that carry a foreign `Origin`, and (when bound to loopback) a non-loopback `Host`. Wildcard CORS headers are removed. The built-in UI is same-origin and is unaffected.
 * Static file serving is confined to `app/dist/`.
 * Outbound requests (web search, page fetching, model and engine downloads, Hugging Face lookups) can only reach public internet addresses. Each redirect is validated and the number of redirects is limited. The address checked is the address connected to. Search and normal downloads are unaffected (Step 9.3).
