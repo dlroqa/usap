@@ -7,7 +7,7 @@
 //   1. adds `Connection: close` to the answer, so the client knows the connection ends after it;
 //   2. once the answer is written, stops reading the socket and half-closes it (FIN), so the client still receives
 //      the complete answer while it is sending. The socket is kept stopped with public stream APIs only, and one
-//      that reads during its grace period anyway is closed within WATCH_MS (see linger);
+//      that reads during its grace period anyway is closed by a periodic fail-closed check (see linger);
 //   3. destroys the socket after a short grace period (GRACE_MS), so a client that keeps the connection open
 //      (silent, slow, or still sending) can't hold it.
 //
@@ -28,8 +28,9 @@
 const GRACE_MS = 2000;
 const SMALL_BODY_BYTES = 64 * 1024;
 const noop = () => {};
-const WATCH_BYTES = 256 * 1024; // more than this read during the grace period: close at once (fail-closed check)
-const WATCH_MS = 100;           // how often the sockets in their grace period are checked (one timer for all of them)
+const WATCH_BYTES = 256 * 1024; // fail-closed trigger: a socket found to have read more than this is closed. Not a cap:
+                                // it keeps reading until the next check finds it.
+const WATCH_MS = 100;           // nominal interval of the shared check; timers run late when the event loop is busy
 let lingering = 0; // sockets currently in their grace period (reported to tests)
 let resumed = 0;      // times Node resumed a socket in its grace period and it was paused again (reported to tests)
 let closedReading = 0; // sockets closed early because they still read during the grace period (reported to tests)
@@ -76,8 +77,10 @@ function linger(socket, graceMs, setTimer, clearTimer, watchBytes = WATCH_BYTES)
   socket.end();             // FIN after the answer already queued
   timer = setTimer(() => socket.destroy(), graceMs);
   // Fail closed: if the socket still reads during its grace period anyway (a Node version that resumes it some other
-  // way), close it within WATCH_MS instead of reading and discarding at network speed for the whole grace period.
-  // Answers are never lost to this on a Node that behaves as checked above, because such a socket reads nothing more.
+  // way), the next check (nominally every WATCH_MS; later when the event loop is busy) closes it instead of letting it
+  // read and discard at network speed for the whole grace period. This is a backstop, not a bound: what it reads
+  // before the check runs depends on network speed and scheduling. Answers are never lost to this on a Node that
+  // behaves as checked above, because such a socket reads nothing more.
   // (No 'data' listener: on a server socket, adding one makes Node's HTTP server change how it reads that socket, and
   // a body in discard mode never emits 'data' on the request.)
   watch(socket, watchBytes);
