@@ -76,14 +76,8 @@ test("proxied backend CORS headers are stripped", () => {
 });
 
 // ── Integration: real serve.cjs ─────────────────────────────────────────────
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer().once("error", reject).listen(0, "127.0.0.1", () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
-    });
-  });
-}
+// A port a child process binds later: owned by this test process (#142; scripts/tests/fixtures/test-ports.cjs).
+const { reservePort: freePort } = require("./fixtures/test-ports.cjs");
 
 function request(port, { method = "GET", rawPath = "/", headers = {}, body } = {}) {
   return new Promise((resolve, reject) => {

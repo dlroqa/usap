@@ -18,13 +18,8 @@ const { decideRestart, isOutOfMemory } = require("../server/restart-policy.cjs")
 const IS_WIN = process.platform === "win32";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const s = net.createServer();
-    s.on("error", reject);
-    s.listen(0, "127.0.0.1", () => { const { port } = s.address(); s.close(() => resolve(port)); });
-  });
-}
+// A port a child process binds later: owned by this test process (#142; scripts/tests/fixtures/test-ports.cjs).
+const { reservePort: freePort } = require("./fixtures/test-ports.cjs");
 
 function get(port, urlPath) {
   return new Promise((resolve) => {
