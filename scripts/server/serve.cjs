@@ -1592,7 +1592,7 @@ function readBody(req, { emptyOnly = false } = {}) {
       if (bytes > MAX_JSON_BODY_BYTES) {
         over = true;
         data = "";
-        reject(new Error(`Request body is too large. Limit is ${Math.round(MAX_JSON_BODY_BYTES / (1024 * 1024))} MB.`));
+        reject(new Error(JSON_TOO_LARGE_ERROR));
         return;
       }
       data += chunk;
@@ -1609,11 +1609,27 @@ function readBody(req, { emptyOnly = false } = {}) {
 // S-9: a JSON route only accepts a JSON body (Content-Type application/json or */*+json). A request
 // with no body and no Content-Type (e.g. POST /api/llm/stop) is still accepted as {}.
 const JSON_TYPE_ERROR = "Request body must be JSON (Content-Type: application/json).";
+const JSON_TOO_LARGE_ERROR = `Request body is too large. Limit is ${Math.round(MAX_JSON_BODY_BYTES / (1024 * 1024))} MB.`;
+// A body whose declared length is over the limit can never be accepted, so it is refused before any of it is read (as
+// the sign-in route does). Only a plain decimal Content-Length without Transfer-Encoding counts: Node has already
+// rejected malformed or conflicting framing, and anything else (chunked, no length) keeps the streamed limit in
+// readBody. Same status, code and message as the streamed 413.
+function declaredOverJsonLimit(req) {
+  const h = req.headers || {};
+  if (h["transfer-encoding"] !== undefined) return false;
+  const v = h["content-length"];
+  return typeof v === "string" && /^\d+$/.test(v) && Number(v) > MAX_JSON_BODY_BYTES;
+}
 async function readJsonBody(req, res) {
   const type = jsonBodyType(req);
   if (type === "other") {
     closeAfterAnswer(req, res); // refused before the body is read
     json(res, 415, { ok: false, error: JSON_TYPE_ERROR, code: "UNSUPPORTED_MEDIA_TYPE" });
+    return null;
+  }
+  if (declaredOverJsonLimit(req)) {
+    closeAfterAnswer(req, res); // refused before the body is read
+    json(res, 413, { ok: false, error: JSON_TOO_LARGE_ERROR, code: "BODY_TOO_LARGE" });
     return null;
   }
   let body;
