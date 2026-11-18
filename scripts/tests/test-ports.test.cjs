@@ -1,5 +1,6 @@
 // Test-port allocator (scripts/tests/fixtures/test-ports.cjs, #142): owned ports outside the ephemeral range, never
-// handed to two test processes, never one that something else is listening on.
+// handed to two test processes, never one that something else is listening on. Lock files are named
+// <port>.<owner pid>.lock, so ownership is never rewritten or taken over from a live process.
 "use strict";
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -9,15 +10,18 @@ const path = require("node:path");
 const test = require("node:test");
 const { spawn, spawnSync } = require("node:child_process");
 
-const ports = require("./fixtures/test-ports.cjs");
-const { reservePort, releasePort, RANGE, LOCK_DIR } = ports;
+const { reservePort, releasePort, RANGE, LOCK_DIR } = require("./fixtures/test-ports.cjs");
 const tmpLocks = () => fs.mkdtempSync(path.join(os.tmpdir(), "usap-contract-ports-"));
 const listenOn = (port) => new Promise((resolve, reject) => {
   const s = net.createServer(); s.once("error", reject); s.listen(port, "127.0.0.1", () => resolve(s));
 });
 const close = (s) => new Promise((r) => s.close(r));
+const lockOf = (dir, port, pid) => path.join(dir, `${port}.${pid}.lock`);
+const freeNow = async () => { const s = await listenOn(0); const p = s.address().port; await close(s); return p; };
+const deadPid = () => Number(spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout);
+const one = (port) => ({ first: port, last: port });
 
-test("ports come from the owned range, are distinct, are locked to this process and released", async () => {
+test("ports come from the owned range, are distinct (also for concurrent calls in one process), locked to this process and released", async () => {
   // The range is outside every OS ephemeral range and the product's own ports.
   assert.ok(RANGE.first >= 20000 && RANGE.last < 28088 && RANGE.last < 32768, `range ${RANGE.first}-${RANGE.last}`);
   const got = await Promise.all(Array.from({ length: 6 }, () => reservePort()));
@@ -25,11 +29,11 @@ test("ports come from the owned range, are distinct, are locked to this process 
     assert.equal(new Set(got).size, got.length, `distinct: ${got}`);
     for (const p of got) {
       assert.ok(p >= RANGE.first && p <= RANGE.last, `${p} in range`);
-      assert.equal(fs.readFileSync(path.join(LOCK_DIR, `${p}.lock`), "utf8"), String(process.pid), `${p} locked to this process`);
+      assert.ok(fs.existsSync(lockOf(LOCK_DIR, p, process.pid)), `${p} locked to this process`);
       const s = await listenOn(p); await close(s); // the owner can bind it
     }
   } finally { for (const p of got) releasePort(p); }
-  for (const p of got) assert.equal(fs.existsSync(path.join(LOCK_DIR, `${p}.lock`)), false, `${p} released`);
+  for (const p of got) assert.equal(fs.existsSync(lockOf(LOCK_DIR, p, process.pid)), false, `${p} released`);
 });
 
 test("negative control: a port something else is listening on is never handed out", async () => {
@@ -37,24 +41,55 @@ test("negative control: a port something else is listening on is never handed ou
   const other = await listenOn(0); // a listener that is not a test-port owner
   const busy = other.address().port;
   try {
-    await assert.rejects(reservePort({ range: { first: busy, last: busy }, lockDir }), /no free test port/);
-    assert.equal(fs.existsSync(path.join(lockDir, `${busy}.lock`)), false, "no lock left for a port it could not bind");
+    await assert.rejects(reservePort({ range: one(busy), lockDir }), /no free test port/);
+    assert.deepEqual(fs.readdirSync(lockDir), [], "no lock left for a port it could not bind");
   } finally { await close(other); fs.rmSync(lockDir, { recursive: true, force: true }); }
 });
 
-test("a port locked by another live process is skipped; a lock left by a process that has exited is reclaimed", async () => {
-  const lockDir = tmpLocks();
-  const probe = await listenOn(0); const port = probe.address().port; await close(probe); // a port free right now
+test("a live owner's lock is never taken over, however old it is; a dead owner's lock does not block and is removed", async () => {
+  const lockDir = tmpLocks(); const port = await freeNow();
   try {
-    fs.writeFileSync(path.join(lockDir, `${port}.lock`), String(process.ppid)); // the parent runner: alive, not us
-    await assert.rejects(reservePort({ range: { first: port, last: port }, lockDir }), /no free test port/);
-    const dead = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" });
-    fs.writeFileSync(path.join(lockDir, `${port}.lock`), dead.stdout); // its process is gone
-    const got = await reservePort({ range: { first: port, last: port }, lockDir });
+    // A live owner (the parent runner, not us) that has been holding the port for an hour: a delayed or slow owner.
+    const live = lockOf(lockDir, port, process.ppid);
+    fs.writeFileSync(live, ""); const old = (Date.now() - 3600e3) / 1000; fs.utimesSync(live, old, old);
+    await assert.rejects(reservePort({ range: one(port), lockDir }), /no free test port/);
+    assert.ok(fs.existsSync(live), "the live owner's lock is untouched");
+    assert.deepEqual(fs.readdirSync(lockDir), [path.basename(live)], "our own attempt left nothing behind");
+    fs.unlinkSync(live);
+    // A dead owner (a crashed test process): its lock does not block the port and is cleaned up.
+    const dead = lockOf(lockDir, port, deadPid());
+    fs.writeFileSync(dead, "");
+    const got = await reservePort({ range: one(port), lockDir });
     assert.equal(got, port);
-    assert.equal(fs.readFileSync(path.join(lockDir, `${port}.lock`), "utf8"), String(process.pid), "reclaimed");
+    assert.equal(fs.existsSync(dead), false, "dead owner's lock removed");
     releasePort(got);
   } finally { fs.rmSync(lockDir, { recursive: true, force: true }); }
+});
+
+test("releasing a port removes only this process's lock, never another owner's", async () => {
+  const lockDir = tmpLocks(); const port = await freeNow();
+  try {
+    const got = await reservePort({ range: one(port), lockDir });
+    const other = lockOf(lockDir, port, process.ppid);
+    fs.writeFileSync(other, ""); // another (live) owner's lock for the same port
+    releasePort(got);
+    assert.equal(fs.existsSync(lockOf(lockDir, port, process.pid)), false, "ours removed");
+    assert.ok(fs.existsSync(other), "the other owner's lock is kept");
+  } finally { fs.rmSync(lockDir, { recursive: true, force: true }); }
+});
+
+test("two processes claiming the same port at the same moment: at most one keeps it", async () => {
+  // Deterministic interleaving: the other process's lock appears after ours is created and before we look for
+  // owners (the worst case for a check-then-act lock). We must see it and back off.
+  const lockDir = tmpLocks(); const port = await freeNow();
+  const other = lockOf(lockDir, port, process.ppid);
+  const readdir = fs.readdirSync;
+  fs.readdirSync = function (dir, ...rest) { if (dir === lockDir && !fs.existsSync(other)) fs.writeFileSync(other, ""); return readdir.call(this, dir, ...rest); };
+  try {
+    await assert.rejects(reservePort({ range: one(port), lockDir }), /no free test port/);
+    assert.equal(fs.existsSync(lockOf(lockDir, port, process.pid)), false, "we backed off and removed our lock");
+    assert.ok(fs.existsSync(other), "the other claimant keeps its lock");
+  } finally { fs.readdirSync = readdir; fs.rmSync(lockDir, { recursive: true, force: true }); }
 });
 
 test("concurrent test processes never receive the same port (all scan the range in the same order)", async () => {
@@ -76,37 +111,8 @@ test("concurrent test processes never receive the same port (all scan the range 
     assert.equal(new Set(all).size, all.length, `no port handed to two processes: ${JSON.stringify(lists)}`);
   } finally {
     await Promise.all(kids.map((k) => new Promise((r) => { if (k.exitCode !== null) return r(); k.once("exit", r); k.stdin.end("x"); })));
-    // every child removed its locks when it exited
     const left = fs.readdirSync(lockDir);
     fs.rmSync(lockDir, { recursive: true, force: true });
-    assert.deepEqual(left, [], "locks removed on exit");
+    assert.deepEqual(left, [], "every child removed its locks when it exited");
   }
-});
-
-test("releasing a port never removes another process's newer lock for it", async () => {
-  const lockDir = tmpLocks();
-  const probe = await listenOn(0); const port = probe.address().port; await close(probe);
-  try {
-    const got = await reservePort({ range: { first: port, last: port }, lockDir });
-    const file = path.join(lockDir, `${got}.lock`);
-    fs.writeFileSync(file, String(process.ppid)); // the port now belongs to another (live) process
-    releasePort(got);
-    assert.equal(fs.readFileSync(file, "utf8"), String(process.ppid), "the other process's lock is kept");
-  } finally { fs.rmSync(lockDir, { recursive: true, force: true }); }
-});
-
-test("an empty lock is a lock being written (respected) until it is old enough to be a crashed process's (reclaimed)", async () => {
-  const lockDir = tmpLocks();
-  const probe = await listenOn(0); const port = probe.address().port; await close(probe);
-  const file = path.join(lockDir, `${port}.lock`);
-  try {
-    fs.writeFileSync(file, "");
-    await assert.rejects(reservePort({ range: { first: port, last: port }, lockDir }), /no free test port/, "fresh empty lock respected");
-    const old = (Date.now() - ports.EMPTY_LOCK_STALE_MS - 5000) / 1000;
-    fs.utimesSync(file, old, old);
-    const got = await reservePort({ range: { first: port, last: port }, lockDir });
-    assert.equal(got, port, "old empty lock reclaimed");
-    assert.equal(fs.readFileSync(file, "utf8"), String(process.pid));
-    releasePort(got);
-  } finally { fs.rmSync(lockDir, { recursive: true, force: true }); }
 });

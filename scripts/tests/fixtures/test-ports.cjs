@@ -8,12 +8,15 @@
 // reservePort() instead hands out ports that test processes own explicitly:
 //   - from RANGE, which is outside the OS ephemeral ranges (Linux 32768-60999, macOS and Windows 49152-65535) and
 //     outside the ports the product itself uses (1420, 8080, 10086-10089, 28088-28190);
-//   - each port is claimed by creating a lock file exclusively (one per port, shared by all test processes on this
-//     machine), so two test processes never get the same port;
+//   - each port is claimed with a lock file named after its owner, <port>.<pid>.lock, in a directory shared by all
+//     test processes on this machine. Creating it is one atomic step, so there is no half-written lock. After
+//     creating its own, a process looks for other owners of that port: if another live process holds one, it
+//     removes its own and moves on (if two claim at once, at least one sees the other, so at most one keeps the
+//     port; both may back off, never both keep it);
 //   - a port another process (not a test) is listening on, or that the OS refuses, is skipped (bind probe);
-//   - releasePort() and process exit remove the lock, only if it is still this process's; a lock whose process is
-//     gone is reclaimed, and so is an empty lock older than EMPTY_LOCK_STALE_MS (a process that crashed between
-//     creating it and writing its PID), so crashed test processes cannot exhaust the range.
+//   - a process only ever deletes its own lock (release, exit, failed probe) or a lock whose owner PID is no longer
+//     running, so it can never remove a live owner's lock, and crashed test processes cannot exhaust the range. A
+//     dead owner's PID reused by another running process only keeps that port unused while that process runs.
 // It does not hide a real failure: a child that still cannot bind its port fails exactly as before.
 "use strict";
 const fs = require("node:fs");
@@ -23,33 +26,38 @@ const path = require("node:path");
 
 const RANGE = { first: 21000, last: 23999 };
 const LOCK_DIR = path.join(os.tmpdir(), "usap-test-ports");
-const EMPTY_LOCK_STALE_MS = 10000;
-const held = new Map(); // port -> lock file, for this process
+const held = new Map(); // port -> own lock file, for this process (set before the bind probe)
+const LOCK_RE = /^(\d+)\.(\d+)\.lock$/;
 
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (err) { return err.code === "EPERM"; }
 }
 
-// Claim the lock file for a port: true if this process now owns it.
-function claim(file) {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const fd = fs.openSync(file, "wx");
-      fs.writeSync(fd, String(process.pid));
-      fs.closeSync(fd);
-      return true;
-    } catch (err) {
-      if (err.code !== "EEXIST") throw err;
-      let text = "", age = 0;
-      try { text = fs.readFileSync(file, "utf8"); age = Date.now() - fs.statSync(file).mtimeMs; } catch (_) { continue; } // removed meanwhile: retry
-      const owner = Number(text);
-      if (text === "") { if (age < EMPTY_LOCK_STALE_MS) return false; } // being written right now: a live owner
-      else if (!Number.isInteger(owner) || owner <= 0 || pidAlive(owner)) return false;
-      try { fs.unlinkSync(file); } catch (_) { /* another process reclaimed it first */ }
-    }
+function ownersOf(lockDir, port) {
+  const pids = [];
+  for (const name of fs.readdirSync(lockDir)) {
+    const m = LOCK_RE.exec(name);
+    if (m && Number(m[1]) === port) pids.push(Number(m[2]));
   }
-  return false;
+  return pids;
+}
+
+// Claim a port: the path of this process's lock file if it now owns the port, else null.
+function claim(lockDir, port) {
+  const mine = path.join(lockDir, `${port}.${process.pid}.lock`);
+  try { fs.writeFileSync(mine, "", { flag: "wx" }); } catch (err) {
+    // Already there with our PID: left by an earlier process that had this PID (it is gone), so it is ours now.
+    if (err.code !== "EEXIST") throw err;
+  }
+  let liveOther = false;
+  for (const pid of ownersOf(lockDir, port)) {
+    if (pid === process.pid) continue;
+    if (pidAlive(pid)) liveOther = true;
+    else { try { fs.unlinkSync(path.join(lockDir, `${port}.${pid}.lock`)); } catch (_) { /* already removed */ } }
+  }
+  if (liveOther) { try { fs.unlinkSync(mine); } catch (_) {} return null; }
+  return mine;
 }
 
 // Can a listener bind this port right now? (Detects listeners of other programs and ports the OS excludes.)
@@ -72,10 +80,10 @@ async function reservePort({ host = "127.0.0.1", range = RANGE, lockDir = LOCK_D
   for (let i = 0; i < span; i += 1) {
     const port = range.first + ((cursor + i) % span);
     if (held.has(port)) continue;
-    const file = path.join(lockDir, `${port}.lock`);
-    if (!claim(file)) continue;
-    if (!(await bindable(port, host))) { try { fs.unlinkSync(file); } catch (_) {} continue; }
-    held.set(port, file);
+    const file = claim(lockDir, port);
+    if (!file) continue;
+    held.set(port, file); // before the probe, so a concurrent call in this process skips it
+    if (!(await bindable(port, host))) { releasePort(port); continue; }
     cursor = (cursor + i + 1) % span;
     return port;
   }
@@ -86,10 +94,9 @@ function releasePort(port) {
   const file = held.get(port);
   if (!file) return;
   held.delete(port);
-  // Remove the lock only while it is still ours: never another process's newer lock for the same port.
-  try { if (fs.readFileSync(file, "utf8") === String(process.pid)) fs.unlinkSync(file); } catch (_) { /* already gone */ }
+  try { fs.unlinkSync(file); } catch (_) { /* already gone */ } // our own lock file: no other process uses this name
 }
 
 process.on("exit", () => { for (const port of [...held.keys()]) releasePort(port); });
 
-module.exports = { reservePort, releasePort, heldPorts: () => [...held.keys()], RANGE, LOCK_DIR, EMPTY_LOCK_STALE_MS };
+module.exports = { reservePort, releasePort, heldPorts: () => [...held.keys()], RANGE, LOCK_DIR };
