@@ -128,9 +128,14 @@ function hostnameOf(hostHeader) {
   try { return new URL(`http://${hostHeader}`).hostname.toLowerCase(); } catch (_) { return ""; }
 }
 
-function peerAddress(req) {
-  const raw = String((req.socket && req.socket.remoteAddress) || "");
+// A peer address as sign-in and connection statistics classify it: IPv4-mapped IPv6 (::ffff:a.b.c.d) as plain IPv4.
+function normalizePeerAddress(remoteAddress) {
+  const raw = String(remoteAddress || "");
   return raw.toLowerCase().startsWith("::ffff:") && net.isIPv4(raw.slice(7)) ? raw.slice(7) : raw;
+}
+
+function peerAddress(req) {
+  return normalizePeerAddress(req.socket && req.socket.remoteAddress);
 }
 
 function isLoopbackAddress(ip) {
@@ -477,6 +482,8 @@ function withoutAuthHeaders(headers) {
 
 module.exports = {
   createLanAuth,
+  normalizePeerAddress,
+  isLoopbackAddress,
   resolveAuthMode,
   generateToken,
   readTokenFile,
