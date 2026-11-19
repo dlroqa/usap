@@ -106,7 +106,7 @@ test("#157 diagnostics: a harness child that ends before reporting its server is
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "usap-157-control-"));
   try {
     const msg = await early(`console.log("phase:root-made " + ${JSON.stringify(dir)}); console.log("phase:server-starting");
-      process.stderr.write("simulated startup failure in " + ${JSON.stringify(dir)} + "\\n"); process.exit(7);`, "control-exit-7");
+      process.stderr.write("simulated startup failure in " + ${JSON.stringify(dir)} + "\\n"); process.exitCode = 7;`, "control-exit-7");
     assert.match(msg, /^child exited early: /);
     const ev = JSON.parse(msg.slice("child exited early: ".length));
     assert.equal(ev.iteration, "control-exit-7"); assert.equal(ev.exitCode, 7); assert.equal(ev.signal, null);
@@ -121,8 +121,9 @@ test("#157 diagnostics: a harness child that ends before reporting its server is
   // a crash (uncaught exception) shows its stack's message in stderr
   const thrown = JSON.parse((await early(`console.log("phase:server-starting"); throw new Error("simulated listen failure EADDRINUSE");`, "control-throw")).slice("child exited early: ".length));
   assert.equal(thrown.exitCode, 1); assert.match(thrown.stderr, /simulated listen failure EADDRINUSE/);
-  // huge output stays bounded
-  const big = await early(`process.stderr.write("x".repeat(200000) + "END"); process.exit(1);`, "control-big-output");
+  // huge output stays bounded. The children set process.exitCode instead of calling process.exit(): on macOS a write
+  // to a stderr pipe is asynchronous and process.exit() would drop what is still pending.
+  const big = await early(`process.stderr.write("x".repeat(200000) + "END"); process.exitCode = 1;`, "control-big-output");
   assert.ok(big.length < 4 * OUTPUT_TAIL + 1000, `message is bounded (${big.length} characters)`); assert.match(big, /END/);
   // killed by a signal (POSIX): the signal is reported
   if (process.platform !== "win32") {
