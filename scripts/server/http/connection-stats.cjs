@@ -8,7 +8,7 @@
 //
 // Privacy: only aggregate numbers are kept — counts, peaks and fixed time buckets. No address, port, request line,
 // header, body, credential or session identifier is stored or reported. Memory is constant: per open socket one
-// small closure, nothing kept after it closes.
+// small state object on the socket, nothing kept after it closes.
 "use strict";
 
 const { normalizePeerAddress, isLoopbackAddress } = require("../lan-auth.cjs");
@@ -31,34 +31,34 @@ function createConnectionStats({ classify = classifyPeer, now = Date.now } = {})
   });
   const classes = { local: newClass(), lan: newClass() };
   let open = 0, peakOpen = 0, accepted = 0;
-  const firstRequest = new WeakMap(); // socket -> recorder, until its first request (removed by GC with the socket)
+  const kState = Symbol("connectionStats"); // per-socket state, on the socket itself (gone with it)
+
+  // Shared handlers (no closures per connection).
+  function onClose() {
+    const st = this[kState];
+    if (!st || st.released) return; // exactly once
+    st.released = true;
+    const cls = st.cls;
+    cls.open -= 1; cls.closed += 1; open -= 1;
+    if (!st.sawRequest) cls.closedWithoutRequest += 1;
+    const ms = now() - st.openedAt;
+    cls.lifetimeMs[LIFETIME_BUCKETS_MS.findIndex((b) => ms <= b)] += 1;
+  }
 
   function onConnection(socket) {
     const cls = classes[classify(socket.remoteAddress)] || classes.lan;
-    const openedAt = now();
     cls.open += 1; cls.accepted += 1; if (cls.open > cls.peakOpen) cls.peakOpen = cls.open;
     open += 1; accepted += 1; if (open > peakOpen) peakOpen = open;
-    let sawRequest = false, released = false;
-    firstRequest.set(socket, () => {
-      if (sawRequest) return;
-      sawRequest = true;
-      const ms = now() - openedAt;
-      cls.firstRequestMs[FIRST_REQUEST_BUCKETS_MS.findIndex((b) => ms <= b)] += 1;
-    });
-    socket.once("close", () => {
-      if (released) return; // exactly once
-      released = true;
-      firstRequest.delete(socket);
-      cls.open -= 1; cls.closed += 1; open -= 1;
-      if (!sawRequest) cls.closedWithoutRequest += 1;
-      const ms = now() - openedAt;
-      cls.lifetimeMs[LIFETIME_BUCKETS_MS.findIndex((b) => ms <= b)] += 1;
-    });
+    socket[kState] = { cls, openedAt: now(), sawRequest: false, released: false };
+    socket.once("close", onClose);
   }
 
   function onRequest(req) {
-    const rec = req && req.socket && firstRequest.get(req.socket);
-    if (rec) rec();
+    const st = req && req.socket && req.socket[kState];
+    if (!st || st.sawRequest) return;
+    st.sawRequest = true;
+    const ms = now() - st.openedAt;
+    st.cls.firstRequestMs[FIRST_REQUEST_BUCKETS_MS.findIndex((b) => ms <= b)] += 1;
   }
 
   /** Listen on an http.Server. Listeners run before the request handler and never touch the socket's data. */
