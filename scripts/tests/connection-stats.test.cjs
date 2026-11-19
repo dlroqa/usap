@@ -152,3 +152,21 @@ test("real server: /api/diagnostics reports connections and refusals, with USAP_
     } finally { for (const s of idle) s.destroy(); await stopServerAndWait(srv); removeTestRoot(root); }
   }
 });
+
+test("an observer error never affects connections: statistics are disabled and the server keeps answering", { timeout: 30000 }, async () => {
+  let calls = 0;
+  const classify = () => { calls += 1; if (calls === 2) throw new Error("observer failure"); return "local"; };
+  await withServer(async ({ server, stats, connect }) => {
+    const get = () => new Promise((resolve, reject) => {
+      const r = http.get({ host: "127.0.0.1", port: server.address().port, path: "/", agent: false }, (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); });
+      r.on("error", reject);
+      r.setTimeout(5000, () => r.destroy(new Error("no answer within 5 s"))); // a broken server fails here, not by hanging
+    });
+    assert.equal(await get(), 200, "before the error");
+    assert.equal(await get(), 200, "the connection whose observer threw is still served");
+    assert.equal(await get(), 200, "and later connections too");
+    const c = await connect(); c.destroy();
+    assert.equal(stats.snapshot().mode, "disabled-after-error");
+    assert.ok(!JSON.stringify(stats.snapshot()).includes("observer failure"), "the error's content is not reported");
+  }, { classify });
+});

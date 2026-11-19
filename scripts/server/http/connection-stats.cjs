@@ -31,10 +31,19 @@ function createConnectionStats({ classify = classifyPeer, now = Date.now } = {})
   });
   const classes = { local: newClass(), lan: newClass() };
   let open = 0, peakOpen = 0, accepted = 0;
+  let disabled = false; // set if an observer handler ever throws: counting stops, the server is never affected
   const kState = Symbol("connectionStats"); // per-socket state, on the socket itself (gone with it)
 
+  // The handlers run inside the HTTP server's own event dispatch, where an exception could end the process. They
+  // never throw: an unexpected error disables the statistics (reported in the snapshot, nothing about the error's
+  // content) and leaves the connection untouched.
+  const safe = (fn) => function safeObserver(...args) {
+    if (disabled) return;
+    try { fn.apply(this, args); } catch (_) { disabled = true; }
+  };
+
   // Shared handlers (no closures per connection).
-  function onClose() {
+  const onClose = safe(function onClose() {
     const st = this[kState];
     if (!st || st.released) return; // exactly once
     st.released = true;
@@ -43,23 +52,23 @@ function createConnectionStats({ classify = classifyPeer, now = Date.now } = {})
     if (!st.sawRequest) cls.closedWithoutRequest += 1;
     const ms = now() - st.openedAt;
     cls.lifetimeMs[LIFETIME_BUCKETS_MS.findIndex((b) => ms <= b)] += 1;
-  }
+  });
 
-  function onConnection(socket) {
+  const onConnection = safe(function onConnection(socket) {
     const cls = classes[classify(socket.remoteAddress)] || classes.lan;
     cls.open += 1; cls.accepted += 1; if (cls.open > cls.peakOpen) cls.peakOpen = cls.open;
     open += 1; accepted += 1; if (open > peakOpen) peakOpen = open;
     socket[kState] = { cls, openedAt: now(), sawRequest: false, released: false };
     socket.once("close", onClose);
-  }
+  });
 
-  function onRequest(req) {
+  const onRequest = safe(function onRequest(req) {
     const st = req && req.socket && req.socket[kState];
     if (!st || st.sawRequest) return;
     st.sawRequest = true;
     const ms = now() - st.openedAt;
     st.cls.firstRequestMs[FIRST_REQUEST_BUCKETS_MS.findIndex((b) => ms <= b)] += 1;
-  }
+  });
 
   /** Listen on an http.Server. Listeners run before the request handler and never touch the socket's data. */
   function attach(server) {
@@ -74,7 +83,7 @@ function createConnectionStats({ classify = classifyPeer, now = Date.now } = {})
       lifetimeMs: Object.fromEntries(bucketNames(LIFETIME_BUCKETS_MS).map((n, i) => [n, c.lifetimeMs[i]])),
       firstRequestMs: Object.fromEntries(bucketNames(FIRST_REQUEST_BUCKETS_MS).map((n, i) => [n, c.firstRequestMs[i]])),
     });
-    return { mode: "observe", since, open, peakOpen, accepted, local: out(classes.local), lan: out(classes.lan), ...extra };
+    return { mode: disabled ? "disabled-after-error" : "observe", since, open, peakOpen, accepted, local: out(classes.local), lan: out(classes.lan), ...extra };
   }
 
   const api = { attach, onConnection, onRequest, snapshot };
