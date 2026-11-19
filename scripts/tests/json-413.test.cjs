@@ -33,9 +33,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function raw(port, { framing = {}, send = "stream", capBytes = 96 * MiB, headers = "", contentType = "application/json", ignoreFin = true, maxMs = GRACE_MS + 10000 } = {}) {
   return new Promise((resolve) => {
     const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: ignoreFin });
-    const st = { status: null, head: "", body: "", sent: 0, sentAtAnswer: null, answeredAt: null, closedAt: null, localPort: null, error: null, t0: Date.now() };
+    const st = { status: null, head: "", body: "", sent: 0, sentAtAnswer: null, answeredAt: null, closedAt: null, localPort: null, error: null, t0: Date.now(),
+      firstDataAt: null, endAt: null, errorAt: null }; // diagnostics: when the client saw data, the server's FIN, an error
     let buf = Buffer.alloc(0), stopped = false;
     s.on("data", (d) => {
+      if (st.firstDataAt === null) st.firstDataAt = Date.now() - st.t0;
       buf = Buffer.concat([buf, d]);
       const text = buf.toString("latin1"); const i = text.indexOf("\r\n\r\n");
       if (i < 0) return;
@@ -47,7 +49,8 @@ function raw(port, { framing = {}, send = "stream", capBytes = 96 * MiB, headers
       const complete = cl ? Buffer.byteLength(st.body, "latin1") >= Number(cl[1]) : /\r\ntransfer-encoding: chunked/i.test(st.head) && st.body.endsWith("0\r\n\r\n");
       if (complete && !/\r\nconnection: close/i.test(st.head)) { st.keptAlive = true; s.destroy(); }
     });
-    s.on("error", (e) => { st.error = e.code || e.message; });
+    s.on("error", (e) => { st.error = e.code || e.message; if (st.errorAt === null) st.errorAt = Date.now() - st.t0; });
+    s.on("end", () => { st.endAt = Date.now() - st.t0; });
     const end = setTimeout(() => { stopped = true; st.clientGaveUp = true; s.destroy(); }, maxMs);
     s.on("close", () => { clearTimeout(end); stopped = true; st.closedAt = Date.now() - st.t0; resolve(st); });
     s.on("connect", () => {
@@ -79,16 +82,26 @@ async function withServer(fn, extra = {}) {
   finally { await stopServerAndWait(srv); removeTestRoot(root); }
 }
 
+// Both sides of one connection, for failure messages: tells "the server never saw the request" (no record), "the
+// server answered and kept the grace period, the client did not read the answer" and "the server closed early" apart.
+function evidence(st, rec) {
+  const c = { status: st.status, error: st.error, sent: st.sent, sentAtAnswer: st.sentAtAnswer, answeredAt: st.answeredAt,
+    firstDataAt: st.firstDataAt, endAt: st.endAt, errorAt: st.errorAt, closedAt: st.closedAt, localPort: st.localPort };
+  const s = rec ? { status: rec.status, bytesRead: rec.bytesRead, answerMs: rec.finishAt && rec.finishAt - rec.arrivedAt,
+    closeAfterAnswerMs: rec.finishAt && rec.sockCloseAt && rec.sockCloseAt - rec.finishAt, body: String(rec.body || "").slice(0, 80) } : null;
+  return `[client ${JSON.stringify(c)} server ${JSON.stringify(s)}]`;
+}
 function assertEarly413(st, rec, label) {
-  assert.equal(st.status, 413, `${label}: status (client error ${st.error})`);
-  assert.match(st.body, /"code":"BODY_TOO_LARGE"/, `${label}: code`);
-  assert.ok(st.body.includes(MESSAGE), `${label}: unchanged message (${st.body.slice(0, 200)})`);
-  assert.match(st.head, /\r\nconnection: close/i, `${label}: Connection: close`);
-  assert.ok(st.answeredAt <= ANSWER_MS, `${label}: answered after ${st.answeredAt} ms`);
-  assert.ok(!st.clientGaveUp, `${label}: the server closed the connection (client gave up at ${st.closedAt} ms)`);
-  assert.ok(rec, `${label}: server record`);
-  assert.equal(rec.status, 413, `${label}: server status`);
-  assert.ok(rec.bytesRead <= EARLY_READ_BOUND, `${label}: the server read ${rec.bytesRead} bytes from this connection (bound ${EARLY_READ_BOUND})`);
+  const ev = evidence(st, rec);
+  assert.equal(st.status, 413, `${label}: status (client error ${st.error}) ${ev}`);
+  assert.match(st.body, /"code":"BODY_TOO_LARGE"/, `${label}: code ${ev}`);
+  assert.ok(st.body.includes(MESSAGE), `${label}: unchanged message (${st.body.slice(0, 200)}) ${ev}`);
+  assert.match(st.head, /\r\nconnection: close/i, `${label}: Connection: close ${ev}`);
+  assert.ok(st.answeredAt <= ANSWER_MS, `${label}: answered after ${st.answeredAt} ms ${ev}`);
+  assert.ok(!st.clientGaveUp, `${label}: the server closed the connection (client gave up at ${st.closedAt} ms) ${ev}`);
+  assert.ok(rec, `${label}: server record ${ev}`);
+  assert.equal(rec.status, 413, `${label}: server status ${ev}`);
+  assert.ok(rec.bytesRead <= EARLY_READ_BOUND, `${label}: the server read ${rec.bytesRead} bytes from this connection (bound ${EARLY_READ_BOUND}) ${ev}`);
 }
 
 test("a declared body over the 64 MiB limit is refused with today's 413 before it is read: still-sending, silent and partial clients", async () => {
