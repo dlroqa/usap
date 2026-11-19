@@ -7,10 +7,19 @@
 //     resCloseAt (the response closed: the gate's release point), sockCloseAt, bytesRead }
 // Times are wall-clock Date.now(). Nothing is changed: the listener runs first only to wrap res.write/res.end so the
 // answer's first bytes can be copied. Without the variable, or in any other process (engines, guards), it does nothing.
+//
+// With USAP_TEST_CONN_LOG_LIMIT=<bytes> (issue #154) each record also says when the server's request stream delivered
+// the body byte that took it past that many bytes, so a body-size refusal is timed from the moment the server could
+// know the limit was exceeded, not from when the client started sending:
+//   limitAt (wall-clock ms, null if never passed), bytesReadAtLimit (the socket's bytesRead then),
+//   bodyAtAnswer (body bytes delivered when the answer was written: res.end), bodyBytes (delivered in total).
+// Counting wraps only this request's own emit() for 'data': it adds no listener and does not change flowing mode, so
+// the route reads exactly as it would without the preload.
 "use strict";
 
 const file = process.env.USAP_TEST_CONN_LOG;
 const prefix = process.env.USAP_TEST_CONN_LOG_PREFIX || "/api/speech/transcribe";
+const limit = /^\d+$/.test(process.env.USAP_TEST_CONN_LOG_LIMIT || "") ? Number(process.env.USAP_TEST_CONN_LOG_LIMIT) : null;
 if (file && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
   const fs = require("node:fs");
   const http = require("node:http");
@@ -21,9 +30,20 @@ if (file && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
       if (!String(req.url || "").startsWith(prefix)) return;
       const rec = { url: String(req.url).slice(0, 200), remotePort: req.socket.remotePort, arrivedAt: Date.now(), status: null, body: "", finishAt: null, resCloseAt: null, sockCloseAt: null, bytesRead: null };
       const copy = (chunk) => { if (chunk && rec.body.length < 300 && typeof chunk !== "function") rec.body += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk); rec.body = rec.body.slice(0, 300); };
+      if (limit !== null) {
+        Object.assign(rec, { limitAt: null, bytesReadAtLimit: null, bodyAtAnswer: null, bodyBytes: 0 });
+        const emit = req.emit;
+        req.emit = function (ev, chunk, ...rest) {
+          if (ev === "data" && chunk && typeof chunk.length === "number") {
+            rec.bodyBytes += chunk.length;
+            if (rec.limitAt === null && rec.bodyBytes > limit) { rec.limitAt = Date.now(); rec.bytesReadAtLimit = req.socket ? req.socket.bytesRead : null; }
+          }
+          return emit.call(this, ev, chunk, ...rest);
+        };
+      }
       const write = res.write, end = res.end;
       res.write = function (chunk, ...rest) { copy(chunk); return write.call(this, chunk, ...rest); };
-      res.end = function (chunk, ...rest) { copy(chunk); return end.call(this, chunk, ...rest); };
+      res.end = function (chunk, ...rest) { copy(chunk); if (limit !== null && rec.bodyAtAnswer === null) rec.bodyAtAnswer = rec.bodyBytes; return end.call(this, chunk, ...rest); };
       res.once("finish", () => { rec.status = res.statusCode; rec.finishAt = Date.now(); });
       res.once("close", () => { rec.resCloseAt = Date.now(); if (rec.status === null && res.headersSent) rec.status = res.statusCode; });
       const sock = req.socket;

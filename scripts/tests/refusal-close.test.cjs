@@ -518,7 +518,7 @@ test("accepted requests are unchanged: a signed-in request with a large chunked 
 });
 
 // ── the real server: JSON-only routes and the fallback (default configuration) ───────────────────────────────────
-test("server (default configuration): JSON-only 415, JSON over the 64 MiB limit 413, unknown /api 404 and static paths answer and close; accepted JSON unchanged", async (t) => {
+test("server (default configuration): JSON-only 415, unknown /api 404 and static paths answer and close; accepted JSON unchanged", async (t) => {
   const root = makeRoot();
   let srv = null;
   try {
@@ -526,21 +526,18 @@ test("server (default configuration): JSON-only 415, JSON over the 64 MiB limit 
     const cases = [
       { label: "JSON-only route, wrong type 415", opts: { url: "/api/cleanup", contentType: "text/plain" }, status: 415 },
       { label: "unknown API endpoint 404", opts: { url: "/api/no-such-route" }, status: 404 },
-      { label: "JSON over the limit 413", opts: { url: "/api/cleanup", capBytes: 80 * MiB }, status: 413 },
+      // JSON over the 64 MiB limit (chunked) has its own test below: it is answered only after the body is read (#154)
     ];
     for (const c of cases) {
       const st = await rawRequest(srv.port, { ...c.opts, mode: "stream", maxMs: GRACE_MS + 15000 });
       assertClosedRefusal(st, c.status, c.label);
-      if (c.status === 413) assert.match(st.body, /BODY_TOO_LARGE/);
-      else {
-        assert.ok(st.sent < 32 * MiB, `${c.label}: the server stopped reading (client sent ${st.sent})`);
-        // a client that ignores the answer and the server's FIN and keeps sending: what it gets to send is bounded by
-        // transport buffers, not by how fast the server can read and discard
-        const keep = await rawRequest(srv.port, { ...c.opts, mode: "stream", ignoreFin: true, capBytes: 4096 * MiB, maxMs: GRACE_MS + 15000 });
-        assert.equal(keep.status, c.status, `${c.label}/ignores the answer: status (client error ${keep.error})`);
-        assert.ok(!keep.clientGaveUp, `${c.label}/ignores the answer: the server closed the connection`);
-        assert.ok(keep.sent <= 2 * READ_SMALL, `${c.label}/ignores the answer: the client could send ${keep.sent} bytes after its answer`);
-      }
+      assert.ok(st.sent < 32 * MiB, `${c.label}: the server stopped reading (client sent ${st.sent})`);
+      // a client that ignores the answer and the server's FIN and keeps sending: what it gets to send is bounded by
+      // transport buffers, not by how fast the server can read and discard
+      const keep = await rawRequest(srv.port, { ...c.opts, mode: "stream", ignoreFin: true, capBytes: 4096 * MiB, maxMs: GRACE_MS + 15000 });
+      assert.equal(keep.status, c.status, `${c.label}/ignores the answer: status (client error ${keep.error})`);
+      assert.ok(!keep.clientGaveUp, `${c.label}/ignores the answer: the server closed the connection`);
+      assert.ok(keep.sent <= 2 * READ_SMALL, `${c.label}/ignores the answer: the client could send ${keep.sent} bytes after its answer`);
     }
     const page = await rawRequest(srv.port, { url: "/some/page", mode: "stream", contentType: "text/plain", maxMs: GRACE_MS + 6000 });
     assert.ok([200, 404].includes(page.status), `static answer (${page.status}; 404 when the test root has no built frontend)`); assert.equal(page.connectionHeader, "close"); assert.ok(!page.clientGaveUp && page.closedAt - page.answeredAt <= GRACE_MS + SLACK_MS, `static page closed (answer ${page.answeredAt} ms, close ${page.closedAt} ms)`);
@@ -551,6 +548,110 @@ test("server (default configuration): JSON-only 415, JSON over the 64 MiB limit 
       r.on("error", reject); r.end(body);
     });
     assert.equal(ok.status, 200); assert.equal(ok.body.ok, true); assert.notEqual(ok.connection, "close");
+  } finally {
+    await stopServerAndWait(srv);
+    await removeTestRoot(root);
+  }
+});
+
+// ── the real server: a chunked JSON body over the 64 MiB limit (#154) ───────────────────────────────────────────────
+// A chunked body declares no length, so the server can only refuse it once it has received more than the 64 MiB JSON
+// limit (serve.cjs readBody; a declared length over the limit is refused before reading, json-413.test.cjs). Getting
+// 64 MiB to the server is the client's upload, which took 7.8 s on a loaded macOS Intel runner: timing the answer from
+// the start of the upload measured the transfer, not the server. Each step is therefore taken from its own record:
+//   upload (client)   request arrived -> the server's request stream passed the limit   reported, not asserted
+//   threshold         body bytes delivered when the answer was written: past the limit, by at most one read's worth
+//   answer            limit passed -> answer handed to the OS ('finish')                 within ANSWER_MS
+//   refusal close     answer -> socket closed: the whole grace period, not more (+ slack); reads after the limit bounded
+//   delivery          the client read the answer (refusal-judge.cjs: unless its process provably did not run)
+// Server times come from the test-only preload api-contract/connection-log-preload.cjs (USAP_TEST_CONN_LOG_LIMIT).
+const JSON_LIMIT = 64 * MiB;
+const JSON_413_BODY = /^\{"ok":false,"error":"Request body is too large\. Limit is 64 MB\.","code":"BODY_TOO_LARGE"\}$/;
+const LIMIT_OVERSHOOT = 1 * MiB; // body bytes the server may have taken past the limit before answering (one socket read is 64 KiB)
+const GRACE_TOLERANCE = 100;     // as fixtures/refusal-judge.cjs: the grace timer starts just before 'finish' is observed
+const preload = path.join(__dirname, "api-contract", "connection-log-preload.cjs").replace(/\\/g, "/");
+const { judgeRefusedClient: judgeClient } = require("./fixtures/refusal-judge.cjs");
+
+// The server's side of one chunked over-limit request, from its preload record. Returns the problems found (none = the
+// server behaved) and the measured steps.
+function checkChunkedJson413(rec) {
+  if (!rec) return { problems: ["no server record for this connection"], steps: null };
+  const steps = { uploadMs: rec.limitAt == null ? null : rec.limitAt - rec.arrivedAt, answerAfterLimitMs: rec.limitAt == null || rec.finishAt == null ? null : rec.finishAt - rec.limitAt,
+    closeAfterAnswerMs: rec.finishAt == null || rec.sockCloseAt == null ? null : rec.sockCloseAt - rec.finishAt, bodyAtAnswer: rec.bodyAtAnswer,
+    readAfterLimit: rec.bytesReadAtLimit == null || rec.bytesRead == null ? null : rec.bytesRead - rec.bytesReadAtLimit };
+  const problems = [];
+  if (rec.status !== 413) problems.push(`status ${rec.status}, expected 413`);
+  if (!JSON_413_BODY.test(rec.body || "")) problems.push(`answer body ${JSON.stringify(String(rec.body).slice(0, 120))}, expected today's BODY_TOO_LARGE answer`);
+  if (rec.finishAt == null) problems.push("no answer was handed to the OS");
+  if (rec.limitAt == null) problems.push(`answered before the request stream passed the ${JSON_LIMIT}-byte limit (wrong threshold)`);
+  if (rec.bodyAtAnswer == null || rec.bodyAtAnswer <= JSON_LIMIT || rec.bodyAtAnswer > JSON_LIMIT + LIMIT_OVERSHOOT) problems.push(`${rec.bodyAtAnswer} body bytes delivered when the answer was written, expected just past ${JSON_LIMIT} (wrong threshold)`);
+  if (steps.answerAfterLimitMs !== null && steps.answerAfterLimitMs > ANSWER_MS) problems.push(`answered ${steps.answerAfterLimitMs} ms after the limit was passed (bound ${ANSWER_MS} ms)`);
+  if (rec.sockCloseAt == null) problems.push("the connection never closed");
+  else if (steps.closeAfterAnswerMs !== null && steps.closeAfterAnswerMs < GRACE_MS - GRACE_TOLERANCE) problems.push(`closed ${steps.closeAfterAnswerMs} ms after the answer, before the ${GRACE_MS} ms grace period ended`);
+  else if (steps.closeAfterAnswerMs !== null && steps.closeAfterAnswerMs > GRACE_MS + SLACK_MS) problems.push(`closed ${steps.closeAfterAnswerMs} ms after the answer (grace ${GRACE_MS} ms + ${SLACK_MS} ms slack)`);
+  if (steps.readAfterLimit === null || steps.readAfterLimit > READ_BOUND) problems.push(`read ${steps.readAfterLimit} bytes after the limit was passed (bound ${READ_BOUND})`);
+  return { problems, steps };
+}
+
+test("chunked JSON 413 judge: the answer is timed from the limit, not from the start of the upload; status, body, threshold, close and reads are each checked", () => {
+  const body = '{"ok":false,"error":"Request body is too large. Limit is 64 MB.","code":"BODY_TOO_LARGE"}';
+  // the #154 run: 7.8 s of upload, then a prompt answer — the server behaved
+  const ok = { status: 413, body, arrivedAt: 1000, limitAt: 8800, finishAt: 8804, sockCloseAt: 8804 + GRACE_MS + 5, bodyAtAnswer: JSON_LIMIT + 65536, bytesReadAtLimit: JSON_LIMIT + 9000, bytesRead: JSON_LIMIT + 9000 + 4 * MiB };
+  const r = checkChunkedJson413(ok);
+  assert.deepEqual(r.problems, []);
+  assert.equal(r.steps.uploadMs, 7800); assert.equal(r.steps.answerAfterLimitMs, 4);
+  assert.ok(ok.finishAt - ok.arrivedAt > ANSWER_MS, "control: measured from the start of the upload, the same record would have failed");
+  const bad = (change, why) => assert.notDeepEqual(checkChunkedJson413({ ...ok, ...change }).problems, [], why);
+  bad({ finishAt: 8800 + ANSWER_MS + 1, sockCloseAt: 8800 + ANSWER_MS + 1 + GRACE_MS }, "answered late after the limit");
+  bad({ status: 400 }, "wrong status");
+  bad({ body: body.replace("BODY_TOO_LARGE", "INVALID_JSON") }, "wrong code");
+  bad({ body: body.replace("64 MB", "32 MB") }, "wrong message");
+  bad({ finishAt: null, body: "", status: null }, "no answer");
+  bad({ limitAt: null, bytesReadAtLimit: null, bodyAtAnswer: 32 * MiB }, "answered below the limit");
+  bad({ bodyAtAnswer: 96 * MiB }, "answered far past the limit");
+  bad({ sockCloseAt: ok.finishAt + 5 }, "closed at once");
+  bad({ sockCloseAt: ok.finishAt + 300 }, "grace period cut short");
+  bad({ sockCloseAt: null }, "never closed");
+  bad({ sockCloseAt: ok.finishAt + GRACE_MS + SLACK_MS + 1000 }, "closed long after the grace period");
+  bad({ bytesRead: ok.bytesReadAtLimit + 64 * MiB }, "kept reading after the limit");
+  assert.notDeepEqual(checkChunkedJson413(null).problems, [], "no record");
+});
+
+test("server (default configuration): a chunked JSON body over the 64 MiB limit gets today's 413 once the server has received the limit — answered promptly from that moment, closed after the grace period, little read after it; a slow upload is the client's time, not the server's (#154)", async (t) => {
+  const root = makeRoot();
+  const log = path.join(root, "conn-log.jsonl");
+  let srv = null;
+  try {
+    srv = await startServer(root, { USAP_TEST_CONN_LOG: log, USAP_TEST_CONN_LOG_PREFIX: "/api/cleanup", USAP_TEST_CONN_LOG_LIMIT: String(JSON_LIMIT),
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require "${preload}"`.trim() });
+    const records = () => { try { return fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch (_) { return []; } };
+    const recordFor = async (localPort) => { const until = Date.now() + GRACE_MS + SLACK_MS; for (;;) { const r = records().find((x) => x.remotePort === localPort); if (r || Date.now() > until) return r; await sleep(50); } };
+    // The client runs in its own process (fixtures/refusal-clients.cjs) and records its event-loop ticks, so a lost
+    // answer can be judged (refusal-judge.cjs). It ignores the server's FIN and would send up to 160 MiB: a server that
+    // went on reading past the limit would read far more than READ_BOUND.
+    const run = async (label, extra) => {
+      const opts = { url: "/api/cleanup", mode: "stream", ignoreFin: true, capBytes: 160 * MiB, maxMs: GRACE_MS + 40000, ...extra };
+      const { clients: [st], ticks } = await new Promise((resolve, reject) => {
+        execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify({ port: srv.port, n: 1, opts })], { timeout: GRACE_MS + 60000, maxBuffer: 16 * MiB },
+          (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
+      });
+      const rec = await recordFor(st.localPort);
+      const { problems, steps } = checkChunkedJson413(rec);
+      const ev = JSON.stringify({ steps, client: { status: st.status, error: st.error, sent: st.sent, answeredAt: st.answeredAt, closedAt: st.closedAt, pausedAt: st.pausedAt, clientGaveUp: !!st.clientGaveUp } });
+      assert.deepEqual(problems, [], `${label}: server ${ev}`);
+      assert.ok(!st.clientGaveUp, `${label}: the server closed the connection ${ev}`);
+      const v = judgeClient(st, { status: rec.status, answeredAt: rec.finishAt, closedAt: rec.sockCloseAt }, ticks, 413, JSON_413_BODY);
+      assert.ok(v.ok, `${label}: client ${v.why} ${ev}`);
+      if (v.kind === "answered") assert.equal(st.connectionHeader, "close", `${label}: Connection: close ${ev}`);
+      t.diagnostic(`${label}: upload to the limit ${steps.uploadMs} ms, answer ${steps.answerAfterLimitMs} ms after it, closed ${steps.closeAfterAnswerMs} ms after the answer, read ${steps.readAfterLimit} bytes after the limit; client ${v.kind}${v.kind === "stalled" ? ` (${v.why})` : ` its answer at ${st.answeredAt} ms`}`);
+      return { st, rec, steps };
+    };
+    await run("upload as fast as possible", {});
+    // Control: an upload that stops for longer than ANSWER_MS before it reaches the limit. The server's answer is still
+    // prompt from the moment the limit is passed; timed from the start of the upload it would not be.
+    const pauseMs = ANSWER_MS + 1000;
+    const slow = await run("upload paused before the limit", { pause: { atBytes: JSON_LIMIT - 4 * MiB, ms: pauseMs } });
+    assert.ok(slow.steps.uploadMs >= pauseMs - 50, `control: the server passed the limit only after the client's pause (${slow.steps.uploadMs} ms)`);
   } finally {
     await stopServerAndWait(srv);
     await removeTestRoot(root);

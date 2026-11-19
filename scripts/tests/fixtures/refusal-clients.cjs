@@ -24,7 +24,9 @@ function dechunk(raw) { // decode a chunked body (complete chunks only)
 // ── a raw HTTP client that keeps sending ─────────────────────────────────────────────────────────────────────────
 // mode: "stream" (chunked, as fast as allowed), "silent" (headers only, large Content-Length), "drip" (1 KiB every
 // 200 ms), "small" (complete 2 KiB body), "pipelined" (finished chunked body, then a second request).
-function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mode = "stream", capBytes = 32 * MiB, maxMs = 8000, contentType = "application/json", second = "", ignoreFin = false } = {}) {
+// pause (mode "stream" only): { atBytes, ms } stop sending for ms once atBytes have been sent, then go on (an upload
+// that is slow for reasons on the client's side; #154).
+function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mode = "stream", capBytes = 32 * MiB, maxMs = 8000, contentType = "application/json", second = "", ignoreFin = false, pause = null } = {}) {
   return new Promise((resolve) => {
     // ignoreFin: keep the sending side open after the server's FIN and go on sending (a client that ignores the answer)
     const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: ignoreFin });
@@ -62,7 +64,10 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
       if (mode === "drip") { const tick = () => { if (stopped || s.destroyed) return; send(CHUNK.subarray(0, 1024)); timer = setTimeout(tick, 200); }; tick(); return; }
       // drainsAt: wall-clock times this socket's I/O was processed after backpressure (evidence the client was running
       // and handling this very connection; used by fixtures-based judges)
-      const pump = () => { while (!stopped && !s.destroyed && st.sent < capBytes) { if (!send(CHUNK)) { s.once("drain", () => { if (st.drainsAt.length < 500) st.drainsAt.push(Date.now()); pump(); }); return; } } };
+      let paused = false;
+      const pump = () => { while (!stopped && !s.destroyed && st.sent < capBytes) {
+        if (pause && !paused && st.sent >= pause.atBytes) { paused = true; st.pausedAt = Date.now() - st.t0; timer = setTimeout(pump, pause.ms); return; }
+        if (!send(CHUNK)) { s.once("drain", () => { if (st.drainsAt.length < 500) st.drainsAt.push(Date.now()); pump(); }); return; } } };
       pump();
     });
   });
