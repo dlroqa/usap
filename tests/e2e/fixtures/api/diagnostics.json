@@ -1,5 +1,67 @@
 {
   "generatedAt": "2026-01-01T12:00:00.000Z",
+  "connections": {
+    "mode": "observe",
+    "since": "2026-01-01T12:00:00.000Z",
+    "open": 1,
+    "peakOpen": 2,
+    "accepted": 6,
+    "local": {
+      "open": 1,
+      "peakOpen": 2,
+      "accepted": 6,
+      "closed": 5,
+      "closedWithoutRequest": 0,
+      "lifetimeMs": {
+        "upTo1000": 0,
+        "upTo10000": 5,
+        "upTo60000": 0,
+        "upTo600000": 0,
+        "over600000": 0
+      },
+      "firstRequestMs": {
+        "upTo100": 6,
+        "upTo1000": 0,
+        "upTo10000": 0,
+        "upTo60000": 0,
+        "over60000": 0
+      }
+    },
+    "lan": {
+      "open": 0,
+      "peakOpen": 0,
+      "accepted": 0,
+      "closed": 0,
+      "closedWithoutRequest": 0,
+      "lifetimeMs": {
+        "upTo1000": 0,
+        "upTo10000": 0,
+        "upTo60000": 0,
+        "upTo600000": 0,
+        "over600000": 0
+      },
+      "firstRequestMs": {
+        "upTo100": 0,
+        "upTo1000": 0,
+        "upTo10000": 0,
+        "upTo60000": 0,
+        "over60000": 0
+      }
+    },
+    "refusals": {
+      "lingering": 0,
+      "peakLingering": 0,
+      "lingeredTotal": 0,
+      "closedEarlyForReading": 0,
+      "lingerMs": {
+        "upTo250": 0,
+        "upTo1000": 0,
+        "upTo2500": 0,
+        "upTo5000": 0,
+        "over5000": 0
+      }
+    }
+  },
   "health": {
     "ok": false,
     "build": "text-image-v1",
