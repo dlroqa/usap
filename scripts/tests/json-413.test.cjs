@@ -25,6 +25,9 @@ const ANSWER_MS = 5000;           // an early refusal answers promptly, whatever
 const SLACK_MS = 2500;
 const CHUNK = Buffer.alloc(64 * 1024, 0x61);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// BENCH ONLY (#151): this process's event-loop gaps over 300 ms (wall-clock start/end), to show when it did not run.
+const GAPS = []; let lastTick = Date.now();
+setInterval(() => { const t = Date.now(); if (t - lastTick > 300 && GAPS.length < 200) GAPS.push([lastTick, t]); lastTick = t; }, 10).unref();
 
 /**
  * One raw HTTP/1.1 request. framing: { contentLength } or { chunked: true } or {} (no body header).
@@ -98,7 +101,9 @@ function evidence(st, rec) {
     firstDataAt: st.firstDataAt, endAt: st.endAt, errorAt: st.errorAt, closedAt: st.closedAt, localPort: st.localPort, kernelAt: st.kernelAt, kernel: st.kernel };
   const s = rec ? { status: rec.status, bytesRead: rec.bytesRead, answerMs: rec.finishAt && rec.finishAt - rec.arrivedAt,
     closeAfterAnswerMs: rec.finishAt && rec.sockCloseAt && rec.sockCloseAt - rec.finishAt, body: String(rec.body || "").slice(0, 80) } : null;
-  return `[client ${JSON.stringify(c)} server ${JSON.stringify(s)}]`;
+  const gaps = GAPS.filter(([a, b]) => b >= st.t0 && a <= st.t0 + (st.closedAt || 0)).map(([a, b]) => [a - st.t0, b - st.t0]);
+  const srv = rec ? { arrived: rec.arrivedAt - st.t0, answered: rec.finishAt - st.t0, closed: rec.sockCloseAt - st.t0 } : null;
+  return `[client ${JSON.stringify(c)} server ${JSON.stringify(s)} timeline(client-relative) ${JSON.stringify(srv)} clientLoopGaps ${JSON.stringify(gaps)}]`;
 }
 function assertEarly413(st, rec, label) {
   const ev = evidence(st, rec);

@@ -1,6 +1,6 @@
 # Issue #151 (json-413 concurrent test: a client receives no answer, macOS Intel). Bench branch only
 # (bench/151-json413-macos): never merged, never a required check. Round 2: the real unit suite exactly as CI runs
-# it, with a bench-only snapshot of the kernel socket queues for a client that has received nothing after 1.5 s.
+# it, with bench-only kernel queue snapshots and event-loop gap records (round 3).
 name: bench-151
 
 on:
@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        run: [1, 2, 3]
+        run: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
