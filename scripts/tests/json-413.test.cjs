@@ -15,6 +15,9 @@ const test = require("node:test");
 
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
 const { GRACE_MS } = require("../server/http/refusal-close.cjs");
+const { execFile } = require("node:child_process");
+const { judgeRefusedClient } = require("./fixtures/refusal-judge.cjs");
+const GRACE_TOLERANCE_MS = 100; // as fixtures/refusal-judge.cjs: the grace timer starts just before 'finish' is observed
 
 const MiB = 1024 * 1024;
 const LIMIT = 64 * MiB;
@@ -120,13 +123,68 @@ test("a declared body over the 64 MiB limit is refused with today's 413 before i
   });
 });
 
+// The concurrent clients run in their own process (fixtures/refusal-clients.cjs), which records its event-loop ticks
+// and its I/O on each connection, so a client that simply did not run can be told apart from a server that
+// misbehaved (#151: on a loaded macOS Intel runner the test process once did not run for 2.1 s, longer than the grace
+// period, and the closing reset discarded an answer it never read). The server is judged from its own records; the
+// client must have read the answer unless fixtures/refusal-judge.cjs shows it did not run (documented reset tradeoff).
+const ANSWER_BODY = /"error":"Request body is too large\. Limit is 64 MB\.","code":"BODY_TOO_LARGE"/;
+function concurrentClients(port, n, opts) {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify({ port, n, opts })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
+      (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
+  });
+}
+// Server side of one connection, from the connection-log preload: the 413 with its body, promptly, the whole grace
+// period (unless the client closed first), reads within the bound. Returns the judge's view of the connection.
+function assertServerRefusal(rec, st, label) {
+  const ev = `[client ${JSON.stringify({ status: st.status, error: st.error, sent: st.sent, answeredAt: st.answeredAt, closedAt: st.closedAt, drains: (st.drainsAt || []).length, localPort: st.localPort })} server ${JSON.stringify(rec && { status: rec.status, bytesRead: rec.bytesRead, answerMs: rec.finishAt - rec.arrivedAt, closeAfterAnswerMs: rec.sockCloseAt - rec.finishAt })}]`;
+  assert.ok(rec, `${label}: server record ${ev}`);
+  assert.equal(rec.status, 413, `${label}: server status ${ev}`);
+  assert.match(rec.body, ANSWER_BODY, `${label}: server answer body ${ev}`);
+  assert.ok(rec.finishAt - rec.arrivedAt <= ANSWER_MS, `${label}: answered ${rec.finishAt - rec.arrivedAt} ms after the request ${ev}`);
+  const clientClosedFirst = st.t0 + st.closedAt < rec.sockCloseAt && st.error === null;
+  if (!clientClosedFirst) assert.ok(rec.sockCloseAt - rec.finishAt >= GRACE_MS - GRACE_TOLERANCE_MS, `${label}: the server closed ${rec.sockCloseAt - rec.finishAt} ms after the answer (grace ${GRACE_MS} ms) ${ev}`);
+  assert.ok(rec.bytesRead <= EARLY_READ_BOUND, `${label}: the server read ${rec.bytesRead} bytes from this connection (bound ${EARLY_READ_BOUND}) ${ev}`);
+  return { conn: { status: rec.status, answeredAt: rec.finishAt, closedAt: rec.sockCloseAt }, ev };
+}
+
 test("concurrent over-limit declarations are each refused early; the server's total read stays bounded", async () => {
-  await withServer(async ({ port, recordFor }) => {
-    const clients = await Promise.all(Array.from({ length: 10 }, () => raw(port, { framing: { contentLength: 100 * MiB }, send: "stream" })));
-    let total = 0;
-    for (const [i, st] of clients.entries()) { const rec = await recordFor(st); assertEarly413(st, rec, `client ${i}`); total += rec.bytesRead; }
+  await withServer(async ({ port, records }) => {
+    const { clients, ticks } = await concurrentClients(port, 10, { url: URL, mode: "stream", contentLength: 100 * MiB, ignoreFin: true, capBytes: 96 * MiB, maxMs: GRACE_MS + 10000 });
+    const until = Date.now() + GRACE_MS + SLACK_MS;
+    while (records().length < clients.length && Date.now() < until) await sleep(50);
+    const recs = records();
+    let total = 0, stalled = 0;
+    for (const [i, st] of clients.entries()) {
+      const rec = recs.find((x) => x.remotePort === st.localPort);
+      const { conn, ev } = assertServerRefusal(rec, st, `client ${i}`);
+      total += rec.bytesRead;
+      const v = judgeRefusedClient(st, conn, ticks, 413, ANSWER_BODY);
+      assert.ok(v.ok, `client ${i}: ${v.why} ${ev}`);
+      if (v.kind === "answered") assert.equal(st.connectionHeader, "close", `client ${i}: Connection: close ${ev}`);
+      else stalled += 1;
+    }
+    assert.ok(stalled < clients.length, "at least one client read its answer (a run where none did proves nothing about delivery)");
     assert.ok(total <= 10 * EARLY_READ_BOUND, `total read ${total}`);
   });
+});
+
+test("judge rules for this test: an answer is required unless the client provably did not run while the server held the connection", () => {
+  const conn = { status: 413, answeredAt: 10000, closedAt: 12000 };
+  const body = '{"ok":false,"error":"Request body is too large. Limit is 64 MB.","code":"BODY_TOO_LARGE"}';
+  const read = { status: 413, body, localPort: 1, drainsAt: [] };
+  const lost = { status: null, body: "", error: "EPIPE", localPort: 1, drainsAt: [] };
+  const asleep = [9990, 12100]; // no tick between the answer and the close
+  assert.equal(judgeRefusedClient(read, conn, asleep, 413, ANSWER_BODY).ok, true, "answer read");
+  assert.equal(judgeRefusedClient({ ...read, body: body.replace("64 MB", "32 MB") }, conn, asleep, 413, ANSWER_BODY).ok, false, "wrong message");
+  assert.equal(judgeRefusedClient({ ...read, status: 400 }, conn, asleep, 413, ANSWER_BODY).ok, false, "wrong status");
+  assert.equal(judgeRefusedClient(lost, null, asleep, 413, ANSWER_BODY).ok, false, "no server record");
+  assert.equal(judgeRefusedClient(lost, conn, asleep, 413, ANSWER_BODY).kind, "stalled", "lost while the client did not run: excused");
+  assert.equal(judgeRefusedClient(lost, { ...conn, closedAt: 10300 }, asleep, 413, ANSWER_BODY).ok, false, "lost after a 300 ms grace period");
+  assert.equal(judgeRefusedClient(lost, { ...conn, status: 400 }, asleep, 413, ANSWER_BODY).ok, false, "server did not answer 413");
+  assert.equal(judgeRefusedClient(lost, conn, [9990, 10500, 10510, 12100], 413, ANSWER_BODY).ok, false, "the client completed an event-loop iteration in the window");
+  assert.equal(judgeRefusedClient({ ...lost, drainsAt: [11000] }, conn, asleep, 413, ANSWER_BODY).ok, false, "the client handled I/O on this connection in the window");
 });
 
 test("unchanged: a declared body of exactly the limit is accepted; one byte more is refused before reading", async () => {
