@@ -24,7 +24,8 @@ function dechunk(raw) { // decode a chunked body (complete chunks only)
 // ── a raw HTTP client that keeps sending ─────────────────────────────────────────────────────────────────────────
 // mode: "stream" (chunked, as fast as allowed), "silent" (headers only, large Content-Length), "drip" (1 KiB every
 // 200 ms), "small" (complete 2 KiB body), "pipelined" (finished chunked body, then a second request).
-function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mode = "stream", capBytes = 32 * MiB, maxMs = 8000, contentType = "application/json", second = "", ignoreFin = false } = {}) {
+// contentLength (mode "stream" only): declare this Content-Length and send the body unframed instead of chunked.
+function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mode = "stream", capBytes = 32 * MiB, maxMs = 8000, contentType = "application/json", second = "", ignoreFin = false, contentLength = null } = {}) {
   return new Promise((resolve) => {
     // ignoreFin: keep the sending side open after the server's FIN and go on sending (a client that ignores the answer)
     const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: ignoreFin });
@@ -56,8 +57,11 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
         return;
       }
       if (mode === "silent") { s.write(`${method} ${url} HTTP/1.1\r\n${host}${headers}Content-Type: ${contentType}\r\nContent-Length: ${10 * MiB}\r\n\r\n`); return; }
-      s.write(`${method} ${url} HTTP/1.1\r\n${host}${headers}Content-Type: ${contentType}\r\nTransfer-Encoding: chunked\r\n\r\n`);
-      const send = (b) => { const ok = s.write(b.length.toString(16) + "\r\n"); s.write(b); s.write("\r\n"); st.sent += b.length; return ok; };
+      const declared = mode === "stream" && contentLength !== null;
+      s.write(`${method} ${url} HTTP/1.1\r\n${host}${headers}Content-Type: ${contentType}\r\n${declared ? `Content-Length: ${contentLength}` : "Transfer-Encoding: chunked"}\r\n\r\n`);
+      const send = declared
+        ? (b) => { st.sent += b.length; return s.write(b); }
+        : (b) => { const ok = s.write(b.length.toString(16) + "\r\n"); s.write(b); s.write("\r\n"); st.sent += b.length; return ok; };
       if (mode === "pipelined") { send(Buffer.from("{}")); s.write("0\r\n\r\n"); s.write(second); return; }
       if (mode === "drip") { const tick = () => { if (stopped || s.destroyed) return; send(CHUNK.subarray(0, 1024)); timer = setTimeout(tick, 200); }; tick(); return; }
       // drainsAt: wall-clock times this socket's I/O was processed after backpressure (evidence the client was running
