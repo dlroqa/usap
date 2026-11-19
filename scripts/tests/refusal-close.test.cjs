@@ -638,7 +638,7 @@ test("server (default configuration): a chunked JSON body over the 64 MiB limit 
       const rec = await recordFor(st.localPort);
       const { problems, steps } = checkChunkedJson413(rec);
       const ev = JSON.stringify({ steps, client: { status: st.status, error: st.error, sent: st.sent, answeredAt: st.answeredAt, closedAt: st.closedAt, pausedAt: st.pausedAt, clientGaveUp: !!st.clientGaveUp } });
-      assert.deepEqual(problems, [], `${label}: server ${ev}`);
+      assert.deepEqual(problems, [], `${label}: server: ${problems.join("; ")} ${ev}`);
       assert.ok(!st.clientGaveUp, `${label}: the server closed the connection ${ev}`);
       const v = judgeClient(st, { status: rec.status, answeredAt: rec.finishAt, closedAt: rec.sockCloseAt }, ticks, 413, JSON_413_BODY);
       assert.ok(v.ok, `${label}: client ${v.why} ${ev}`);
