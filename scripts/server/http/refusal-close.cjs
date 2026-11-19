@@ -31,7 +31,11 @@ const noop = () => {};
 const WATCH_BYTES = 256 * 1024; // fail-closed trigger: a socket found to have read more than this is closed. Not a cap:
                                 // it keeps reading until the next check finds it.
 const WATCH_MS = 100;           // nominal interval of the shared check; timers run late when the event loop is busy
-let lingering = 0; // sockets currently in their grace period (reported to tests)
+let lingering = 0; // sockets currently in their grace period (reported to tests and connection statistics)
+let lingeredTotal = 0, peakLingering = 0;
+// How long refused sockets stayed in their grace period (observation only; fixed buckets, upper bounds in ms).
+const LINGER_BUCKETS_MS = [250, 1000, 2500, 5000, Infinity];
+const lingerBuckets = LINGER_BUCKETS_MS.map(() => 0);
 let resumed = 0;      // times Node resumed a socket in its grace period and it was paused again (reported to tests)
 let closedReading = 0; // sockets closed early because they still read during the grace period (reported to tests)
 const watched = new Map(); // socket -> { readAtStart, watchBytes }
@@ -63,10 +67,16 @@ function bodyMayRemain(req, smallBodyBytes = SMALL_BODY_BYTES) {
 function linger(socket, graceMs, setTimer, clearTimer, watchBytes = WATCH_BYTES) {
   if (!socket || socket.destroyed || socket.__usapLingering) return;
   socket.__usapLingering = true;
-  lingering += 1;
+  lingering += 1; lingeredTotal += 1; if (lingering > peakLingering) peakLingering = lingering;
+  const lingerStart = Date.now();
   socket.on("error", noop); // a reset from the client during the grace period is expected
   let timer = null;
-  socket.once("close", () => { if (timer) clearTimer(timer); lingering -= 1; });
+  socket.once("close", () => {
+    if (timer) clearTimer(timer);
+    lingering -= 1;
+    const ms = Date.now() - lingerStart;
+    lingerBuckets[LINGER_BUCKETS_MS.findIndex((b) => ms <= b)] += 1;
+  });
   // Read nothing more, and keep it that way, using public stream APIs only. pause() alone is not enough: when the
   // answer finishes, Node switches the unread body to discard mode and, on the next tick, resumes the socket so the
   // body is read and thrown away. A resumed stream emits 'resume' in the same tick in which it starts reading, before
@@ -142,4 +152,9 @@ function closeAfterAnswer(req, res, { graceMs = GRACE_MS, smallBodyBytes = SMALL
 module.exports = {
   closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, WATCH_BYTES, WATCH_MS,
   lingeringCount: () => lingering, resumedCount: () => resumed, closedReadingCount: () => closedReading,
+  // Aggregate counts only (for connection statistics in /api/diagnostics): nothing about any client.
+  refusalStats: () => ({
+    lingering, peakLingering, lingeredTotal, closedEarlyForReading: closedReading,
+    lingerMs: Object.fromEntries(LINGER_BUCKETS_MS.map((b, i) => [b === Infinity ? "over5000" : `upTo${b}`, lingerBuckets[i]])),
+  }),
 };

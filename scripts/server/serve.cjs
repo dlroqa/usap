@@ -24,7 +24,9 @@ const { publicPaths } = require("./public-paths.cjs");
 // Step 9.8: request pipeline (security order + error boundary), router and route modules.
 const { createRouter } = require("./http/router.cjs");
 const { createPipeline } = require("./http/pipeline.cjs");
-const { closeAfterAnswer } = require("./http/refusal-close.cjs");
+const { closeAfterAnswer, refusalStats } = require("./http/refusal-close.cjs");
+const { createConnectionStats } = require("./http/connection-stats.cjs");
+const connectionStats = createConnectionStats();
 const { systemRoutes } = require("./routes/system.cjs");
 const { createTtsService } = require("./services/tts-engine.cjs");
 const { ttsRoutes } = require("./routes/tts.cjs");
@@ -1686,6 +1688,7 @@ try {
 async function getDiagnostics() {
   return {
     generatedAt: new Date().toISOString(),
+    connections: connectionStats.snapshot({ refusals: refusalStats() }),
     health: await getHealth(),
     cleanupCandidates: getCleanupCandidates(),
     download: downloads.getState(),
@@ -1918,6 +1921,8 @@ async function legacyRoutes(req, res) {
 // Every request: Host → Origin → CORS → preflight → sign-in → module routes → legacy routes,
 // inside one error boundary (scripts/server/http/pipeline.cjs).
 const server = http.createServer(createPipeline({ requestPolicy, lanAuth, router, fallback: legacyRoutes, json, errors }));
+// Observe-only connection statistics (counts, peaks, time buckets; never refuses or delays): /api/diagnostics.
+connectionStats.attach(server);
 
 server.timeout = 0; // Disable socket timeout for large model uploads/downloads
 
