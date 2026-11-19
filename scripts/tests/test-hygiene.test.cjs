@@ -9,6 +9,53 @@ const test = require("node:test");
 
 const HARNESS = path.join(__dirname, "api-contract", "harness.cjs");
 
+// ── #157: evidence when a harness child process ends before it reports its server ──────────────────────────────────
+// The interrupted-run test starts a child that makes a root, starts a test server and prints {root, pid}. Once, on
+// Linux CI, the child exited after ~0.5 s with nothing on stdout, and the failure message held only stdout. A failure
+// now reports: the iteration, the child's exit code and signal, how far it got (phase markers it prints on stdout),
+// whether the root it made is still on disk, how long it ran, and the end of its stdout and stderr. Output is bounded,
+// and the temp directory, repository and home paths are replaced by placeholders before anything is printed.
+const os = require("node:os");
+const OUTPUT_TAIL = 2000; // characters of stdout / stderr kept for a failure message
+const PATHS = [[os.tmpdir(), "<tmp>"], [path.resolve(__dirname, "..", ".."), "<repo>"], [os.homedir(), "<home>"]]
+  .filter(([p]) => p && p.length > 1).sort((a, b) => b[0].length - a[0].length);
+function redact(text) { let t = String(text); for (const [p, r] of PATHS) t = t.split(p).join(r).split(p.replace(/\\/g, "/")).join(r); return t; }
+function tail(text) { return text.length > OUTPUT_TAIL ? `…${text.slice(-OUTPUT_TAIL)}` : text; }
+const PHASE_PREFIX = "phase:";
+
+/**
+ * Spawn `node -e script` and resolve with { child, info } once it prints a JSON line (its server info). If it exits,
+ * or prints nothing usable within timeoutMs, reject with the evidence above. `iteration` names the loop step.
+ */
+function startHarnessChild(script, iteration, { timeoutMs = 60000 } = {}) {
+  const { spawn } = require("node:child_process");
+  const started = Date.now();
+  const child = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+  let out = "", err = "", root = null;
+  const phases = [];
+  const evidence = (how, extra = {}) => JSON.stringify({
+    iteration, how, ms: Date.now() - started, exitCode: child.exitCode, signal: child.signalCode, phases,
+    serverStartReached: phases.includes("server-starting"), serverReported: false,
+    rootLeftOnDisk: root === null ? null : fs.existsSync(root), ...extra,
+    stdout: redact(tail(out)), stderr: redact(tail(err)),
+  });
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => { if (!done) { done = true; reject(new Error(`timeout: ${evidence("no server info within " + timeoutMs + " ms")}`)); } }, timeoutMs);
+    child.stdout.on("data", (d) => {
+      out += d;
+      for (const line of out.split("\n")) {
+        if (line.startsWith(PHASE_PREFIX)) { const [name, ...rest] = line.slice(PHASE_PREFIX.length).split(" "); if (!phases.includes(name)) phases.push(name); if (name === "root-made") root = rest.join(" ").trim(); }
+      }
+      const line = out.split("\n").find((l) => l.startsWith("{"));
+      if (line && !done) { done = true; clearTimeout(timer); resolve({ child, info: JSON.parse(line) }); }
+    });
+    child.stderr.on("data", (d) => { err = (err + d).slice(-4 * OUTPUT_TAIL); });
+    // 'close' (not 'exit'): all of the child's stdout and stderr has been read by then
+    child.on("close", () => { if (!done) { done = true; clearTimeout(timer); reject(new Error(`child exited early: ${evidence("exited before reporting its server")}`)); } });
+  });
+}
+
 test("harness: temp roots a test does not remove are removed when the test process exits", () => {
   const script = `const h = require(${JSON.stringify(HARNESS)}); const r = h.makeRoot(); console.log(r);`;
   const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
@@ -35,17 +82,10 @@ test("harness: a server a test does not stop is stopped, and its root removed, w
 });
 
 test("harness: an interrupted test run (SIGINT, SIGTERM) still removes its roots and stops its servers", { skip: process.platform === "win32" && "Windows has no catchable SIGINT/SIGTERM for child processes" }, async () => {
-  const { spawn } = require("node:child_process");
   for (const signal of ["SIGINT", "SIGTERM"]) {
     const script = `const h = require(${JSON.stringify(HARNESS)});
-      (async () => { const r = h.makeRoot(); const s = await h.startServer(r); console.log(JSON.stringify({ root: r, pid: s.proc.pid })); setInterval(() => {}, 1000); })();`;
-    const child = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
-    let out = "";
-    const info = await new Promise((resolve, reject) => {
-      child.stdout.on("data", (d) => { out += d; const line = out.split("\n").find((l) => l.startsWith("{")); if (line) resolve(JSON.parse(line)); });
-      child.on("exit", () => reject(new Error(`child exited early: ${out}`)));
-      setTimeout(() => reject(new Error("timeout")), 60000);
-    });
+      (async () => { const r = h.makeRoot(); console.log("phase:root-made " + r); console.log("phase:server-starting"); const s = await h.startServer(r); console.log(JSON.stringify({ root: r, pid: s.proc.pid })); setInterval(() => {}, 1000); })();`;
+    const { child, info } = await startHarnessChild(script, signal);
     const exited = new Promise((resolve) => child.on("exit", (code, sig) => resolve({ code, sig })));
     child.kill(signal);
     const { code } = await exited;
@@ -54,6 +94,40 @@ test("harness: an interrupted test run (SIGINT, SIGTERM) still removes its roots
     let alive = true;
     for (let i = 0; i < 50 && alive; i++) { try { process.kill(info.pid, 0); await new Promise((r) => setTimeout(r, 100)); } catch (_) { alive = false; } }
     assert.equal(alive, false, `${signal}: server stopped`);
+  }
+});
+
+test("#157 diagnostics: a harness child that ends before reporting its server is reported with iteration, exit code, signal, phase, root status and bounded, path-free output", async () => {
+  const early = async (script, iteration) => {
+    try { await startHarnessChild(script, iteration, { timeoutMs: 30000 }); } catch (e) { return e.message; }
+    assert.fail(`${iteration}: the child was reported as started`);
+  };
+  // started its server start, wrote an error, exited 7, and left the root it made on disk
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "usap-157-control-"));
+  try {
+    const msg = await early(`console.log("phase:root-made " + ${JSON.stringify(dir)}); console.log("phase:server-starting");
+      process.stderr.write("simulated startup failure in " + ${JSON.stringify(dir)} + "\\n"); process.exit(7);`, "control-exit-7");
+    assert.match(msg, /^child exited early: /);
+    const ev = JSON.parse(msg.slice("child exited early: ".length));
+    assert.equal(ev.iteration, "control-exit-7"); assert.equal(ev.exitCode, 7); assert.equal(ev.signal, null);
+    assert.deepEqual(ev.phases, ["root-made", "server-starting"]); assert.equal(ev.serverStartReached, true); assert.equal(ev.serverReported, false);
+    assert.equal(ev.rootLeftOnDisk, true, "the root the child made is reported as still on disk");
+    assert.match(ev.stderr, /simulated startup failure in <tmp>/);
+    assert.ok(!msg.includes(os.tmpdir()), `no temp-directory path in the message: ${msg}`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  // exited before starting a server: phase says so
+  const before = JSON.parse((await early(`console.log("phase:root-made <none>"); process.exit(3);`, "control-before-server")).slice("child exited early: ".length));
+  assert.equal(before.exitCode, 3); assert.equal(before.serverStartReached, false); assert.equal(before.rootLeftOnDisk, false);
+  // a crash (uncaught exception) shows its stack's message in stderr
+  const thrown = JSON.parse((await early(`console.log("phase:server-starting"); throw new Error("simulated listen failure EADDRINUSE");`, "control-throw")).slice("child exited early: ".length));
+  assert.equal(thrown.exitCode, 1); assert.match(thrown.stderr, /simulated listen failure EADDRINUSE/);
+  // huge output stays bounded
+  const big = await early(`process.stderr.write("x".repeat(200000) + "END"); process.exit(1);`, "control-big-output");
+  assert.ok(big.length < 4 * OUTPUT_TAIL + 1000, `message is bounded (${big.length} characters)`); assert.match(big, /END/);
+  // killed by a signal (POSIX): the signal is reported
+  if (process.platform !== "win32") {
+    const killed = JSON.parse((await early(`process.kill(process.pid, "SIGKILL");`, "control-sigkill")).slice("child exited early: ".length));
+    assert.equal(killed.signal, "SIGKILL"); assert.equal(killed.exitCode, null);
   }
 });
 
