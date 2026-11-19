@@ -55,6 +55,15 @@ function raw(port, { framing = {}, send = "stream", capBytes = 96 * MiB, headers
     s.on("close", () => { clearTimeout(end); stopped = true; st.closedAt = Date.now() - st.t0; resolve(st); });
     s.on("connect", () => {
       st.localPort = s.localPort;
+      // BENCH ONLY (#151): kernel view of this connection if nothing has arrived 1500 ms after connecting
+      setTimeout(() => {
+        if (st.firstDataAt !== null || stopped) return;
+        try {
+          const out = require("node:child_process").execFileSync("netstat", ["-an", "-p", "tcp"], { encoding: "utf8", timeout: 5000 });
+          st.kernel = out.split("\n").filter((l) => l.includes(`.${st.localPort} `)).map((l) => l.trim().replace(/\s+/g, " "));
+          st.kernelAt = Date.now() - st.t0;
+        } catch (e) { st.kernel = [`netstat failed: ${e.message}`]; }
+      }, 1500);
       const frame = framing.chunked ? "Transfer-Encoding: chunked\r\n" : framing.contentLength !== undefined ? `Content-Length: ${framing.contentLength}\r\n` : "";
       s.write(`POST ${URL} HTTP/1.1\r\nHost: 127.0.0.1\r\n${headers}Content-Type: ${contentType}\r\n${frame}\r\n`);
       const write = (b) => {
@@ -86,7 +95,7 @@ async function withServer(fn, extra = {}) {
 // server answered and kept the grace period, the client did not read the answer" and "the server closed early" apart.
 function evidence(st, rec) {
   const c = { status: st.status, error: st.error, sent: st.sent, sentAtAnswer: st.sentAtAnswer, answeredAt: st.answeredAt,
-    firstDataAt: st.firstDataAt, endAt: st.endAt, errorAt: st.errorAt, closedAt: st.closedAt, localPort: st.localPort };
+    firstDataAt: st.firstDataAt, endAt: st.endAt, errorAt: st.errorAt, closedAt: st.closedAt, localPort: st.localPort, kernelAt: st.kernelAt, kernel: st.kernel };
   const s = rec ? { status: rec.status, bytesRead: rec.bytesRead, answerMs: rec.finishAt && rec.finishAt - rec.arrivedAt,
     closeAfterAnswerMs: rec.finishAt && rec.sockCloseAt && rec.sockCloseAt - rec.finishAt, body: String(rec.body || "").slice(0, 80) } : null;
   return `[client ${JSON.stringify(c)} server ${JSON.stringify(s)}]`;

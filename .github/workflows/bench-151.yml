@@ -1,5 +1,6 @@
 # Issue #151 (json-413 concurrent test: a client receives no answer, macOS Intel). Bench branch only
-# (bench/151-json413-macos): never merged, never a required check. Output: timings, statuses, socket queue sizes.
+# (bench/151-json413-macos): never merged, never a required check. Round 2: the real unit suite exactly as CI runs
+# it, with a bench-only snapshot of the kernel socket queues for a client that has received nothing after 1.5 s.
 name: bench-151
 
 on:
@@ -11,15 +12,14 @@ permissions:
   contents: read
 
 jobs:
-  probe:
-    name: probe (${{ matrix.os }}, run ${{ matrix.run }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+  suite:
+    name: suite (macOS Intel, run ${{ matrix.run }})
+    runs-on: macos-15-intel
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15-intel, macos-15]
-        run: [1, 2]
+        run: [1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -27,12 +27,11 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22.12.0"
-      - name: Probe alone (20 rounds x 10 clients)
-        run: node bench/151/probe.cjs 20
-      - name: Probe while the unit suite runs (as in CI)
+      - name: Unit suite as in CI (json-413 instrumented)
         shell: bash
         run: |
-          (node --test --test-timeout=600000 "scripts/tests/*.test.cjs" > suite.log 2>&1; echo "suite exit $?" > suite.done) &
-          sleep 20
-          node bench/151/probe.cjs 30
-          while [ ! -f suite.done ]; do sleep 10; done; cat suite.done; grep -E "^ℹ (pass|fail)|^# (pass|fail)" suite.log | head -4
+          set +e
+          node --test --test-timeout=600000 --test-reporter=spec "scripts/tests/*.test.cjs" > suite.log 2>&1
+          echo "suite exit $?"
+          grep -E "concurrent over-limit|AssertionError.*client [0-9]|ℹ (pass|fail)" suite.log | cut -c1-3000
+          exit 0
