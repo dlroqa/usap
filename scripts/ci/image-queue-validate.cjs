@@ -10,7 +10,7 @@
 // received by the job that has the running turn, two complete and waiting), with the real engine loaded and idle.
 // The resident memory of the studio process, the engine process and this client is sampled separately before,
 // during and after; the bodies are never sent to the engine (their clients leave while they wait). Stop condition:
-// the scenario ends at once if the studio grows past 2 GiB or free memory drops below 1 GiB.
+// the scenario ends at once if the studio grows past 2 GiB or available memory (availableBytes) drops below 1 GiB.
 //
 //   node scripts/ci/image-queue-validate.cjs --image stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf --results out.jsonl --logs ci-logs
 "use strict";
@@ -111,6 +111,22 @@ async function enginePid() {
   const d = (await call("GET", "/api/diagnostics", undefined, { timeoutMs: 10000 })).json;
   const r = ((d && d.engines && d.engines.processes && d.engines.processes.supervised) || []).find((x) => x.label === "image");
   return r ? (r.enginePid || r.guardPid) : null;
+}
+// Memory the system can still give out, per platform. os.freemem() is right on Windows (available physical memory)
+// but on macOS it counts only never-used pages (inactive and purgeable memory, which macOS reclaims at once, are left
+// out), so it is often a few hundred MiB on a healthy Mac; on Linux MemAvailable is the kernel's own estimate.
+function availableBytes() {
+  try {
+    if (process.platform === "linux") { const m = fs.readFileSync("/proc/meminfo", "utf8").match(/MemAvailable:\s+(\d+) kB/); if (m) return Number(m[1]) * 1024; }
+    if (process.platform === "darwin") {
+      const out = String(spawnSync("vm_stat", [], { encoding: "utf8" }).stdout || "");
+      const pageSize = Number((out.match(/page size of (\d+) bytes/) || [])[1]) || 4096;
+      const pages = (name) => Number((out.match(new RegExp(`${name}:\\s+(\\d+)`)) || [])[1]) || 0;
+      const n = pages("Pages free") + pages("Pages inactive") + pages("Pages speculative") + pages("Pages purgeable");
+      if (n > 0) return n * pageSize;
+    }
+  } catch (_) { /* fall back */ }
+  return os.freemem();
 }
 const mib = (kib) => (kib === null || kib === undefined ? "n/a" : `${Math.round(kib / 1024)} MiB`);
 
@@ -268,7 +284,7 @@ function heldUpload(declared, send) {
       if (load.status !== 200) throw new Error(`load ${load.status}`);
       const ePid = await enginePid();
       const sPid = srv.child.pid;
-      const sample = () => ({ studio: rssKiB(sPid), engine: rssKiB(ePid), client: Math.round(process.memoryUsage().rss / 1024), free: os.freemem() });
+      const sample = () => ({ studio: rssKiB(sPid), engine: rssKiB(ePid), client: Math.round(process.memoryUsage().rss / 1024), free: availableBytes() });
       await sleep(2000);
       const base = sample();
       const before = (await queueNow()).iq.counts;
@@ -298,7 +314,7 @@ function heldUpload(declared, send) {
       const counts = (await queueNow()).iq.counts;
       const forwarded = counts.forwarded - before.forwarded;
       record("D6 peak memory, three 64 MiB bodies held", stopped ? "FAIL" : "MEASURED",
-        `held ${held ? Math.round(held.reservedBytes / MiB) : "?"} MiB in ${held ? held.heldJobs : "?"} jobs; studio RSS baseline ${mib(base.studio)}, peak ${mib(peak.studio)} (+${base.studio && peak.studio ? Math.round((peak.studio - base.studio) / 1024) : "?"} MiB), after release ${mib(after.studio)} (resident: Node need not return freed memory to the OS; the queue's own count is below); engine RSS ${mib(base.engine)} → ${mib(peak.engine)} (loaded, idle); client ${mib(peak.client)}; free memory ${Math.round(peak.free / MiB)} MiB${stopped ? `; STOP CONDITION at studio ${mib(stopped.studio)}, free ${Math.round(stopped.free / MiB)} MiB` : ""}`);
+        `held ${held ? Math.round(held.reservedBytes / MiB) : "?"} MiB in ${held ? held.heldJobs : "?"} jobs; studio RSS baseline ${mib(base.studio)}, peak ${mib(peak.studio)} (+${base.studio && peak.studio ? Math.round((peak.studio - base.studio) / 1024) : "?"} MiB), after release ${mib(after.studio)} (resident: Node need not return freed memory to the OS; the queue's own count is below); engine RSS ${mib(base.engine)} → ${mib(peak.engine)} (loaded, idle); client ${mib(peak.client)}; available memory ${Math.round(base.free / MiB)} MiB before, ${Math.round(peak.free / MiB)} MiB at the peak${stopped ? `; STOP CONDITION at studio ${mib(stopped.studio)}, available ${Math.round(stopped.free / MiB)} MiB` : ""}`);
       record("D6 bodies released, none forwarded to the engine", released && forwarded === 0 ? "PASS" : "FAIL", `reserved after ${released ? 0 : "not 0"}; held jobs ${released ? 0 : "?"}; forwarded ${forwarded}`);
       // The default budget (128 MiB) bounds the same workload: a third 64 MiB body is refused.
     } finally { for (const u of uploads) u.abort(); await stopServer(srv); srv = null; }
