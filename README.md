@@ -301,7 +301,7 @@ only, no force pushes. Details: [CI_GUIDE.md](docs/ci/CI_GUIDE.md),
 * **Step 9, foundational backend** (current): API contract tests; a paths/config module ready for
   portable and installed storage; remaining security findings; engine crash supervision and
   diagnostics; consistent API errors; modular backend (9.8, done;
-  remaining limitations in its plan); 9.9 resource scheduling (planned); 9.10 performance benchmarks; 9.11 an optimized Intel
+  remaining limitations in its plan); 9.9 resource scheduling (in progress); 9.10 performance benchmarks; 9.11 an optimized Intel
   image engine; 9.12 installed-mode storage preparation. [Plan](docs/roadmap/STEP9_BACKEND_PLAN.md).
 * **Step 10, desktop installers** (planned): an installed edition next to the portable one,
   Windows `.exe`/`.msi`, Linux AppImage/`.deb`, macOS Apple Silicon and Intel `.dmg`, from the same
