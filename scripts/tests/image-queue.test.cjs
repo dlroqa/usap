@@ -338,16 +338,40 @@ test("queue: body bounds — declared over the ceiling 413 at once; chunked over
   } finally { await h.close(); }
 });
 
-test("queue: budget reservation is checked before admission (declared lengths)", async () => {
-  const h = await harness({ bodyBytes: 256 * 1024, bodyBudgetBytes: 300 * 1024 });
+test("queue: body budget — the aggregate reservation never exceeds the budget; a request that would cross it is refused 429 body-budget before admission; one that exactly fits is admitted", async () => {
+  const KiB = 1024;
+  const budget = 300 * KiB;
+  // Upload deadlines longer than this test, so the held upload keeps its reservation for the whole check.
+  const h = await harness({ bodyBytes: 256 * KiB, bodyBudgetBytes: budget, uploadIdleMs: 20000, uploadMaxMs: 30000 });
+  let peak = 0;
+  const sampler = setInterval(() => { peak = Math.max(peak, h.q.memory().reservedBytes); }, 2);
   try {
-    const a = h.send({ body: Buffer.alloc(10), declared: 250 * 1024, hold: true }); // reserves 250 KiB, keeps uploading
-    await waitFor(() => h.q.memory().reservedBytes === 250 * 1024);
-    const r = await h.send({ body: Buffer.alloc(100 * 1024) }).done; // 250 + 100 > 300
-    assert.equal(r.status, 429); assert.equal(r.json.code, "QUEUE_FULL"); assert.equal(r.json.reason, "body-budget");
-    a.abort();
-    await waitFor(() => h.q.memory().reservedBytes === 0, 3000, "released when the client left");
-  } finally { await h.close(); }
+    const a = h.send({ body: Buffer.alloc(10), declared: 250 * KiB, hold: true }); // reserves 250 KiB, keeps uploading
+    await waitFor(() => h.q.memory().reservedBytes === 250 * KiB);
+    const before = { ...h.q.stats() };
+    // 250 + 100 > 300: must be refused at admission. A missing budget check admits it instead: it then waits behind the
+    // held upload and never answers, so the answer is bounded here and the invariant is checked first, by name.
+    const over = await within(h.send({ body: Buffer.alloc(100 * KiB) }).done, 3000);
+    const m = h.q.memory();
+    peak = Math.max(peak, m.reservedBytes);
+    assert.ok(peak <= budget, `body budget: peak reservation ${peak} bytes must stay within the ${budget}-byte budget`);
+    assert.equal(m.reservedBytes, 250 * KiB, "body budget: the refused request reserved nothing");
+    assert.equal(m.heldJobs, 1, "body budget: the refused request holds no body");
+    assert.deepEqual({ running: h.q.stats().running, waiting: h.q.stats().waiting }, { running: before.running, waiting: before.waiting }, "body budget: the refused request took no queue place");
+    assert.ok(!over.timedOut, "body budget: the request over the budget is answered at once, not admitted");
+    assert.equal(over.status, 429); assert.equal(over.json.code, "QUEUE_FULL"); assert.equal(over.json.reason, "body-budget");
+    assert.ok(Number(over.headers["retry-after"]) >= MIN_RETRY_AFTER_SECONDS);
+    assert.equal(h.q.counts().bodyBudget, 1, "body budget: counted once");
+    // Boundary: 250 + 50 = 300 fits the budget exactly and is admitted (waits behind the held upload).
+    const fit = h.send({ body: Buffer.alloc(10), declared: 50 * KiB, hold: true });
+    await waitFor(() => h.q.memory().reservedBytes === budget, 3000, "an exactly fitting request reserved");
+    assert.equal(h.q.counts().bodyBudget, 1, "body budget: the exactly fitting request is not refused");
+    assert.equal(h.up.seen.length, 0, "nothing forwarded while uploads are incomplete");
+    a.abort(); fit.abort();
+    await waitFor(() => h.q.memory().reservedBytes === 0, 3000, "released when the clients left");
+    assert.equal(h.q.memory().heldJobs, 0);
+    assert.ok(peak <= budget, `body budget: peak reservation ${peak} bytes stayed within the budget throughout`);
+  } finally { clearInterval(sampler); await h.close(); }
 });
 
 test("queue: stop/restart refuse waiting jobs with 503 ENGINE_NOT_READY; the running job is not touched", async () => {

@@ -366,7 +366,13 @@ When on, `/api/resources` adds `limits.imageQueue: "on"`, `engines.image.queue`
   in progress).
 * `scripts/ci/image-queue-validate.cjs` in `native-runtime` on all four CPU targets with the real sd-server: §11.2's
   rows, and the D6 memory measurement (studio, engine and client resident memory while the studio holds three
-  64 MiB bodies that are never sent to the engine; a stop condition ends it early if the studio passes 2 GiB or free
-  memory falls below 1 GiB). Its results are evidence for the memory-versus-disk decision; they are not a default.
+  64 MiB bodies that are never sent to the engine; a stop condition ends it early if the studio passes 2 GiB or
+  available memory falls below 1 GiB). The engine is measured only when its process is verified (the PID the guard
+  reported, an sd binary whose parent is that guard); the guard is reported separately. A validator-only probe loaded
+  into that one test studio (`scripts/ci/image-queue-memprobe.cjs`, `--expose-gc`) adds heap, external and
+  `arrayBuffers` figures: after release and a forced garbage collection, `arrayBuffers` must be back near its baseline
+  (the bodies are no longer referenced; resident memory alone is not used for that, since Node need not return freed
+  memory to the OS). Four cancellation cycles and one 64 MiB body forwarded to the engine then check that retained
+  buffers do not grow. Its results are evidence for the memory-versus-disk decision; they are not a default.
 * GPU and NPU paths are not exercised; the queue makes no GPU or NPU claim.
 

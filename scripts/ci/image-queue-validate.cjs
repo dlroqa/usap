@@ -107,11 +107,45 @@ function rssKiB(pid) {
   } catch (_) { /* unavailable */ }
   return null;
 }
-async function enginePid() {
+// The native image engine's process, verified: the supervisor's record gives the guard and the engine PID it
+// reported; the engine must be a stable-diffusion.cpp binary (the names in serve.cjs BACKEND_PATHS) whose parent is
+// that guard. No fallback to the guard (a Node process): an unverified identity is reported as such, never measured.
+const ENGINE_NAME = /^(sd|sd-(cpu|cuda|vulkan)\.exe|sd-server-(cpu|vulkan|rocm|cuda))$/i;
+function processInfo(pid) {
+  try {
+    if (process.platform === "linux") {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+      return { name: path.basename(fs.readlinkSync(`/proc/${pid}/exe`)), ppid };
+    }
+    if (process.platform === "darwin") {
+      const r = spawnSync("ps", ["-o", "ppid=,comm=", "-p", String(pid)], { encoding: "utf8" });
+      const m = String(r.stdout).trim().match(/^(\d+)\s+(.+)$/);
+      return m ? { name: path.basename(m[2]), ppid: Number(m[1]) } : null;
+    }
+    if (process.platform === "win32") {
+      const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command",
+        `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}"; if ($p) { "$($p.ParentProcessId)|$($p.Name)" }`], { encoding: "utf8", windowsHide: true, timeout: 20000 });
+      const m = String(r.stdout).trim().match(/^(\d+)\|(.+)$/);
+      return m ? { name: m[2].trim(), ppid: Number(m[1]) } : null;
+    }
+  } catch (_) { /* unavailable */ }
+  return null;
+}
+async function engineIdentity() {
   const d = (await call("GET", "/api/diagnostics", undefined, { timeoutMs: 10000 })).json;
   const r = ((d && d.engines && d.engines.processes && d.engines.processes.supervised) || []).find((x) => x.label === "image");
-  return r ? (r.enginePid || r.guardPid) : null;
+  if (!r) return { verified: false, why: "no supervised image engine" };
+  const id = { guardPid: r.guardPid, enginePid: Number.isInteger(r.enginePid) ? r.enginePid : null, verified: false };
+  if (!id.enginePid) return { ...id, why: "the guard reported no engine PID" };
+  const info = processInfo(id.enginePid);
+  if (!info) return { ...id, why: "engine process not readable" };
+  Object.assign(id, { name: info.name, ppid: info.ppid });
+  if (!ENGINE_NAME.test(info.name)) return { ...id, why: `PID ${id.enginePid} is ${info.name}, not an sd binary` };
+  if (info.ppid !== id.guardPid) return { ...id, why: `parent ${info.ppid} is not the guard ${id.guardPid}` };
+  return { ...id, verified: true, why: "" };
 }
+async function enginePid() { const id = await engineIdentity(); return id.verified ? id.enginePid : null; }
 // Memory the system can still give out, per platform. os.freemem() is right on Windows (available physical memory)
 // but on macOS it counts only never-used pages (inactive and purgeable memory, which macOS reclaims at once, are left
 // out), so it is often a few hundred MiB on a healthy Mac; on Linux MemAvailable is the kernel's own estimate.
@@ -275,49 +309,104 @@ function heldUpload(declared, send) {
   } finally { await stopServer(srv); srv = null; }
 
   // ── D6 memory measurement ──
+  // Studio: resident memory from the OS, plus heap / external / arrayBuffers from a validator-only probe loaded into
+  // this studio only (image-queue-memprobe.cjs, --expose-gc). Engine: the verified sd process (engineIdentity), never
+  // the guard. Client: this process. "Released" is judged on arrayBuffers after a forced GC (buffers still referenced),
+  // not on RSS (Node and the allocator need not return freed memory to the OS). Bounded repeated cycles then check that
+  // retained buffers do not grow: cancellation (all three clients leave) x4, and one body forwarded to the engine.
   await scenario("D6 peak memory, three 64 MiB bodies held", async () => {
-    srv = await startServer("memory", { ...ON, USAP_IMAGE_QUEUE_BODY_BUDGET_BYTES: String(192 * MiB) });
+    const probeFile = path.join(LOGDIR, "image-queue-memprobe.json");
+    try { fs.unlinkSync(probeFile); } catch (_) { /* none */ }
+    srv = await startServer("memory", { ...ON, USAP_IMAGE_QUEUE_BODY_BUDGET_BYTES: String(192 * MiB), USAP_IQ_MEMPROBE: probeFile,
+      NODE_OPTIONS: `--expose-gc --require ${JSON.stringify(path.join(__dirname, "image-queue-memprobe.cjs"))}` });
     const uploads = [];
     let stopped = null;
+    const readProbe = () => { try { return JSON.parse(fs.readFileSync(probeFile, "utf8")); } catch (_) { return null; } };
+    let gcSeq = 0;
+    const gcSample = async () => {
+      const id = `gc-${++gcSeq}`;
+      fs.writeFileSync(`${probeFile}.gc`, id);
+      return waitUntil(() => { const p = readProbe(); return p && p.gcId === id ? p : null; }, 10000, 100);
+    };
+    const MB = (b) => (typeof b === "number" ? `${Math.round(b / MiB)} MiB` : "n/a");
     try {
       const load = await imageLoad(); await imageReady();
       if (load.status !== 200) throw new Error(`load ${load.status}`);
-      const ePid = await enginePid();
+      const eng = await engineIdentity();
+      record("D6 engine process identity", eng.verified ? "PASS" : "FAIL", eng.verified
+        ? `engine PID ${eng.enginePid} is ${eng.name}, child of guard PID ${eng.guardPid}; the guard is measured separately`
+        : `not verified (${eng.why}); engine memory is not reported`);
+      const ePid = eng.verified ? eng.enginePid : null;
+      const gPid = eng.guardPid || null;
       const sPid = srv.child.pid;
-      const sample = () => ({ studio: rssKiB(sPid), engine: rssKiB(ePid), client: Math.round(process.memoryUsage().rss / 1024), free: availableBytes() });
+      const sample = () => ({ studio: rssKiB(sPid), engine: ePid ? rssKiB(ePid) : null, guard: gPid ? rssKiB(gPid) : null, client: Math.round(process.memoryUsage().rss / 1024), free: availableBytes(), probe: readProbe() });
+      const overLimit = (s) => (s.studio && s.studio > STOP_STUDIO_RSS_KIB) || s.free < STOP_FREE_BYTES;
       await sleep(2000);
+      const probeOk = Boolean(await waitUntil(() => { const p = readProbe(); return p && p.pid === sPid && p.gcAvailable; }, 10000, 200));
+      const baseGc = probeOk ? await gcSample() : null;
       const base = sample();
       const before = (await queueNow()).iq.counts;
-      // A: the running turn, 64 MiB declared, all but 1 MiB sent (its upload stays open). B, C: complete, waiting.
-      const A = heldUpload(64 * MiB, 63 * MiB); uploads.push(A);
-      await waitUntil(async () => (await queueNow()).q.running === 1, 20000, 100);
-      await A.sent;
-      const B = heldUpload(64 * MiB, 64 * MiB); uploads.push(B); await B.sent;
-      const C = heldUpload(64 * MiB, 64 * MiB); uploads.push(C); await C.sent;
-      const held = await waitUntil(async () => { const { iq, q } = await queueNow(); return iq.memory.reservedBytes === 192 * MiB && q.waiting === 2 ? iq.memory : null; }, 60000, 200);
-      await sleep(1500); // let the last chunks land
-      let peak = sample();
-      for (let i = 0; i < 10; i += 1) {
-        const s = sample();
-        if (s.studio && (!peak.studio || s.studio > peak.studio)) peak = s;
-        if ((s.studio && s.studio > STOP_STUDIO_RSS_KIB) || s.free < STOP_FREE_BYTES) { stopped = s; break; }
-        await sleep(500);
-      }
-      // Cleanup: the waiting clients leave first (so the turn is never handed to a held body), then the running
-      // turn's client, whose upload is still incomplete. Nothing reaches the engine.
-      C.abort(); B.abort();
-      await waitUntil(async () => (await queueNow()).q.waiting === 0, 10000, 100);
-      A.abort();
-      const released = await waitUntil(async () => { const { iq, q } = await queueNow(); return iq.memory.reservedBytes === 0 && iq.memory.heldJobs === 0 && q.running === 0 && q.waiting === 0 ? iq : null; }, 30000, 200);
-      await sleep(3000);
-      const after = sample();
-      const counts = (await queueNow()).iq.counts;
-      const forwarded = counts.forwarded - before.forwarded;
+      // One cycle: A has the running turn with 63 of 64 MiB sent (its upload stays open), B and C complete and waiting;
+      // then every client leaves (waiting first, so the turn is never handed to a held body). Nothing is forwarded.
+      const holdCycle = async () => {
+        const A = heldUpload(64 * MiB, 63 * MiB); uploads.push(A);
+        await waitUntil(async () => (await queueNow()).q.running === 1, 20000, 100);
+        await A.sent;
+        const B = heldUpload(64 * MiB, 64 * MiB); uploads.push(B); await B.sent;
+        const C = heldUpload(64 * MiB, 64 * MiB); uploads.push(C); await C.sent;
+        const held = await waitUntil(async () => { const { iq, q } = await queueNow(); return iq.memory.reservedBytes === 192 * MiB && q.waiting === 2 ? iq.memory : null; }, 60000, 200);
+        await sleep(1500); // let the last chunks land
+        let peak = sample();
+        for (let i = 0; i < 10; i += 1) {
+          const s = sample();
+          if (s.studio && (!peak.studio || s.studio > peak.studio)) peak = s;
+          if (overLimit(s)) { stopped = s; break; }
+          await sleep(500);
+        }
+        C.abort(); B.abort();
+        await waitUntil(async () => (await queueNow()).q.waiting === 0, 10000, 100);
+        A.abort();
+        const released = await waitUntil(async () => { const { iq, q } = await queueNow(); return iq.memory.reservedBytes === 0 && iq.memory.heldJobs === 0 && q.running === 0 && q.waiting === 0 ? iq : null; }, 30000, 200);
+        await sleep(1000);
+        const after = sample();
+        const afterGc = probeOk ? await gcSample() : null;
+        return { held, peak, released: Boolean(released), after, afterGc };
+      };
+      const c1 = await holdCycle();
+      const forwarded1 = (await queueNow()).iq.counts.forwarded - before.forwarded;
+      const peakP = c1.peak.probe || {};
       record("D6 peak memory, three 64 MiB bodies held", stopped ? "FAIL" : "MEASURED",
-        `held ${held ? Math.round(held.reservedBytes / MiB) : "?"} MiB in ${held ? held.heldJobs : "?"} jobs; studio RSS baseline ${mib(base.studio)}, peak ${mib(peak.studio)} (+${base.studio && peak.studio ? Math.round((peak.studio - base.studio) / 1024) : "?"} MiB), after release ${mib(after.studio)} (resident: Node need not return freed memory to the OS; the queue's own count is below); engine RSS ${mib(base.engine)} → ${mib(peak.engine)} (loaded, idle); client ${mib(peak.client)}; available memory ${Math.round(base.free / MiB)} MiB before, ${Math.round(peak.free / MiB)} MiB at the peak${stopped ? `; STOP CONDITION at studio ${mib(stopped.studio)}, available ${Math.round(stopped.free / MiB)} MiB` : ""}`);
-      record("D6 bodies released, none forwarded to the engine", released && forwarded === 0 ? "PASS" : "FAIL", `reserved after ${released ? 0 : "not 0"}; held jobs ${released ? 0 : "?"}; forwarded ${forwarded}`);
-      // The default budget (128 MiB) bounds the same workload: a third 64 MiB body is refused.
-    } finally { for (const u of uploads) u.abort(); await stopServer(srv); srv = null; }
+        `held ${c1.held ? Math.round(c1.held.reservedBytes / MiB) : "?"} MiB in ${c1.held ? c1.held.heldJobs : "?"} jobs; studio RSS ${mib(base.studio)} -> peak ${mib(c1.peak.studio)} (+${base.studio && c1.peak.studio ? Math.round((c1.peak.studio - base.studio) / 1024) : "?"} MiB) -> ${mib(c1.after.studio)} after release; studio arrayBuffers ${MB(baseGc && baseGc.arrayBuffers)} -> ${MB(peakP.arrayBuffers)} at the peak, heapUsed ${MB(baseGc && baseGc.heapUsed)} -> ${MB(peakP.heapUsed)}, external ${MB(baseGc && baseGc.external)} -> ${MB(peakP.external)}; engine RSS ${eng.verified ? `${mib(base.engine)} -> ${mib(c1.peak.engine)} (loaded, idle)` : "n/a (identity not verified)"}; guard RSS ${mib(base.guard)}; client ${mib(c1.peak.client)}; available memory ${Math.round(base.free / MiB)} MiB before, ${Math.round(c1.peak.free / MiB)} MiB at the peak${stopped ? `; STOP CONDITION at studio ${mib(stopped.studio)}, available ${Math.round(stopped.free / MiB)} MiB` : ""}`);
+      record("D6 bodies released, none forwarded to the engine", c1.released && forwarded1 === 0 ? "PASS" : "FAIL", `queue count: reserved 0 and held jobs 0 ${c1.released ? "reached" : "NOT reached"}; forwarded ${forwarded1}`);
+      // Buffers still referenced after a full GC: back near the baseline (64 MiB margin, a third of one body).
+      const RETAIN_MARGIN = 64 * MiB;
+      const gcOk = (g) => Boolean(g && baseGc && g.arrayBuffers <= baseGc.arrayBuffers + RETAIN_MARGIN);
+      record("D6 body buffers unreferenced after release (forced GC)", probeOk && gcOk(c1.afterGc) ? "PASS" : "FAIL",
+        probeOk ? `studio arrayBuffers after GC: baseline ${MB(baseGc.arrayBuffers)}, after release ${MB(c1.afterGc && c1.afterGc.arrayBuffers)} (192 MiB were held; margin ${MB(RETAIN_MARGIN)}); heapUsed ${MB(baseGc.heapUsed)} -> ${MB(c1.afterGc && c1.afterGc.heapUsed)}; RSS after release ${mib(c1.after.studio)} (resident, not a leak measure)` : "studio memory probe unavailable");
+      if (stopped) return;
+      // Bounded repetition: three more cancellation cycles, then one complete 64 MiB body forwarded to the engine
+      // (not a valid request: the engine answers it with an error) - the forwarded path's release.
+      const series = [c1];
+      for (let i = 2; i <= 4 && !stopped; i += 1) series.push(await holdCycle());
+      let fwd = null;
+      if (!stopped) {
+        await idleEngine();
+        const before2 = (await queueNow()).iq.counts.forwarded;
+        const F = heldUpload(64 * MiB, 64 * MiB); uploads.push(F); await F.sent; F.finish();
+        const rf = await Promise.race([F.done, sleep(120000).then(() => ({ status: "timeout" }))]);
+        await waitUntil(async () => { const { iq, q } = await queueNow(); return iq.memory.reservedBytes === 0 && q.running === 0 ? iq : null; }, 60000, 200);
+        await sleep(1000);
+        const s = sample(); if (overLimit(s)) stopped = s;
+        fwd = { status: rf.status, forwarded: (await queueNow()).iq.counts.forwarded - before2, afterGc: probeOk ? await gcSample() : null, after: s };
+      }
+      const ab = series.map((c) => (c.afterGc ? Math.round(c.afterGc.arrayBuffers / MiB) : "?"));
+      const rss = series.map((c) => mib(c.after.studio));
+      const grew = probeOk && series.length >= 2 && series[series.length - 1].afterGc && series[0].afterGc
+        && series[series.length - 1].afterGc.arrayBuffers - series[0].afterGc.arrayBuffers > 16 * MiB;
+      const ok = probeOk && !stopped && series.every((c) => c.released && gcOk(c.afterGc)) && !grew && fwd && fwd.forwarded === 1 && gcOk(fwd.afterGc);
+      record("D6 repeated cycles: no growing retained buffers", ok ? "PASS" : "FAIL",
+        `${series.length} cancellation cycles of 192 MiB: studio arrayBuffers after GC ${ab.join(", ")} MiB (baseline ${MB(baseGc && baseGc.arrayBuffers)}); RSS after each ${rss.join(", ")}; forwarded 64 MiB body: engine answered ${fwd ? fwd.status : "n/a"}, forwarded ${fwd ? fwd.forwarded : "?"}, arrayBuffers after GC ${MB(fwd && fwd.afterGc && fwd.afterGc.arrayBuffers)}, RSS ${mib(fwd && fwd.after.studio)}; engine RSS ${eng.verified ? mib(fwd && fwd.after.engine) : "n/a"}${stopped ? `; STOP CONDITION at studio ${mib(stopped.studio)}, available ${Math.round(stopped.free / MiB)} MiB` : ""}`);
+    } finally { for (const u of uploads) u.abort(); await stopServer(srv); srv = null; try { fs.unlinkSync(`${probeFile}.gc`); } catch (_) { /* none */ } }
   });
   await scenario("Default budget refuses a third 64 MiB body", async () => {
     srv = await startServer("budget", ON);
