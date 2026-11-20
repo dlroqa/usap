@@ -372,7 +372,10 @@ When on, `/api/resources` adds `limits.imageQueue: "on"`, `engines.image.queue`
   into that one test studio (`scripts/ci/image-queue-memprobe.cjs`, `--expose-gc`) adds heap, external and
   `arrayBuffers` figures: after release and a forced garbage collection, `arrayBuffers` must be back near its baseline
   (the bodies are no longer referenced; resident memory alone is not used for that, since Node need not return freed
-  memory to the OS). Four cancellation cycles and one 64 MiB body forwarded to the engine then check that retained
-  buffers do not grow. Its results are evidence for the memory-versus-disk decision; they are not a default.
+  memory to the OS; the value before the forced collection is recorded too). Eight cancellation cycles then check that
+  retained buffers do not grow, and one valid 64 MiB generation request (the normal JSON body followed by JSON
+  whitespace) is forwarded and must return an image and release its body. The verified engine's memory is broken down
+  where the OS allows (Windows: working set, private working set, private bytes; Linux: anonymous and file-backed
+  RSS; macOS: resident size only); no single figure covers every byte of a loaded model. Its results are evidence for the memory-versus-disk decision; they are not a default.
 * GPU and NPU paths are not exercised; the queue makes no GPU or NPU claim.
 

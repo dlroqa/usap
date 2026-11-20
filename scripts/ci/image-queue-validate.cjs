@@ -216,6 +216,54 @@ function heldUpload(declared, send) {
   return { done, sent, abort: () => req.destroy(), finish: () => writeSome(declared).then(() => req.end()) };
 }
 
+// A valid generation request of exactly `size` bytes: the normal JSON body followed by JSON whitespace (RFC 8259
+// allows whitespace after the value), so the engine parses and runs the ordinary request. No unknown fields.
+function paddedGeneration(size) {
+  const head = Buffer.from(JSON.stringify(GEN));
+  if (head.length > size) throw new Error("padded body smaller than the request");
+  return Buffer.concat([head, Buffer.alloc(size - head.length, 0x20)]);
+}
+function sendBody(buf) {
+  const req = http.request({ host: "127.0.0.1", port: PORT, path: "/sdapi/v1/txt2img", method: "POST", agent: false,
+    headers: { "content-type": "application/json", "content-length": buf.length } });
+  const done = new Promise((resolve) => {
+    req.on("response", (res) => { let t = ""; res.on("data", (c) => { t += c; }); res.on("end", () => { let j = null; try { j = JSON.parse(t); } catch (_) { j = null; } resolve({ status: res.statusCode, json: j }); }); });
+    req.on("error", (e) => resolve({ status: 0, error: e.code || e.message }));
+  });
+  req.end(buf);
+  return { done, abort: () => req.destroy() };
+}
+// What the verified engine process's memory figures mean, per OS (never the guard):
+//   Windows: working set (resident pages, incl. shared/mapped), private working set (resident pages only this
+//   process can use), private bytes (committed private memory, resident or paged out); shared = working set minus
+//   private working set (mapped files such as the model, DLLs). None of these alone is "all memory of the model":
+//   model file pages that are mapped but not resident appear in none of them.
+//   Linux: RSS split into anonymous (heap, tensors copied into memory), file-backed (mapped model and libraries) and
+//   shared memory, from /proc/<pid>/status.  macOS: resident size only (ps); no breakdown is recorded.
+function engineMemory(pid) {
+  try {
+    if (process.platform === "win32") {
+      const ps = `$p = Get-Process -Id ${Number(pid)}; $f = Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -Filter "IDProcess=${Number(pid)}"; ` +
+        `"$($p.WorkingSet64)|$($p.PrivateMemorySize64)|$($f.WorkingSetPrivate)"`;
+      const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps], { encoding: "utf8", windowsHide: true, timeout: 30000 });
+      const [ws, priv, wsPriv] = String(r.stdout).trim().split("|").map(Number);
+      if (!(ws > 0)) return null;
+      const M = (b) => (b > 0 ? `${Math.round(b / MiB)} MiB` : "n/a");
+      return { detail: `working set ${M(ws)}; private working set ${M(wsPriv)}; shared working set ${wsPriv > 0 ? M(ws - wsPriv) : "n/a"} (mapped files and DLLs); private bytes ${M(priv)} (committed, resident or paged out). Mapped model pages that are not resident appear in none of these.` };
+    }
+    if (process.platform === "linux") {
+      const t = fs.readFileSync(`/proc/${pid}/status`, "utf8");
+      const kb = (k) => { const m = t.match(new RegExp(`${k}:\\s+(\\d+) kB`)); return m ? Math.round(Number(m[1]) / 1024) : null; };
+      return { detail: `RSS ${kb("VmRSS")} MiB = anonymous ${kb("RssAnon")} MiB + file-backed ${kb("RssFile")} MiB (mapped model and libraries) + shared ${kb("RssShmem")} MiB` };
+    }
+    if (process.platform === "darwin") {
+      const k = rssKiB(pid);
+      return k ? { detail: `resident ${Math.round(k / 1024)} MiB (ps; macOS gives no private/shared split here)` } : null;
+    }
+  } catch (_) { /* unavailable */ }
+  return null;
+}
+
 (async () => {
   console.log(`| Check | Result | Detail |\n|---|---|---|`);
   if (!fs.existsSync(path.join(APP, "models", IMAGE))) {
@@ -384,28 +432,40 @@ function heldUpload(declared, send) {
       record("D6 body buffers unreferenced after release (forced GC)", probeOk && gcOk(c1.afterGc) ? "PASS" : "FAIL",
         probeOk ? `studio arrayBuffers after GC: baseline ${MB(baseGc.arrayBuffers)}, after release ${MB(c1.afterGc && c1.afterGc.arrayBuffers)} (192 MiB were held; margin ${MB(RETAIN_MARGIN)}); heapUsed ${MB(baseGc.heapUsed)} -> ${MB(c1.afterGc && c1.afterGc.heapUsed)}; RSS after release ${mib(c1.after.studio)} (resident, not a leak measure)` : "studio memory probe unavailable");
       if (stopped) return;
-      // Bounded repetition: three more cancellation cycles, then one complete 64 MiB body forwarded to the engine
-      // (not a valid request: the engine answers it with an error) - the forwarded path's release.
+      // Bounded repetition: seven more cancellation cycles (8 in all), each sampled after release before and after a
+      // forced GC, then one valid 64 MiB generation request forwarded to the engine (the forwarded path's release).
       const series = [c1];
-      for (let i = 2; i <= 4 && !stopped; i += 1) series.push(await holdCycle());
-      let fwd = null;
+      for (let i = 2; i <= 8 && !stopped; i += 1) series.push(await holdCycle());
+      const ab = series.map((c) => (c.afterGc ? Math.round(c.afterGc.arrayBuffers / MiB) : "?"));
+      const abPre = series.map((c) => (c.after.probe ? Math.round(c.after.probe.arrayBuffers / MiB) : "?"));
+      const rss = series.map((c) => (c.after.studio ? Math.round(c.after.studio / 1024) : "?"));
+      const grew = probeOk && series.length >= 2 && series[series.length - 1].afterGc && series[0].afterGc
+        && series[series.length - 1].afterGc.arrayBuffers - series[0].afterGc.arrayBuffers > 16 * MiB;
+      const half = Math.floor(series.length / 2);
+      const rssStep = (a, b) => (series[a].after.studio && series[b].after.studio ? Math.round((series[b].after.studio - series[a].after.studio) / 1024) : "?");
+      const okCycles = probeOk && !stopped && series.every((c) => c.released && gcOk(c.afterGc)) && !grew;
+      record("D6 repeated cycles: no growing retained buffers", okCycles ? "PASS" : "FAIL",
+        `${series.length} cancellation cycles of 192 MiB; studio arrayBuffers after release: before forced GC ${abPre.join(",")} MiB, after forced GC ${ab.join(",")} MiB (baseline ${MB(baseGc && baseGc.arrayBuffers)}); studio RSS after each ${rss.join(",")} MiB (cycles 1-${half}: ${rssStep(0, half - 1)} MiB, ${half + 1}-${series.length}: ${rssStep(half, series.length - 1)} MiB; resident memory and allocator retention, not referenced buffers)${stopped ? `; STOP CONDITION at studio ${mib(stopped.studio)}, available ${Math.round(stopped.free / MiB)} MiB` : ""}`);
       if (!stopped) {
         await idleEngine();
         const before2 = (await queueNow()).iq.counts.forwarded;
-        const F = heldUpload(64 * MiB, 64 * MiB); uploads.push(F); await F.sent; F.finish();
-        const rf = await Promise.race([F.done, sleep(120000).then(() => ({ status: "timeout" }))]);
+        const body = paddedGeneration(64 * MiB);
+        const F = sendBody(body); uploads.push(F);
+        const rf = await Promise.race([F.done, sleep(300000).then(() => ({ status: "timeout" }))]);
         await waitUntil(async () => { const { iq, q } = await queueNow(); return iq.memory.reservedBytes === 0 && q.running === 0 ? iq : null; }, 60000, 200);
         await sleep(1000);
         const s = sample(); if (overLimit(s)) stopped = s;
-        fwd = { status: rf.status, forwarded: (await queueNow()).iq.counts.forwarded - before2, afterGc: probeOk ? await gcSample() : null, after: s };
+        const pre = s.probe;
+        const post = probeOk ? await gcSample() : null;
+        const images = rf.json && Array.isArray(rf.json.images) ? rf.json.images.length : 0;
+        const fwdOk = rf.status === 200 && images >= 1 && (await queueNow()).iq.counts.forwarded - before2 === 1 && gcOk(post) && !stopped;
+        record("D6 valid 64 MiB request forwarded and released", fwdOk ? "PASS" : "FAIL",
+          `a ${Math.round(body.length / MiB)} MiB generation request (the normal JSON body followed by JSON whitespace, valid under the engine's parser) answered ${rf.status} with ${images} image(s); studio arrayBuffers after release ${MB(pre && pre.arrayBuffers)} before forced GC, ${MB(post && post.arrayBuffers)} after; studio RSS ${mib(s.studio)}; engine RSS ${eng.verified ? mib(s.engine) : "n/a"}${stopped ? "; STOP CONDITION" : ""}`);
       }
-      const ab = series.map((c) => (c.afterGc ? Math.round(c.afterGc.arrayBuffers / MiB) : "?"));
-      const rss = series.map((c) => mib(c.after.studio));
-      const grew = probeOk && series.length >= 2 && series[series.length - 1].afterGc && series[0].afterGc
-        && series[series.length - 1].afterGc.arrayBuffers - series[0].afterGc.arrayBuffers > 16 * MiB;
-      const ok = probeOk && !stopped && series.every((c) => c.released && gcOk(c.afterGc)) && !grew && fwd && fwd.forwarded === 1 && gcOk(fwd.afterGc);
-      record("D6 repeated cycles: no growing retained buffers", ok ? "PASS" : "FAIL",
-        `${series.length} cancellation cycles of 192 MiB: studio arrayBuffers after GC ${ab.join(", ")} MiB (baseline ${MB(baseGc && baseGc.arrayBuffers)}); RSS after each ${rss.join(", ")}; forwarded 64 MiB body: engine answered ${fwd ? fwd.status : "n/a"}, forwarded ${fwd ? fwd.forwarded : "?"}, arrayBuffers after GC ${MB(fwd && fwd.afterGc && fwd.afterGc.arrayBuffers)}, RSS ${mib(fwd && fwd.after.studio)}; engine RSS ${eng.verified ? mib(fwd && fwd.after.engine) : "n/a"}${stopped ? `; STOP CONDITION at studio ${mib(stopped.studio)}, available ${Math.round(stopped.free / MiB)} MiB` : ""}`);
+      if (eng.verified) {
+        const m = engineMemory(eng.enginePid);
+        record("D6 engine memory breakdown (verified engine process)", m ? "MEASURED" : "UNAVAILABLE", m ? m.detail : "no breakdown available on this OS");
+      }
     } finally { for (const u of uploads) u.abort(); await stopServer(srv); srv = null; try { fs.unlinkSync(`${probeFile}.gc`); } catch (_) { /* none */ } }
   });
   await scenario("Default budget refuses a third 64 MiB body", async () => {
