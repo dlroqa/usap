@@ -74,4 +74,4 @@ function judgeRefusedClientProposed(st, conn, ticks, status, bodyMatch = null, p
   return { ok: true, kind: "stalled", why: `client process did not run past a single activity point while the server held the connection (macOS rule)${timeline(st, conn, ticks)}` };
 }
 
-module.exports = { judgeRefusedClient, judgeRefusedClientProposed };
+module.exports = { judgeRefusedClient, judgeRefusedClientProposed, timeline };
