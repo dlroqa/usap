@@ -1,0 +1,90 @@
+# PR #164 macOS Intel diagnostic comparison (owner-approved option B). Bench branch only
+# (bench/164-macos-intel-contention): never merged, never a required check, not merge-gate evidence.
+# A = main (complete suite); B = #164 production code with scripts/tests/image-queue.test.cjs removed (diagnostic
+# exclusion only); C = #164 complete suite. Same runner image, Node, install/build steps and `node --test` command as
+# ci.yml. Every config carries the same passive instrumentation (bench/164): a preload recording event-loop delay and
+# timer-lateness episodes per Node process, a 1 s system sampler, iostat, and a bench-only timing log in the two
+# affected tests (no assertion changed). Timing assertions, the grace period and the judge are unchanged.
+name: bench-164
+
+on:
+  push:
+    branches: [bench/164-macos-intel-contention]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22.12.0"
+  REF_MAIN: 59ef1d930e25e06994e40a12ec36c724c6547b5d
+  REF_164: 33e8ab1544d36c10d0b9d4c481d6aff500758a1b
+
+jobs:
+  suite:
+    name: ${{ matrix.config }} run ${{ matrix.run }}
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        run: [1, 2, 3, 4, 5, 6, 7, 8]
+        config: [A, B, C]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: tools
+      - name: Choose the code under test
+        id: ref
+        run: |
+          if [ "${{ matrix.config }}" = "A" ]; then echo "sha=$REF_MAIN" >> "$GITHUB_OUTPUT"; else echo "sha=$REF_164" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ steps.ref.outputs.sha }}
+          path: w
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Verify Intel hardware, no translation
+        run: |
+          test "$(uname -m)" = x86_64; test "$(node -p process.arch)" = x64
+          test "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 0
+          test "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 0
+          echo "cpu=$(sysctl -n machdep.cpu.brand_string) ncpu=$(sysctl -n hw.ncpu) mem=$(sysctl -n hw.memsize) node=$(node -v) parallelism=$(node -p 'require(\"os\").availableParallelism()')" | tee runner.txt
+      - name: Prepare the configuration
+        working-directory: w
+        run: |
+          git log -1 --format='%H %s'
+          git apply ../tools/bench/164/diag.patch
+          if [ "${{ matrix.config }}" = "B" ]; then rm scripts/tests/image-queue.test.cjs; fi
+          ls scripts/tests/*.test.cjs | wc -l
+      - name: Install and build as in ci.yml
+        working-directory: w/app/frontend
+        run: npm ci --no-audit --no-fund && npm run build
+      - name: Unit suite as in ci.yml (instrumented)
+        working-directory: w
+        run: |
+          export BENCH164_DIR="$RUNNER_TEMP/b164"; mkdir -p "$BENCH164_DIR"
+          bash ../tools/bench/164/sampler.sh & SP=$!
+          iostat -w 1 -C > "$BENCH164_DIR/iostat.txt" 2>&1 & IP=$!
+          perl -MTime::HiRes=time -e 'printf "%d", time*1000' > "$BENCH164_DIR/suite-start"
+          set +e
+          NODE_OPTIONS="--require $GITHUB_WORKSPACE/tools/bench/164/loopmon.cjs" node --test --test-timeout=600000 \
+            --test-reporter=spec --test-reporter-destination=stdout \
+            --test-reporter=junit --test-reporter-destination="$BENCH164_DIR/junit.xml" \
+            "scripts/tests/*.test.cjs" > "$BENCH164_DIR/suite.log" 2>&1
+          echo "$?" > "$BENCH164_DIR/suite-exit"
+          kill $SP $IP 2>/dev/null
+          cp ../runner.txt "$BENCH164_DIR/"
+          echo "suite exit $(cat $BENCH164_DIR/suite-exit)"
+          grep -E "^ℹ (tests|pass|fail|cancelled|skipped)|^✖ " "$BENCH164_DIR/suite.log" | head -40
+          exit 0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: b164-${{ matrix.config }}-${{ matrix.run }}
+          path: ${{ runner.temp }}/b164/
+          retention-days: 14

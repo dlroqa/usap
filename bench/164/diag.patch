@@ -1,0 +1,24 @@
+diff --git a/scripts/tests/refusal-close.test.cjs b/scripts/tests/refusal-close.test.cjs
+index 56657d4..b3c0ea2 100644
+--- a/scripts/tests/refusal-close.test.cjs
++++ b/scripts/tests/refusal-close.test.cjs
+@@ -402,6 +402,7 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
+     });
+     assert.equal(await noneLingering(), 0);
+     const conns = [...srv.conns];
++    if (process.env.BENCH164_DIR) require("node:fs").appendFileSync(require("node:path").join(process.env.BENCH164_DIR, "timings.jsonl"), JSON.stringify({ test: "20client", pid: process.pid, conns: conns.map((c) => [c.acceptedAt, c.answeredAt, c.closedAt, c.peerEnded ? 1 : 0, c.peerError ? 1 : 0]) }) + "\n"); // bench only
+     const record = () => JSON.stringify({ server: conns.map(({ s, ...c }) => ({ ...c, answeredMs: c.answeredAt - c.acceptedAt, keptMs: c.closedAt - c.answeredAt })), clients: all });
+     assert.equal(all.length, 20);
+     // The server: 20 connections, each refused with 403 promptly, closed within the grace period, nothing routed.
+diff --git a/scripts/tests/transcription-queue.test.cjs b/scripts/tests/transcription-queue.test.cjs
+index 3b44952..f567aaf 100644
+--- a/scripts/tests/transcription-queue.test.cjs
++++ b/scripts/tests/transcription-queue.test.cjs
+@@ -741,6 +741,7 @@ function maxAdmittedAtOnce(records) {
+ // #151 diagnostics: excused clients (documented reset tradeoff) are reported with the judge's timeline, never silently.
+ const reportExcused = (t, list) => { if (list.length) t.diagnostic(`${list.length} refused client(s) excused (documented reset tradeoff): ${list.join(" | ")}`); };
+ function assertGateRefusals(records, run, label, expected) {
++  if (process.env.BENCH164_DIR) require("node:fs").appendFileSync(require("node:path").join(process.env.BENCH164_DIR, "timings.jsonl"), JSON.stringify({ test: "gate", label, pid: process.pid, recs: records.filter((r) => GATE_TEXT.test(r.body)).map((r) => [r.arrivedAt, r.finishAt, r.sockCloseAt]) }) + "\n"); // bench only
+   const excused = [];
+   const refused = records.filter((r) => GATE_TEXT.test(r.body));
+   for (const st of run.clients) {
