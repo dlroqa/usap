@@ -20,6 +20,7 @@ const { createLanAuth, MAX_FAILURES } = require("../server/lan-auth.cjs");
 const { closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, WATCH_BYTES, WATCH_MS, lingeringCount, resumedCount, closedReadingCount } = require("../server/http/refusal-close.cjs");
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
 const { rawRequest } = require("./fixtures/refusal-clients.cjs");
+const { timeline: timelineOf } = require("./fixtures/refusal-judge.cjs");
 const { execFile } = require("node:child_process");
 
 const MiB = 1024 * 1024;
@@ -418,9 +419,11 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
     // The clients: each read the complete answer, or provably was not running while the server held the connection.
     const stalled = [];
     all.forEach((st, i) => {
-      const v = judgeRefusedClient(st, conns.find((c) => c.remotePort === st.localPort), ticks, 403);
-      assert.ok(v.ok, `client ${i}: ${v.why}; client error ${st.error}: ${record()}`);
-      if (v.kind === "stalled") { stalled.push(`client ${i}: ${v.why}`); return; }
+      const c = conns.find((x) => x.remotePort === st.localPort);
+      const v = judgeRefusedClient(st, c, ticks, 403);
+      const tl = timelineOf(st, c, ticks); // #151 diagnostics: client activity relative to the server's answer (message only)
+      assert.ok(v.ok, `client ${i}: ${v.why}${tl}; client error ${st.error}: ${record()}`);
+      if (v.kind === "stalled") { stalled.push(`client ${i}: ${v.why}${tl}`); return; }
       assert.doesNotThrow(() => JSON.parse(st.body), `client ${i}: complete JSON answer, got ${JSON.stringify(st.body.slice(0, 80))}`);
       assert.equal(st.connectionHeader, "close", `client ${i}: Connection: close`);
     });
@@ -441,9 +444,11 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
       if (!c.peerError) assert.ok(c.closedAt - c.answeredAt >= GRACE_MS - GRACE_TOLERANCE_MS, `ignores the answer: server closed port ${c.remotePort} only ${c.closedAt - c.answeredAt} ms after the answer`);
     }
     hostile.clients.forEach((st, i) => {
-      const v = judgeRefusedClient(st, hConns.find((c) => c.remotePort === st.localPort), hostile.ticks, 403);
-      assert.ok(v.ok, `ignores the answer, client ${i}: ${v.why}`);
-      if (v.kind === "stalled") stalled.push(`ignores the answer, client ${i}: ${v.why}`);
+      const c = hConns.find((x) => x.remotePort === st.localPort);
+      const v = judgeRefusedClient(st, c, hostile.ticks, 403);
+      const tl = timelineOf(st, c, hostile.ticks);
+      assert.ok(v.ok, `ignores the answer, client ${i}: ${v.why}${tl}`);
+      if (v.kind === "stalled") stalled.push(`ignores the answer, client ${i}: ${v.why}${tl}`);
     });
     if (stalled.length) t.diagnostic(`${stalled.length}/20 answers lost by a client process that was not running (documented reset tradeoff): ${stalled.join("; ")}`);
     assert.deepEqual(errors, [], "no uncaught socket errors");

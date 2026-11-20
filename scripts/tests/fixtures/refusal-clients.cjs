@@ -31,7 +31,9 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
   return new Promise((resolve) => {
     // ignoreFin: keep the sending side open after the server's FIN and go on sending (a client that ignores the answer)
     const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: ignoreFin });
-    const st = { status: null, head: "", body: "", sent: 0, closedAt: null, answeredAt: null, error: null, t0: Date.now(), connectionHeader: null, drainsAt: [] };
+    const st = { status: null, head: "", body: "", sent: 0, closedAt: null, answeredAt: null, error: null, t0: Date.now(), connectionHeader: null, drainsAt: [],
+      // io (#151 diagnostics): wall-clock times of this socket's read-side events, for judge failure messages
+      io: { firstDataAt: null, dataEvents: 0, endAt: null, errorAt: null, closeAt: null } };
     let buf = Buffer.alloc(0), stopped = false, timer = null;
     const parse = () => {
       const text = buf.toString("latin1"); const i = text.indexOf("\r\n\r\n");
@@ -41,9 +43,10 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
       const raw = text.slice(i + 4);
       st.body = /\r\ntransfer-encoding: chunked/i.test(st.head) ? dechunk(raw) : raw;
     };
-    s.on("data", (d) => { buf = Buffer.concat([buf, d]); parse(); });
-    s.on("error", (e) => { st.error = e.code || e.message; });
-    s.on("close", () => { st.closedAt = Date.now() - st.t0; stopped = true; clearTimeout(timer); resolve(st); });
+    s.on("data", (d) => { if (st.io.firstDataAt === null) st.io.firstDataAt = Date.now(); st.io.dataEvents += 1; buf = Buffer.concat([buf, d]); parse(); });
+    s.on("end", () => { if (st.io.endAt === null) st.io.endAt = Date.now(); });
+    s.on("error", (e) => { if (st.io.errorAt === null) st.io.errorAt = Date.now(); st.error = e.code || e.message; });
+    s.on("close", () => { st.io.closeAt = Date.now(); st.closedAt = Date.now() - st.t0; stopped = true; clearTimeout(timer); resolve(st); });
     const end = setTimeout(() => { stopped = true; st.clientGaveUp = true; s.destroy(); }, maxMs);
     s.on("close", () => clearTimeout(end));
     s.on("connect", () => {
