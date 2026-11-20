@@ -738,7 +738,10 @@ function maxAdmittedAtOnce(records) {
 }
 // Server side of every gate refusal: 429 with the gate's text, answered at once, closed within the grace period, the
 // body left unread (bounded), counted once. Client side: each client read it, or provably was not running.
+// #151 diagnostics: excused clients (documented reset tradeoff) are reported with the judge's timeline, never silently.
+const reportExcused = (t, list) => { if (list.length) t.diagnostic(`${list.length} refused client(s) excused (documented reset tradeoff): ${list.join(" | ")}`); };
 function assertGateRefusals(records, run, label, expected) {
+  const excused = [];
   const refused = records.filter((r) => GATE_TEXT.test(r.body));
   for (const st of run.clients) {
     const r = records.find((x) => x.remotePort === st.localPort);
@@ -750,15 +753,17 @@ function assertGateRefusals(records, run, label, expected) {
     assert.ok(r.bytesRead <= 16 * MiB, `${label}: read ${r.bytesRead} bytes of a refused body`);
     const v = judgeRefusedClient(st, { status: r.status, answeredAt: r.finishAt, closedAt: r.sockCloseAt }, run.ticks, 429, GATE_TEXT);
     assert.ok(v.ok, `${label}: ${v.why}: ${JSON.stringify({ server: r, client: st })}`);
+    if (v.kind === "stalled") excused.push(`${label} client port ${st.localPort}: ${v.why}`);
     if (v.kind === "answered") {
       assert.match(st.head, /\r\nretry-after: 5/i, `${label}: Retry-After`);
       assert.equal(st.connectionHeader, "close", `${label}: Connection: close`);
     }
   }
   if (expected !== undefined) assert.equal(refused.length, expected, `${label}: ${refused.length} gate refusals in the server log`);
+  return excused;
 }
 
-test("server, on (#131): at most limit + 2 upload connections across running, waiting and draining; past it 429 QUEUE_FULL at once, the body unread and the connection closed; nothing reaches the queue or the disk; the count returns to 0", async () => {
+test("server, on (#131): at most limit + 2 upload connections across running, waiting and draining; past it 429 QUEUE_FULL at once, the body unread and the connection closed; nothing reaches the queue or the disk; the count returns to 0", async (t) => {
   const root0 = fs.mkdtempSync(path.join(os.tmpdir(), "usap-gate-log-"));
   try {
     const env = gateEnv(root0, { USAP_TRANSCRIPTION_QUEUE_LIMIT: "1" }); // limit 1: gate = 1 + 1 + 1 = 3
@@ -803,17 +808,17 @@ test("server, on (#131): at most limit + 2 upload connections across running, wa
       // The server's own record of every request.
       await waitFor(() => connLog(env.USAP_TEST_CONN_LOG).length >= 16, 10000, "server records for every request");
       const log = connLog(env.USAP_TEST_CONN_LOG);
-      assertGateRefusals(log, streaming, "streaming");
+      reportExcused(t, assertGateRefusals(log, streaming, "streaming"));
       assert.ok(streaming.clients[0].sent < 32 * MiB, `the server stopped reading the refused body (client sent ${streaming.clients[0].sent})`);
-      assertGateRefusals(log, silent, "silent");
-      assertGateRefusals(log, burst, "burst", 12);
+      reportExcused(t, assertGateRefusals(log, silent, "silent"));
+      reportExcused(t, assertGateRefusals(log, burst, "burst", 12));
       assert.ok(maxAdmittedAtOnce(log) <= 3, `admitted requests open at once never above the gate (max ${maxAdmittedAtOnce(log)})`);
       assert.equal((await conns()).open, 0, "no stale or negative count");
     });
   } finally { fs.rmSync(root0, { recursive: true, force: true }); }
 });
 
-test("server, on (#131): admission is atomic: ten requests arriving together while the gate is empty admit exactly limit + 2; the rest are refused; disconnects release every place exactly once", async () => {
+test("server, on (#131): admission is atomic: ten requests arriving together while the gate is empty admit exactly limit + 2; the rest are refused; disconnects release every place exactly once", async (t) => {
   const root0 = fs.mkdtempSync(path.join(os.tmpdir(), "usap-gate-log-"));
   try {
     const env = gateEnv(root0, { USAP_TRANSCRIPTION_QUEUE_LIMIT: "1" }); // gate 3
@@ -834,7 +839,7 @@ test("server, on (#131): admission is atomic: ten requests arriving together whi
       assert.equal(admitted.length, 3, `exactly 3 admitted (server log: ${JSON.stringify(log.map((r) => [r.status, r.body.slice(0, 40)]))})`);
       assert.equal(maxAdmittedAtOnce(log), 3);
       const refusedRun = { clients: clients.filter((st) => !admitted.some((r) => r.remotePort === st.localPort)), ticks };
-      assertGateRefusals(log, refusedRun, "burst", 7);
+      reportExcused(t, assertGateRefusals(log, refusedRun, "burst", 7));
       assert.deepEqual(c.started(), [], "nothing reached whisper-cli");
       assert.equal((await c.resources()).transcriptionQueue.counts.connectionsRefused, 7, "counted once each");
       await assertDrained(c);

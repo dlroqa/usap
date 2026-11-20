@@ -149,7 +149,7 @@ function assertServerRefusal(rec, st, label) {
   return { conn: { status: rec.status, answeredAt: rec.finishAt, closedAt: rec.sockCloseAt }, ev };
 }
 
-test("concurrent over-limit declarations are each refused early; the server's total read stays bounded", async () => {
+test("concurrent over-limit declarations are each refused early; the server's total read stays bounded", async (t) => {
   await withServer(async ({ port, records }) => {
     const { clients, ticks } = await concurrentClients(port, 10, { url: URL, mode: "stream", contentLength: 100 * MiB, ignoreFin: true, capBytes: 96 * MiB, maxMs: GRACE_MS + 10000 });
     const until = Date.now() + GRACE_MS + SLACK_MS;
@@ -166,6 +166,7 @@ test("concurrent over-limit declarations are each refused early; the server's to
       if (v.kind === "answered") assert.equal(st.connectionHeader, "close", `client ${i}: Connection: close ${ev}`);
       else { stalled += 1; excused.push(`client ${i}: ${v.why}`); }
     }
+    if (excused.length) t.diagnostic(`${excused.length}/${clients.length} clients excused (documented reset tradeoff): ${excused.join(" | ")}`);
     assert.ok(stalled < clients.length, `at least one client read its answer (a run where none did proves nothing about delivery); excused: ${excused.join(" | ")}`);
     assert.ok(total <= 10 * EARLY_READ_BOUND, `total read ${total}`);
   });
