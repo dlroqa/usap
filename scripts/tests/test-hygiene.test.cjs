@@ -40,8 +40,16 @@ function startHarnessChild(script, iteration, { timeoutMs = 60000 } = {}) {
     stdout: redact(tail(out)), stderr: redact(tail(err)),
   });
   return new Promise((resolve, reject) => {
-    let done = false;
-    const timer = setTimeout(() => { if (!done) { done = true; reject(new Error(`timeout: ${evidence("no server info within " + timeoutMs + " ms")}`)); } }, timeoutMs);
+    let done = false, timedOut = false, hardKill = null;
+    // A child that never reports is stopped, not left running: SIGTERM first (a harness child then removes its root and
+    // stops its server), SIGKILL if it is still there 5 s later. The rejection waits for it to close, so the evidence
+    // says how it ended and nothing is left holding this test file open.
+    const timer = setTimeout(() => {
+      if (done) return;
+      timedOut = true;
+      child.kill("SIGTERM");
+      hardKill = setTimeout(() => child.kill("SIGKILL"), 5000);
+    }, timeoutMs);
     child.stdout.on("data", (d) => {
       out += d;
       for (const line of out.split("\n")) {
@@ -52,7 +60,13 @@ function startHarnessChild(script, iteration, { timeoutMs = 60000 } = {}) {
     });
     child.stderr.on("data", (d) => { err = (err + d).slice(-4 * OUTPUT_TAIL); });
     // 'close' (not 'exit'): all of the child's stdout and stderr has been read by then
-    child.on("close", () => { if (!done) { done = true; clearTimeout(timer); reject(new Error(`child exited early: ${evidence("exited before reporting its server")}`)); } });
+    child.on("close", () => {
+      clearTimeout(hardKill);
+      if (done) return;
+      done = true; clearTimeout(timer);
+      if (timedOut) reject(new Error(`timeout: ${evidence(`no server info within ${timeoutMs} ms; child stopped`)}`));
+      else reject(new Error(`child exited early: ${evidence("exited before reporting its server")}`));
+    });
   });
 }
 
@@ -98,8 +112,8 @@ test("harness: an interrupted test run (SIGINT, SIGTERM) still removes its roots
 });
 
 test("#157 diagnostics: a harness child that ends before reporting its server is reported with iteration, exit code, signal, phase, root status and bounded, path-free output", async () => {
-  const early = async (script, iteration) => {
-    try { await startHarnessChild(script, iteration, { timeoutMs: 30000 }); } catch (e) { return e.message; }
+  const early = async (script, iteration, timeoutMs = 30000) => {
+    try { await startHarnessChild(script, iteration, { timeoutMs }); } catch (e) { return e.message; }
     assert.fail(`${iteration}: the child was reported as started`);
   };
   // started its server start, wrote an error, exited 7, and left the root it made on disk
@@ -125,6 +139,14 @@ test("#157 diagnostics: a harness child that ends before reporting its server is
   // to a stderr pipe is asynchronous and process.exit() would drop what is still pending.
   const big = await early(`process.stderr.write("x".repeat(200000) + "END"); process.exitCode = 1;`, "control-big-output");
   assert.ok(big.length < 4 * OUTPUT_TAIL + 1000, `message is bounded (${big.length} characters)`); assert.match(big, /END/);
+  // a child that never reports is stopped, and the rejection comes only after it has closed (no process left behind)
+  const t0 = Date.now();
+  const hung = await early(`console.log("phase:server-starting"); setInterval(() => {}, 1000);`, "control-never-reports", 1500);
+  assert.match(hung, /^timeout: /);
+  const hev = JSON.parse(hung.slice("timeout: ".length));
+  assert.equal(hev.iteration, "control-never-reports"); assert.equal(hev.serverStartReached, true);
+  assert.ok(hev.exitCode !== null || hev.signal !== null, `the child had ended when the timeout was reported: ${hung}`);
+  assert.ok(Date.now() - t0 < 1500 + 5000 + 3000, "stopped within the SIGTERM/SIGKILL bound");
   // killed by a signal (POSIX): the signal is reported
   if (process.platform !== "win32") {
     const killed = JSON.parse((await early(`process.kill(process.pid, "SIGKILL");`, "control-sigkill")).slice("child exited early: ".length));
