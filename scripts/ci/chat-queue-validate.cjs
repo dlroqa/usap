@@ -37,7 +37,7 @@ fs.mkdirSync(LOGDIR, { recursive: true });
 fs.writeFileSync(RESULTS, "");
 let failed = false;
 function record(check, status, detail) {
-  const d = String(detail).replace(/\s+/g, " ").replace(/\|/g, "\\|").slice(0, 400);
+  const d = String(detail).replace(/\s+/g, " ").replace(/\|/g, "\\|").slice(0, 700);
   fs.appendFileSync(RESULTS, JSON.stringify({ check, status, platform: `${process.platform}-${process.arch}`, detail: d }) + "\n");
   console.log(`| ${check} | ${status} | ${d} |`);
   if (status === "FAIL") failed = true;
@@ -85,6 +85,8 @@ function call(port, method, p, body, { timeoutMs = 600000 } = {}) {
   return { promise, first, abort: () => req && req.destroy() };
 }
 const getJson = async (port, p) => { const r = await call(port, "GET", p, undefined, { timeoutMs: 10000 }).promise; try { return { status: r.status, json: JSON.parse(r.text) }; } catch (_) { return { status: r.status, json: null }; } };
+const { observeJson, describeObservation } = require("./observe-json.cjs");
+const serverState = (srv) => ({ alive: srv.child.exitCode === null && srv.child.signalCode === null, code: srv.child.exitCode, signal: srv.child.signalCode, upMs: Date.now() - srv.startedAt });
 const parseJson = (t) => { try { return JSON.parse(t); } catch (_) { return null; } };
 function sse(text) {
   const events = String(text || "").split("\n\n").filter(Boolean);
@@ -137,6 +139,7 @@ function rssMb(pid) {
 async function startServer(label, env) {
   const log = fs.openSync(path.join(LOGDIR, `chat-queue-${label}.log`), "w");
   const child = spawn(NODE, [SERVE], { cwd: ROOT, env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT), ...env }, stdio: ["ignore", log, log], windowsHide: true });
+  const startedAt = Date.now();
   const exited = new Promise((r) => child.once("exit", (code, signal) => r({ code, signal, at: Date.now() })));
   const up = await waitUntil(async () => (await getJson(PORT, "/api/health")).status === 200, 60000, 500);
   if (!up) throw new Error(`server ${label} did not start (see chat-queue-${label}.log)`);
@@ -147,7 +150,7 @@ async function startServer(label, env) {
   const enginePort = (await getJson(PORT, "/api/llm/status")).json.port;
   const enginePids = listenerPids(enginePort).filter((pid) => pid !== child.pid);
   if (!enginePids.length) throw new Error(`no engine process found listening on port ${enginePort}`);
-  return { label, child, exited, enginePort, enginePids };
+  return { label, child, exited, enginePort, enginePids, startedAt };
 }
 async function stopServer(srv) {
   if (!srv || srv.child.exitCode !== null || srv.child.signalCode !== null) return;
@@ -212,9 +215,11 @@ async function scenario(name, fn) {
 
 // ── Scenarios ───────────────────────────────────────────────────────────────────────────────────────────
 async function queueOnScenarios(srv) {
-  const res = await getJson(PORT, "/api/resources");
-  record("queue on (environment only): /api/resources", res.json?.limits?.chatQueue === "on" && res.json?.scheduler?.mode === "chat-queue" ? "PASS" : "FAIL",
-    `limits.chatQueue=${res.json?.limits?.chatQueue}, scheduler.mode=${res.json?.scheduler?.mode}`);
+  // Same request and 10 s timeout as getJson; the record now says what was observed (status, time, timeout, content
+  // type, key names, the expected fields, server state) instead of only the two field values (#163 native run).
+  const obs = await observeJson(PORT, "/api/resources", { timeoutMs: 10000 });
+  const seen = describeObservation(obs, { "limits.chatQueue": "on", "scheduler.mode": "chat-queue" }, { server: () => serverState(srv) });
+  record("queue on (environment only): /api/resources", seen.ok ? "PASS" : "FAIL", seen.detail);
 
   await scenario("capacity, FIFO, QUEUE_FULL", async () => {
     const hold = await holdEngine();
