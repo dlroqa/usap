@@ -101,10 +101,11 @@ async function harness({ limit = 2, maxWaitMs = 60000, bodyBytes = 1 * MiB, body
   const sport = await new Promise((r) => studio.listen(0, "127.0.0.1", () => r(studio.address().port)));
   // A client: sends `body` (Buffer) with Content-Length unless chunked; resolves { status, headers, json, text }.
   const clients = [];
-  function send({ url = "/sdapi/v1/txt2img", body = Buffer.from(JSON.stringify({ prompt: "p" })), chunked = false, declared, headers = {}, hold = false } = {}) {
+  const keepAlive = new http.Agent({ keepAlive: true, maxSockets: 64 });
+  function send({ url = "/sdapi/v1/txt2img", body = Buffer.from(JSON.stringify({ prompt: "p" })), chunked = false, declared, headers = {}, hold = false, reuse = false } = {}) {
     const h = { "Content-Type": "application/json", Authorization: "Bearer secret", Cookie: "s=1", ...headers };
     if (!chunked) h["Content-Length"] = String(declared !== undefined ? declared : body.length);
-    const req = http.request({ host: "127.0.0.1", port: sport, method: "POST", path: url, headers: h, agent: false });
+    const req = http.request({ host: "127.0.0.1", port: sport, method: "POST", path: url, headers: h, agent: reuse ? keepAlive : false });
     const done = new Promise((resolve) => {
       req.on("response", (res) => { let t = ""; res.on("data", (c) => { t += c; }); res.on("end", () => { let j; try { j = JSON.parse(t); } catch (_) { j = undefined; } resolve({ status: res.statusCode, headers: res.headers, json: j, text: t }); }); res.on("error", () => resolve({ status: res.statusCode, error: "res" })); });
       req.on("error", (e) => resolve({ error: e.code || e.message }));
@@ -116,7 +117,7 @@ async function harness({ limit = 2, maxWaitMs = 60000, bodyBytes = 1 * MiB, body
   }
   return {
     q, up, eng, send, passed, tracked: () => tracked, sport,
-    async close() { for (const c of clients) c.req.destroy(); studio.closeAllConnections(); await new Promise((r) => studio.close(() => r())); await up.close(); },
+    async close() { keepAlive.destroy(); for (const c of clients) c.req.destroy(); studio.closeAllConnections(); await new Promise((r) => studio.close(() => r())); await up.close(); },
   };
 }
 
@@ -264,12 +265,14 @@ test("queue: not ready at admission (starting, loading, unloading, other owner) 
     for (const change of [{ ready: false }, { slotPhase: "loading" }, { slotPhase: "unloading" }, { slotOwner: "text" }, { slotOwner: null, slotPhase: "idle" }, { proc: null }]) {
       const saved = { ...h.eng };
       Object.assign(h.eng, change);
-      const r = await h.send({ body: Buffer.alloc(200 * 1024, 120) }).done;
+      const r = await h.send({ body: Buffer.alloc(200 * 1024, 120), reuse: true }).done; // a keep-alive client
       Object.assign(h.eng, saved);
       assert.equal(r.status, 503, JSON.stringify(change)); assert.equal(r.json.code, "ENGINE_NOT_READY");
       assert.equal(r.headers.connection, "close", "the unread body is not read: the connection closes after the answer");
     }
     assert.equal(h.up.seen.length, 0); assert.equal(h.q.memory().reservedBytes, 0);
+    assert.equal(h.q.counts().notReady, 6, "refused at admission, before any body byte");
+    assert.equal(h.q.counts().admitted, 0, "nothing was admitted (a later dispatch check is not the admission check)");
   } finally { await h.close(); }
 });
 
@@ -294,11 +297,14 @@ test("queue: stale ownership or a different engine at dispatch → 503 ENGINE_NO
 test("queue: body bounds — declared over the ceiling 413 at once; chunked over the ceiling 413; budget exhausted 429 body-budget; idle and total upload deadlines 408", async () => {
   const h = await harness({ bodyBytes: 256 * 1024, bodyBudgetBytes: 512 * 1024, uploadIdleMs: 300, uploadMaxMs: 1500 });
   try {
-    const big = await h.send({ body: Buffer.alloc(10), declared: 300 * 1024, hold: true }).done;
+    const big = await h.send({ body: Buffer.alloc(10), declared: 300 * 1024, hold: true, reuse: true }).done;
     assert.equal(big.status, 413); assert.equal(big.json.code, "BODY_TOO_LARGE"); assert.equal(big.headers.connection, "close");
     const chunked = await h.send({ body: Buffer.alloc(300 * 1024, 97), chunked: true }).done;
     assert.ok(chunked.status === 413 || chunked.error, `chunked overflow refused (${chunked.status || chunked.error})`);
     if (chunked.status) assert.equal(chunked.json.code, "BODY_TOO_LARGE");
+    await sleep(200);
+    assert.equal(h.up.seen.length, 0, "a body over the ceiling (counted in actual bytes, not Content-Length) never reaches the engine");
+    assert.equal(h.q.counts().tooLarge, 2);
     // Budget: one running job (chunked reserves the whole ceiling) and one held → a third chunked request can't reserve.
     const a = h.send({ chunked: true });
     await waitFor(() => h.up.seen.length === 1);
@@ -323,6 +329,7 @@ test("queue: body bounds — declared over the ceiling 413 at once; chunked over
     const rd = await drip.done; clearInterval(t);
     assert.equal(rd.status, 408); assert.equal(rd.json.phase, "total");
     assert.equal(h.up.seen.length, 2, "nothing over a bound was ever forwarded");
+    for (const r of h.up.seen) assert.ok(r.body.length <= 256 * 1024, `forwarded body ${r.body.length} bytes is within the ceiling`);
   } finally { await h.close(); }
 });
 
@@ -380,10 +387,12 @@ function writeModel(dir, name) {
   fs.truncateSync(file, 130 * 1024 * 1024);
 }
 const MODEL = "sd1-slow-generate-q4_0.gguf"; // each txt2img takes 3 s on the fake
+const QUIET = "sd1-slow-generate-quiet-generate-q4_0.gguf"; // 3 s, no step lines: the log never says "generating"
 async function withServer(env, fn) {
   const root = makeRoot();
   installFakeSdServer(root);
   writeModel(path.join(root, "app", "models"), MODEL);
+  writeModel(path.join(root, "app", "models"), QUIET);
   const srv = await startServer(root, env);
   try { await fn(srv); } finally {
     try { await request(srv.port, "POST", "/api/stop-backend", { body: {} }); } catch (_) { /* gone */ }
@@ -468,6 +477,7 @@ test("server: on (with engineSlot) — one at a time, FIFO, 429 past the limit, 
     const r2 = await Promise.all(q2);
     const waitingRefused = r2.slice(1);
     for (const r of waitingRefused) { assert.equal(r.status, 503); assert.equal(r.json.code, "ENGINE_NOT_READY"); }
+    assert.equal((await resources(srv)).imageQueue.counts.refused, 2, "the stop itself refused the waiting jobs (not a later dispatch check)");
     assert.ok(r2[0].error || r2[0].status >= 500 || r2[0].status === 200, "the running job ends with the engine");
     const after = await resources(srv);
     assert.equal(after.imageQueue.memory.reservedBytes, 0); assert.equal(after.imageQueue.memory.heldJobs, 0);
@@ -500,3 +510,19 @@ test("server: shutdown with a running and waiting jobs exits cleanly; waiting cl
     try { fs.rmSync(root, { recursive: true, force: true }); } catch (_) { /* Windows */ }
   }
 });
+
+test("server: restart answers 409 while a queued generation is forwarded, even before the engine's log shows it generating", async () => {
+  await withServer({ USAP_ENGINE_SLOT: "on", USAP_IMAGE_QUEUE: "on" }, async (srv) => {
+    const r0 = await request(srv.port, "POST", "/api/restart-backend", { body: { model: QUIET, backend_type: "cpu", use_gpu: false, width: 64, height: 64, steps: 4 } });
+    assert.equal(r0.status, 200, r0.text);
+    await waitFor(async () => (await request(srv.port, "GET", "/api/backend-status")).json.ready, 30000, "ready");
+    const gen = txt2img(srv.port, "quiet");
+    await waitFor(async () => (await resources(srv)).engines.image.queue.running === 1, 5000, "forwarded");
+    const progress = (await request(srv.port, "GET", "/api/generation-progress")).json;
+    assert.notEqual(progress.active, true, "the log-based state does not show this generation (the window the check closes)");
+    const restart = await request(srv.port, "POST", "/api/restart-backend", { body: { model: QUIET, backend_type: "cpu", use_gpu: false, width: 64, height: 64, steps: 5 } });
+    assert.equal(restart.status, 409, `restart refused while the forwarded job is unsettled: ${restart.text}`);
+    assert.equal((await gen).status, 200, "the running generation finishes normally");
+  });
+});
+
