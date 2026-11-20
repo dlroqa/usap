@@ -1,7 +1,10 @@
-# Step 9.9e: thread budget (design, not implemented)
+# Step 9.9e: thread budget (design; whisper-only part implemented, off by default)
 
-Status: **Planned**. This is a design proposal backed by measurements. Nothing in it is implemented or turned on,
-and no thread count changes until the owner approves an implementation separately. It builds on the scheduler
+Status: **partly implemented.** The budget for whisper transcriptions is implemented and merged (#96, §7) and is
+**off by default** (`USAP_THREADS=on` turns it on). The budget for the other engines (llama.cpp, sd.cpp, Kokoro) is
+**not implemented**. Separately, the whisper logical-CPU cap (§9, #98) is implemented and **on by default**.
+`USAP_SCHEDULER=off` turns both off. Any further thread-count change needs the owner's approval. The rest of this
+document is the original design proposal, backed by measurements. It builds on the scheduler
 (`services/scheduler.cjs`, `GET /api/resources`, `limits.threads: "off"`) from
 [STEP9_9_SCHEDULING.md](STEP9_9_SCHEDULING.md); there is no new service or framework.
 
@@ -122,7 +125,7 @@ text engine 0.5–0.7 GB, image engine 1.8–2.2 GB, whisper-cli 0.17–0.35 GB,
 4. **Kokoro behaves like a full-width CPU job** (11–18 OS threads, 39–90% of the CPU alone) and slows a chat by
    56–751%. The studio can't control it without changing the worker.
 
-## 3. Proposed policy (owner-approved direction; not implemented)
+## 3. Proposed policy (owner-approved direction; implemented for whisper only, off by default, see §7)
 
 **What it is and isn't.** The budget is an **advisory scheduling heuristic**, not enforcement. It decides only the
 thread count of a per-job engine at the moment that job starts. It never limits, pauses or restarts the persistent
