@@ -16,6 +16,8 @@ const { withoutAuthHeaders } = require("../server/lan-auth.cjs");
 
 const MiB = 1024 * 1024;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// A client answer within `ms`, or { timedOut: true } (a request wrongly forwarded to the held fake engine never ends).
+const within = (p, ms = 5000) => Promise.race([p, sleep(ms).then(() => ({ timedOut: true }))]);
 async function waitFor(fn, ms = 10000, label = "condition") {
   const end = Date.now() + ms;
   for (;;) {
@@ -105,6 +107,7 @@ async function harness({ limit = 2, maxWaitMs = 60000, bodyBytes = 1 * MiB, body
   function send({ url = "/sdapi/v1/txt2img", body = Buffer.from(JSON.stringify({ prompt: "p" })), chunked = false, declared, headers = {}, hold = false, reuse = false } = {}) {
     const h = { "Content-Type": "application/json", Authorization: "Bearer secret", Cookie: "s=1", ...headers };
     if (!chunked) h["Content-Length"] = String(declared !== undefined ? declared : body.length);
+    else h["Transfer-Encoding"] = "chunked"; // explicit: Node would otherwise add Content-Length for a body passed to end()
     const req = http.request({ host: "127.0.0.1", port: sport, method: "POST", path: url, headers: h, agent: reuse ? keepAlive : false });
     const done = new Promise((resolve) => {
       req.on("response", (res) => { let t = ""; res.on("data", (c) => { t += c; }); res.on("end", () => { let j; try { j = JSON.parse(t); } catch (_) { j = undefined; } resolve({ status: res.statusCode, headers: res.headers, json: j, text: t }); }); res.on("error", () => resolve({ status: res.statusCode, error: "res" })); });
@@ -286,7 +289,8 @@ test("queue: stale ownership or a different engine at dispatch → 503 ENGINE_NO
       await waitFor(() => h.q.stats().waiting === 1);
       if (change === "epoch") h.eng.epoch += 1; else h.eng.proc = fakeProc(); // a reload / a different process now owns the slot
       h.up.answer(0); await a.done;
-      const rb = await b.done;
+      const rb = await within(b.done);
+      assert.ok(!rb.timedOut, `${change}: answered, not forwarded to the wrong engine`);
       assert.equal(rb.status, 503, change); assert.equal(rb.json.code, "ENGINE_NOT_READY");
       assert.equal(h.up.seen.length, 1, `${change}: not forwarded`);
       assert.equal(h.q.counts().refusedAtDispatch, 1);
@@ -299,7 +303,8 @@ test("queue: body bounds — declared over the ceiling 413 at once; chunked over
   try {
     const big = await h.send({ body: Buffer.alloc(10), declared: 300 * 1024, hold: true, reuse: true }).done;
     assert.equal(big.status, 413); assert.equal(big.json.code, "BODY_TOO_LARGE"); assert.equal(big.headers.connection, "close");
-    const chunked = await h.send({ body: Buffer.alloc(300 * 1024, 97), chunked: true }).done;
+    const chunked = await within(h.send({ body: Buffer.alloc(300 * 1024, 97), chunked: true }).done);
+    assert.ok(!chunked.timedOut, "a chunked body over the ceiling is refused, not forwarded");
     assert.ok(chunked.status === 413 || chunked.error, `chunked overflow refused (${chunked.status || chunked.error})`);
     if (chunked.status) assert.equal(chunked.json.code, "BODY_TOO_LARGE");
     await sleep(200);
@@ -366,7 +371,8 @@ test("queue: with the Core ML backend (apple-npu) requests pass through to today
   const h = await harness();
   try {
     h.eng.backend = "apple-npu";
-    const r = await h.send().done;
+    const r = await within(h.send().done);
+    assert.ok(!r.timedOut, "passed through, not queued and forwarded");
     assert.equal(r.status, 299); assert.equal(r.text, "passthrough");
     assert.equal(h.q.stats().inactive, "backend");
     assert.equal(h.q.counts().passedThrough, 1);
