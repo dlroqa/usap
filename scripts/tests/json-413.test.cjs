@@ -149,13 +149,14 @@ function assertServerRefusal(rec, st, label) {
   return { conn: { status: rec.status, answeredAt: rec.finishAt, closedAt: rec.sockCloseAt }, ev };
 }
 
-test("concurrent over-limit declarations are each refused early; the server's total read stays bounded", async () => {
+test("concurrent over-limit declarations are each refused early; the server's total read stays bounded", async (t) => {
   await withServer(async ({ port, records }) => {
     const { clients, ticks } = await concurrentClients(port, 10, { url: URL, mode: "stream", contentLength: 100 * MiB, ignoreFin: true, capBytes: 96 * MiB, maxMs: GRACE_MS + 10000 });
     const until = Date.now() + GRACE_MS + SLACK_MS;
     while (records().length < clients.length && Date.now() < until) await sleep(50);
     const recs = records();
     let total = 0, stalled = 0;
+    const excused = []; // #151 diagnostics: each excused client with its timeline, for the guard below
     for (const [i, st] of clients.entries()) {
       const rec = recs.find((x) => x.remotePort === st.localPort);
       const { conn, ev } = assertServerRefusal(rec, st, `client ${i}`);
@@ -163,9 +164,10 @@ test("concurrent over-limit declarations are each refused early; the server's to
       const v = judgeRefusedClient(st, conn, ticks, 413, ANSWER_BODY);
       assert.ok(v.ok, `client ${i}: ${v.why} ${ev}`);
       if (v.kind === "answered") assert.equal(st.connectionHeader, "close", `client ${i}: Connection: close ${ev}`);
-      else stalled += 1;
+      else { stalled += 1; excused.push(`client ${i}: ${v.why}`); }
     }
-    assert.ok(stalled < clients.length, "at least one client read its answer (a run where none did proves nothing about delivery)");
+    if (excused.length) t.diagnostic(`${excused.length}/${clients.length} clients excused (documented reset tradeoff): ${excused.join(" | ")}`);
+    assert.ok(stalled < clients.length, `at least one client read its answer (a run where none did proves nothing about delivery); excused: ${excused.join(" | ")}`);
     assert.ok(total <= 10 * EARLY_READ_BOUND, `total read ${total}`);
   });
 });
