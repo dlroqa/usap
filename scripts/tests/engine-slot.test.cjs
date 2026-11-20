@@ -183,8 +183,9 @@ test("guard (#136): a stop that arrives as soon as the guard reports its engine 
   }
 });
 
-test("slot (#136): an engine still running after its guard died is stopped through the guard's process group; the slot stays reserved until its exit is seen", { skip: !POSIX && "Windows: the guard stops engines with taskkill /T; no process groups" }, async () => {
+test("slot (#136, #160): an engine still running after its guard died is stopped through the guard's process group; the slot is never idle while that engine is alive and is released only after its exit is seen", { skip: !POSIX && "Windows: the guard stops engines with taskkill /T; no process groups" }, async () => {
   const { spawnSupervised } = require("../server/supervisor.cjs");
+  const { defaultReapOrphan } = require("../server/services/engine-slot.cjs");
   const { dir, engine } = fakeEngineDir();
   const started = [];
   const orphan = async () => {
@@ -194,29 +195,51 @@ test("slot (#136): an engine still running after its guard died is stopped throu
     process.kill(g.pid, "SIGKILL"); // the guard alone dies; its engine keeps running in the guard's process group
     return g;
   };
+  // Engine liveness exactly as the product checks it (engine-slot.cjs defaultIsAlive: signal 0), with every answer the
+  // slot acts on recorded. The slot can release only in the callback that just got a liveness answer (confirmGone), and
+  // it does so synchronously; a microtask queued here runs right after that callback, so each recorded decision carries
+  // the phase it produced. Every point at which the slot could release is checked: no sampling between them (#160).
+  const realAlive = (pid) => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (err) { return err.code === "EPERM"; } };
   try {
     for (const reaping of [true, false]) {
-      const opts = { log: quietLog, pidGoneTimeoutMs: 200, recheckMs: 50 };
-      if (!reaping) opts.reapOrphan = async () => false; // negative control: nothing stops the orphan
-      const slot = createEngineSlot(opts);
+      const decisions = []; let slot = null, g = null;
+      const isAlive = (pid) => {
+        const alive = realAlive(pid);
+        const d = { t: Date.now(), pid, alive, phaseAfter: null, groupAfter: null };
+        decisions.push(d);
+        queueMicrotask(() => { d.phaseAfter = slot.current().phase; if (d.phaseAfter === "idle") d.groupAfter = groupMembers(g.pid); });
+        return alive;
+      };
+      // reaping: the product's own reaper; negative control: nothing stops the orphan
+      slot = createEngineSlot({ log: quietLog, pidGoneTimeoutMs: 200, recheckMs: 50, isAlive, reapOrphan: reaping ? defaultReapOrphan : async () => false });
       const e = slot.begin("image", "i.gguf");
-      const g = await orphan();
+      g = await orphan();
+      const enginePid = g.enginePid;
+      assert.ok(enginePid > 0 && enginePid !== g.pid, "the guard reported its engine (a process other than itself)");
+      assert.ok(groupMembers(g.pid).includes(enginePid), "that engine runs in the guard's process group");
       slot.track("image", g, e);
       slot.end("image", { live: false });
       await new Promise((r) => g.once("exit", r));
-      assert.ok(g.enginePid > 0, "the guard reported its engine");
-      await sleep(250);
-      assert.notEqual(slot.current().phase, "idle", `${reaping}: never idle while the engine runs`);
+      const ev = () => JSON.stringify(decisions.slice(-8).map((d) => ({ ms: d.t - decisions[0].t, pid: d.pid === enginePid ? "engine" : d.pid, alive: d.alive, phase: d.phaseAfter, group: d.groupAfter })));
       if (reaping) {
         const end = Date.now() + 8000;
-        while (slot.current().phase !== "idle" && Date.now() < end) await sleep(50);
-        assert.equal(slot.current().phase, "idle", "released after the engine's exit was seen");
-        assert.deepEqual(groupMembers(g.pid), [], "the engine is gone");
+        while (slot.current().phase !== "idle" && Date.now() < end) await sleep(20);
+        await sleep(0);
+        assert.equal(slot.current().phase, "idle", `released after the engine's exit was seen ${ev()}`);
+        assert.ok(decisions.length > 0 && decisions.every((d) => d.pid === enginePid), `the slot judged liveness by the engine's own PID ${ev()}`);
+        assert.ok(decisions.some((d) => d.alive), `the slot saw the orphan alive first (the clean-up path ran) ${ev()}`);
+        assert.ok(decisions.filter((d) => d.alive).every((d) => d.phaseAfter !== "idle"), `never idle right after the engine was seen alive ${ev()}`);
+        const release = decisions.find((d) => d.phaseAfter === "idle");
+        assert.ok(release && release.alive === false, `idle first appeared right after an 'exited' answer ${ev()}`);
+        assert.ok(decisions.slice(0, decisions.indexOf(release)).every((d) => d.phaseAfter !== "idle"), `reserved for the whole clean-up ${ev()}`);
+        assert.deepEqual(release.groupAfter, [], `the engine's process group was empty at the moment of release ${ev()}`);
         assert.equal(slot.snapshot().counts.orphansStopped, 1);
+        assert.deepEqual(groupMembers(g.pid), [], "the engine is gone");
       } else {
         await sleep(1500);
         assert.notEqual(slot.current().phase, "idle", "negative control: still reserved");
         assert.ok(groupMembers(g.pid).length > 0, "negative control: the engine is still running");
+        assert.ok(decisions.every((d) => d.phaseAfter !== "idle"), `negative control: never released ${ev()}`);
       }
     }
   } finally {
