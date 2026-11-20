@@ -703,12 +703,13 @@ function createImageEngine(deps) {
     const maxAttempts = isNpu ? 1200 : 240;
     const interval = setInterval(async () => {
       attempts += 1;
-      if (!backendProc || backendReady || attempts > maxAttempts || (slot && pollProc && backendProc !== pollProc)) {
+      // #120: a process the studio has asked to stop is never marked ready again (it may still answer while it stops).
+      if (!backendProc || backendReady || attempts > maxAttempts || (pollProc && pollProc.usapStopRequested === true) || (slot && pollProc && backendProc !== pollProc)) {
         clearInterval(interval);
         return;
       }
       if (await pingBackendReady()) {
-        if (slot && pollProc && backendProc !== pollProc) { clearInterval(interval); return; }
+        if ((pollProc && pollProc.usapStopRequested === true) || (slot && pollProc && backendProc !== pollProc)) { clearInterval(interval); return; }
         markBackendReady();
         clearInterval(interval);
       }
@@ -988,7 +989,7 @@ function createImageEngine(deps) {
       process.stdout.write("  [sd] " + output);
       updateCoreMLLoadProgress(output);
       const cleanOutput = stripAnsi(output);
-      if (cleanOutput.includes("listening on") && !(slot && backendProc !== proc)) {
+      if (cleanOutput.includes("listening on") && !(slot && backendProc !== proc) && proc.usapStopRequested !== true) {
         markBackendReady();
       }
       
@@ -997,7 +998,7 @@ function createImageEngine(deps) {
         const cleanLine = stripAnsi(line);
         if (!cleanLine.trim()) continue;
         
-        if (cleanLine.includes("listening on")) {
+        if (cleanLine.includes("listening on") && proc.usapStopRequested !== true) {
           markBackendReady();
         }
 

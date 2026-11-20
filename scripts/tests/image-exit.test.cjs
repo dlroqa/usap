@@ -231,6 +231,28 @@ function suite(label, env) {
         untell();
       }
     });
+
+    test("8 an engine that starts listening while it is being stopped is never marked ready again (readiness poll and its own 'listening' line)", async (t) => {
+      t.after(gone);
+      await load("sd1-hold-load-ignore-sigterm-q4_0.gguf");
+      await waitFor(async () => (await status()).running, 15000, "spawned");
+      await sleep(200);
+      const stopping = stop(); // the engine ignores SIGTERM, so the stop takes until the forced kill
+      await sleep(100);
+      fs.writeFileSync(path.join(models(), "sd1-hold-load-ignore-sigterm-q4_0.gguf.release"), ""); // now it listens and answers pings
+      const r = await stopping;
+      assert.equal(r.status, 200);
+      const s = await waitFor(async () => { const st = await status(); return st.running ? null : st; }, 15000, "stopped");
+      await sleep(1200); // past more than two readiness-poll ticks
+      const after = await status();
+      assert.equal(after.ready, false, "a process that was asked to stop is never shown as ready");
+      assert.equal(after.running, false);
+      assert.equal(after.error, null, `a requested stop is not an error: ${after.error}`);
+      assert.equal(s.error, null);
+      const next = await load("sd1-plain-q4_0.gguf");
+      assert.equal(next.status, 200, `the next model is not refused by a phantom 'loaded' state: ${JSON.stringify(next.json)}`);
+      await waitFor(async () => (await status()).ready, 30000, "next model ready");
+    });
   });
 }
 
