@@ -1,6 +1,7 @@
 # Step 9.9f-3: image-generation queue (design)
 
-Status: **design only, not implemented.** Nothing in this document is turned on, and implementation needs separate
+Status: **implemented, off by default** (§13, "As built", which takes precedence over §2–§12 where they differ).
+Nothing in this document is turned on by default; turning it on needs `engineSlot` on and, as a default, separate
 approval. It expands §5.3 of [STEP9_9F_WORKLOAD_QUEUES.md](STEP9_9F_WORKLOAD_QUEUES.md), using the CPU measurements
 of sd-server and the voice and Whisper queues ([STEP9_9F_WHISPER_QUEUE.md](STEP9_9F_WHISPER_QUEUE.md)) as models.
 The owner's decisions D1–D6 are recorded in §10. All limits are **provisional design targets**, not final defaults.
@@ -309,3 +310,63 @@ nothing changes (today's "unknown" stays). `generationsInFlight` keeps its 9.9e 
 3. Turning it on, even only for testing outside CI, requires `engineSlot` to be cleared for activation first
    (#120). Turning it on by default is a later decision, after the aggregate connection admission (#131) and GPU/NPU
    measurements.
+
+## 13. As built
+
+Implementation: `scripts/server/services/image-queue.cjs`, wired in `serve.cjs` (setting, creation, `/api/resources`,
+shutdown) and `routes/image.cjs` (the four routes, restart and stop). `services/job-queue.cjs` is unchanged.
+
+### 13.1 Settings
+| Setting (environment wins over `app/config/scheduler.json`) | Default | Range |
+|---|---|---|
+| `USAP_IMAGE_QUEUE` / `imageQueue` | `off` | `on`, `off` |
+| `USAP_IMAGE_QUEUE_LIMIT` / `imageQueueLimit` (waiting) | 2 | 1–2 |
+| `USAP_IMAGE_QUEUE_MAX_WAIT_MS` / `imageQueueMaxWaitMs` | 600000 (10 min) | 1 s – 60 min |
+| `USAP_IMAGE_QUEUE_BODY_BYTES` / `imageQueueBodyBytes` | 64 MiB | 1–64 MiB |
+| `USAP_IMAGE_QUEUE_BODY_BUDGET_BYTES` / `imageQueueBodyBudgetBytes` | 128 MiB | 1–192 MiB, and at least the per-request ceiling |
+
+A value outside its range is ignored and reported at start-up, never clamped. The upload deadlines are fixed as
+designed (§5.2): 120 s from arrival, 30 s without data. `USAP_SCHEDULER=off` forces the queue off
+(`forcedOffBy: "scheduler-off"`). `imageQueue: on` without `engineSlot: on` is not supported: the queue stays off
+(`forcedOffBy: "engine-slot-off"`) and the server logs why at start-up. The 192 MiB upper end of the budget exists so
+the D6 measurement (§13.5) can hold three full bodies; the default stays 128 MiB.
+
+### 13.2 Ownership and dispatch
+* Engine identity comes only from the slot and the image engine's own state: the slot owner (`image`), phase
+  (`loaded`), epoch, the current engine process and its readiness. The epoch and process are recorded at admission
+  and compared at dispatch (§6); there is no second ownership mechanism.
+* The running place is released exactly once: upstream response ended, upstream request or response failed, or the
+  engine process's exit event. The body and its reservation are released when the body has been written to the
+  engine (or when the job ends without being forwarded), before the place is released.
+* Forwarding uses the proxy's own header handling (credentials removed, `Host` rewritten, CORS headers removed from
+  the answer), `timeout: 0`, and writes the held chunks with backpressure. Upstream connection errors keep today's
+  `502 "Image backend is not reachable: …"`.
+* The Step 9.9e generation count (`generationsInFlight`) counts forwarded jobs as the proxy does (through a shared
+  `trackGeneration` helper), so its meaning is unchanged.
+
+### 13.3 Answers
+Every queue answer is `{ ok: false, code, error, detail }`, with `detail` = `"Generation failed: "` + the message:
+`503 ENGINE_NOT_READY`, `429 QUEUE_FULL` (plus `reason: "body-budget"` for the budget), `503 QUEUE_TIMEOUT`,
+`413 BODY_TOO_LARGE`, `408 UPLOAD_TIMEOUT` (with `phase`: `idle` or `total`). `Retry-After` is at least 30 s.
+Refusals before the body was read close the connection after the answer without reading the body
+(`http/refusal-close.cjs`, as every other refusal).
+
+### 13.4 Reporting
+When on, `/api/resources` adds `limits.imageQueue: "on"`, `engines.image.queue`
+`{ running, waiting, limit, known: true, abandoned, runningSeconds, inactive }`, and `imageQueue`
+`{ mode, limit, maxWaitSeconds, memory: { bodyBytes, budgetBytes, reservedBytes, heldJobs }, counts }`. Off: unchanged.
+
+### 13.5 Tests and evidence
+* `scripts/tests/image-queue.test.cjs`: the setting and routes; the queue in process against a controllable fake
+  upstream and engine state (FIFO and one at a time; pass-through of the engine's answer; a client leaving while
+  waiting and while running; a stalled engine and its exit; an engine failure; the waiting deadline; not ready at
+  admission; stale epoch and a different engine at dispatch; every body bound and both upload deadlines; the budget;
+  stop/restart refusals; the Core ML pass-through); and the real server with the fake sd-server (off by default and
+  unchanged; refused without engineSlot; `USAP_SCHEDULER=off`; on, with restart `409` and stop; shutdown with work
+  in progress).
+* `scripts/ci/image-queue-validate.cjs` in `native-runtime` on all four CPU targets with the real sd-server: §11.2's
+  rows, and the D6 memory measurement (studio, engine and client resident memory while the studio holds three
+  64 MiB bodies that are never sent to the engine; a stop condition ends it early if the studio passes 2 GiB or free
+  memory falls below 1 GiB). Its results are evidence for the memory-versus-disk decision; they are not a default.
+* GPU and NPU paths are not exercised; the queue makes no GPU or NPU claim.
+
