@@ -40,10 +40,15 @@ function startHarnessChild(script, iteration, { timeoutMs = 60000 } = {}) {
     stdout: redact(tail(out)), stderr: redact(tail(err)),
   });
   return new Promise((resolve, reject) => {
-    let done = false, timedOut = false, hardKill = null;
+    // Single-shot: exactly one of resolve/reject runs, and every timer is cleared when it does.
+    let done = false, timedOut = false, stdioOpenAfterExit = false, hardKill = null, closeWait = null;
+    const settle = (fn) => { if (done) return; done = true; clearTimeout(timer); clearTimeout(hardKill); clearTimeout(closeWait); fn(); };
+    const fail = () => settle(() => reject(new Error(timedOut
+      ? `timeout: ${evidence(`no server info within ${timeoutMs} ms; child stopped`, { stdioOpenAfterExit })}`
+      : `child exited early: ${evidence("exited before reporting its server", { stdioOpenAfterExit })}`)));
     // A child that never reports is stopped, not left running: SIGTERM first (a harness child then removes its root and
-    // stops its server), SIGKILL if it is still there 5 s later. The rejection waits for it to close, so the evidence
-    // says how it ended and nothing is left holding this test file open.
+    // stops its server), SIGKILL 5 s later only if it has not exited. child.kill() signals only this ChildProcess's own
+    // process, and only while Node still holds its handle (released when the exit is reaped), so a reused PID is never hit.
     const timer = setTimeout(() => {
       if (done) return;
       timedOut = true;
@@ -56,17 +61,17 @@ function startHarnessChild(script, iteration, { timeoutMs = 60000 } = {}) {
         if (line.startsWith(PHASE_PREFIX)) { const [name, ...rest] = line.slice(PHASE_PREFIX.length).split(" "); if (!phases.includes(name)) phases.push(name); if (name === "root-made") root = rest.join(" ").trim(); }
       }
       const line = out.split("\n").find((l) => l.startsWith("{"));
-      if (line && !done) { done = true; clearTimeout(timer); resolve({ child, info: JSON.parse(line) }); }
+      if (line) settle(() => resolve({ child, info: JSON.parse(line) }));
     });
     child.stderr.on("data", (d) => { err = (err + d).slice(-4 * OUTPUT_TAIL); });
-    // 'close' (not 'exit'): all of the child's stdout and stderr has been read by then
-    child.on("close", () => {
-      clearTimeout(hardKill);
+    // Report on 'close' (all output read), but never wait for it more than 2 s after the child has exited: a process the
+    // child started may still hold its stdout/stderr. Then this side of the pipes is destroyed and the report says so.
+    child.on("exit", () => {
+      clearTimeout(timer); clearTimeout(hardKill);
       if (done) return;
-      done = true; clearTimeout(timer);
-      if (timedOut) reject(new Error(`timeout: ${evidence(`no server info within ${timeoutMs} ms; child stopped`)}`));
-      else reject(new Error(`child exited early: ${evidence("exited before reporting its server")}`));
+      closeWait = setTimeout(() => { stdioOpenAfterExit = true; child.stdout.destroy(); child.stderr.destroy(); fail(); }, 2000);
     });
+    child.on("close", () => fail());
   });
 }
 
@@ -147,6 +152,18 @@ test("#157 diagnostics: a harness child that ends before reporting its server is
   assert.equal(hev.iteration, "control-never-reports"); assert.equal(hev.serverStartReached, true);
   assert.ok(hev.exitCode !== null || hev.signal !== null, `the child had ended when the timeout was reported: ${hung}`);
   assert.ok(Date.now() - t0 < 1500 + 5000 + 3000, "stopped within the SIGTERM/SIGKILL bound");
+  // a process the child started keeps its stdout/stderr open after the child exits: reported within 2 s of the exit
+  // anyway (not when that process ends), and the report says the pipes were still open. The grandchild is ours: killed.
+  const g0 = Date.now();
+  const held = await early(`const { spawn } = require("node:child_process");
+    const g = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)"], { stdio: "inherit", detached: true }); g.unref();
+    console.log("phase:grandchild " + g.pid); process.exitCode = 3;`, "control-stdio-held");
+  const gev = JSON.parse(held.slice("child exited early: ".length));
+  const gpid = Number((gev.stdout.match(/phase:grandchild (\d+)/) || [])[1]);
+  try {
+    assert.equal(gev.exitCode, 3); assert.equal(gev.stdioOpenAfterExit, true, held);
+    assert.ok(Date.now() - g0 < 2000 + 3000, `reported within the 2 s bound after the exit, not when the grandchild ended (${Date.now() - g0} ms)`);
+  } finally { if (gpid > 0) { try { process.kill(gpid, "SIGKILL"); } catch (_) { /* already gone */ } } }
   // killed by a signal (POSIX): the signal is reported
   if (process.platform !== "win32") {
     const killed = JSON.parse((await early(`process.kill(process.pid, "SIGKILL");`, "control-sigkill")).slice("child exited early: ".length));
