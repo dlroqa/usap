@@ -1,0 +1,323 @@
+#!/usr/bin/env node
+// Step 9.9f-3 native check: the image-generation queue (docs/roadmap/STEP9_9F_IMAGE_QUEUE.md §11.2) with the real
+// sd-server and Stable Diffusion 1.5 Q4_0 on the CPU (installed by runtime-validate).
+//
+// Starts its own test servers on port 14985 (`--port`) from this checkout. imageQueue and engineSlot are switched on
+// only in their environment; the installed default stays off (its first check). GPU and NPU paths are not exercised
+// (CPU only) and are recorded as UNAVAILABLE, never as passed. Timings are evidence, not pass/fail.
+//
+// The D6 memory measurement (design §5.5): the studio holds three 64 MiB request bodies at once (one still being
+// received by the job that has the running turn, two complete and waiting), with the real engine loaded and idle.
+// The resident memory of the studio process, the engine process and this client is sampled separately before,
+// during and after; the bodies are never sent to the engine (their clients leave while they wait). Stop condition:
+// the scenario ends at once if the studio grows past 2 GiB or free memory drops below 1 GiB.
+//
+//   node scripts/ci/image-queue-validate.cjs --image stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf --results out.jsonl --logs ci-logs
+"use strict";
+
+const fs = require("fs");
+const http = require("http");
+const net = require("net");
+const os = require("os");
+const path = require("path");
+const { spawn, spawnSync } = require("child_process");
+
+const ROOT = path.resolve(__dirname, "..", "..");
+const APP = path.join(ROOT, "app");
+const SERVE = path.join(ROOT, "scripts", "server", "serve.cjs");
+const arg = (name, def) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : def; };
+const IMAGE = arg("image", "stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf");
+const RESULTS = arg("results", path.join(ROOT, "ci-logs", "image-queue-results.jsonl"));
+const LOGDIR = arg("logs", path.join(ROOT, "ci-logs"));
+const PORT = Number(arg("port", "14985"));
+const MiB = 1024 * 1024;
+const NODE = [path.join(APP, "tools", "node-win", "node.exe"), path.join(APP, "tools", "node-linux", "bin", "node"), path.join(APP, "tools", "node-mac", "bin", "node")]
+  .find((p) => fs.existsSync(p)) || process.execPath;
+const GEN = { prompt: "a red apple", steps: 2, width: 128, height: 128, seed: 42, batch_size: 1 };
+const STOP_STUDIO_RSS_KIB = 2 * 1024 * 1024;
+const STOP_FREE_BYTES = 1024 * MiB;
+
+fs.mkdirSync(path.dirname(RESULTS), { recursive: true });
+fs.mkdirSync(LOGDIR, { recursive: true });
+fs.writeFileSync(RESULTS, "");
+let failed = false;
+function record(check, status, detail) {
+  const d = String(detail).replace(/\s+/g, " ").replace(/\|/g, "\\|").slice(0, 700);
+  fs.appendFileSync(RESULTS, JSON.stringify({ check, status, platform: `${process.platform}-${process.arch}`, detail: d }) + "\n");
+  console.log(`| ${check} | ${status} | ${d} |`);
+  if (status === "FAIL") failed = true;
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function waitUntil(fn, ms, every = 250) {
+  const end = Date.now() + ms;
+  for (;;) {
+    let v; try { v = await fn(); } catch (_) { v = undefined; }
+    if (v) return v;
+    if (Date.now() > end) return undefined;
+    await sleep(every);
+  }
+}
+const portOpen = (port) => new Promise((resolve) => {
+  const s = net.connect(port, "127.0.0.1"); s.setTimeout(1000);
+  s.on("connect", () => { s.destroy(); resolve(true); }); s.on("error", () => resolve(false)); s.on("timeout", () => { s.destroy(); resolve(false); });
+});
+function call(method, p, body, { timeoutMs = 900000 } = {}) {
+  return new Promise((resolve) => {
+    const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
+    const req = http.request({ host: "127.0.0.1", port: PORT, path: p, method, agent: false, timeout: timeoutMs,
+      headers: data ? { "content-type": "application/json", "content-length": data.length } : {} }, (res) => {
+      let text = ""; res.setEncoding("utf8");
+      res.on("data", (c) => { text += c; });
+      res.on("end", () => { let json = null; try { json = JSON.parse(text); } catch (_) { json = null; } resolve({ status: res.statusCode, text, json }); });
+    });
+    req.on("timeout", () => req.destroy(new Error("client timeout")));
+    req.on("error", (err) => resolve({ status: 0, text: String(err.message), json: null }));
+    if (data) req.write(data);
+    req.end();
+  });
+}
+// A generation that can be abandoned: resolves when answered; abort() makes the client leave.
+function generation(body = GEN) {
+  const data = Buffer.from(JSON.stringify(body));
+  const t0 = Date.now();
+  const req = http.request({ host: "127.0.0.1", port: PORT, path: "/sdapi/v1/txt2img", method: "POST", agent: false,
+    headers: { "content-type": "application/json", "content-length": data.length } });
+  const done = new Promise((resolve) => {
+    req.on("response", (res) => { let t = ""; res.on("data", (c) => { t += c; }); res.on("end", () => { let j = null; try { j = JSON.parse(t); } catch (_) { j = null; } resolve({ status: res.statusCode, json: j, ms: Date.now() - t0, endedAt: Date.now() }); }); res.on("error", () => resolve({ status: 0, ms: Date.now() - t0 })); });
+    req.on("error", (e) => resolve({ status: 0, error: e.code || e.message, ms: Date.now() - t0 }));
+  });
+  req.end(data);
+  return { done, abort: () => req.destroy() };
+}
+const resources = async () => (await call("GET", "/api/resources", undefined, { timeoutMs: 10000 })).json || {};
+const queueNow = async () => { const r = await resources(); return { q: (r.engines && r.engines.image && r.engines.image.queue) || {}, iq: r.imageQueue || null, limits: r.limits || {} }; };
+const imageLoad = () => call("POST", "/api/restart-backend", { model: IMAGE, backend_type: "cpu", use_gpu: false, width: 128, height: 128, steps: 2 });
+const imageReady = () => waitUntil(async () => (await call("GET", "/api/backend-status", undefined, { timeoutMs: 10000 })).json.ready === true, 900000, 1000);
+const idleEngine = () => waitUntil(async () => { const { q } = await queueNow(); return q.running === 0 && q.waiting === 0; }, 900000, 500);
+
+function rssKiB(pid) {
+  if (!pid) return null;
+  try {
+    if (process.platform === "linux") { const m = fs.readFileSync(`/proc/${pid}/status`, "utf8").match(/VmRSS:\s+(\d+) kB/); return m ? Number(m[1]) : null; }
+    if (process.platform === "darwin") { const r = spawnSync("ps", ["-o", "rss=", "-p", String(pid)], { encoding: "utf8" }); const n = Number(String(r.stdout).trim()); return n > 0 ? n : null; }
+    if (process.platform === "win32") {
+      const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid}).WorkingSet64`], { encoding: "utf8", windowsHide: true });
+      const n = Number(String(r.stdout).trim()); return n > 0 ? Math.round(n / 1024) : null;
+    }
+  } catch (_) { /* unavailable */ }
+  return null;
+}
+async function enginePid() {
+  const d = (await call("GET", "/api/diagnostics", undefined, { timeoutMs: 10000 })).json;
+  const r = ((d && d.engines && d.engines.processes && d.engines.processes.supervised) || []).find((x) => x.label === "image");
+  return r ? (r.enginePid || r.guardPid) : null;
+}
+const mib = (kib) => (kib === null || kib === undefined ? "n/a" : `${Math.round(kib / 1024)} MiB`);
+
+async function startServer(label, env) {
+  const logPath = path.join(LOGDIR, `image-queue-${label}.log`);
+  const log = fs.openSync(logPath, "w");
+  const child = spawn(NODE, [SERVE], {
+    cwd: ROOT, windowsHide: true, stdio: ["ignore", log, log],
+    env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT), LLM_PORT: String(PORT + 1), BACKEND_PORT: String(PORT + 2), SD_BACKEND_PORT: String(PORT + 2), SPEECH_PORT: String(PORT + 3), ...env },
+  });
+  const exited = new Promise((r) => child.once("exit", (code, signal) => r({ code, signal })));
+  const srv = { label, child, exited, logPath, log: () => { try { return fs.readFileSync(logPath, "utf8"); } catch (_) { return ""; } } };
+  const up = await waitUntil(async () => (await call("GET", "/api/health", undefined, { timeoutMs: 3000 })).status === 200, 60000, 500);
+  if (!up) throw new Error(`server ${label} did not start (see image-queue-${label}.log)`);
+  return srv;
+}
+async function stopServer(srv) {
+  if (!srv || srv.child.exitCode !== null || srv.child.signalCode !== null) return;
+  await call("POST", "/api/stop-backend", {}, { timeoutMs: 30000 });
+  srv.child.kill("SIGTERM");
+  let timer = null;
+  const gone = await Promise.race([srv.exited, new Promise((r) => { timer = setTimeout(() => r(false), 20000); })]);
+  clearTimeout(timer);
+  if (!gone) { try { srv.child.kill("SIGKILL"); } catch (_) { /* gone */ } await srv.exited; }
+  await waitUntil(async () => !(await portOpen(PORT)), 15000);
+}
+async function scenario(name, fn) { try { await fn(); } catch (err) { record(name, "FAIL", err.message); } }
+const ON = { USAP_ENGINE_SLOT: "on", USAP_IMAGE_QUEUE: "on" };
+
+// A large body held by the studio: `declared` bytes announced; `send` bytes written now; the rest only on finish().
+function heldUpload(declared, send) {
+  const req = http.request({ host: "127.0.0.1", port: PORT, path: "/sdapi/v1/txt2img", method: "POST", agent: false,
+    headers: { "content-type": "application/json", "content-length": declared } });
+  const done = new Promise((resolve) => {
+    req.on("response", (res) => { let t = ""; res.on("data", (c) => { t += c; }); res.on("end", () => { let j = null; try { j = JSON.parse(t); } catch (_) { j = null; } resolve({ status: res.statusCode, json: j }); }); });
+    req.on("error", (e) => resolve({ status: 0, error: e.code || e.message }));
+  });
+  req.flushHeaders(); // the request reaches the server even before any body byte is written
+  const block = Buffer.alloc(MiB, 97);
+  let written = 0;
+  const writeSome = (target) => new Promise((resolve) => {
+    const more = () => {
+      while (written < target) {
+        const n = Math.min(block.length, target - written);
+        written += n;
+        if (!req.write(n === block.length ? block : block.subarray(0, n))) { req.once("drain", more); return; }
+      }
+      resolve();
+    };
+    more();
+  });
+  const sent = writeSome(send);
+  return { done, sent, abort: () => req.destroy(), finish: () => writeSome(declared).then(() => req.end()) };
+}
+
+(async () => {
+  console.log(`| Check | Result | Detail |\n|---|---|---|`);
+  if (!fs.existsSync(path.join(APP, "models", IMAGE))) {
+    record("Model installed", "FAIL", `need app/models/${IMAGE} (runtime-validate installs it)`);
+    process.exit(1);
+  }
+  await scenario("Default: imageQueue off", async () => {
+    const srv = await startServer("default", { USAP_IMAGE_QUEUE: "", USAP_ENGINE_SLOT: "" });
+    try {
+      const r = await resources();
+      const q = r.engines && r.engines.image && r.engines.image.queue;
+      const ok = !("imageQueue" in r) && !("imageQueue" in (r.limits || {})) && q && q.known === false;
+      record("Default: imageQueue off", ok ? "PASS" : "FAIL", `imageQueue key ${"imageQueue" in r ? "present" : "absent"}; image queue known ${q && q.known}`);
+      const load = await imageLoad(); await imageReady();
+      const g = await generation().done;
+      record("Default: a generation answers as before", load.status === 200 && g.status === 200 && g.json && Array.isArray(g.json.images) ? "PASS" : "FAIL", `load ${load.status}, generate ${g.status} in ${g.ms} ms`);
+    } finally { await stopServer(srv); }
+  });
+  await scenario("imageQueue on without engineSlot stays off", async () => {
+    const srv = await startServer("noslot", { USAP_IMAGE_QUEUE: "on", USAP_ENGINE_SLOT: "" });
+    try {
+      const r = await resources();
+      const logged = /image queue "on" is not supported without engineSlot and stays off/.test(srv.log());
+      record("imageQueue on without engineSlot stays off", !("imageQueue" in r) && logged ? "PASS" : "FAIL", `imageQueue key ${"imageQueue" in r ? "present" : "absent"}; refusal logged ${logged}`);
+    } finally { await stopServer(srv); }
+  });
+  await scenario("USAP_SCHEDULER=off rollback", async () => {
+    const srv = await startServer("rollback", { ...ON, USAP_SCHEDULER: "off" });
+    try {
+      const r = await call("GET", "/api/resources", undefined, { timeoutMs: 10000 });
+      const notQueued = !/Image queue on/.test(srv.log());
+      record("USAP_SCHEDULER=off rollback", notQueued ? "PASS" : "FAIL", `queue started ${!notQueued}; /api/resources ${r.status} (left out when the scheduler is off)`);
+    } finally { await stopServer(srv); }
+  });
+
+  let srv = null;
+  try {
+    srv = await startServer("on", ON);
+    const load = await imageLoad();
+    await imageReady();
+    record("Load with imageQueue + engineSlot on", load.status === 200 ? "PASS" : "FAIL", `load ${load.status}`);
+    const pid = await enginePid();
+
+    await scenario("Two requests run one after the other", async () => {
+      const a = generation();
+      await waitUntil(async () => (await queueNow()).q.running === 1, 30000, 100);
+      const b = generation({ ...GEN, seed: 43 });
+      const mid = await waitUntil(async () => { const { q } = await queueNow(); return q.running === 1 && q.waiting === 1 ? q : null; }, 30000, 100);
+      const [ra, rb] = await Promise.all([a.done, b.done]);
+      const { q } = await queueNow();
+      const ok = ra.status === 200 && rb.status === 200 && rb.endedAt - ra.endedAt >= Math.min(ra.ms * 0.5, 1000);
+      record("Two requests run one after the other", ok ? "PASS" : "FAIL", `A ${ra.status} in ${ra.ms} ms, B ${rb.status} in ${rb.ms} ms (B ended ${rb.endedAt - ra.endedAt} ms after A); saw running 1 / waiting ${mid ? mid.waiting : "?"}; now running ${q.running}`);
+    });
+    await scenario("A waiting request whose client leaves never reaches the engine", async () => {
+      const before = (await queueNow()).iq.counts;
+      const a = generation(); await waitUntil(async () => (await queueNow()).q.running === 1, 30000, 100);
+      const b = generation({ ...GEN, seed: 44 }); await waitUntil(async () => (await queueNow()).q.waiting === 1, 30000, 100);
+      b.abort();
+      await waitUntil(async () => (await queueNow()).q.waiting === 0, 10000, 100);
+      const ra = await a.done;
+      await sleep(3000);
+      const after = (await queueNow()).iq.counts;
+      const progress = (await call("GET", "/api/generation-progress", undefined, { timeoutMs: 10000 })).json || {};
+      const forwarded = after.forwarded - before.forwarded;
+      const ok = ra.status === 200 && forwarded === 1 && after.leftWhileWaiting - before.leftWhileWaiting === 1 && progress.active !== true;
+      record("A waiting request whose client leaves never reaches the engine", ok ? "PASS" : "FAIL", `forwarded ${forwarded} (only A); left while waiting ${after.leftWhileWaiting - before.leftWhileWaiting}; engine generating 3 s after A: ${Boolean(progress.active)}`);
+    });
+    await scenario("A running request whose client leaves keeps ownership until the engine finishes", async () => {
+      const before = (await queueNow()).iq.counts;
+      const a = generation(); await waitUntil(async () => (await queueNow()).q.running === 1, 30000, 100);
+      await sleep(200);
+      a.abort();
+      const abandoned = await waitUntil(async () => { const { q } = await queueNow(); return q.abandoned === true && q.running === 1 ? q : null; }, 10000, 100);
+      const b = generation({ ...GEN, seed: 45 });
+      const rb = await b.done;
+      const after = (await queueNow()).iq.counts;
+      const ok = Boolean(abandoned) && rb.status === 200 && after.completed - before.completed === 2 && after.leftWhileRunning - before.leftWhileRunning === 1;
+      record("A running request whose client leaves keeps ownership until the engine finishes", ok ? "PASS" : "FAIL", `shown abandoned ${Boolean(abandoned)}; next ${rb.status} in ${rb.ms} ms; completed +${after.completed - before.completed} (the abandoned job ran to its end)`);
+    });
+    await scenario("Stop refuses waiting requests", async () => {
+      const a = generation(); await waitUntil(async () => (await queueNow()).q.running === 1, 30000, 100);
+      const b = generation({ ...GEN, seed: 46 }); await waitUntil(async () => (await queueNow()).q.waiting === 1, 30000, 100);
+      const st = await call("POST", "/api/stop-backend", {});
+      const [ra, rb] = await Promise.all([a.done, b.done]);
+      const ok = st.status === 200 && rb.status === 503 && rb.json && rb.json.code === "ENGINE_NOT_READY" && /^Generation failed: /.test(rb.json.detail || "");
+      record("Stop refuses waiting requests", ok ? "PASS" : "FAIL", `stop ${st.status}; waiting ${rb.status} ${rb.json && rb.json.code}; running ${ra.status || ra.error}`);
+      const after = await queueNow();
+      record("Nothing held after stop", after.iq.memory.reservedBytes === 0 && after.iq.memory.heldJobs === 0 && after.q.running === 0 ? "PASS" : "FAIL", JSON.stringify(after.iq.memory));
+    });
+    void pid;
+  } finally { await stopServer(srv); srv = null; }
+
+  // ── D6 memory measurement ──
+  await scenario("D6 peak memory, three 64 MiB bodies held", async () => {
+    srv = await startServer("memory", { ...ON, USAP_IMAGE_QUEUE_BODY_BUDGET_BYTES: String(192 * MiB) });
+    const uploads = [];
+    let stopped = null;
+    try {
+      const load = await imageLoad(); await imageReady();
+      if (load.status !== 200) throw new Error(`load ${load.status}`);
+      const ePid = await enginePid();
+      const sPid = srv.child.pid;
+      const sample = () => ({ studio: rssKiB(sPid), engine: rssKiB(ePid), client: Math.round(process.memoryUsage().rss / 1024), free: os.freemem() });
+      await sleep(2000);
+      const base = sample();
+      const before = (await queueNow()).iq.counts;
+      // A: the running turn, 64 MiB declared, all but 1 MiB sent (its upload stays open). B, C: complete, waiting.
+      const A = heldUpload(64 * MiB, 63 * MiB); uploads.push(A);
+      await waitUntil(async () => (await queueNow()).q.running === 1, 20000, 100);
+      await A.sent;
+      const B = heldUpload(64 * MiB, 64 * MiB); uploads.push(B); await B.sent;
+      const C = heldUpload(64 * MiB, 64 * MiB); uploads.push(C); await C.sent;
+      const held = await waitUntil(async () => { const { iq, q } = await queueNow(); return iq.memory.reservedBytes === 192 * MiB && q.waiting === 2 ? iq.memory : null; }, 60000, 200);
+      await sleep(1500); // let the last chunks land
+      let peak = sample();
+      for (let i = 0; i < 10; i += 1) {
+        const s = sample();
+        if (s.studio && (!peak.studio || s.studio > peak.studio)) peak = s;
+        if ((s.studio && s.studio > STOP_STUDIO_RSS_KIB) || s.free < STOP_FREE_BYTES) { stopped = s; break; }
+        await sleep(500);
+      }
+      // Cleanup: the waiting clients leave first (so the turn is never handed to a held body), then the running
+      // turn's client, whose upload is still incomplete. Nothing reaches the engine.
+      C.abort(); B.abort();
+      await waitUntil(async () => (await queueNow()).q.waiting === 0, 10000, 100);
+      A.abort();
+      const released = await waitUntil(async () => { const { iq, q } = await queueNow(); return iq.memory.reservedBytes === 0 && iq.memory.heldJobs === 0 && q.running === 0 && q.waiting === 0 ? iq : null; }, 30000, 200);
+      await sleep(3000);
+      const after = sample();
+      const counts = (await queueNow()).iq.counts;
+      const forwarded = counts.forwarded - before.forwarded;
+      record("D6 peak memory, three 64 MiB bodies held", stopped ? "FAIL" : "MEASURED",
+        `held ${held ? Math.round(held.reservedBytes / MiB) : "?"} MiB in ${held ? held.heldJobs : "?"} jobs; studio RSS baseline ${mib(base.studio)}, peak ${mib(peak.studio)} (+${base.studio && peak.studio ? Math.round((peak.studio - base.studio) / 1024) : "?"} MiB), after release ${mib(after.studio)} (resident: Node need not return freed memory to the OS; the queue's own count is below); engine RSS ${mib(base.engine)} → ${mib(peak.engine)} (loaded, idle); client ${mib(peak.client)}; free memory ${Math.round(peak.free / MiB)} MiB${stopped ? `; STOP CONDITION at studio ${mib(stopped.studio)}, free ${Math.round(stopped.free / MiB)} MiB` : ""}`);
+      record("D6 bodies released, none forwarded to the engine", released && forwarded === 0 ? "PASS" : "FAIL", `reserved after ${released ? 0 : "not 0"}; held jobs ${released ? 0 : "?"}; forwarded ${forwarded}`);
+      // The default budget (128 MiB) bounds the same workload: a third 64 MiB body is refused.
+    } finally { for (const u of uploads) u.abort(); await stopServer(srv); srv = null; }
+  });
+  await scenario("Default budget refuses a third 64 MiB body", async () => {
+    srv = await startServer("budget", ON);
+    const uploads = [];
+    try {
+      const load = await imageLoad(); await imageReady();
+      if (load.status !== 200) throw new Error(`load ${load.status}`);
+      const A = heldUpload(64 * MiB, 63 * MiB); uploads.push(A); await A.sent;
+      const B = heldUpload(64 * MiB, 64 * MiB); uploads.push(B); await B.sent;
+      await waitUntil(async () => (await queueNow()).iq.memory.reservedBytes === 128 * MiB, 30000, 200);
+      const C = heldUpload(64 * MiB, 0); uploads.push(C); // sends nothing: refused at admission, before any body byte
+      const rc = await Promise.race([C.done, sleep(30000).then(() => ({ status: "timeout" }))]);
+      const ok = rc.status === 429 && rc.json && rc.json.reason === "body-budget";
+      record("Default budget refuses a third 64 MiB body", ok ? "PASS" : "FAIL", `third ${rc.status} ${rc.json && rc.json.code} ${rc.json && rc.json.reason}`);
+    } finally { for (const u of uploads) u.abort(); await stopServer(srv); srv = null; }
+  });
+  record("GPU / NPU image queue", "UNAVAILABLE", "CPU only on hosted runners; Vulkan, CUDA, ROCm, Metal, Core ML and OpenVINO are not exercised");
+  process.exit(failed ? 1 : 0);
+})().catch((err) => { record("validator", "FAIL", err.stack || err.message); process.exit(1); });

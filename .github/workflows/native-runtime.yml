@@ -24,6 +24,7 @@ on:
       - "scripts/ci/engine-lifecycle-validate.cjs"
       - "scripts/ci/voice-queue-validate.cjs"
       - "scripts/ci/transcription-queue-validate.cjs"
+      - "scripts/ci/image-queue-validate.cjs"
       - "scripts/ci/p4-token-check.cjs"
       - "scripts/ci/p4-fixed-document-id.cjs"
       - "scripts/ci/memory-check-report.cjs"
@@ -212,6 +213,25 @@ jobs:
         if: always()
         env:
           FRONTEND_PORT: "14975"
+        run: bash scripts/ci/stop-app.sh
+
+      # Step 9.9f-3 image generation: the image queue with the real sd-server (SD 1.5 Q4_0) on the CPU, with imageQueue
+      # and engineSlot on only for the script's own test servers (port 14985); the installed default stays off (its
+      # first check). Includes the design's D6 measurement: resident memory of the studio, the engine and the client
+      # while the studio holds three 64 MiB request bodies (never sent to the engine), with a stop condition.
+      - name: Image queue with the real sd-server (imageQueue on for test servers only)
+        # Independent of the steps before it (it starts its own servers): it still runs, and the job still fails,
+        # when an earlier check failed, so its evidence isn't lost to an unrelated failure.
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          node scripts/ci/image-queue-validate.cjs --image stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf \
+            --results ci-logs/image-queue-results.jsonl --logs ci-logs | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop image queue test servers
+        if: always()
+        env:
+          FRONTEND_PORT: "14985"
         run: bash scripts/ci/stop-app.sh
 
       - name: Second launch must not re-run setup
