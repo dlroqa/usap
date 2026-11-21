@@ -11,6 +11,7 @@
 "use strict";
 
 const { describeSpawnError, isLaunchFailure } = require("../spawn-error.cjs");
+const { imageExitOutcome } = require("./image-exit.cjs");
 
 const REQUIRED = ["BACKEND_PATHS","IS_MAC_INTEL","MAC_INTEL_IMAGE_MESSAGE","MODELS","OUTPUTS","PREFERRED_BACKEND_PORT","ROOT","assertNoOtherActiveRuntime","backendValidationErrors","badRequest","checkPort","conflict","describeLinuxRuntimeLinkerError","findOpenVinoModel","fs","getBackendOptions","getBackendPath","getDefaultModel","getModelLoadIssue","getOpenVinoModelInfo","getOpenVinoNpuInfo","getPreferredVulkanBackendName","http","json","killLlm","os","osPlatform","path","pollNvidiaVram","readdirVisible","requestJson","safeOutputName","spawn","spawnSync","stripAnsi","supervisor","withoutAuthHeaders","withoutCorsHeaders"];
 
@@ -702,12 +703,13 @@ function createImageEngine(deps) {
     const maxAttempts = isNpu ? 1200 : 240;
     const interval = setInterval(async () => {
       attempts += 1;
-      if (!backendProc || backendReady || attempts > maxAttempts || (slot && pollProc && backendProc !== pollProc)) {
+      // #120: a process the studio has asked to stop is never marked ready again (it may still answer while it stops).
+      if (!backendProc || backendReady || attempts > maxAttempts || (pollProc && pollProc.usapStopRequested === true) || (slot && pollProc && backendProc !== pollProc)) {
         clearInterval(interval);
         return;
       }
       if (await pingBackendReady()) {
-        if (slot && pollProc && backendProc !== pollProc) { clearInterval(interval); return; }
+        if ((pollProc && pollProc.usapStopRequested === true) || (slot && pollProc && backendProc !== pollProc)) { clearInterval(interval); return; }
         markBackendReady();
         clearInterval(interval);
       }
@@ -748,6 +750,7 @@ function createImageEngine(deps) {
       }
       backendUnloadState = { active: true, phase: "Stopping backend process...", progress: 10 };
       backendReady = false;
+      proc.usapStopRequested = true; // #120: this exit is a requested stop, not an unexpected one
       try { proc.kill("SIGTERM"); } catch (_) {}
       backendUnloadState = { active: true, phase: "Waiting for process exit...", progress: 50 };
       setTimeout(() => {
@@ -770,6 +773,7 @@ function createImageEngine(deps) {
     backendUnloadState = { active: true, phase: "Stopping backend process...", progress: 10 };
     backendReady = false;
     backendUnloadState = { active: true, phase: "Waiting for process exit...", progress: 50 };
+    proc.usapStopRequested = true; // #120: this exit is a requested stop, not an unexpected one
     const exited = await stopImageProcess(proc);
     if (backendProc === proc) backendProc = null;
     backendUnloadState = exited
@@ -985,7 +989,7 @@ function createImageEngine(deps) {
       process.stdout.write("  [sd] " + output);
       updateCoreMLLoadProgress(output);
       const cleanOutput = stripAnsi(output);
-      if (cleanOutput.includes("listening on") && !(slot && backendProc !== proc)) {
+      if (cleanOutput.includes("listening on") && !(slot && backendProc !== proc) && proc.usapStopRequested !== true) {
         markBackendReady();
       }
       
@@ -994,7 +998,7 @@ function createImageEngine(deps) {
         const cleanLine = stripAnsi(line);
         if (!cleanLine.trim()) continue;
         
-        if (cleanLine.includes("listening on")) {
+        if (cleanLine.includes("listening on") && proc.usapStopRequested !== true) {
           markBackendReady();
         }
 
@@ -1122,21 +1126,27 @@ function createImageEngine(deps) {
     });
     proc.on("exit", (code, signal) => {
       if (coremlLoadHeartbeat) clearInterval(coremlLoadHeartbeat);
-      if (backendProc !== proc) {
+      // #120: classify before the state is reset. backendReady belongs to this process when it is the current one.
+      const ended = imageExitOutcome({ current: backendProc, proc, wasReady: backendReady, code, signal });
+      if (ended.stale) {
         console.log("  [backend] stale process exited with code", code, signal ? `(signal ${signal})` : "", `(process ${procSeq})`);
         return;
       }
       backendReady = false;
       backendProc  = null;
       if (slot) slot.stopped("image", proc.usapEpoch);
-      console.log("  [backend] exited with code", code, signal ? `(signal ${signal})` : "", `(process ${procSeq})`);
-      if (code !== null && code !== 0) {
+      console.log("  [backend] exited with code", code, signal ? `(signal ${signal})` : "", `(process ${procSeq}):`, ended.kind);
+      if (ended.kind === "requested") {
+        // A stop the studio asked for is never an engine error (on Windows it ends with exit code 1).
+      } else if (ended.reason === "exit-code") {
         if (!backendError) {
           backendError = describeBackendExitCode(code, currentSettings.backendBinary || getBackendPath());
         }
-      } else if (signal && signal !== "SIGTERM" && signal !== "SIGKILL" && !backendError) {
+      } else if (ended.reason === "signal") {
         // e.g. SIGABRT from an unsupported Metal operation: say so instead of a later "socket hang up".
-        backendError = `The image engine stopped unexpectedly (signal ${signal}). Try the CPU backend, or a smaller image size.`;
+        if (!backendError) backendError = `The image engine stopped unexpectedly (signal ${signal}). Try the CPU backend, or a smaller image size.`;
+      } else if (!backendError) {
+        backendError = ended.message; // exit code 0, or SIGTERM/SIGKILL the studio did not send
       }
       backendLoadState.active = false;
       generationState.active = false;
