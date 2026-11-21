@@ -45,6 +45,7 @@ const { createMemoryAdmission, memoryAdmissionSetting } = require("./services/me
 const { createEngineSlot, engineSlotSetting } = require("./services/engine-slot.cjs");
 const { createJobQueue, jobQueueSetting } = require("./services/job-queue.cjs");
 const { transcriptionQueueSetting, prepareUploadDir, createTranscriptionQueue } = require("./services/transcription-queue.cjs");
+const { staleFileReportSetting, createStaleFileReport } = require("./services/stale-file-report.cjs");
 const { createThreadBudget, threadsSetting } = require("./services/thread-budget.cjs");
 const { createWhisperThreadCap, whisperThreadCapSetting } = require("./services/whisper-thread-cap.cjs");
 const { inspectModel } = require("./model-metadata.cjs");
@@ -1710,6 +1711,7 @@ async function getDiagnostics() {
     hardware: getHardwareSpecs(),
     telemetry: getTelemetry(),
     engines: { llm: llmLifecycleSnapshot(), processes: supervisor.snapshot() }, // additive (Step 9.6)
+    ...(staleFileReport.snapshot() ? { staleFiles: staleFileReport.snapshot() } : {}), // only when the report is on (R1)
   };
 }
 
@@ -1775,6 +1777,11 @@ if (TRANSCRIPTION_QUEUE.mode === "on") {
     console.warn(`  [scheduler] transcription queue stays off: ${err.message}`);
   }
 }
+// Startup stale-file report, R1: counts only, never deletes; off by default (services/stale-file-report.cjs).
+const STALE_FILE_REPORT = staleFileReportSetting({ configDir: LLM_CONFIG_DIR, schedulerMode: schedulerMode({ configDir: LLM_CONFIG_DIR }) });
+for (const x of STALE_FILE_REPORT.ignored) console.warn(`  [stale-files] ignored ${x.name} from ${x.source} (${x.reason})`);
+if (STALE_FILE_REPORT.forcedOffBy) console.warn(`  [stale-files] report "${STALE_FILE_REPORT.requested}" is off because USAP_SCHEDULER=off.`);
+const staleFileReport = createStaleFileReport({ setting: STALE_FILE_REPORT, dataRoot: LAYOUT.dataRoot, transcriptions: TRANSCRIPTIONS });
 router.use(speechRoutes({ speech, SPEECH_MODELS, TRANSCRIPTIONS, downloadBlockReason, getDownloadState: () => downloads.getState(), errorBody, errorStatus, fs, json, jsonErrorStatus, path, pathInside, readBinaryBody, readJsonBody, startModelDownload, streamModelUpload, transcriptionQueue }));
 router.use(searchRoutes({ webSearch, json, readJsonBody, errorStatus, errorBody }));
 router.use(imageRoutes({
@@ -1948,6 +1955,16 @@ server.listen(PORT_FRONTEND, LISTEN_HOST, () => {
 
   // Do not auto-start backend; wait for selection from the Web UI
   console.log("  [backend] Ready. Waiting for model load request from the webapp...");
+  // R1 report (off by default): after listening, never before; it only counts and never blocks a request for long.
+  if (STALE_FILE_REPORT.mode === "report") {
+    setImmediate(() => {
+      staleFileReport.run().then((r) => {
+        if (!r) return;
+        const l = r.legacyTranscriptionTemporaries || {}, q = r.oldFormatQueueUploads || {};
+        console.log(`  [stale-files] report only (nothing removed): ${l.matched || 0} legacy transcription temporaries, ${q.matched || 0} old-format queue uploads${l.truncated || q.truncated ? " (scan limit reached)" : ""}; details in /api/diagnostics.`);
+      }).catch((err) => console.warn(`  [stale-files] report failed: ${err && err.code ? err.code : "error"}`));
+    });
+  }
 });
 
 // Last line of defence for exits that skip the handlers below (uncaught errors, process.exit):
