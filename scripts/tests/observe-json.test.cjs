@@ -5,6 +5,8 @@ const assert = require("node:assert/strict");
 const http = require("node:http");
 const net = require("node:net");
 const test = require("node:test");
+const path = require("node:path");
+const os = require("node:os");
 const { observeJson, describeObservation, runtimeLabel } = require("../ci/observe-json.cjs");
 
 const EXPECT = { "limits.chatQueue": "on", "scheduler.mode": "chat-queue" };
@@ -120,6 +122,8 @@ test("observe-json: allowlists — a word-like value or key outside them is neve
 test("observe-json: runtime label names the validator's and the launched server's Node separately", () => {
   const label = runtimeLabel(process.execPath, "/nowhere-root");
   assert.match(label, new RegExp(`^validator node ${process.version.replace(/\./g, "\\.")}; server node v\\d+\\.\\d+\\.\\d+ \\(the validator's own node\\)$`));
-  const fake = runtimeLabel("/no/such/node", "/no");
-  assert.match(fake, /server node unknown \(such\/node\)/, "an unreadable server node is reported as unknown, not guessed");
+  const root = path.join(os.tmpdir(), "usap-no-such-root");
+  const missing = path.join(root, "no-such", "node");
+  const fake = runtimeLabel(missing, root);
+  assert.equal(fake, `validator node ${process.version}; server node unknown (${path.relative(root, missing)})`, "an unreadable server node is reported as unknown, not guessed");
 });
