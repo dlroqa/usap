@@ -1,7 +1,26 @@
 # Step 9.9: resource scheduling (plan)
 
-Status: **planned** (owner decisions in section 5). This document only describes and plans; nothing in it is implemented yet. Each rollout stage
-below is a separate PR that needs the owner's approval. Part of [STEP9_BACKEND_PLAN.md](STEP9_BACKEND_PLAN.md).
+Status: **in progress**: most stages are implemented and merged, mostly off by default (owner decisions in section 5).
+This document began as the plan; the "as built" sections record what was implemented. As of `f1b99a7`, updated for #164:
+
+| Part | State |
+|---|---|
+| 9.9a bug fixes (#72, #73) | implemented, merged |
+| 9.9b accounting and `GET /api/resources` (#77) | implemented, merged; **observe-only**, on by default (it records and reports, decides nothing) |
+| 9.9c chat queue (#85) | implemented, merged; **off by default** |
+| 9.9d memory check (#93) | implemented, merged; **warn-only**, on by default |
+| 9.9e thread budget, whisper only (#96) | implemented, merged; **off by default**; other engines not implemented |
+| Whisper logical-CPU cap (#98) | implemented, merged; **on by default** ([STEP9_9E_THREADS.md §9](STEP9_9E_THREADS.md#9-whisper-logical-cpu-cap-on-by-default)) |
+| 9.9f-1 chat timeouts (#101) | implemented, merged; **off by default** |
+| 9.9f-2 memory admission (#106) | implemented, merged; **off by default**; the force option is not implemented |
+| Cross-engine load coordination, `engineSlot` (#112, #105) | implemented, merged; **off by default**; **activation blocked** (#120) |
+| 9.9f-3 voice queue (#114) | implemented, merged; **off by default** |
+| 9.9f-3 transcription queue and its connection gate (#130, #143) | implemented, merged; **off by default**; activation waits for the stale-file cleanup ([STEP9_9F_WHISPER_QUEUE.md §7](STEP9_9F_WHISPER_QUEUE.md)), which is **not implemented** |
+| 9.9f-3 image-generation queue (#164) | implemented; **off by default**; on only together with `engineSlot` (refused otherwise), so its activation is **blocked** with engineSlot's ([STEP9_9F_IMAGE_QUEUE.md §13](STEP9_9F_IMAGE_QUEUE.md)) |
+
+`USAP_SCHEDULER=off` turns off every setting above, including the three that are on by default (the observe-only
+accounting, the warn-only memory check and the logical-CPU cap); the 9.9a bug fixes are not settings. Every behaviour
+change still needs the owner's approval, separately for implementation, merge and any default change. Part of [STEP9_BACKEND_PLAN.md](STEP9_BACKEND_PLAN.md).
 
 Goal: one studio on one computer should stay responsive and never run out of memory because of what it starts
 itself. The studio stays a single local process that works offline. Single-user use doesn't change unless a limit is
@@ -101,10 +120,10 @@ separate UI change is approved.
 |---|---|---|---|
 | 9.9a (done) | Fix #68 (unstartable engine stops the server; PR #72) and #67 (non-streaming chat errors; PR #73), both merged | Bug fixes only | Revert the PR |
 | 9.9b (done, #77) | `services/scheduler.cjs` with read-only accounting; `GET /api/resources`; tests | None: it only records and reports | `USAP_SCHEDULER=off` (or `"scheduler": "off"` in `app/config/scheduler.json`) leaves the route out |
-| 9.9c (in review, off by default) | Bounded chat queue (decision A): 1 running + 4 waiting per engine, FIFO, `429 QUEUE_FULL` with `Retry-After`, waiting requests leave on disconnect, `503 QUEUE_TIMEOUT` after the longest wait (10 min) | Only when turned on: requests past the limit get `429` | `chatQueue: off` (the default) or `USAP_SCHEDULER=off` restores the unbounded queue |
-| 9.9d (in review) | Memory check before loading a model, **warn only** (a field in the start response and a log line) | None for users; adds a field | Setting `memoryCheck: off` |
-| 9.9e (design done, #95: [STEP9_9E_THREADS.md](STEP9_9E_THREADS.md); whisper-only implementation in review, off by default) | Thread budget shared between engines | Thread counts change only when engines overlap | `threads: off` (the default) |
-| 9.9f (first substage, chat timeouts and cleanup: implemented, off by default, [STEP9_9F_TIMEOUTS.md](STEP9_9F_TIMEOUTS.md); second substage, memory-aware text-model load admission: implemented, off by default, [STEP9_9F_MEMORY_ADMISSION.md](STEP9_9F_MEMORY_ADMISSION.md); the force option is deferred until scoped authorization exists; prerequisite for the remaining queues, cross-engine model-load coordination (#105): implemented, off by default, [STEP9_9F_ENGINE_LIFECYCLE.md](STEP9_9F_ENGINE_LIFECYCLE.md); third substage, job queues: voice queue implemented, off by default; transcription queue implemented, off by default, [STEP9_9F_WHISPER_QUEUE.md](STEP9_9F_WHISPER_QUEUE.md); image design only, [STEP9_9F_WORKLOAD_QUEUES.md](STEP9_9F_WORKLOAD_QUEUES.md), detailed in [STEP9_9F_IMAGE_QUEUE.md](STEP9_9F_IMAGE_QUEUE.md)) | Memory check **enforced** (with a force option), image/speech/voice queues, queue timeouts, stream idle timeout. Still one heavy model at a time (decision B) | New refusals, each with a clear message | Per-setting `off` |
+| 9.9c (done, #85; off by default) | Bounded chat queue (decision A): 1 running + 4 waiting per engine, FIFO, `429 QUEUE_FULL` with `Retry-After`, waiting requests leave on disconnect, `503 QUEUE_TIMEOUT` after the longest wait (10 min) | Only when turned on: requests past the limit get `429` | `chatQueue: off` (the default) or `USAP_SCHEDULER=off` restores the unbounded queue |
+| 9.9d (done, #93; warn only, on by default) | Memory check before loading a model, **warn only** (a field in the start response and a log line) | None for users; adds a field | Setting `memoryCheck: off` |
+| 9.9e (design done, #95: [STEP9_9E_THREADS.md](STEP9_9E_THREADS.md); whisper-only implementation done, #96, off by default; whisper logical-CPU cap done, #98, on by default) | Thread budget shared between engines | Thread counts change only when engines overlap | `threads: off` (the default) |
+| 9.9f (first substage, chat timeouts and cleanup: implemented, off by default, [STEP9_9F_TIMEOUTS.md](STEP9_9F_TIMEOUTS.md); second substage, memory-aware text-model load admission: implemented, off by default, [STEP9_9F_MEMORY_ADMISSION.md](STEP9_9F_MEMORY_ADMISSION.md); the force option is deferred until scoped authorization exists; prerequisite for the remaining queues, cross-engine model-load coordination (#105): implemented, off by default, [STEP9_9F_ENGINE_LIFECYCLE.md](STEP9_9F_ENGINE_LIFECYCLE.md); third substage, job queues: voice queue implemented, off by default; transcription queue implemented, off by default, [STEP9_9F_WHISPER_QUEUE.md](STEP9_9F_WHISPER_QUEUE.md); image queue implemented, off by default, needs engineSlot, [STEP9_9F_WORKLOAD_QUEUES.md](STEP9_9F_WORKLOAD_QUEUES.md), detailed in [STEP9_9F_IMAGE_QUEUE.md](STEP9_9F_IMAGE_QUEUE.md)) | Memory check **enforced** (with a force option), image/speech/voice queues, queue timeouts, stream idle timeout. Still one heavy model at a time (decision B) | New refusals, each with a clear message | Per-setting `off` |
 
 Each stage lands only after its tests pass on all 4 OS and the native-runtime timings (Step 9.10) don't regress.
 Stages 9.9c–f change behaviour and each needs a separate owner approval.
@@ -276,5 +295,4 @@ counts as proof that a workload fits:** when free VRAM or RAM is unknown, the an
 concept, after the stages that produce them are tested. A minimal UI change may be proposed then, as its own PR,
 keeping the layout, visual design, navigation, themes and behaviour. No UI change is part of 9.9b–9.9f.
 
-Stage 9.9b (read-only accounting and `GET /api/resources`) is authorized for implementation; its PR needs a separate
-merge approval.
+Stage 9.9b (read-only accounting and `GET /api/resources`) was implemented and merged (#77).
