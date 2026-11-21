@@ -264,3 +264,59 @@ test("server: USAP_SCHEDULER=off turns the report off (provisional) and says so"
     assert.match(srv.log(), /\[stale-files\] report "report" is off because USAP_SCHEDULER=off/);
   });
 });
+
+test("concurrent change: entries removed, replaced by a link or a folder between listing and lstat are never followed or counted as files", async () => {
+  const d = tempData();
+  try {
+    for (const n of ["gone", "tolink", "todir", "kept"]) put(path.join(d.tx, `.speech-${STAMP}-${n}.wav`), n);
+    const outside = path.join(d.base, "outside.wav"); put(outside, "user data");
+    const first = new Set();
+    // The first lstat of each entry happens after the listing: change the entry right before it, as another process could.
+    const racing = { ...fs, lstatSync: (p, ...a) => {
+      const b = path.basename(String(p));
+      if (!first.has(b)) {
+        first.add(b);
+        if (b.includes("-gone.")) fs.rmSync(p);
+        if (b.includes("-tolink.")) { fs.rmSync(p); try { fs.symlinkSync(outside, p, "file"); } catch (_) { fs.writeFileSync(p + ".x", ""); } }
+        if (b.includes("-todir.")) { fs.rmSync(p); fs.mkdirSync(p); }
+      }
+      return fs.lstatSync(p, ...a);
+    } };
+    const r = await report(d, { fs: racing }).run();
+    const l = r.legacyTranscriptionTemporaries;
+    assert.equal(l.matched, 1 + (fs.lstatSync(path.join(d.tx, `.speech-${STAMP}-tolink.wav`), { throwIfNoEntry: false })?.isFile() ? 1 : 0), "only regular files are counted");
+    assert.ok(l.errors.ENOENT >= 1, "the vanished entry is counted as an error, not thrown");
+    assert.ok(l.skippedNotFile >= 1, "the folder (and the link, where created) is skipped");
+    assert.equal(fs.readFileSync(outside, "utf8"), "user data", "a link's target is never touched");
+    assert.equal(r.removed, 0);
+  } finally { d.rm(); }
+});
+
+test("unusual structures: a folder with a legacy name, very long and non-ASCII names, and nested folders are handled within the bounds", async () => {
+  const d = tempData();
+  try {
+    fs.mkdirSync(path.join(d.tx, `.speech-${STAMP}-dir.wav`));                              // a folder, not a file
+    put(path.join(d.tx, `.speech-${STAMP}-dir.wav`, `.speech-${STAMP}-inner.wav`));          // never recursed into
+    put(path.join(d.tx, `.speech-${STAMP}-${"a".repeat(120)}.wav`));                           // longest allowed base
+    put(path.join(d.tx, `.speech-${STAMP}-${"a".repeat(121)}.wav`));                           // one longer: not matched
+    put(path.join(d.tx, `.speech-${STAMP}-ünïcode.wav`));                                       // outside the name charset
+    const before = snapshot(d.base);
+    const r = await report(d).run();
+    const l = r.legacyTranscriptionTemporaries;
+    assert.equal(l.matched, 1, "only the regular file with an allowed name");
+    assert.equal(l.skippedNotFile, 1, "the folder with a legacy name is skipped, not entered");
+    assert.equal(l.scanned, 4, "only the top level is listed");
+    assert.deepEqual(snapshot(d.base), before);
+  } finally { d.rm(); }
+});
+
+test("server: with the report on, /api/diagnostics stays behind the existing Host and Origin checks", async () => {
+  await withServer({ USAP_STALE_FILE_REPORT: "report" }, async (srv) => {
+    const foreignOrigin = await request(srv.port, "GET", "/api/diagnostics", { headers: { Origin: "http://evil.example" } });
+    assert.equal(foreignOrigin.status, 403);
+    assert.ok(!/staleFiles/.test(foreignOrigin.text || JSON.stringify(foreignOrigin.json || {})), "nothing from the report in a refusal");
+    const foreignHost = await request(srv.port, "GET", "/api/diagnostics", { headers: { Host: `rebind.example:${srv.port}` } });
+    assert.ok(foreignHost.status === 403 || foreignHost.status === 421 || foreignHost.status === 400, `non-loopback Host refused (${foreignHost.status})`);
+    assert.ok(!/staleFiles/.test(foreignHost.text || JSON.stringify(foreignHost.json || {})));
+  });
+});
