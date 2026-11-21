@@ -11,6 +11,8 @@
 //   slow-generate     each txt2img takes 3 s, with step lines (concurrency and cancellation tests)
 //   hold-load         don't listen until the file "<model path>.release" exists (issue #105 tests)
 //   ignore-sigterm    ignore SIGTERM, so stopping needs SIGKILL (issue #105 tests)
+//   exit-when-told    exit on its own, with the code written in the file "<model path>.exit", as soon as that file
+//                     appears (issue #120 tests; combine with hold-load for an exit before listening)
 // GET /fake/stats reports {requests, completed, aborted, pid, args}.
 //
 // Diagnostics (#142): every start, listen result and exit is appended as one JSON line to fake-sd-diag.jsonl next to
@@ -106,6 +108,15 @@ const server = http.createServer((req, res) => {
 });
 const port = Number(arg("--listen-port", "8080"));
 if (model.includes("ignore-sigterm")) process.on("SIGTERM", () => console.error("[WARN ] fake: ignoring SIGTERM"));
+if (model.includes("exit-when-told")) {
+  const exitFile = `${arg("--model", "")}.exit`;
+  setInterval(() => {
+    if (!fs.existsSync(exitFile)) return;
+    const code = Number.parseInt(fs.readFileSync(exitFile, "utf8"), 10);
+    diag("told-to-exit", { code });
+    process.exit(Number.isInteger(code) ? code : 0);
+  }, 25);
+}
 server.on("error", (err) => {
   const holders = err.code === "EADDRINUSE" ? portHolders(port) : "";
   diag("listen-error", { code: err.code, message: err.message, port, holders });
