@@ -211,7 +211,12 @@ test("slot (#136, #160): an engine still running after its guard died is stopped
         return alive;
       };
       // reaping: the product's own reaper; negative control: nothing stops the orphan
-      slot = createEngineSlot({ log: quietLog, pidGoneTimeoutMs: 200, recheckMs: 50, isAlive, reapOrphan: reaping ? defaultReapOrphan : async () => false });
+      // The product's own reaper, run unchanged; the wrapper only records that it ran, with which PIDs, and its result.
+      // The slot counts a stopped orphan when the reaper's promise settles, which can be after the release: the reaper
+      // polls the engine every 50 ms after its SIGTERM, while the slot's own liveness check may see the exit first (#160).
+      const reaps = [];
+      const reaper = async (a) => { const call = { guardPid: a.guardPid, enginePid: a.enginePid, result: undefined }; reaps.push(call); call.result = await defaultReapOrphan(a); return call.result; };
+      slot = createEngineSlot({ log: quietLog, pidGoneTimeoutMs: 200, recheckMs: 50, isAlive, reapOrphan: reaping ? reaper : async () => false });
       const e = slot.begin("image", "i.gguf");
       g = await orphan();
       const enginePid = g.enginePid;
@@ -233,7 +238,13 @@ test("slot (#136, #160): an engine still running after its guard died is stopped
         assert.ok(release && release.alive === false, `idle first appeared right after an 'exited' answer ${ev()}`);
         assert.ok(decisions.slice(0, decisions.indexOf(release)).every((d) => d.phaseAfter !== "idle"), `reserved for the whole clean-up ${ev()}`);
         assert.deepEqual(release.groupAfter, [], `the engine's process group was empty at the moment of release ${ev()}`);
-        assert.equal(slot.snapshot().counts.orphansStopped, 1);
+        // The genuine reaper ran once, for this guard and its engine, and reported success; the slot then counted it.
+        // Bounded by the same 8 s deadline; the counter is diagnostic and may settle after the release (#160).
+        assert.equal(reaps.length, 1, `the reaper ran exactly once ${ev()}`);
+        assert.deepEqual({ guardPid: reaps[0].guardPid, enginePid: reaps[0].enginePid }, { guardPid: g.pid, enginePid }, "the reaper was given the guard and its own engine");
+        while ((reaps[0].result === undefined || slot.snapshot().counts.orphansStopped < 1) && Date.now() < end) await sleep(10);
+        assert.equal(reaps[0].result, true, `the reaper reported that it stopped the orphan ${ev()}`);
+        assert.equal(slot.snapshot().counts.orphansStopped, 1, "the slot counted the stopped orphan once");
         assert.deepEqual(groupMembers(g.pid), [], "the engine is gone");
       } else {
         await sleep(1500);
