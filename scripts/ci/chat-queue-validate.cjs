@@ -85,7 +85,7 @@ function call(port, method, p, body, { timeoutMs = 600000 } = {}) {
   return { promise, first, abort: () => req && req.destroy() };
 }
 const getJson = async (port, p) => { const r = await call(port, "GET", p, undefined, { timeoutMs: 10000 }).promise; try { return { status: r.status, json: JSON.parse(r.text) }; } catch (_) { return { status: r.status, json: null }; } };
-const { observeJson, describeObservation } = require("./observe-json.cjs");
+const { observeJson, describeObservation, runtimeLabel } = require("./observe-json.cjs");
 const serverState = (srv) => ({ alive: srv.child.exitCode === null && srv.child.signalCode === null, code: srv.child.exitCode, signal: srv.child.signalCode, upMs: Date.now() - srv.startedAt });
 const parseJson = (t) => { try { return JSON.parse(t); } catch (_) { return null; } };
 function sse(text) {
@@ -218,7 +218,11 @@ async function queueOnScenarios(srv) {
   // Same request and 10 s timeout as getJson; the record now says what was observed (status, time, timeout, content
   // type, key names, the expected fields, server state) instead of only the two field values (#163 native run).
   const obs = await observeJson(PORT, "/api/resources", { timeoutMs: 10000 });
-  const seen = describeObservation(obs, { "limits.chatQueue": "on", "scheduler.mode": "chat-queue" }, { server: () => serverState(srv) });
+  const seen = describeObservation(obs, { "limits.chatQueue": "on", "scheduler.mode": "chat-queue" }, {
+    server: () => serverState(srv),
+    knownKeys: ["ok", "scheduler", "limits", "engines", "memory", "cpu"],
+    allowedValues: { "limits.chatQueue": ["on", "off"], "scheduler.mode": ["observe", "off", "chat-queue"] },
+  });
   record("queue on (environment only): /api/resources", seen.ok ? "PASS" : "FAIL", seen.detail);
 
   await scenario("capacity, FIFO, QUEUE_FULL", async () => {
@@ -441,7 +445,7 @@ async function rollbackScenario(label, env, expectResources, writeConfig) {
 
 (async () => {
   console.log(`\n### Chat queue with a real model (queue switched on for these test servers only; default stays off)\n`);
-  console.log(`node ${process.version} (server: ${NODE.startsWith(ROOT) ? path.relative(ROOT, NODE) : "this node"}), model ${MODEL}\n`);
+  console.log(`${runtimeLabel(NODE, ROOT)}, model ${MODEL}\n`);
   console.log("| Check | Status | Detail |\n|---|---|---|");
   if (!fs.existsSync(path.join(APP, "llm-models", MODEL))) { record("chat queue validation", "FAIL", `model ${MODEL} is not installed`); process.exit(1); }
   if (await portOpen(PORT)) { record("chat queue validation", "FAIL", `port ${PORT} is already in use`); process.exit(1); }
