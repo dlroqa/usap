@@ -9,6 +9,8 @@
 //   fail-load         print a stable-diffusion.cpp [ERROR] line and exit 1 before listening
 //   crash-on-generate become ready; the first txt2img request kills the process (SIGSEGV-like exit 139)
 //   slow-generate     each txt2img takes 3 s, with step lines (concurrency and cancellation tests)
+//   quiet-generate    with slow-generate: no start or step lines, so the studio's log-based "generating" stays false
+//                     while the job runs (the log lag the image queue's restart check covers, 9.9f-3)
 //   hold-load         don't listen until the file "<model path>.release" exists (issue #105 tests)
 //   ignore-sigterm    ignore SIGTERM, so stopping needs SIGKILL (issue #105 tests)
 //   exit-when-told    exit on its own, with the code written in the file "<model path>.exit", as soon as that file
@@ -55,7 +57,8 @@ if (model.includes("fail-load")) {
   console.error("[ERROR] stable-diffusion.cpp:300 - load tensors from model loader failed");
   process.exit(1);
 }
-console.log("  |==================================================| 2/2 - 1.00it/s");
+// quiet-generate: a byte rate, as real sd.cpp prints while loading (an "it/s" load line marks "generating" in the studio)
+console.log(model.includes("quiet-generate") ? "  |==================================================| 2/2 - 3.63GB/s" : "  |==================================================| 2/2 - 1.00it/s");
 console.log("[INFO ] model.cpp:1200 - model files processing completed");
 
 const stats = { requests: 0, completed: 0, aborted: 0, pid: process.pid, args };
@@ -81,11 +84,12 @@ const server = http.createServer((req, res) => {
       if (model.includes("crash-on-generate")) { console.error("[ERROR] fake: segmentation fault"); process.exit(139); }
       const steps = Math.max(1, Math.min(50, Number(params.steps) || 4));
       const total = model.includes("slow-generate") ? 3000 : 300;
-      console.log("[INFO ] stable-diffusion.cpp:2000 - generate_image 1x1");
+      if (!model.includes("quiet-generate")) console.log("[INFO ] stable-diffusion.cpp:2000 - generate_image 1x1");
       let step = 0;
       let done = false;
       const tick = setInterval(() => {
         step += 1;
+        if (model.includes("quiet-generate")) return;
         console.log(`  |=====     | ${Math.min(step, steps)}/${steps} - 2.00it/s`);
       }, Math.max(10, Math.floor(total / steps)));
       res.on("close", () => { if (!done) { stats.aborted += 1; clearInterval(tick); } });

@@ -74,7 +74,7 @@ const queue = (pending) => (pending === null
 // (services/memory-check.cjs). Both are optional; without them the snapshot is exactly the 9.9c one.
 // Step 9.9e: `threads` is the thread-budget setting and `threadBudget()` its latest decision (services/thread-budget.cjs).
 // Optional; without them (or with threads off) the snapshot is exactly the 9.9d one.
-function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null, chatTimeouts = null, memoryAdmission = null, engineSlot = null, voiceQueue = null, transcriptionQueue = null }) {
+function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { mode: "off" }, memoryCheck = { mode: "off" }, memoryChecks = null, threads = { mode: "off" }, threadBudget = null, whisperThreadCap = null, chatTimeouts = null, memoryAdmission = null, engineSlot = null, voiceQueue = null, transcriptionQueue = null, imageQueue = null }) {
   for (const [name, value] of Object.entries({ budget, cpu, engines })) {
     if (!value) throw new Error(`scheduler: missing dependency ${name}`);
   }
@@ -188,6 +188,20 @@ function createScheduler({ budget, cpu, engines, now = Date.now, chatQueue = { m
         out.engines.speech.queue = { running: q.running, waiting: q.waiting, uploading: q.uploading, known: true, limit: q.limit };
         out.transcriptionQueue = { mode: "on", limit: q.limit, maxWaitSeconds: q.maxWaitSeconds, storage: q.storage, counts: q.counts };
         if (q.uploadConnections) out.transcriptionQueue.uploadConnections = q.uploadConnections; // #131
+        out.scheduler.decisions = true; // a refusal is a decision
+      }
+    }
+    // Additive (Step 9.9f-3, only when imageQueue is on): running/waiting/limit on the image engine, whether the running
+    // job's client left, how long it has run, and whether the queue is inactive for this backend; the longest wait, the
+    // in-memory body budget and what is booked, and counts. Numbers and fixed words only (no prompts, images or
+    // names). Absent when off (the default), where the image queue stays "unknown" as before.
+    if (imageQueue) {
+      let q = null;
+      try { q = imageQueue(); } catch (_) { q = null; }
+      if (q) {
+        out.limits.imageQueue = "on";
+        out.engines.image.queue = { running: q.running, waiting: q.waiting, limit: q.limit, known: true, abandoned: q.abandoned, runningSeconds: q.runningSeconds, inactive: q.inactive };
+        out.imageQueue = { mode: "on", limit: q.limit, maxWaitSeconds: q.maxWaitSeconds, memory: q.memory, counts: q.counts };
         out.scheduler.decisions = true; // a refusal is a decision
       }
     }
