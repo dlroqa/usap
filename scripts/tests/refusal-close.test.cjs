@@ -207,14 +207,33 @@ test("helper fails closed: a socket that still reads during its grace period (a 
   // Simulates a runtime on which the helper never sees Node resume the socket: the test (only) removes the helper's
   // 'resume' listener as soon as the answer is written, so Node's discard mode reads the body as before the fix.
   const failsafe0 = closedReadingCount();
-  const { st, rec } = await floodRefusal((s, res) => res.once("finish", () => {
-    const helperListener = s.listeners("resume").at(-1); // added last, by the helper's grace period
-    if (helperListener) s.removeListener("resume", helperListener);
-  }));
-  assert.equal(st.status, 403, `answer (client error ${st.error})`);
-  assert.equal(closedReadingCount(), failsafe0 + 1, "the fail-closed check closed the socket");
+  // #151 diagnostics (messages only): server and client share this process here, so a lost answer can come from this
+  // process not running, from the server closing before the client read, or from the client's own writes. Ticks of
+  // this process every 10 ms and both sides' timestamps go into the failure messages; no assertion or bound changes.
+  const ticks = []; const tick = setInterval(() => { if (ticks.length < 3000) ticks.push(Date.now()); }, 10);
+  let flood;
+  try {
+    flood = await floodRefusal((s, res) => res.once("finish", () => {
+      const helperListener = s.listeners("resume").at(-1); // added last, by the helper's grace period
+      if (helperListener) s.removeListener("resume", helperListener);
+    }));
+  } finally { clearInterval(tick); }
+  const { st, rec } = flood;
+  const timeline = () => {
+    const a = rec.answeredAt; if (!a) return " [no server answer recorded]";
+    const rel = (t) => (t === null || t === undefined ? "none" : `${t - a}`);
+    const near = ticks.filter((t) => t >= a - 100 && t <= (rec.closedAt || a) + 100).map((t) => t - a);
+    const gaps = []; for (let i = 1; i < ticks.length; i += 1) if (ticks[i] - ticks[i - 1] >= 100) gaps.push(`${ticks[i - 1] - a}+${ticks[i] - ticks[i - 1]}`);
+    const io = st.io || {};
+    return ` [ms from the server's answer: server close ${rel(rec.closedAt)}, read ${rec.read - rec.readAtAnswer} B after the answer; `
+      + `client first data ${rel(io.firstDataAt)} (${io.dataEvents || 0} events), error ${rel(io.errorAt)} ${st.error || ""}, close ${rel(io.closeAt)}, `
+      + `drains in [answer, close] ${(st.drainsAt || []).filter((t) => t >= a && t <= (rec.closedAt || a)).length}, sent ${st.sent} B; `
+      + `process ticks near the close ${near.length ? `${near[0]}..${near[near.length - 1]} (${near.length})` : "none"}, gaps >= 100 ms ${gaps.slice(0, 5).join(",") || "none"}]`;
+  };
+  assert.equal(st.status, 403, `answer (client error ${st.error})${timeline()}`);
+  assert.equal(closedReadingCount(), failsafe0 + 1, `the fail-closed check closed the socket${timeline()}`);
   // closed within a few checks (WATCH_MS) instead of being read for the whole grace period
-  assert.ok(rec.closedAt - rec.answeredAt <= WATCH_MS * 5, `closed well before the grace period ended (${rec.closedAt - rec.answeredAt} ms; read ${rec.read - rec.readAtAnswer} bytes after the answer)`);
+  assert.ok(rec.closedAt - rec.answeredAt <= WATCH_MS * 5, `closed well before the grace period ended (${rec.closedAt - rec.answeredAt} ms; read ${rec.read - rec.readAtAnswer} bytes after the answer)${timeline()}`);
 });
 
 test("helper: Node's own drain handling after the answer does not restart reading", async () => {
