@@ -45,6 +45,7 @@ const { createMemoryAdmission, memoryAdmissionSetting } = require("./services/me
 const { createEngineSlot, engineSlotSetting } = require("./services/engine-slot.cjs");
 const { createJobQueue, jobQueueSetting } = require("./services/job-queue.cjs");
 const { transcriptionQueueSetting, prepareUploadDir, createTranscriptionQueue } = require("./services/transcription-queue.cjs");
+const { imageQueueSetting, createImageQueue } = require("./services/image-queue.cjs");
 const { staleFileReportSetting, createStaleFileReport } = require("./services/stale-file-report.cjs");
 const { createThreadBudget, threadsSetting } = require("./services/thread-budget.cjs");
 const { createWhisperThreadCap, whisperThreadCapSetting } = require("./services/whisper-thread-cap.cjs");
@@ -1784,6 +1785,27 @@ if (STALE_FILE_REPORT.forcedOffBy) console.warn(`  [stale-files] report "${STALE
 const staleFileReport = createStaleFileReport({ setting: STALE_FILE_REPORT, dataRoot: LAYOUT.dataRoot, transcriptions: TRANSCRIPTIONS });
 router.use(speechRoutes({ speech, SPEECH_MODELS, TRANSCRIPTIONS, downloadBlockReason, getDownloadState: () => downloads.getState(), errorBody, errorStatus, fs, json, jsonErrorStatus, path, pathInside, readBinaryBody, readJsonBody, startModelDownload, streamModelUpload, transcriptionQueue }));
 router.use(searchRoutes({ webSearch, json, readJsonBody, errorStatus, errorBody }));
+// Step 9.9f-3 image-generation queue (docs/roadmap/STEP9_9F_IMAGE_QUEUE.md). Off by default (USAP_IMAGE_QUEUE=on or
+// scheduler.json "imageQueue": "on"). It needs engineSlot on (engine ownership comes from the slot); without it, and with
+// USAP_SCHEDULER=off, it stays off and the reason is logged. Off: not created, and the four generation routes are the
+// proxy from before.
+const IMAGE_QUEUE = imageQueueSetting({ configDir: LLM_CONFIG_DIR, schedulerMode: schedulerMode({ configDir: LLM_CONFIG_DIR }), engineSlotMode: ENGINE_SLOT.mode });
+for (const x of IMAGE_QUEUE.ignored) console.warn(`  [scheduler] ignored ${x.name} from ${x.source} (${x.reason}); using the next setting or the default`);
+if (IMAGE_QUEUE.forcedOffBy === "scheduler-off") console.warn(`  [scheduler] image queue "${IMAGE_QUEUE.requested}" is off because USAP_SCHEDULER=off.`);
+if (IMAGE_QUEUE.forcedOffBy === "engine-slot-off") console.warn(`  [scheduler] image queue "${IMAGE_QUEUE.requested}" is not supported without engineSlot and stays off: it needs the engine slot to know which image engine owns it. Turn on engineSlot as well (USAP_ENGINE_SLOT=on), or leave the image queue off.`);
+const imageQueue = IMAGE_QUEUE.mode === "on" && engineSlot ? createImageQueue({
+  setting: IMAGE_QUEUE, json, withoutAuthHeaders, withoutCorsHeaders,
+  engine: {
+    snapshot: () => {
+      const slotNow = engineSlot.current();
+      const img = imageEngine.state;
+      return { slotOwner: slotNow.owner, slotPhase: slotNow.phase, epoch: slotNow.epoch, proc: img.backendProc, ready: img.backendReady === true,
+        port: img.PORT_BACKEND, backend: img.currentSettings && img.currentSettings.backendType === "apple-npu" ? "apple-npu" : "sd-server" };
+    },
+    trackGeneration: imageEngine.trackGeneration,
+  },
+}) : null;
+if (imageQueue) console.log(`  [scheduler] Image queue on: 1 running, ${IMAGE_QUEUE.limit} waiting at most, ${Math.round(IMAGE_QUEUE.maxWaitMs / 1000)} s longest wait, bodies up to ${Math.round(IMAGE_QUEUE.bodyBytes / (1024 * 1024))} MB each and ${Math.round(IMAGE_QUEUE.bodyBudgetBytes / (1024 * 1024))} MB in total.`);
 router.use(imageRoutes({
   state: imageEngine.routeState, MIME, MODELS, OUTPUTS, PREFERRED_BACKEND_PORT, SERVER_BUILD, appleNpuRuntimeMatches, assertNoOtherActiveRuntime,
   backendSettingsMatch, deleteGeneratedOutputs, errorBody, errorStatus, findAvailableBackendPort, fs, generateWithOpenVino,
@@ -1791,6 +1813,7 @@ router.use(imageRoutes({
   proxyImageBackendRequest, readJsonBody, saveGeneratedOutput, startBackend,
   memoryCheck: memoryAdvisor ? () => memoryAdvisor.last("image") : null, // optional (Step 9.9d)
   imageLifecycle: engineSlot ? createImageLifecycle() : null, // optional (issue #105)
+  imageQueue, // optional (Step 9.9f-3, only when on)
 }));
 router.use(modelRoutes({
   IMAGE_BACKEND_DOWNLOADS, LLM_MODELS, MODELS, OPENVINO_MODELS, SPEECH_MODELS, addHuggingFaceFileSize, cancelModelDownload,
@@ -1855,6 +1878,7 @@ if (SCHEDULER_MODE !== "off") {
     chatTimeouts: chatTimeouts ? () => chatTimeouts.snapshot() : null,
     memoryAdmission: memoryAdmissionEngine ? () => memoryAdmissionEngine.snapshot() : null,
     voiceQueue: voiceQueue ? () => ({ mode: "on", ...voiceQueue.stats(), maxWaitSeconds: Math.round(voiceQueue.maxWaitMs / 1000), counts: voiceQueue.counts() }) : null,
+    imageQueue: imageQueue ? () => ({ ...imageQueue.stats(), maxWaitSeconds: Math.round(imageQueue.maxWaitMs / 1000), memory: imageQueue.memory(), counts: imageQueue.counts() }) : null,
     transcriptionQueue: transcriptionQueue ? () => ({ ...transcriptionQueue.stats(), maxWaitSeconds: Math.round(transcriptionQueue.maxWaitMs / 1000), storage: transcriptionQueue.storage(), counts: transcriptionQueue.counts() }) : null,
     engineSlot: engineSlot ? () => ({ ...engineSlot.snapshot(), imageOperations: imageEngine.lifecycle.pendingOperations() }) : null,
     memoryCheck: MEMORY_CHECK,
@@ -1972,5 +1996,5 @@ server.listen(PORT_FRONTEND, LISTEN_HOST, () => {
 process.on("exit", () => supervisor.stopAllSync());
 
 // Graceful shutdown
-process.on("SIGINT",  async () => { await killBackend(); await killOpenVinoWorker(); await killLlm(); await speech.stopSpeech(); await tts.stopTts(); process.exit(0); });
-process.on("SIGTERM", async () => { await killBackend(); await killOpenVinoWorker(); await killLlm(); await speech.stopSpeech(); await tts.stopTts(); process.exit(0); });
+process.on("SIGINT",  async () => { if (imageQueue) imageQueue.refuseWaiting("shutdown"); await killBackend(); await killOpenVinoWorker(); await killLlm(); await speech.stopSpeech(); await tts.stopTts(); process.exit(0); });
+process.on("SIGTERM", async () => { if (imageQueue) imageQueue.refuseWaiting("shutdown"); await killBackend(); await killOpenVinoWorker(); await killLlm(); await speech.stopSpeech(); await tts.stopTts(); process.exit(0); });
