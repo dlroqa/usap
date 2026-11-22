@@ -5,6 +5,10 @@
 // `ticks` are the wall-clock times (Date.now()) at which this process's event loop ran a 10 ms interval timer. A gap in
 // them is a time when the process did not run at all (seen for seconds under full-suite load on macOS Intel CI); the
 // test uses it to tell a client that was not running from a server that misbehaved.
+// With "cpuDiag": true in the argument (#151 diagnostics, message only, never judged), the output also has "proc":
+// { samples: [[t, userMs, systemMs, voluntarySwitches, involuntarySwitches, [sentKiB per client]], ...] taken at
+// each tick, watchdog: { samples, maxGapMs, gaps: [[at, ms]] } from a timer thread inside this process, or null }.
+// Without it the output is exactly as before.
 "use strict";
 const net = require("node:net");
 const MiB = 1024 * 1024;
@@ -27,7 +31,8 @@ function dechunk(raw) { // decode a chunked body (complete chunks only)
 // contentLength (mode "stream" only): declare this Content-Length and send the body unframed instead of chunked.
 // pause (mode "stream" only): { atBytes, ms } stop sending for ms once atBytes have been sent, then go on (an upload
 // that is slow for reasons on the client's side; #154).
-function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mode = "stream", capBytes = 32 * MiB, maxMs = 8000, contentType = "application/json", second = "", ignoreFin = false, contentLength = null, pause = null } = {}) {
+function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mode = "stream", capBytes = 32 * MiB, maxMs = 8000, contentType = "application/json", second = "", ignoreFin = false, contentLength = null, pause = null } = {}, live = null) {
+  // live (#151 diagnostics): an array this request's state is added to, so a sampler can read `sent` while it runs
   return new Promise((resolve) => {
     // ignoreFin: keep the sending side open after the server's FIN and go on sending (a client that ignores the answer)
     const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: ignoreFin });
@@ -38,6 +43,7 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
         // event-loop iteration ran (setImmediate scheduled in the drain handler). A value before the server's close
         // means the loop got past the I/O phase that handled the drain, where a ready read would also have run.
         drainChecksAt: [], firstDataCheckAt: null } };
+    if (Array.isArray(live)) live.push(st);
     let buf = Buffer.alloc(0), stopped = false, timer = null;
     const parse = () => {
       const text = buf.toString("latin1"); const i = text.indexOf("\r\n\r\n");
@@ -96,12 +102,55 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
 
 module.exports = { rawRequest, dechunk };
 
+// #151 diagnostics: a timer thread inside this process. It keeps running while the main thread is busy or waiting,
+// and stops only when the whole process does not run. Records its own gaps >= 50 ms (at most 50). Never throws:
+// any problem gives null.
+const WATCHDOG_SRC = `
+const { parentPort } = require("node:worker_threads");
+let last = Date.now(), samples = 0, maxGapMs = 0; const gaps = [];
+const iv = setInterval(() => { const now = Date.now(), g = now - last; samples += 1; if (g > maxGapMs) maxGapMs = g;
+  if (g >= 50 && gaps.length < 50) gaps.push([last, g]); last = now; }, 10);
+parentPort.on("message", () => { clearInterval(iv); parentPort.postMessage({ samples, maxGapMs, gaps }); parentPort.close(); });`;
+function startWatchdog() {
+  let w = null;
+  try { w = new (require("node:worker_threads").Worker)(WATCHDOG_SRC, { eval: true }); w.on("error", () => {}); w.unref(); }
+  catch (_) { return { stop: async () => null }; }
+  return {
+    stop: () => new Promise((resolve) => {
+      const t = setTimeout(() => { try { w.terminate(); } catch (_) {} resolve(null); }, 2000);
+      w.once("message", (m) => { clearTimeout(t); resolve(m); });
+      w.once("exit", () => { clearTimeout(t); resolve(null); });
+      try { w.postMessage("stop"); } catch (_) { clearTimeout(t); resolve(null); }
+    }),
+  };
+}
+const MAX_PROC_SAMPLES = 6000;
+// One sample of this process: wall time, CPU time (user, system; ms), context switches (voluntary, involuntary) and
+// each client's bytes sent (KiB). Returns null if the platform does not provide it.
+function procSample(live) {
+  try {
+    const r = process.resourceUsage();
+    return [Date.now(), Math.round(r.userCPUTime / 1000), Math.round(r.systemCPUTime / 1000), r.voluntaryContextSwitches, r.involuntaryContextSwitches, live.map((st) => Math.round(st.sent / 1024))];
+  } catch (_) { return null; }
+}
+
+module.exports.startWatchdog = startWatchdog;
+module.exports.procSample = procSample;
+
 if (require.main === module) {
-  const { port, n, opts } = JSON.parse(process.argv[2]);
+  const { port, n, opts, cpuDiag } = JSON.parse(process.argv[2]);
+  const live = cpuDiag ? [] : null;
+  let proc = cpuDiag ? [] : null;
+  const watchdog = cpuDiag ? startWatchdog() : null;
+  const sample = () => { if (!proc || proc.length >= MAX_PROC_SAMPLES) return; const p = procSample(live); if (p) proc.push(p); else proc = null; };
   const ticks = [Date.now()];
-  const tick = setInterval(() => ticks.push(Date.now()), 10);
-  Promise.all(Array.from({ length: n }, () => rawRequest(port, opts))).then((clients) => {
+  sample();
+  const tick = setInterval(() => { ticks.push(Date.now()); sample(); }, 10);
+  Promise.all(Array.from({ length: n }, () => rawRequest(port, opts, live))).then(async (clients) => {
     clearInterval(tick); ticks.push(Date.now());
-    process.stdout.write(JSON.stringify({ clients, ticks }));
+    if (!cpuDiag) { process.stdout.write(JSON.stringify({ clients, ticks })); return; }
+    sample();
+    const wd = await watchdog.stop();
+    process.stdout.write(JSON.stringify({ clients, ticks, proc: { samples: proc, watchdog: wd } }));
   });
 }
