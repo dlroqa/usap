@@ -17,6 +17,7 @@ This document began as the plan; the "as built" sections record what was impleme
 | 9.9f-3 voice queue (#114) | implemented, merged; **off by default** |
 | 9.9f-3 transcription queue and its connection gate (#130, #143) | implemented, merged; **off by default**; activation waits for the stale-file cleanup ([STEP9_9F_WHISPER_QUEUE.md §7](STEP9_9F_WHISPER_QUEUE.md)), which is **not implemented** |
 | 9.9f-3 image-generation queue | design merged (#132); **not implemented** |
+| Startup stale-file cleanup, stage R1 (report only) | implemented; **off by default**; counts only, never deletes ([STEP9_9F_WHISPER_QUEUE.md §7.1](STEP9_9F_WHISPER_QUEUE.md)); deletion stages not implemented |
 
 `USAP_SCHEDULER=off` turns off every setting above, including the three that are on by default (the observe-only
 accounting, the warn-only memory check and the logical-CPU cap); the 9.9a bug fixes are not settings. Every behaviour
