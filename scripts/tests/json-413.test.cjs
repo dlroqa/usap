@@ -17,6 +17,8 @@ const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./
 const { GRACE_MS } = require("../server/http/refusal-close.cjs");
 const { execFile } = require("node:child_process");
 const { judgeRefusedClient } = require("./fixtures/refusal-judge.cjs");
+const { describeLostClient } = require("./fixtures/stall-diag.cjs");
+const { spawn } = require("node:child_process");
 const GRACE_TOLERANCE_MS = 100; // as fixtures/refusal-judge.cjs: the grace timer starts just before 'finish' is observed
 
 const MiB = 1024 * 1024;
@@ -137,6 +139,23 @@ function concurrentClients(port, n, opts) {
 }
 // Server side of one connection, from the connection-log preload: the 413 with its body, promptly, the whole grace
 // period (unless the client closed first), reads within the bound. Returns the judge's view of the connection.
+// #151 diagnostics: an independent process that only records scheduling gaps (fixtures/stall-sampler.cjs). Never
+// throws and never decides anything: on any problem it yields null and the description says "unavailable".
+function startSampler() {
+  let child = null, out = "";
+  try { child = spawn(process.execPath, [path.join(__dirname, "fixtures", "stall-sampler.cjs")], { stdio: ["pipe", "pipe", "ignore"] }); } catch (_) { return { stop: async () => null }; }
+  child.on("error", () => {}); child.stdin.on("error", () => {});
+  child.stdout.on("data", (d) => { if (out.length < 65536) out += d; });
+  const exited = new Promise((r) => child.once("exit", r));
+  return {
+    stop: async () => {
+      try { child.stdin.end(); } catch (_) {}
+      const t = await Promise.race([exited.then(() => "exit"), sleep(5000).then(() => "timeout")]);
+      if (t === "timeout") { try { child.kill(); } catch (_) {} return null; }
+      try { return JSON.parse(out); } catch (_) { return null; }
+    },
+  };
+}
 function assertServerRefusal(rec, st, label) {
   const ev = `[client ${JSON.stringify({ status: st.status, error: st.error, sent: st.sent, answeredAt: st.answeredAt, closedAt: st.closedAt, drains: (st.drainsAt || []).length, localPort: st.localPort })} server ${JSON.stringify(rec && { status: rec.status, bytesRead: rec.bytesRead, answerMs: rec.finishAt - rec.arrivedAt, closeAfterAnswerMs: rec.sockCloseAt - rec.finishAt })}]`;
   assert.ok(rec, `${label}: server record ${ev}`);
@@ -151,10 +170,18 @@ function assertServerRefusal(rec, st, label) {
 
 test("concurrent over-limit declarations are each refused early; the server's total read stays bounded", async (t) => {
   await withServer(async ({ port, records }) => {
+    const sampler = startSampler(); // #151 diagnostics only
     const { clients, ticks } = await concurrentClients(port, 10, { url: URL, mode: "stream", contentLength: 100 * MiB, ignoreFin: true, capBytes: 96 * MiB, maxMs: GRACE_MS + 10000 });
     const until = Date.now() + GRACE_MS + SLACK_MS;
     while (records().length < clients.length && Date.now() < until) await sleep(50);
     const recs = records();
+    // #151 diagnostics, printed before (and independent of) the assertions below: every client whose answer was lost.
+    const samples = await sampler.stop();
+    for (const [i, st] of clients.entries()) {
+      if (st.status !== null) continue;
+      let d; try { d = describeLostClient(st, recs.find((x) => x.remotePort === st.localPort), ticks, samples); } catch (_) { d = "description failed"; }
+      t.diagnostic(`#151 lost answer, client ${i}: ${d}`);
+    }
     let total = 0, stalled = 0;
     const excused = []; // #151 diagnostics: each excused client with its timeline, for the guard below
     for (const [i, st] of clients.entries()) {
@@ -169,7 +196,7 @@ test("concurrent over-limit declarations are each refused early; the server's to
     if (excused.length) t.diagnostic(`${excused.length}/${clients.length} clients excused (documented reset tradeoff): ${excused.join(" | ")}`);
     assert.ok(stalled < clients.length, `at least one client read its answer (a run where none did proves nothing about delivery); excused: ${excused.join(" | ")}`);
     assert.ok(total <= 10 * EARLY_READ_BOUND, `total read ${total}`);
-  });
+  }, { USAP_TEST_CONN_LOG_LOOP: "1" }); // #151 diagnostics: the server's loop summary in each record
 });
 
 test("judge rules for this test: an answer is required unless the client provably did not run while the server held the connection", () => {
