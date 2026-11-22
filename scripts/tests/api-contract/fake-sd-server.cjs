@@ -13,6 +13,12 @@
 //   ignore-sigterm    ignore SIGTERM, so stopping needs SIGKILL (issue #105 tests)
 //   exit-when-told    exit on its own, with the code written in the file "<model path>.exit", as soon as that file
 //                     appears (issue #120 tests; combine with hold-load for an exit before listening)
+//   linger<ms>        (#170, POSIX only) on SIGTERM, hand the listening socket to a detached holder process, then exit;
+//                     the holder keeps the port busy until <ms> after this engine's exit, then releases it and exits
+//                     (never longer than 20 s). Simulates a port still in use after the engine is gone, with no engine
+//                     process left. Windows stops engines with taskkill /F (no SIGTERM), so the mode does nothing there.
+//   lingerheld        (#170, POSIX only) as linger<ms>, but the holder keeps the port until the file
+//                     "<model path>.release-port" exists (the test decides when; never longer than 30 s).
 // GET /fake/stats reports {requests, completed, aborted, pid, args}.
 //
 // Diagnostics (#142): every start, listen result and exit is appended as one JSON line to fake-sd-diag.jsonl next to
@@ -26,6 +32,29 @@ const http = require("node:http");
 const path = require("node:path");
 const args = process.argv.slice(2);
 const arg = (name, fallback) => { const i = args.indexOf(name); return i === -1 ? fallback : args[i + 1]; };
+// #170 port holder (started by the linger mode below; never an engine): keeps the handed-over listening socket until
+// `lingerMs` after the engine process is gone, refusing every connection, then closes it and exits. Hard cap 20 s.
+if (args[0] === "--port-holder") {
+  const holderDiag = (e, extra = {}) => { try { fs.appendFileSync(path.join(__dirname, "fake-sd-diag.jsonl"), JSON.stringify({ e, t: Date.now(), pid: process.pid, ...extra }) + "\n"); } catch (_) {} };
+  const enginePid = Number(args[1]); const lingerMs = Number(args[2]); const port = Number(args[3]); const releaseFile = args[4] || "";
+  const gone = (pid) => { try { process.kill(pid, 0); return false; } catch (err) { return err.code !== "EPERM"; } };
+  const cap = setTimeout(() => { holderDiag("holder-cap", { port }); process.exit(0); }, releaseFile ? 30000 : 20000);
+  process.on("message", (m, handle) => {
+    if (m !== "server" || !handle) return;
+    handle.on("connection", (c) => c.destroy());
+    holderDiag("holder-holding", { port, enginePid });
+    process.send("held", () => { try { process.disconnect(); } catch (_) {} });
+    const watch = setInterval(() => {
+      if (!gone(enginePid)) return;
+      clearInterval(watch);
+      holderDiag("holder-engine-gone", { port });
+      const releaseNow = () => handle.close(() => { holderDiag("holder-released", { port }); clearTimeout(cap); process.exit(0); });
+      if (!releaseFile) { setTimeout(releaseNow, lingerMs); return; }
+      const told = setInterval(() => { if (fs.existsSync(releaseFile)) { clearInterval(told); releaseNow(); } }, 10);
+    }, 10);
+  });
+  return;
+}
 const model = path.basename(arg("--model", "model.gguf"));
 const DIAG = path.join(__dirname, "fake-sd-diag.jsonl");
 const diag = (e, extra = {}) => { try { fs.appendFileSync(DIAG, JSON.stringify({ e, t: Date.now(), pid: process.pid, ...extra }) + "\n"); } catch (_) {} };
@@ -127,6 +156,24 @@ const listenNow = () => server.listen(port, "127.0.0.1", () => {
   diag("listening", { address: server.address() });
   console.log(`[INFO ] main.cpp:500 - listening on: 127.0.0.1:${port}`);
 });
+const lingerMatch = /linger(\d+|held)/.exec(model);
+if (lingerMatch && process.platform !== "win32") {
+  let handing = false;
+  process.on("SIGTERM", () => {
+    if (handing) return;
+    handing = true;
+    if (!server.listening) process.exit(0);
+    const { spawn } = require("node:child_process");
+    const held = lingerMatch[1] === "held";
+    const holder = spawn(process.execPath, [__filename, "--port-holder", String(process.pid), held ? "-1" : lingerMatch[1], String(port),
+      ...(held ? [`${arg("--model", "")}.release-port`] : [])],
+      { detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"] });
+    holder.unref();
+    holder.once("message", (m) => { if (m === "held") { diag("handed-port", { holder: holder.pid, port }); process.exit(0); } });
+    holder.send("server", server);
+    setTimeout(() => process.exit(0), 3000).unref(); // never outlive the guard's grace because of the hand-over
+  });
+}
 if (model.includes("hold-load")) {
   const t = setInterval(() => { if (require("node:fs").existsSync(`${arg("--model", "")}.release`)) { clearInterval(t); listenNow(); } }, 25);
 } else listenNow();
