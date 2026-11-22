@@ -534,11 +534,29 @@ not reproduced. The deterministic tests below reproduce each ingredient instead.
 **Tests.** `image-port.test.cjs` (all four OS, fake clock and port table): no port is checked before the exit wait ends;
 a late-binding superseded engine's port is not chosen while busy; the release wait is bounded; occupied backup ports are
 skipped; a foreign holder is not waited for; no free port gives the existing error; an unconfirmed exit checks no port;
-a stop ends the wait; an explicit port is verified; a failing port check counts as busy. `engine-slot.test.cjs` "#170"
-tests (Linux and macOS; the fake's `linger<ms>` mode hands the stopped engine's socket to a detached holder, so the port
-stays busy after the engine is gone): release awaited then the preferred port used; still busy after 5 s → a verified
-backup port, an occupied backup port skipped; a stop during the wait cancels; concurrent loads keep one engine on a free
-port. Windows stops engines with `taskkill /F`, so the hand-over can't be simulated there; Windows runs the unit tests,
-R2 and the native lifecycle validation. Negative controls (old order, no release wait, unbounded wait, unverified
-backup port, waiting for foreign holders, no cancellation check, previous port not tracked, unconfirmed exit ignored,
-failing check as free) are each caught.
+a stop ends the wait; an explicit port is verified; a failing port check counts as busy.
+
+`engine-slot.test.cjs` "#170" tests (Linux and macOS). The fake's `lingerheld` mode hands the stopped engine's socket to a
+detached holder that keeps the port until the test releases it; a test-only preload (`api-contract/port-check-preload.cjs`)
+records every port check the server makes. The tests synchronize on, and measure from, the server's own first "busy"
+check of the old port, never from the request, so the varying lifecycle time before that point (exit confirmation, the
+route's 500 ms pause) can't affect them:
+* released strictly after that busy check → the replacement gets the preferred port, found free within the 5 s wait, no
+  backup port tried, the new engine tracked and the old one gone; the busy check came after the old engine's exit;
+* never released → the time from that busy check to the first backup-port check is the bounded wait (at least 5 s, at most
+  5 s + 2.5 s for one delayed poll); the occupied backup port was checked and skipped; the chosen port was the last one
+  checked, found free, and the engine started on it;
+* a stop right after that busy check → `409 ENGINE_START_CANCELLED` within 2 s, no backup port tried, no engine started;
+* concurrent loads after a lingering engine (`linger<ms>`) → never two image processes, one tracked engine, no orphan.
+
+A first version measured the whole load from the request and bounded it by the holder's linger time; on a stalled macOS
+Intel runner the lifecycle before the wait took about 1.7 s and the bound failed although the product chose correctly
+(PR #171, first CI run). Windows stops engines with `taskkill /F`, so the hand-over can't be simulated there; Windows
+runs the unit tests, R2 and the native lifecycle validation.
+
+**Negative controls** (each run against the unit and "#170" tests): old main `image-engine.cjs`; port checked before the
+exit wait; no release wait; a 10× release wait; backup port not verified; waiting for foreign holders; every cancellation
+check in the wait loop removed (C7b); previous port not tracked; unconfirmed exit ignored; a failing check treated as
+free. Each is caught. **C7** (only the check right after each poll's sleep removed) is an *equivalent* mutation and is
+not caught by design: the loop checks for cancellation again after every port check, so a stop still ends the wait
+within one 150 ms poll. C7b is the control that matters and is kept.
