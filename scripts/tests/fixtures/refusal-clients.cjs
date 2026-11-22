@@ -33,7 +33,11 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
     const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: ignoreFin });
     const st = { status: null, head: "", body: "", sent: 0, closedAt: null, answeredAt: null, error: null, t0: Date.now(), connectionHeader: null, drainsAt: [],
       // io (#151 diagnostics): wall-clock times of this socket's read-side events, for judge failure messages
-      io: { firstDataAt: null, dataEvents: 0, endAt: null, errorAt: null, closeAt: null } };
+      io: { firstDataAt: null, dataEvents: 0, endAt: null, errorAt: null, closeAt: null,
+        // #151 diagnostics (message only, never judged): for each recorded drain, when the check phase of the same
+        // event-loop iteration ran (setImmediate scheduled in the drain handler). A value before the server's close
+        // means the loop got past the I/O phase that handled the drain, where a ready read would also have run.
+        drainChecksAt: [], firstDataCheckAt: null } };
     let buf = Buffer.alloc(0), stopped = false, timer = null;
     const parse = () => {
       const text = buf.toString("latin1"); const i = text.indexOf("\r\n\r\n");
@@ -43,7 +47,10 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
       const raw = text.slice(i + 4);
       st.body = /\r\ntransfer-encoding: chunked/i.test(st.head) ? dechunk(raw) : raw;
     };
-    s.on("data", (d) => { if (st.io.firstDataAt === null) st.io.firstDataAt = Date.now(); st.io.dataEvents += 1; buf = Buffer.concat([buf, d]); parse(); });
+    s.on("data", (d) => {
+      if (st.io.firstDataAt === null) { st.io.firstDataAt = Date.now(); setImmediate(() => { st.io.firstDataCheckAt = Date.now(); }); }
+      st.io.dataEvents += 1; buf = Buffer.concat([buf, d]); parse();
+    });
     s.on("end", () => { if (st.io.endAt === null) st.io.endAt = Date.now(); });
     s.on("error", (e) => { if (st.io.errorAt === null) st.io.errorAt = Date.now(); st.error = e.code || e.message; });
     s.on("close", () => { st.io.closeAt = Date.now(); st.closedAt = Date.now() - st.t0; stopped = true; clearTimeout(timer); resolve(st); });
@@ -74,7 +81,14 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
       let paused = false;
       const pump = () => { while (!stopped && !s.destroyed && st.sent < capBytes) {
         if (pause && !paused && st.sent >= pause.atBytes) { paused = true; st.pausedAt = Date.now() - st.t0; timer = setTimeout(pump, pause.ms); return; }
-        if (!send(CHUNK)) { s.once("drain", () => { if (st.drainsAt.length < 500) st.drainsAt.push(Date.now()); pump(); }); return; } } };
+        if (!send(CHUNK)) { s.once("drain", () => {
+          if (st.drainsAt.length < 500) {
+            st.drainsAt.push(Date.now());
+            const k = st.io.drainChecksAt.push(null) - 1; // same bound as drainsAt
+            setImmediate(() => { st.io.drainChecksAt[k] = Date.now(); });
+          }
+          pump();
+        }); return; } } };
       pump();
     });
   });
