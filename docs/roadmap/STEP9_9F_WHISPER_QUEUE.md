@@ -196,6 +196,30 @@ with the queue off (for today's `.speech-*` leftovers).
   start. Startup never fails because of the sweep.
 - **Portable and installed:** both resolve the directory through `paths.cjs`, so the same rules apply.
 
+
+### 7.1 Stage R1 as built: report only (off by default)
+
+`services/stale-file-report.cjs`. The cleanup is staged: R1 only **reports**; deletion is a later stage that needs its
+own approval, and legacy files never get automatic deletion from their name or age.
+
+* Setting `staleFileReport` (`USAP_STALE_FILE_REPORT` or `app/config/scheduler.json`): `report` or `off` (default
+  `off`; any other value is ignored and logged). `USAP_SCHEDULER=off` also turns it off; whether the rollback switch
+  should cover it is an open owner decision, so this is provisional.
+* On: once, after the server listens, it counts (1) legacy whisper temporaries in `transcriptions/`
+  (`.speech-<ISO stamp>-<name>.wav`, `-out.txt`, `-out.json`) and (2) transcription-queue uploads in
+  `cache/speech-uploads/` (`<16 hex>-<n>-<16 hex>.wav`, `.out.txt`, `.out.json`). It reports per folder: state
+  (`scanned`, `absent`, `not-a-plain-folder`, `outside-data-folder`, `unreadable`), entries scanned, matches, their
+  bytes, age buckets, skipped non-files, errors by code, `truncated`, and the time taken; plus `removed: 0` and
+  `ownership: "not determined"`.
+* It never deletes, moves, renames, writes or creates anything (a test checks the module for any such call, and every
+  test compares every file before and after). A missing folder is reported, not created. No file name or path is
+  reported or logged.
+* Safety: a folder is read only if it is a plain folder (not a link or junction) whose real path is inside the data
+  folder; entries are `lstat`ed, only regular files count, links are never followed. At most 10 000 entries and about
+  500 ms per folder; asynchronous; errors are counted, never thrown.
+* Not in R1: an instance registry and ownership (depends on open owner decisions), any deletion, moving the legacy
+  path's temporaries elsewhere, and any change to the transcription queue's activation (it stays blocked).
+
 ## 8. Reporting
 
 In `/api/resources`, **only when the queue is on**, as additive keys:
