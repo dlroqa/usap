@@ -12,6 +12,7 @@
 
 const { describeSpawnError, isLaunchFailure } = require("../spawn-error.cjs");
 const { imageExitOutcome } = require("./image-exit.cjs");
+const { selectImagePort } = require("./image-port.cjs");
 
 const REQUIRED = ["BACKEND_PATHS","IS_MAC_INTEL","MAC_INTEL_IMAGE_MESSAGE","MODELS","OUTPUTS","PREFERRED_BACKEND_PORT","ROOT","assertNoOtherActiveRuntime","backendValidationErrors","badRequest","checkPort","conflict","describeLinuxRuntimeLinkerError","findOpenVinoModel","fs","getBackendOptions","getBackendPath","getDefaultModel","getModelLoadIssue","getOpenVinoModelInfo","getOpenVinoNpuInfo","getPreferredVulkanBackendName","http","json","killLlm","os","osPlatform","path","pollNvidiaVram","readdirVisible","requestJson","safeOutputName","spawn","spawnSync","stripAnsi","supervisor","withoutAuthHeaders","withoutCorsHeaders"];
 
@@ -35,6 +36,7 @@ function createImageEngine(deps) {
   const waitForChildExit = deps.waitForChildExit || null;
   if (slot && typeof waitForChildExit !== "function") throw new Error("image-engine: engineSlot needs waitForChildExit");
   let imageStartToken = 0;      // bumped by a stop request; a load that sees a new value ends before its spawn
+  let lastImagePort = null;     // #170: port of the image engine this server started last (slot on: its release is awaited)
   let backendEpoch = 0;         // slot epoch of the current backendProc / openvinoProc
   let imageOperationQueue = Promise.resolve();
   let pendingImageOperations = 0;
@@ -50,6 +52,16 @@ function createImageEngine(deps) {
   }
   function checkImageToken(token) {
     if (slot && token !== undefined && token !== null && token !== imageStartToken) throw imageStartCancelledError();
+  }
+  // #170, slot on: wait for every earlier image engine's exit, then choose the port (bounded release wait for our own
+  // previous port, then the backup range). The token check makes a stop request end the wait before any spawn.
+  async function chooseImagePortAfterExits(wantedPort, token) {
+    const sel = await selectImagePort({
+      slot, wantedPort, previousPort: lastImagePort, checkPort,
+      isCancelled: () => token !== undefined && token !== null && token !== imageStartToken,
+      cancelledError: imageStartCancelledError,
+    });
+    return sel.port;
   }
   // Slot on: SIGTERM, wait for the exit, SIGKILL, wait again. Never treats a timer as an exit.
   async function stopImageProcess(proc) {
@@ -570,15 +582,18 @@ function createImageEngine(deps) {
 
     await killBackend();
     await killOpenVinoWorker();
-    if (slot && !(await slot.waitForExits("image", 5000))) throw slot.unconfirmedError("image");
+    // #170, slot on: earlier image engines' exits are confirmed, then the port is chosen and verified, before any state
+    // below changes (as before, a failed exit wait leaves it untouched). Slot off: unchanged.
+    const chosenOpenvinoPort = slot ? await chooseImagePortAfterExits(PREFERRED_BACKEND_PORT, token) : null;
     openvinoError = null;
     openvinoReady = false;
     openvinoModel = model.id;
     openvinoWidth = 512;
     openvinoHeight = 512;
-    openvinoPort = await findAvailableBackendPort();
+    openvinoPort = slot ? chosenOpenvinoPort : await findAvailableBackendPort();
     checkImageToken(token); // last await before the spawn
     PORT_BACKEND = openvinoPort;
+    lastImagePort = openvinoPort;
 
     currentSettings = { ...currentSettings, ...settings };
     currentSettings.backendType = "openvino-npu";
@@ -834,8 +849,15 @@ function createImageEngine(deps) {
       throw new Error(modelLoadIssue);
     }
 
-    PORT_BACKEND = Number(settings.backendPort) > 0 ? Number(settings.backendPort) : await findAvailableBackendPort();
-    if (slot && !(await slot.waitForExits("image", 5000))) throw slot.unconfirmedError("image");
+    if (!slot) {
+      PORT_BACKEND = Number(settings.backendPort) > 0 ? Number(settings.backendPort) : await findAvailableBackendPort();
+    } else {
+      // #170: wait for earlier image engines to exit before choosing the port, then verify the port (bounded release
+      // wait for our own previous port, backup range otherwise). An explicitly requested port is verified the same way.
+      const requested = Number(settings.backendPort) > 0 ? Number(settings.backendPort) : null;
+      PORT_BACKEND = await chooseImagePortAfterExits(requested || PREFERRED_BACKEND_PORT, token);
+      if (requested && PORT_BACKEND !== requested) currentSettings.backendPort = PORT_BACKEND;
+    }
     checkImageToken(token); // the last await before the spawn is above
 
     const resolvedBackendType = resolveBackendType(currentSettings.useGpu, currentSettings.backendType, currentSettings.model);
@@ -986,6 +1008,7 @@ function createImageEngine(deps) {
     const procSeq = ++backendProcSeq;
     const proc = supervisor.spawnSupervised(backendPath, args, { stdio: "pipe", env: spawnEnv }, { label: "image" });
     backendProc = proc;
+    lastImagePort = PORT_BACKEND;
     if (slot) { backendEpoch = slot.current().epoch; slot.track("image", proc, backendEpoch); }
     startBackendReadyPoll(proc);
     const coremlLoadHeartbeat = startCoreMLLoadHeartbeat(proc);

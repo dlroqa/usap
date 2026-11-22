@@ -217,6 +217,12 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   Queue answers add a `detail` that starts with "Generation failed:", which the WebUI shows. With the Core ML backend
   the queue is inactive. Off (the default), image generation behaves as before
   ([details](docs/roadmap/STEP9_9F_IMAGE_QUEUE.md#13-as-built)).
+  A startup stale-file report (stale-file cleanup, first stage R1, **Experimental**, off by default;
+  `USAP_STALE_FILE_REPORT=report` turns it on, `USAP_SCHEDULER=off` turns it off) counts temporary transcription
+  files that a hard stop (a crash, a closed console window, power loss) may have left behind, and reports only the
+  counts in `/api/diagnostics` `staleFiles`. It **never deletes, moves or changes a file**, names no file, follows no
+  link and reads only inside the data folder, with a time and entry limit. Automatic cleanup is **Planned** and needs
+  separate approval ([details](docs/roadmap/STEP9_9F_WHISPER_QUEUE.md#7-stale-file-cleanup-separate-narrow-fix)).
   [Plan](docs/roadmap/STEP9_9_SCHEDULING.md).
 * **GitHub Actions CI** on Windows x64, Linux x64, macOS arm64 and macOS Intel, with native-hardware
   checks so Intel results aren't Apple Silicon emulating Intel ([#3](https://github.com/dlroqa/usap/pull/3)).
