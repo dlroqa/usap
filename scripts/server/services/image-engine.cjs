@@ -485,7 +485,9 @@ function createImageEngine(deps) {
   // follows the engine's log and can lag at the start of a generation.
   let generationsInFlight = 0;
 
-  function proxyImageBackendRequest(req, res) {
+  // Counted while the client's response is open (it drops when the client leaves, even if the engine still works).
+  // Also used by the image queue (9.9f-3) for the jobs it forwards, so the count keeps this meaning.
+  function trackGeneration(req, res) {
     if (req.method === "POST" && /^\/sdapi\/v1\/(txt2img|img2img)(?:[?#]|$)/.test(String(req.url || ""))) {
       generationsInFlight += 1;
       let counted = true;
@@ -493,6 +495,10 @@ function createImageEngine(deps) {
       res.once("close", done);
       res.once("finish", done);
     }
+  }
+
+  function proxyImageBackendRequest(req, res) {
+    trackGeneration(req, res);
     const headers = withoutAuthHeaders(req.headers); // USAP credentials stay in USAP
     delete headers.host;
     headers.host = `127.0.0.1:${PORT_BACKEND}`;
@@ -1403,6 +1409,7 @@ function createImageEngine(deps) {
       set PORT_BACKEND(value) { PORT_BACKEND = value; },
     }),
     activeGenerations: () => generationsInFlight, // Step 9.9e (read-only)
+    trackGeneration, // Step 9.9f-3 image queue: count forwarded jobs as the proxy does
     // Issue #105 (used only when engineSlot is on).
     lifecycle: Object.freeze({
       runExclusive: runExclusiveImageOperation,

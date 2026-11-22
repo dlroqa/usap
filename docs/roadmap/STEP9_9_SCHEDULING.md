@@ -1,7 +1,7 @@
 # Step 9.9: resource scheduling (plan)
 
 Status: **in progress**: most stages are implemented and merged, mostly off by default (owner decisions in section 5).
-This document began as the plan; the "as built" sections record what was implemented. As of `f1b99a7`:
+This document began as the plan; the "as built" sections record what was implemented. As of `f1b99a7`, updated for #164:
 
 | Part | State |
 |---|---|
@@ -16,7 +16,7 @@ This document began as the plan; the "as built" sections record what was impleme
 | Cross-engine load coordination, `engineSlot` (#112, #105) | implemented, merged; **off by default**; **activation blocked** (#120) |
 | 9.9f-3 voice queue (#114) | implemented, merged; **off by default** |
 | 9.9f-3 transcription queue and its connection gate (#130, #143) | implemented, merged; **off by default**; activation waits for the stale-file cleanup ([STEP9_9F_WHISPER_QUEUE.md §7](STEP9_9F_WHISPER_QUEUE.md)), which is **not implemented** |
-| 9.9f-3 image-generation queue | design merged (#132); **not implemented** |
+| 9.9f-3 image-generation queue (#164) | implemented; **off by default**; on only together with `engineSlot` (refused otherwise), so its activation is **blocked** with engineSlot's ([STEP9_9F_IMAGE_QUEUE.md §13](STEP9_9F_IMAGE_QUEUE.md)) |
 | Startup stale-file cleanup, stage R1 (report only) | implemented; **off by default**; counts only, never deletes ([STEP9_9F_WHISPER_QUEUE.md §7.1](STEP9_9F_WHISPER_QUEUE.md)); deletion stages not implemented |
 
 `USAP_SCHEDULER=off` turns off every setting above, including the three that are on by default (the observe-only
@@ -126,7 +126,7 @@ separate UI change is approved.
 | 9.9c (done, #85; off by default) | Bounded chat queue (decision A): 1 running + 4 waiting per engine, FIFO, `429 QUEUE_FULL` with `Retry-After`, waiting requests leave on disconnect, `503 QUEUE_TIMEOUT` after the longest wait (10 min) | Only when turned on: requests past the limit get `429` | `chatQueue: off` (the default) or `USAP_SCHEDULER=off` restores the unbounded queue |
 | 9.9d (done, #93; warn only, on by default) | Memory check before loading a model, **warn only** (a field in the start response and a log line) | None for users; adds a field | Setting `memoryCheck: off` |
 | 9.9e (design done, #95: [STEP9_9E_THREADS.md](STEP9_9E_THREADS.md); whisper-only implementation done, #96, off by default; whisper logical-CPU cap done, #98, on by default) | Thread budget shared between engines | Thread counts change only when engines overlap | `threads: off` (the default) |
-| 9.9f (first substage, chat timeouts and cleanup: implemented, off by default, [STEP9_9F_TIMEOUTS.md](STEP9_9F_TIMEOUTS.md); second substage, memory-aware text-model load admission: implemented, off by default, [STEP9_9F_MEMORY_ADMISSION.md](STEP9_9F_MEMORY_ADMISSION.md); the force option is deferred until scoped authorization exists; prerequisite for the remaining queues, cross-engine model-load coordination (#105): implemented, off by default, [STEP9_9F_ENGINE_LIFECYCLE.md](STEP9_9F_ENGINE_LIFECYCLE.md); third substage, job queues: voice queue implemented, off by default; transcription queue implemented, off by default, [STEP9_9F_WHISPER_QUEUE.md](STEP9_9F_WHISPER_QUEUE.md); image queue design merged, not implemented, [STEP9_9F_WORKLOAD_QUEUES.md](STEP9_9F_WORKLOAD_QUEUES.md), detailed in [STEP9_9F_IMAGE_QUEUE.md](STEP9_9F_IMAGE_QUEUE.md)) | Memory check **enforced** (with a force option), image/speech/voice queues, queue timeouts, stream idle timeout. Still one heavy model at a time (decision B) | New refusals, each with a clear message | Per-setting `off` |
+| 9.9f (first substage, chat timeouts and cleanup: implemented, off by default, [STEP9_9F_TIMEOUTS.md](STEP9_9F_TIMEOUTS.md); second substage, memory-aware text-model load admission: implemented, off by default, [STEP9_9F_MEMORY_ADMISSION.md](STEP9_9F_MEMORY_ADMISSION.md); the force option is deferred until scoped authorization exists; prerequisite for the remaining queues, cross-engine model-load coordination (#105): implemented, off by default, [STEP9_9F_ENGINE_LIFECYCLE.md](STEP9_9F_ENGINE_LIFECYCLE.md); third substage, job queues: voice queue implemented, off by default; transcription queue implemented, off by default, [STEP9_9F_WHISPER_QUEUE.md](STEP9_9F_WHISPER_QUEUE.md); image queue implemented, off by default, needs engineSlot, [STEP9_9F_WORKLOAD_QUEUES.md](STEP9_9F_WORKLOAD_QUEUES.md), detailed in [STEP9_9F_IMAGE_QUEUE.md](STEP9_9F_IMAGE_QUEUE.md)) | Memory check **enforced** (with a force option), image/speech/voice queues, queue timeouts, stream idle timeout. Still one heavy model at a time (decision B) | New refusals, each with a clear message | Per-setting `off` |
 
 Each stage lands only after its tests pass on all 4 OS and the native-runtime timings (Step 9.10) don't regress.
 Stages 9.9c–f change behaviour and each needs a separate owner approval.

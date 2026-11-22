@@ -203,6 +203,20 @@ Changes USAP has made on top of the original project (details in [CHANGELOG.md](
   `/api/speech/stop` refuses the jobs still waiting (`409 ENGINE_NOT_READY`). The routes, parameters and answers are
   otherwise unchanged. Off (the default), transcription behaves as before. Every limit can be changed within checked
   ranges ([details](docs/roadmap/STEP9_9F_WHISPER_QUEUE.md#13-as-built)).
+  A bounded image-generation queue (Step 9.9f-3, **Experimental**, off by default; `USAP_IMAGE_QUEUE=on` turns it on
+  only together with `USAP_ENGINE_SLOT=on`, and stays off with a log message otherwise; `USAP_SCHEDULER=off` turns it
+  off) sends one generation at a time to the stable-diffusion.cpp server and lets at most 2 more wait (then
+  `429 QUEUE_FULL` with `Retry-After`), none longer than 10 minutes (`503 QUEUE_TIMEOUT`). It covers the four
+  generation routes the studio forwards (`/sdapi/v1/txt2img`, `/sdapi/v1/img2img`, `/v1/images/generations`,
+  `/v1/images/edits`); everything else is forwarded as before. Requests are refused before their body is read while
+  the image model is not loaded (`503 ENGINE_NOT_READY`) or when the declared size is over 64 MB (`413`). Waiting
+  bodies are held in memory, within a 128 MB total (`429` with reason `body-budget`); an upload with no data for 30 s,
+  or longer than 120 s, is ended (`408`). A request whose client disconnects while it waits never reaches the engine;
+  a running generation can't be cancelled by the engine, so it finishes and its place is freed only when the engine
+  is done. Stop and restart refuse the waiting requests, and a restart is refused while a queued generation runs.
+  Queue answers add a `detail` that starts with "Generation failed:", which the WebUI shows. With the Core ML backend
+  the queue is inactive. Off (the default), image generation behaves as before
+  ([details](docs/roadmap/STEP9_9F_IMAGE_QUEUE.md#13-as-built)).
   A startup stale-file report (stale-file cleanup, first stage R1, **Experimental**, off by default;
   `USAP_STALE_FILE_REPORT=report` turns it on, `USAP_SCHEDULER=off` turns it off) counts temporary transcription
   files that a hard stop (a crash, a closed console window, power loss) may have left behind, and reports only the

@@ -19,6 +19,9 @@ function imageRoutes(deps) {
   // Optional (issue #105, only when engineSlot is on): image lifecycle chain, start token and the heavy-engine slot.
   // Without it, /api/restart-backend and /api/stop-backend are exactly the handlers from before.
   const lifecycle = deps.imageLifecycle || null;
+  // Optional (Step 9.9f-3, only when imageQueue is on, which needs engineSlot): the bounded image-generation queue.
+  // Without it, the four generation routes are today's proxy and restart/stop are unchanged.
+  const imageQueue = deps.imageQueue || null;
   const { state, MIME, MODELS, OUTPUTS, PREFERRED_BACKEND_PORT, SERVER_BUILD, appleNpuRuntimeMatches, assertNoOtherActiveRuntime, backendSettingsMatch, deleteGeneratedOutputs, errorBody, errorStatus, findAvailableBackendPort, fs, generateWithOpenVino, getCoreMLPythonPath, getDefaultModel, json, jsonErrorStatus, killBackend, killOpenVinoWorker, listGeneratedOutputs, path, proxyImageBackendRequest, readJsonBody, saveGeneratedOutput, startBackend } = deps;
   // Issue #105: /api/restart-backend with the heavy-engine slot. Same checks, answers and order as the handler below,
   // but inside the image chain; the slot is claimed before the first await, so a text load can't start in between,
@@ -45,7 +48,9 @@ function imageRoutes(deps) {
         if (imageBackendReady && backendSettingsMatch(state.currentSettings, requestedSettings)) {
           return json(res, 200, { ok: true, message: "Backend already running with requested settings.", settings: state.currentSettings, port: state.PORT_BACKEND });
         }
-        if (state.generationState.active) {
+        // Step 9.9f-3: a job the image queue forwarded and that has not settled counts as a generation in progress (the
+        // engine's log lags at the start of a job).
+        if (state.generationState.active || (imageQueue && imageQueue.forwardedUnsettled())) {
           return json(res, 409, {
             ok: false,
             error: "Image generation is in progress. Wait for it to finish or cancel it before changing backend settings.",
@@ -55,6 +60,7 @@ function imageRoutes(deps) {
           state.currentSettings = requestedSettings;
           return json(res, 200, { ok: true, message: "Apple NPU backend already running; updated generation defaults.", settings: state.currentSettings, port: state.PORT_BACKEND });
         }
+        if (imageQueue) imageQueue.refuseWaiting("restart"); // waiting jobs were admitted for the engine being replaced
         lifecycle.reserve(targetModel); // synchronous claim, before the first await below; throws 409 if text owns it
         owned = true;
         await killBackend();
@@ -111,6 +117,7 @@ function imageRoutes(deps) {
   return (r) => {
     // Original condition: (req.url.startsWith("/v1/") || req.url.startsWith("/sdapi/")) && GET or POST
     const proxyRoute = async (req, res) => {
+    if (imageQueue && imageQueue.isQueuedRoute(req)) return imageQueue.handle(req, res, proxyImageBackendRequest);
     return proxyImageBackendRequest(req, res);
     };
     r.getPrefix("/v1/", proxyRoute);
@@ -230,6 +237,7 @@ function imageRoutes(deps) {
     if (lifecycle) {
       // Ends a load in progress at once (start token) and stops the processes outside the chain, then once more in
       // the chain for anything a load spawned meanwhile. Answers only after every exit was seen.
+      if (imageQueue) imageQueue.refuseWaiting("stop"); // waiting jobs are refused; a forwarded one ends with the engine
       let exited = await lifecycle.stopNow();
       exited = (await lifecycle.runExclusive(async () => {
         const a = await killBackend();
