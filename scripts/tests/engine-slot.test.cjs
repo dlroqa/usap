@@ -319,7 +319,7 @@ function imageModel(dir, name) {
   fs.writeFileSync(file, Buffer.concat([header, kv("general.architecture", 8, "sd1"), kv("general.file_type", 4, 2)]));
   fs.truncateSync(file, 130 * 1024 * 1024);
 }
-const IMAGE_MODELS = ["sd1-img-q4_0.gguf", "sd1-hold-load-q4_0.gguf", "sd1-ignore-sigterm-q4_0.gguf", "sd1-fail-load-q4_0.gguf"];
+const IMAGE_MODELS = ["sd1-img-q4_0.gguf", "sd1-hold-load-q4_0.gguf", "sd1-ignore-sigterm-q4_0.gguf", "sd1-fail-load-q4_0.gguf", "sd1-linger1500-q4_0.gguf", "sd1-linger6500-q4_0.gguf"];
 const TEXT_MODELS = ["plain.gguf", "other.gguf", "hold-start.gguf", "crash-once.gguf", "crash-once-hold-start.gguf", "ignore-sigterm.gguf"];
 
 let root;
@@ -826,6 +826,138 @@ test("9.9f-2 (slot on, memory admission observe): text loads are assessed as bef
     const m2 = (await resources(srv)).memoryAdmission;
     assert.deepEqual(m2.counts, m1.counts, "no admission decision for a load the slot refused");
   });
+});
+
+// #170: a replacement image engine's port. The fake's linger<ms> mode (POSIX) hands the stopped engine's listening socket
+// to a detached holder that keeps the port busy until <ms> after the engine's exit: a port still in use with no engine
+// process left (the Windows hypothesis of #170, made deterministic). Windows stops engines with taskkill /F, so the
+// hand-over can't happen there; Windows is covered by R2 above, the unit tests (image-port.test.cjs) and native validation.
+const LINGER_SKIP = IS_WIN ? "Windows stops engines with taskkill /F (no SIGTERM), so the fake can't hand its port over" : false;
+// The fake's load progress line marks a generation as active until one runs (as in R1b): run one, so a settings
+// change (which replaces the engine) is accepted.
+async function settleGeneration(srv) {
+  const gen = await request(srv.port, "POST", "/sdapi/v1/txt2img", { body: { prompt: "x", steps: 4, width: 64, height: 64, seed: 1, batch_size: 1 } });
+  assert.equal(gen.status, 200, gen.text);
+  await waitFor(async () => (await request(srv.port, "GET", "/api/generation-progress")).json.active === false, 5000, "generation done");
+}
+const diagSince = (t0) => fakeSdDiag(root).filter((r) => r.t >= t0);
+// Every holder started since t0 has released its port (or hit its 20 s cap), so no later test meets a held port.
+async function holdersReleased(t0, ms = 15000) {
+  return waitFor(async () => {
+    const d = diagSince(t0);
+    const held = d.filter((r) => r.e === "holder-holding").map((r) => r.pid);
+    return held.every((pid) => d.some((r) => r.pid === pid && (r.e === "holder-released" || r.e === "holder-cap")) && !alive(pid));
+  }, ms, "port holders released");
+}
+
+test("#170 (slot on): a replacement image engine waits for the previous engine's port to be released, then uses it", { skip: LINGER_SKIP }, async () => {
+  const t0 = Date.now();
+  try {
+    await withServer(SLOT_ON, async (srv) => {
+      assert.equal((await imageLoad(srv, "sd1-linger1500-q4_0.gguf")).status, 200);
+      await imageReady(srv);
+      assert.equal((await backendStatus(srv)).port, srv.sdPort);
+      await settleGeneration(srv);
+      const r = await imageLoad(srv, "sd1-linger1500-q4_0.gguf", { steps: 5 }); // new settings: the engine is replaced
+      assert.equal(r.status, 200, r.text);
+      await imageReady(srv);
+      const d = diagSince(t0);
+      const released = d.find((x) => x.e === "holder-released");
+      const starts = d.filter((x) => x.e === "start");
+      const msg = `records ${JSON.stringify(d)}`;
+      assert.ok(d.some((x) => x.e === "holder-holding"), `the old port was held after the engine's exit; ${msg}`);
+      assert.equal((await backendStatus(srv)).port, srv.sdPort, `the preferred port, after its release (not a backup port); ${msg}`);
+      assert.ok(released && starts.length === 2 && starts[1].t >= released.t, `the replacement started after the release; ${msg}`);
+      assert.equal(d.filter((x) => x.e === "listen-error").length, 0, msg);
+      assert.equal((await engines(srv)).length, 1);
+      assert.equal((await imageStop(srv)).status, 200);
+      await waitNoEngines(srv);
+      await waitIdle(srv);
+    });
+  } finally { await holdersReleased(t0); }
+});
+
+test("#170 (slot on): a port still busy after the bounded wait → a verified backup port; an occupied backup port is skipped", { skip: LINGER_SKIP }, async () => {
+  const t0 = Date.now();
+  const blocker = net.createServer();
+  const blocked = await new Promise((r) => { blocker.once("error", () => r(false)); blocker.listen(28088, "127.0.0.1", () => r(true)); });
+  try {
+    await withServer(SLOT_ON, async (srv) => {
+      assert.equal((await imageLoad(srv, "sd1-linger6500-q4_0.gguf")).status, 200);
+      await imageReady(srv);
+      await settleGeneration(srv);
+      const began = Date.now();
+      const r = await imageLoad(srv, "sd1-linger6500-q4_0.gguf", { steps: 5 });
+      assert.equal(r.status, 200, r.text);
+      await imageReady(srv);
+      const took = Date.now() - began;
+      const port = (await backendStatus(srv)).port;
+      const msg = `port ${port}, load ${took} ms, 28088 held by the test ${blocked}; records ${JSON.stringify(diagSince(t0))}`;
+      assert.ok(port >= 28088 && port <= 28120 && port !== srv.sdPort, `a backup port; ${msg}`);
+      assert.notEqual(port, 28088, `the occupied backup port was skipped; ${msg}`);
+      assert.ok(took >= 5000, `the release was awaited (bounded, 5 s) before the backup range; ${msg}`);
+      assert.ok(took < 6500, `not until the old port's release; ${msg}`);
+      assert.equal((await engines(srv)).length, 1);
+      assert.equal((await imageStop(srv)).status, 200);
+      await waitNoEngines(srv);
+    });
+  } finally {
+    await new Promise((r) => (blocked ? blocker.close(r) : r()));
+    await holdersReleased(t0);
+  }
+});
+
+test("#170 (slot on): a stop during the release wait cancels the load at once; no engine starts", { skip: LINGER_SKIP }, async () => {
+  const t0 = Date.now();
+  try {
+    await withServer(SLOT_ON, async (srv) => {
+      assert.equal((await imageLoad(srv, "sd1-linger6500-q4_0.gguf")).status, 200);
+      await imageReady(srv);
+      await settleGeneration(srv);
+      const load = imageLoad(srv, "sd1-linger6500-q4_0.gguf", { steps: 5 });
+      await waitFor(() => diagSince(t0).some((x) => x.e === "holder-engine-gone"), 10000, "old engine gone, port still held");
+      await sleep(600); // inside the release wait (5 s)
+      const stoppedAt = Date.now();
+      assert.equal((await imageStop(srv)).status, 200);
+      const r = await load;
+      const msg = `records ${JSON.stringify(diagSince(t0))}`;
+      assert.equal(r.status, 409, r.text);
+      assert.equal(r.json.code, "ENGINE_START_CANCELLED");
+      assert.ok(Date.now() - stoppedAt < 2000, `cancelled promptly (${Date.now() - stoppedAt} ms); ${msg}`);
+      assert.equal(diagSince(t0).filter((x) => x.e === "start").length, 1, `no replacement engine started; ${msg}`);
+      await waitNoEngines(srv);
+      await waitIdle(srv);
+    });
+  } finally { await holdersReleased(t0); }
+});
+
+test("#170 (slot on): concurrent loads after a lingering engine: never two image processes, the survivor is tracked on a free port", { skip: LINGER_SKIP }, async () => {
+  const t0 = Date.now();
+  try {
+    await withServer(SLOT_ON, async (srv) => {
+      assert.equal((await imageLoad(srv, "sd1-linger1500-q4_0.gguf")).status, 200);
+      await imageReady(srv);
+      await settleGeneration(srv);
+      const done = sampler(srv);
+      const first = (await engines(srv))[0];
+      const rs = await Promise.all([5, 6, 7].map((steps) => imageLoad(srv, "sd1-linger1500-q4_0.gguf", { steps })));
+      await imageReady(srv);
+      await sleep(400);
+      const seen = await done();
+      const msg = `statuses ${rs.map((x) => x.status)}; records ${JSON.stringify(diagSince(t0))}`;
+      for (const x of rs) assert.ok([200, 409].includes(x.status), x.text);
+      assert.ok(rs.some((x) => x.status === 200), `at least one replacement loaded; ${msg}`);
+      const live = await engines(srv);
+      assert.ok(live.length === 1 && live[0].pid !== first.pid && !alive(first.pid), `the first engine was replaced; ${msg}`);
+      assert.equal(seen.maxImage, 1, `never two image processes alive (saw ${seen.maxImage}); ${msg}`);
+      assert.equal(diagSince(t0).filter((x) => x.e === "listen-error").length, 0, `no engine met a busy port; ${msg}`);
+      assert.equal((await engines(srv)).length, 1, msg);
+      assert.equal((await backendStatus(srv)).running, true);
+      assert.equal((await imageStop(srv)).status, 200);
+      assert.deepEqual(await engines(srv), [], "no orphan after a normal stop");
+      await waitIdle(srv);
+    });
+  } finally { await holdersReleased(t0); }
 });
 
 test("delete model (slot on): deleting the loaded text model stops its engine through the text chain and releases the slot", async () => {

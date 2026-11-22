@@ -503,3 +503,42 @@ progress lines end in `GB/s`, `MB/s` or are `#` bars without a rate (`|====| 113
 generation-progress pattern requires `it/s` or `s/it`, so a real load doesn't set `generationState.active`. Only the
 fake engine's load line (`2/2 - 1.00it/s`) does. That is a test-fixture inaccuracy, left as it is here, so existing
 image tests are unaffected. A later test-only change can make the fake print a byte rate.
+
+### 13.6 Port of a replacement image engine (#170)
+
+Found by a Windows CI failure of R2 (main `6a09341`): with the slot on, the image path chose its port
+(`findAvailableBackendPort()`) **before** `slot.waitForExits("image", 5000)`, and it never waited for the old port's
+release. `killBackendConfirmed()` waits for the engine *guard's* exit; the engine process's own exit is confirmed by
+`waitForExits`, which came after the port check. The text path already waited for exits before choosing its port, and
+for the port's release after a stop.
+
+**Corrected order (slot on only; `services/image-port.cjs`, used by both the stable-diffusion.cpp and OpenVINO paths):**
+
+1. Wait (bounded, 5 s, as before) until every earlier image engine process has a confirmed exit. Not confirmed →
+   `503 ENGINE_EXIT_UNCONFIRMED`, as before, and no port is checked.
+2. If the wanted port (the preferred one, or an explicitly requested one) is free, use it.
+3. If it is busy **and** it was the port of the image engine this server started last, wait for its release, polling
+   every 150 ms for at most 5 s (as the text engine's release wait).
+4. Otherwise, or if it is still busy after that, use the existing backup range 28088–28120, each port verified free
+   before it is chosen. A port held by another program is not waited for (the backup range is used at once, as before).
+5. A stop request during any of this ends the load at once with `409 ENGINE_START_CANCELLED`; nothing is spawned.
+
+Nothing retries a failed start: if another process still takes the chosen port before the engine binds it, the start
+fails as any load failure does (the engine's error is reported, its exit is classified, the slot is released). With
+the slot **off**, the earlier code path is unchanged (`findAvailableBackendPort()` as before; no exit or release wait).
+
+**Hypothesis, not proven:** the Windows failure fits a superseded engine that bound the preferred port after the new
+load's port check and was then stopped, with Windows releasing its socket a moment later. The exact Windows timing was
+not reproduced. The deterministic tests below reproduce each ingredient instead.
+
+**Tests.** `image-port.test.cjs` (all four OS, fake clock and port table): no port is checked before the exit wait ends;
+a late-binding superseded engine's port is not chosen while busy; the release wait is bounded; occupied backup ports are
+skipped; a foreign holder is not waited for; no free port gives the existing error; an unconfirmed exit checks no port;
+a stop ends the wait; an explicit port is verified; a failing port check counts as busy. `engine-slot.test.cjs` "#170"
+tests (Linux and macOS; the fake's `linger<ms>` mode hands the stopped engine's socket to a detached holder, so the port
+stays busy after the engine is gone): release awaited then the preferred port used; still busy after 5 s → a verified
+backup port, an occupied backup port skipped; a stop during the wait cancels; concurrent loads keep one engine on a free
+port. Windows stops engines with `taskkill /F`, so the hand-over can't be simulated there; Windows runs the unit tests,
+R2 and the native lifecycle validation. Negative controls (old order, no release wait, unbounded wait, unverified
+backup port, waiting for foreign holders, no cancellation check, previous port not tracked, unconfirmed exit ignored,
+failing check as free) are each caught.

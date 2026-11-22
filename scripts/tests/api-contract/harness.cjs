@@ -111,7 +111,7 @@ async function startServer(root, extraEnv = {}, { readyPath = "/api/health" } = 
     }
     await new Promise((r) => setTimeout(r, 200));
   }
-  const srv = { port, llmPort: llm, proc, root, log: () => log };
+  const srv = { port, llmPort: llm, sdPort: sd, proc, root, log: () => log };
   liveServers.add(srv);
   proc.on("exit", () => liveServers.delete(srv));
   return srv;
