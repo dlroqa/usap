@@ -61,6 +61,7 @@ const portOpen = (port) => new Promise((resolve) => {
   const s = net.connect(port, "127.0.0.1"); s.setTimeout(1000);
   s.on("connect", () => { s.destroy(); resolve(true); }); s.on("error", () => resolve(false)); s.on("timeout", () => { s.destroy(); resolve(false); });
 });
+const { classifyDefaultOff } = require("./image-queue-observe.cjs");
 function call(method, p, body, { timeoutMs = 900000 } = {}) {
   return new Promise((resolve) => {
     const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
@@ -172,7 +173,7 @@ async function startServer(label, env) {
     env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT), LLM_PORT: String(PORT + 1), BACKEND_PORT: String(PORT + 2), SD_BACKEND_PORT: String(PORT + 2), SPEECH_PORT: String(PORT + 3), ...env },
   });
   const exited = new Promise((r) => child.once("exit", (code, signal) => r({ code, signal })));
-  const srv = { label, child, exited, logPath, log: () => { try { return fs.readFileSync(logPath, "utf8"); } catch (_) { return ""; } } };
+  const srv = { label, child, exited, logPath, startedAt: Date.now(), log: () => { try { return fs.readFileSync(logPath, "utf8"); } catch (_) { return ""; } } };
   const up = await waitUntil(async () => (await call("GET", "/api/health", undefined, { timeoutMs: 3000 })).status === 200, 60000, 500);
   if (!up) throw new Error(`server ${label} did not start (see image-queue-${label}.log)`);
   return srv;
@@ -273,10 +274,12 @@ function engineMemory(pid) {
   await scenario("Default: imageQueue off", async () => {
     const srv = await startServer("default", { USAP_IMAGE_QUEUE: "", USAP_ENGINE_SLOT: "" });
     try {
-      const r = await resources();
-      const q = r.engines && r.engines.image && r.engines.image.queue;
-      const ok = !("imageQueue" in r) && !("imageQueue" in (r.limits || {})) && q && q.known === false;
-      record("Default: imageQueue off", ok ? "PASS" : "FAIL", `imageQueue key ${"imageQueue" in r ? "present" : "absent"}; image queue known ${q && q.known}`);
+      // The same single request (10 s timeout) and the same condition as before; the detail now says what was
+      // observed (timeout, request error, invalid response, missing measurement or state mismatch) (#164 native run).
+      const t0 = Date.now();
+      const res = await call("GET", "/api/resources", undefined, { timeoutMs: 10000 });
+      const seen = classifyDefaultOff(res, Date.now() - t0, { alive: srv.child.exitCode === null && srv.child.signalCode === null, upMs: Date.now() - srv.startedAt });
+      record("Default: imageQueue off", seen.ok ? "PASS" : "FAIL", seen.detail);
       const load = await imageLoad(); await imageReady();
       const g = await generation().done;
       record("Default: a generation answers as before", load.status === 200 && g.status === 200 && g.json && Array.isArray(g.json.images) ? "PASS" : "FAIL", `load ${load.status}, generate ${g.status} in ${g.ms} ms`);
