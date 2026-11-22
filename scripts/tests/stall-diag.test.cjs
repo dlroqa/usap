@@ -34,7 +34,7 @@ test("stall-diag: bounded, numbers-only output; missing records are said, not gu
   assert.equal(describeLostClient(lost([], []), null, [], null), "no server answer recorded");
 });
 
-test("stall-sampler: reports its own gaps, stops when its stdin closes, and its output is bounded", async () => {
+test("stall-sampler: reports its own gaps, stops when its stdin closes, and its output is bounded", { skip: process.platform === "win32" ? "no SIGSTOP on Windows" : false }, async () => {
   const child = spawn(process.execPath, [path.join(__dirname, "fixtures", "stall-sampler.cjs")], { stdio: ["pipe", "pipe", "ignore"] });
   let out = "";
   child.stdout.on("data", (d) => { out += d; });
@@ -49,4 +49,4 @@ test("stall-sampler: reports its own gaps, stops when its stdin closes, and its 
   const res = JSON.parse(out);
   assert.ok(res.samples > 10 && res.gaps.length <= 50, JSON.stringify(res).slice(0, 300));
   assert.ok(res.maxGapMs >= 200, `the 250 ms stop is seen (${res.maxGapMs})`);
-}, { skip: process.platform === "win32" ? "no SIGSTOP on Windows" : false });
+});
