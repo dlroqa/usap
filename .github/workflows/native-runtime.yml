@@ -20,6 +20,8 @@ on:
       - "scripts/ci/runtime-validate.sh"
       - "scripts/ci/chat-queue-validate.cjs"
       - "scripts/ci/observe-json.cjs"
+      - "scripts/ci/resources-timing.cjs"
+      - "scripts/tests/api-contract/resources-timing-preload.cjs"
       - "scripts/ci/chat-timeouts-validate.cjs"
       - "scripts/ci/memory-admission-validate.cjs"
       - "scripts/ci/engine-lifecycle-validate.cjs"

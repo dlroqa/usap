@@ -84,7 +84,8 @@ function call(port, method, p, body, { timeoutMs = 600000 } = {}) {
   });
   return { promise, first, abort: () => req && req.destroy() };
 }
-const getJson = async (port, p) => { const r = await call(port, "GET", p, undefined, { timeoutMs: 10000 }).promise; try { return { status: r.status, json: JSON.parse(r.text) }; } catch (_) { return { status: r.status, json: null }; } };
+const RT = require("./resources-timing.cjs").createResourcesTiming(LOGDIR, "chat-queue"); // #181 diagnostics only (message only)
+const getJson = async (port, p) => { const sentAt = Date.now(); const r = await call(port, "GET", p, undefined, { timeoutMs: 10000 }).promise; if (p === "/api/resources") RT.note(sentAt, r.status); try { return { status: r.status, json: JSON.parse(r.text) }; } catch (_) { return { status: r.status, json: null }; } };
 const { observeJson, describeObservation, runtimeLabel } = require("./observe-json.cjs");
 const serverState = (srv) => ({ alive: srv.child.exitCode === null && srv.child.signalCode === null, code: srv.child.exitCode, signal: srv.child.signalCode, upMs: Date.now() - srv.startedAt });
 const parseJson = (t) => { try { return JSON.parse(t); } catch (_) { return null; } };
@@ -138,7 +139,7 @@ function rssMb(pid) {
 
 async function startServer(label, env) {
   const log = fs.openSync(path.join(LOGDIR, `chat-queue-${label}.log`), "w");
-  const child = spawn(NODE, [SERVE], { cwd: ROOT, env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT), ...env }, stdio: ["ignore", log, log], windowsHide: true });
+  const child = spawn(NODE, [SERVE], { cwd: ROOT, env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT), ...RT.env(label, env) }, stdio: ["ignore", log, log], windowsHide: true });
   const startedAt = Date.now();
   const exited = new Promise((r) => child.once("exit", (code, signal) => r({ code, signal, at: Date.now() })));
   const up = await waitUntil(async () => (await getJson(PORT, "/api/health")).status === 200, 60000, 500);
@@ -153,6 +154,9 @@ async function startServer(label, env) {
   return { label, child, exited, enginePort, enginePids, startedAt };
 }
 async function stopServer(srv) {
+  try { await stopServerOnly(srv); } finally { if (srv) RT.stopped(srv.label); }
+}
+async function stopServerOnly(srv) {
   if (!srv || srv.child.exitCode !== null || srv.child.signalCode !== null) return;
   await call(PORT, "POST", "/api/llm/stop", {}, { timeoutMs: 30000 }).promise;
   srv.child.kill("SIGTERM");
@@ -218,6 +222,7 @@ async function queueOnScenarios(srv) {
   // Same request and 10 s timeout as getJson; the record now says what was observed (status, time, timeout, content
   // type, key names, the expected fields, server state) instead of only the two field values (#163 native run).
   const obs = await observeJson(PORT, "/api/resources", { timeoutMs: 10000 });
+  RT.note(Date.now() - obs.durationMs, obs.status);
   const seen = describeObservation(obs, { "limits.chatQueue": "on", "scheduler.mode": "chat-queue" }, {
     server: () => serverState(srv),
     knownKeys: ["ok", "scheduler", "limits", "engines", "memory", "cpu"],

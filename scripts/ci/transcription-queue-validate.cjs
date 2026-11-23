@@ -153,7 +153,7 @@ async function startServer(label, env) {
   const logPath = path.join(LOGDIR, `transcription-queue-${label}.log`);
   const log = fs.openSync(logPath, "w");
   const child = spawn(NODE, [SERVE], { cwd: ROOT, windowsHide: true, stdio: ["ignore", log, log],
-    env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT), LLM_PORT: String(PORT + 1), BACKEND_PORT: String(PORT + 2), SD_BACKEND_PORT: String(PORT + 2), SPEECH_PORT: String(PORT + 3), TTS_PORT: String(PORT + 4), ...env } });
+    env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT), LLM_PORT: String(PORT + 1), BACKEND_PORT: String(PORT + 2), SD_BACKEND_PORT: String(PORT + 2), SPEECH_PORT: String(PORT + 3), TTS_PORT: String(PORT + 4), ...RT.env(label, env) } });
   const exited = new Promise((r) => child.once("exit", (code, signal) => r({ code, signal })));
   const srv = { label, child, exited, logPath, startsBefore: 0 };
   const up = await waitUntil(async () => (await get("/api/health")).status === 200, 60000, 500);
@@ -162,6 +162,9 @@ async function startServer(label, env) {
   return srv;
 }
 async function stopServer(srv) {
+  try { await stopServerOnly(srv); } finally { if (srv) RT.stopped(srv.label); }
+}
+async function stopServerOnly(srv) {
   if (!srv || srv.child.exitCode !== null || srv.child.signalCode !== null) return;
   srv.child.kill("SIGTERM");
   let timer = null;
@@ -176,7 +179,8 @@ function starts(srv) {
 }
 const threadsOf = (line) => { const m = / -t (\d+)/.exec(line); return m ? Number(m[1]) : null; };
 async function scenario(name, fn) { try { await fn(); } catch (err) { record(name, "FAIL", err.message); } }
-const resources = async () => (await get("/api/resources")).json || {};
+const RT = require("./resources-timing.cjs").createResourcesTiming(LOGDIR, "transcription-queue"); // #181 diagnostics only (message only)
+const resources = async () => { const sentAt = Date.now(); const r = await get("/api/resources"); RT.note(sentAt, r.status); return r.json || {}; };
 const queue = async () => ((await resources()).engines || {}).speech?.queue || {};
 // #131 gate: the server's own counters (uploadConnections { open, limit } and counts.connectionsRefused).
 const GATE_TEXT = /Too many audio uploads are in progress/;

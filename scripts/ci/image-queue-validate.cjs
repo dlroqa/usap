@@ -89,7 +89,8 @@ function generation(body = GEN) {
   req.end(data);
   return { done, abort: () => req.destroy() };
 }
-const resources = async () => (await call("GET", "/api/resources", undefined, { timeoutMs: 10000 })).json || {};
+const RT = require("./resources-timing.cjs").createResourcesTiming(LOGDIR, "image-queue"); // #181 diagnostics only (message only)
+const resources = async () => { const sentAt = Date.now(); const r = await call("GET", "/api/resources", undefined, { timeoutMs: 10000 }); RT.note(sentAt, r.status); return r.json || {}; };
 const queueNow = async () => { const r = await resources(); return { q: (r.engines && r.engines.image && r.engines.image.queue) || {}, iq: r.imageQueue || null, limits: r.limits || {} }; };
 const imageLoad = () => call("POST", "/api/restart-backend", { model: IMAGE, backend_type: "cpu", use_gpu: false, width: 128, height: 128, steps: 2 });
 const imageReady = () => waitUntil(async () => (await call("GET", "/api/backend-status", undefined, { timeoutMs: 10000 })).json.ready === true, 900000, 1000);
@@ -169,7 +170,7 @@ async function startServer(label, env) {
   const log = fs.openSync(logPath, "w");
   const child = spawn(NODE, [SERVE], {
     cwd: ROOT, windowsHide: true, stdio: ["ignore", log, log],
-    env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT), LLM_PORT: String(PORT + 1), BACKEND_PORT: String(PORT + 2), SD_BACKEND_PORT: String(PORT + 2), SPEECH_PORT: String(PORT + 3), ...env },
+    env: { ...process.env, PORT: String(PORT), FRONTEND_PORT: String(PORT), LLM_PORT: String(PORT + 1), BACKEND_PORT: String(PORT + 2), SD_BACKEND_PORT: String(PORT + 2), SPEECH_PORT: String(PORT + 3), ...RT.env(label, env) },
   });
   const exited = new Promise((r) => child.once("exit", (code, signal) => r({ code, signal })));
   const srv = { label, child, exited, logPath, log: () => { try { return fs.readFileSync(logPath, "utf8"); } catch (_) { return ""; } } };
@@ -178,6 +179,9 @@ async function startServer(label, env) {
   return srv;
 }
 async function stopServer(srv) {
+  try { await stopServerOnly(srv); } finally { if (srv) RT.stopped(srv.label); }
+}
+async function stopServerOnly(srv) {
   if (!srv || srv.child.exitCode !== null || srv.child.signalCode !== null) return;
   await call("POST", "/api/stop-backend", {}, { timeoutMs: 30000 });
   srv.child.kill("SIGTERM");
@@ -293,7 +297,9 @@ function engineMemory(pid) {
   await scenario("USAP_SCHEDULER=off rollback", async () => {
     const srv = await startServer("rollback", { ...ON, USAP_SCHEDULER: "off" });
     try {
+      const sentAt = Date.now();
       const r = await call("GET", "/api/resources", undefined, { timeoutMs: 10000 });
+      RT.note(sentAt, r.status);
       const notQueued = !/Image queue on/.test(srv.log());
       record("USAP_SCHEDULER=off rollback", notQueued ? "PASS" : "FAIL", `queue started ${!notQueued}; /api/resources ${r.status} (left out when the scheduler is off)`);
     } finally { await stopServer(srv); }
