@@ -22,6 +22,8 @@ This document began as the plan; the "as built" sections record what was impleme
 `USAP_SCHEDULER=off` turns off every setting above, including the three that are on by default (the observe-only
 accounting, the warn-only memory check and the logical-CPU cap); the 9.9a bug fixes are not settings. Every behaviour
 change still needs the owner's approval, separately for implementation, merge and any default change. Part of [STEP9_BACKEND_PLAN.md](STEP9_BACKEND_PLAN.md).
+Before any of these features is proposed for activation, it goes through Step 9.9g, reliability stabilization and
+activation readiness ([STEP9_9G_STABILIZATION.md](STEP9_9G_STABILIZATION.md)); readiness does not turn anything on.
 
 Goal: one studio on one computer should stay responsive and never run out of memory because of what it starts
 itself. The studio stays a single local process that works offline. Single-user use doesn't change unless a limit is
