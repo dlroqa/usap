@@ -37,7 +37,10 @@ if (file && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
   // snapshot() timing, attributed to the request whose handler called it (AsyncLocalStorage, entered in the
   // request listener below, which runs before the server's own handler).
   const als = new AsyncLocalStorage();
-  const schedulerFile = path.join(path.dirname(process.argv[1]), "services", "scheduler.cjs");
+  // Compared by real path: Node resolves modules through symlinks (macOS temp folders are under /var -> /private/var)
+  // while argv[1] keeps the path it was given.
+  const real = (f) => { try { return fs.realpathSync(f); } catch (_) { return f; } };
+  const schedulerFile = real(path.join(path.dirname(process.argv[1]), "services", "scheduler.cjs"));
   const load = Module._load;
   let patched = false;
   Module._load = function (request, parent, ...rest) {
@@ -45,7 +48,7 @@ if (file && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
     if (!patched && exp && typeof exp.createScheduler === "function") {
       let resolved = null;
       try { resolved = Module._resolveFilename(request, parent); } catch (_) { /* not a file */ }
-      if (resolved === schedulerFile) {
+      if (resolved && real(resolved) === schedulerFile) {
         patched = true;
         const create = exp.createScheduler;
         exp.createScheduler = function (...a) {
