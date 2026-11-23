@@ -577,8 +577,11 @@ test("crash during load (slot on): an image engine that fails to load releases t
   });
 });
 
-test("R1b (slot on): with an image engine loaded, a text load gets 409 and the image engine keeps running; a settings change still works", async () => {
-  await withServer(SLOT_ON, async (srv) => {
+test("R1b (slot on): with an image engine loaded, a text load gets 409 and the image engine keeps running; a settings change still works", async (tc) => {
+  // #170 diagnostics only: the server's port checks are recorded (api-contract/port-check-preload.cjs, record-only), so
+  // a failed replacement can be described from the records; the assertions below are unchanged.
+  const pc = portCheckServerEnv();
+  await withServer(pc.env, async (srv) => {
     assert.equal((await imageLoad(srv)).status, 200);
     await imageReady(srv, 20000, "image ready");
     const before = await engines(srv);
@@ -590,9 +593,11 @@ test("R1b (slot on): with an image engine loaded, a text load gets 409 and the i
     assert.equal(gen.status, 200);
     await waitFor(async () => (await request(srv.port, "GET", "/api/generation-progress")).json.active === false, 5000, "generation done");
     const done = sampler(srv);
+    const t0 = Date.now();
     const r = await imageLoad(srv, "sd1-img-q4_0.gguf", { steps: 6 });
     assert.equal(r.status, 200, r.text);
-    await imageReady(srv, 20000, "image ready again");
+    try { await imageReady(srv, 20000, "image ready again"); }
+    catch (err) { await describeReplacement(tc, srv, { t0, file: pc.file, oldPid: before[0].pid, stopSampler: done }); throw err; }
     const seen = await done();
     assert.ok(seen.maxImage <= 1);
     const after = await engines(srv);
@@ -849,6 +854,18 @@ function portCheckServerEnv() {
 }
 const portChecks = (file, since = 0) => { try { return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((c) => c.t >= since); } catch (_) { return []; } };
 const inBackupRange = (port) => port >= FALLBACK_FIRST && port <= FALLBACK_LAST;
+// #170 diagnostics only: one bounded line describing an image-engine replacement (fixtures/port-diag.cjs), printed
+// before the test's own error is rethrown. Never throws and never changes a verdict.
+const { describeImageReplacement } = require("./fixtures/port-diag.cjs");
+async function describeReplacement(tc, srv, { t0, file, oldPid, stopSampler }) {
+  let line;
+  try {
+    const seen = stopSampler ? await stopSampler() : null;
+    let slot = null; try { slot = await slotState(srv); } catch (_) {}
+    line = describeImageReplacement({ t0, port: srv.sdPort, oldPid, checks: portChecks(file), diag: fakeSdDiag(root), oldAlive: oldPid ? alive(oldPid) : null, maxImage: seen ? seen.maxImage : null, slot });
+  } catch (_) { line = "description failed"; }
+  tc.diagnostic(`#170 image replacement: ${line}`);
+}
 // The fake's load progress line marks a generation as active until one runs (as in R1b): run one, so a settings
 // change (which replaces the engine) is accepted.
 async function settleGeneration(srv) {
