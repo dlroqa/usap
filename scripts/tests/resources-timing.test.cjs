@@ -89,7 +89,9 @@ test("control: a server paused while a request waits shows the late receipt and 
     assert.ok(r.receivedAt - a.sentAt >= 1000, `received late: ${r.receivedAt - a.sentAt} ms`);
     assert.ok(r.loop.gaps.some(([, ms]) => ms >= 1000), `a gap >= 1000 ms: ${JSON.stringify(r.loop.gaps)}`);
     assert.ok(r.loop.delayMaxMs >= 1000);
-    assert.match(describeSlow(recs), /2 recorded, 1 slow, unanswered or with a loop gap >= 1000 ms/);
+    // The first request was answered before the pause, but its socket's close may only be handled after it (its
+    // window then includes the gap too): one or two of the two are listed.
+    assert.match(describeSlow(recs), /2 recorded, [12] slow, unanswered or with a loop gap >= 1000 ms/);
   } finally { await stopServerAndWait(srv); }
 });
 
@@ -111,6 +113,7 @@ test("reader: missing, unloaded and unreadable records are said, never filled in
     const env = rt.env("on", { NODE_OPTIONS: "--max-old-space-size=64", A: "1" });
     assert.equal(env.A, "1");
     assert.match(env.NODE_OPTIONS, /^--max-old-space-size=64 --require ".*resources-timing-preload\.cjs"$/, "the caller's NODE_OPTIONS are kept");
+    assert.equal(env.USAP_TEST_GPU_PROBE_TIMING, "1", "the validators' test servers opt in to the GPU-probe measurement");
     rt.note(T, 200, T + 40);
     rt.note(T, 404, T + 2);
     assert.equal(lines.length, 0, "a prompt answer of any status prints nothing (404: the route is left out with the scheduler off)");
