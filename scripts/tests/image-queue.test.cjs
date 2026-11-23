@@ -406,6 +406,7 @@ test("queue: with the Core ML backend (apple-npu) requests pass through to today
 // ── Part 3: the real server with the fake sd-server ──────────────────────────────────────────────────────────────
 const { makeRoot, startServer, stopServer, request, installFakeSdServer, fakeSdDiag } = require("./api-contract/harness.cjs");
 const { describeRollbackFailures } = require("./fixtures/rollback-diag.cjs");
+const { describeQueueOnObservation } = require("./fixtures/queue-on-diag.cjs");
 function writeModel(dir, name) {
   const kv = (key, type, val) => {
     const k = Buffer.from(key); const head = Buffer.alloc(8 + k.length + 4); head.writeBigUInt64LE(BigInt(k.length)); k.copy(head, 8); head.writeUInt32LE(type, 8 + k.length);
@@ -492,16 +493,45 @@ test("server: USAP_SCHEDULER=off forces the queue off even with engineSlot and i
   });
 });
 
-test("server: on (with engineSlot) — one at a time, FIFO, 429 past the limit, reported in /api/resources; restart 409 while forwarded; stop refuses waiting", async () => {
+test("server: on (with engineSlot) — one at a time, FIFO, 429 past the limit, reported in /api/resources; restart 409 while forwarded; stop refuses waiting", async (t) => {
   await withServer({ USAP_ENGINE_SLOT: "on", USAP_IMAGE_QUEUE: "on" }, async (srv) => {
     assert.match(srv.log(), /Image queue on: 1 running, 2 waiting at most/);
     // Not ready yet: refused before any body byte.
     const early = await txt2img(srv.port, "too early");
     assert.equal(early.status, 503); assert.equal(early.json.code, "ENGINE_NOT_READY"); assert.match(early.json.detail, /^Generation failed: /);
     await load(srv);
-    const ps = [0, 1, 2].map(async (i) => { await sleep(i * 150); return txt2img(srv.port, `p${i}`); });
+    // #179 diagnostics (record only): send/answer times, queue and engine counts sampled while waiting, engine
+    // lifecycle. The requests, the 700 ms wait and the observation are as before; the line is printed only when the
+    // observation is not 1 running / 2 waiting, before the unchanged assertions. Never throws.
+    const t0 = Date.now(), sent = [], results = [];
+    let enginePort = null;
+    try { enginePort = (await request(srv.port, "GET", "/api/backend-status")).json.port; } catch (_) { /* record only */ }
+    const ps = [0, 1, 2].map(async (i) => { await sleep(i * 150); sent[i] = Date.now(); const r = await txt2img(srv.port, `p${i}`); r.doneAt = Date.now(); results[i] = r; return r; });
+    const samples = [];
+    let sampling = true;
+    const sampler = (async () => {
+      while (sampling && samples.length < 12) {
+        const s = { t: Date.now() };
+        try { const q = (await resources(srv)).engines.image.queue; s.running = q.running; s.waiting = q.waiting; s.known = q.known; } catch (_) { /* record only */ }
+        try { if (enginePort) { const st = (await request(enginePort, "GET", "/fake/stats")).json; s.engineRequests = st.requests; s.engineCompleted = st.completed; s.engineAborted = st.aborted; } } catch (_) { /* record only */ }
+        samples.push(s);
+        await sleep(150);
+      }
+    })();
     await sleep(700);
     const rs = await resources(srv);
+    const observedAt = Date.now();
+    sampling = false;
+    await sampler;
+    const oq = rs && rs.engines && rs.engines.image && rs.engines.image.queue;
+    if (!oq || oq.running !== 1 || oq.waiting !== 2) {
+      let line;
+      try {
+        await Promise.race([Promise.all(ps), sleep(15000)]);
+        line = describeQueueOnObservation({ t0, sent, results: results.slice(), observedAt, rs, samples, diag: fakeSdDiag(srv.root), log: srv.log() });
+      } catch (_) { line = "description failed"; }
+      t.diagnostic(`#179 queue-on observation: ${line}`);
+    }
     assert.equal(rs.limits.imageQueue, "on");
     assert.deepEqual({ ...rs.engines.image.queue, runningSeconds: 0 }, { running: 1, waiting: 2, limit: 2, known: true, abandoned: false, runningSeconds: 0, inactive: null });
     const full = await txt2img(srv.port, "p3");
