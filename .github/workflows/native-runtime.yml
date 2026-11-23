@@ -27,6 +27,7 @@ on:
       - "scripts/ci/transcription-queue-validate.cjs"
       - "scripts/ci/image-queue-validate.cjs"
       - "scripts/ci/image-queue-memprobe.cjs"
+      - "scripts/ci/memprobe-gc.cjs"
       - "scripts/ci/p4-token-check.cjs"
       - "scripts/ci/p4-fixed-document-id.cjs"
       - "scripts/ci/memory-check-report.cjs"
