@@ -18,6 +18,7 @@ const { createRouter } = require("../server/http/router.cjs");
 const { createRequestPolicy } = require("../server/request-policy.cjs");
 const { createLanAuth, MAX_FAILURES } = require("../server/lan-auth.cjs");
 const { describeFailClosed } = require("./fixtures/failclosed-diag.cjs");
+const { describeArrivals } = require("./fixtures/arrival-diag.cjs"); // request-arrival evidence only
 const { closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, WATCH_BYTES, WATCH_MS, lingeringCount, resumedCount, closedReadingCount } = require("../server/http/refusal-close.cjs");
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
 const { rawRequest } = require("./fixtures/refusal-clients.cjs");
@@ -61,11 +62,12 @@ async function startPipelineServerIn(dir, auth) {
   const bySocket = new WeakMap();
   const server = http.createServer((req, res) => {
     const c = bySocket.get(req.socket);
+    if (c && c.requestAt == null) c.requestAt = Date.now(); // the request head arrived and was parsed (evidence only)
     if (c) res.once("finish", () => { c.status = res.statusCode; c.answeredAt = Date.now(); });
     return pipeline(req, res);
   });
   server.on("connection", (s) => {
-    const c = { s, bytesRead: 0, remotePort: s.remotePort, acceptedAt: Date.now(), status: null, answeredAt: null, closedAt: null, peerEnded: false, peerError: null };
+    const c = { s, bytesRead: 0, remotePort: s.remotePort, acceptedAt: Date.now(), requestAt: null, status: null, answeredAt: null, closedAt: null, peerEnded: false, peerError: null };
     conns.add(c); bySocket.set(s, c);
     // whether the client ended or reset the connection first (then an early close is the client's, not the server's)
     s.on("end", () => { c.peerEnded = true; }); s.on("error", (e) => { c.peerError = c.peerError || e.code || e.message; });
@@ -430,13 +432,18 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
     // the server.
     // Timing is therefore asserted on the server's side; the client process's own timing is only diagnostic.
     const opts = { headers: "Origin: http://evil.example\r\n", capBytes: 8 * MiB, maxMs: GRACE_MS + 10000 };
+    // Request-arrival evidence (fixtures/arrival-diag.cjs, messages only): this (server) process's own 10 ms ticks.
+    const serverTicks = []; const serverTick = setInterval(() => { if (serverTicks.length < 3000) serverTicks.push(Date.now()); }, 10); serverTick.unref();
     const { clients: all, ticks } = await new Promise((resolve, reject) => {
       execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify({ port: srv.port, n: 20, opts })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
         (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
     });
     assert.equal(await noneLingering(), 0);
+    clearInterval(serverTick);
     const conns = [...srv.conns];
     const record = () => JSON.stringify({ server: conns.map(({ s, ...c }) => ({ ...c, answeredMs: c.answeredAt - c.acceptedAt, keptMs: c.closedAt - c.answeredAt })), clients: all });
+    let arrivals; try { arrivals = describeArrivals(conns, serverTicks, ANSWER_MS); } catch (_) { arrivals = "description failed"; }
+    t.diagnostic(`request arrival evidence: ${arrivals}`);
     assert.equal(all.length, 20);
     // The server: 20 connections, each refused with 403 promptly, closed within the grace period, nothing routed.
     assert.equal(conns.length, 20, `server saw ${conns.length} connections`);
