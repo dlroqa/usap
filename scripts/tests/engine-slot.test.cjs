@@ -30,6 +30,7 @@ async function waitFor(fn, ms = 20000, label = "condition") {
     await sleep(50);
   }
 }
+const { describeLegacyR1 } = require("./fixtures/r1-legacy-diag.cjs"); // default-off R1 diagnostics only
 const WEBUI_TEXT_BLOCK = /already loaded as a text model/i; // app/frontend/src/components/Generator.jsx
 
 // ── Unit: setting ────────────────────────────────────────────────────────────
@@ -1039,22 +1040,42 @@ test("server shutdown (slot on): SIGTERM to the server stops its engines", { ski
 
 // An empty value means "not set" (the default), even when the test run itself exports USAP_ENGINE_SLOT=on.
 const DEFAULT = { USAP_ENGINE_SLOT: "" };
-test("default off: no engineSlot report, and the earlier behaviour is kept (R3 still answers 500; R1 can still overlap)", async () => {
+test("default off: no engineSlot report, and the earlier behaviour is kept (R3 still answers 500; R1 can still overlap)", async (tc) => {
   await withServer(DEFAULT, async (srv) => {
     const r = await resources(srv);
     assert.equal("engineSlot" in r, false);
     assert.equal("engineSlot" in r.limits, false);
     // R1, the known race, unchanged with the slot off: both loads succeed and both engines are resident.
+    // Default-off R1 diagnostics (fixtures/r1-legacy-diag.cjs, messages only): send and answer times, and after the
+    // wait the live engines, the supervisor's tracked processes and recent exits, both engines' status, the fake image
+    // engine's records and the server's engine lines, printed in every run before the unchanged assertions.
     const free = await holdTextPort(srv);
-    const pText = textLoad(srv, "plain.gguf");
+    const t0 = Date.now();
+    const pText = textLoad(srv, "plain.gguf").then((r) => { r.doneAt = Date.now(); return r; });
     await sleep(100);
+    const imageSentAt = Date.now();
     const img = await imageLoad(srv);
+    const imageDoneAt = Date.now();
     const txt = await pText;
     await free();
+    const d1 = { t0, text: { sentAt: t0, doneAt: txt.doneAt, status: txt.status, code: txt.json && txt.json.code }, image: { sentAt: imageSentAt, doneAt: imageDoneAt, status: img.status, code: img.json && img.json.code } };
     assert.equal(img.status, 200);
     assert.equal(txt.status, 200);
     await sleep(500);
-    assert.deepEqual((await engines(srv)).map((e) => e.label).sort(), ["image", "llm"], "legacy overlap (no exclusivity guarantee when off)");
+    const live = await engines(srv);
+    {
+      const safe = async (fn) => { try { return await fn(); } catch (_) { return null; } };
+      const observedAt = Date.now();
+      const dg = await safe(async () => (await request(srv.port, "GET", "/api/diagnostics")).json);
+      const pr = dg && dg.engines && dg.engines.processes;
+      let line;
+      try {
+        line = describeLegacyR1({ ...d1, observedAt, engines: live, supervised: pr && pr.supervised, recentExits: pr && pr.recentExits,
+          backend: await safe(() => backendStatus(srv)), llm: await safe(() => llmStatus(srv)), diag: fakeSdDiag(root), log: srv.log() });
+      } catch (_) { line = "description failed"; }
+      tc.diagnostic(`default-off R1 observation: ${line}`);
+    }
+    assert.deepEqual(live.map((e) => e.label).sort(), ["image", "llm"], "legacy overlap (no exclusivity guarantee when off)");
   });
   await withServer(DEFAULT, async (srv) => {
     assert.equal((await imageLoad(srv)).status, 200);
