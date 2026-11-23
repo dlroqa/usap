@@ -131,9 +131,9 @@ test("a declared body over the 64 MiB limit is refused with today's 413 before i
 // period, and the closing reset discarded an answer it never read). The server is judged from its own records; the
 // client must have read the answer unless fixtures/refusal-judge.cjs shows it did not run (documented reset tradeoff).
 const ANSWER_BODY = /"error":"Request body is too large\. Limit is 64 MB\.","code":"BODY_TOO_LARGE"/;
-function concurrentClients(port, n, opts) {
+function concurrentClients(port, n, opts, cpuDiag = false) {
   return new Promise((resolve, reject) => {
-    execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify({ port, n, opts })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
+    execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify(cpuDiag ? { port, n, opts, cpuDiag } : { port, n, opts })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
       (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
   });
 }
@@ -171,7 +171,9 @@ function assertServerRefusal(rec, st, label) {
 test("concurrent over-limit declarations are each refused early; the server's total read stays bounded", async (t) => {
   await withServer(async ({ port, records }) => {
     const sampler = startSampler(); // #151 diagnostics only
-    const { clients, ticks } = await concurrentClients(port, 10, { url: URL, mode: "stream", contentLength: 100 * MiB, ignoreFin: true, capBytes: 96 * MiB, maxMs: GRACE_MS + 10000 });
+    // cpuDiag (#151 diagnostics only): the client process also records its CPU time, context switches and bytes sent
+    // at each tick, and runs a watchdog thread; `proc` is used only in the description below
+    const { clients, ticks, proc } = await concurrentClients(port, 10, { url: URL, mode: "stream", contentLength: 100 * MiB, ignoreFin: true, capBytes: 96 * MiB, maxMs: GRACE_MS + 10000 }, true);
     const until = Date.now() + GRACE_MS + SLACK_MS;
     while (records().length < clients.length && Date.now() < until) await sleep(50);
     const recs = records();
@@ -179,7 +181,7 @@ test("concurrent over-limit declarations are each refused early; the server's to
     const samples = await sampler.stop();
     for (const [i, st] of clients.entries()) {
       if (st.status !== null) continue;
-      let d; try { d = describeLostClient(st, recs.find((x) => x.remotePort === st.localPort), ticks, samples); } catch (_) { d = "description failed"; }
+      let d; try { d = describeLostClient(st, recs.find((x) => x.remotePort === st.localPort), ticks, samples, proc || null, i); } catch (_) { d = "description failed"; }
       t.diagnostic(`#151 lost answer, client ${i}: ${d}`);
     }
     let total = 0, stalled = 0;
