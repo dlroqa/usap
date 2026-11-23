@@ -17,6 +17,7 @@ const { makeRoot, startServer, stopServer, request, IS_WIN, fakeLlamaPath } = re
 const { transcriptionQueueSetting, createStorageLedger, prepareUploadDir, createTranscriptionQueue } = require("../server/services/transcription-queue.cjs");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const { describeDeadline } = require("./fixtures/deadline-diag.cjs"); // absolute-deadline evidence only
 async function waitFor(fn, ms = 10000, label = "condition") {
   const end = Date.now() + ms;
   for (;;) { const v = await fn(); if (v) return v; if (Date.now() > end) throw new Error(`timed out waiting for ${label}`); await sleep(25); }
@@ -476,14 +477,20 @@ async function withService(opts, fn) {
   const json = (res, status, body) => { res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(body)); };
   // The service's own timers, counted so a test can check that every one was cleared or fired (exactly-once settling).
   const pending = new Set();
-  const setTimer = (f, ms) => { const t = setTimeout(() => { pending.delete(t); f(); }, ms); pending.add(t); return t; };
-  const clearTimer = (t) => { pending.delete(t); clearTimeout(t); };
+  // Each timer is also recorded (armed, due, fired or cleared) for the absolute-deadline evidence line; records only.
+  const timerLog = [];
+  const setTimer = (f, ms) => {
+    const rec = { setAt: Date.now(), ms, dueAt: Date.now() + ms, firedAt: null, clearedAt: null };
+    if (timerLog.length < 200) timerLog.push(rec);
+    const t = setTimeout(() => { rec.firedAt = Date.now(); pending.delete(t); f(); }, ms); t.__rec = rec; pending.add(t); return t;
+  };
+  const clearTimer = (t) => { if (t && t.__rec && t.__rec.firedAt === null && t.__rec.clearedAt === null) t.__rec.clearedAt = Date.now(); pending.delete(t); clearTimeout(t); };
   const q = createTranscriptionQueue({ setting, dir, speech, json, statfs: opts.statfs, maxUploadBytes: opts.maxUploadBytes, setTimer, clearTimer });
   const srv = http.createServer((req, res) => q.handle(req, res, {}));
   const conns = []; // server side, per connection: body+header bytes read and when the server saw it close
   srv.on("connection", (sock) => { const c = { t0: Date.now(), bytesRead: 0, closedMs: null }; conns.push(c); sock.on("close", () => { c.bytesRead = sock.bytesRead; c.closedMs = Date.now() - c.t0; }); });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-  try { return await fn({ port: srv.address().port, q, dir, runs, conns, pendingTimers: () => pending.size, releaseHold: () => holdResolve && holdResolve() }); }
+  try { return await fn({ timerLog, port: srv.address().port, q, dir, runs, conns, pendingTimers: () => pending.size, releaseHold: () => holdResolve && holdResolve() }); }
   finally { srv.closeAllConnections(); srv.close(); for (const t of pending) clearTimeout(t); fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -510,7 +517,7 @@ function rawUpload(port, { claim = null, chunked = claim === null, steps = [], t
       const bodyText = cut >= 0 ? text.slice(cut + 4) : "";
       let json = null; try { json = JSON.parse(bodyText); } catch (_) { /* incomplete */ }
       const complete = m && len && Buffer.byteLength(bodyText, "latin1") >= Number(len[1]);
-      resolve({ status: complete ? Number(m[1]) : 0, json, closedMs: Date.now() - t0, answerMs, sent, error });
+      resolve({ status: complete ? Number(m[1]) : 0, json, closedMs: Date.now() - t0, answerMs, sent, error, t0 });
     });
     sock.on("connect", async () => {
       const head = ["POST /api/speech/transcribe HTTP/1.1", "Host: 127.0.0.1", "Content-Type: audio/wav", claim === null ? "Transfer-Encoding: chunked" : `Content-Length: ${claim}`];
@@ -592,13 +599,23 @@ test("service: bytes count once per request: a refusal after part of the upload 
   });
 });
 
-test("service: one absolute deadline from arrival covers the upload and any discarding after a refusal", async () => {
+test("service: one absolute deadline from arrival covers the upload and any discarding after a refusal", async (t) => {
   await withService({ setting: { uploadIdleMs: 1500, uploadMaxMs: 2000 } }, async (s) => {
+    // Evidence (messages only, fixtures/deadline-diag.cjs): this process's 10 ms ticks and the service's timers.
+    const ticks = []; const tick = setInterval(() => { if (ticks.length < 2000) ticks.push(Date.now()); }, 10);
     // "RIFF" + 2 bytes, 1 s later 6 bytes that aren't "WAVE": refused at about 1 s; then 1 byte every 200 ms.
-    const r = await rawUpload(s.port, { steps: [{ data: Buffer.from("RIFF\0\0") }, { waitMs: 1000 }, { data: Buffer.from("\0\0NOPE") }], tail: "drip" });
+    let r;
+    try { r = await rawUpload(s.port, { steps: [{ data: Buffer.from("RIFF\0\0") }, { waitMs: 1000 }, { data: Buffer.from("\0\0NOPE") }], tail: "drip" }); } finally { clearInterval(tick); }
     assert.equal(r.status, 500);
     assert.equal(r.json.error, "Speech transcription currently accepts WAV audio only.");
     await assertSettled(s);
+    let line;
+    try {
+      const c = s.conns[0];
+      line = describeDeadline({ arrival: c.t0, closeAt: c.closedMs == null ? null : c.t0 + c.closedMs, answerAt: r.answerMs == null ? null : r.t0 + r.answerMs,
+        timers: s.timerLog, ticks, deadlineMs: 2000, boundMs: 2700 });
+    } catch (_) { line = "description failed"; }
+    t.diagnostic(`absolute deadline evidence: ${line}`);
     assert.ok(s.conns[0].closedMs < 2700, `closed ${s.conns[0].closedMs} ms after arrival (deadline 2000 ms from arrival, not from the refusal)`);
     assert.deepEqual(s.runs, []);
   });
