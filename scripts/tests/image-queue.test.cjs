@@ -404,7 +404,8 @@ test("queue: with the Core ML backend (apple-npu) requests pass through to today
 });
 
 // ── Part 3: the real server with the fake sd-server ──────────────────────────────────────────────────────────────
-const { makeRoot, startServer, stopServer, request, installFakeSdServer } = require("./api-contract/harness.cjs");
+const { makeRoot, startServer, stopServer, request, installFakeSdServer, fakeSdDiag } = require("./api-contract/harness.cjs");
+const { describeRollbackFailures } = require("./fixtures/rollback-diag.cjs");
 function writeModel(dir, name) {
   const kv = (key, type, val) => {
     const k = Buffer.from(key); const head = Buffer.alloc(8 + k.length + 4); head.writeBigUInt64LE(BigInt(k.length)); k.copy(head, 8); head.writeUInt32LE(type, 8 + k.length);
@@ -470,11 +471,23 @@ test("server: imageQueue on without engineSlot is refused at start with a clear 
   });
 });
 
-test("server: USAP_SCHEDULER=off forces the queue off even with engineSlot and imageQueue on (rollback)", async () => {
+test("server: USAP_SCHEDULER=off forces the queue off even with engineSlot and imageQueue on (rollback)", async (t) => {
   await withServer({ USAP_ENGINE_SLOT: "on", USAP_IMAGE_QUEUE: "on", USAP_SCHEDULER: "off" }, async (srv) => {
     assert.doesNotMatch(srv.log(), /Image queue on/);
     await load(srv);
+    const t0 = Date.now();
     const all = await Promise.all([0, 1, 2, 3].map((i) => txt2img(srv.port, `p${i}`)));
+    // Diagnostics only (a Windows run once answered one of these 502): printed before, and independent of, the
+    // unchanged assertions below. Never throws.
+    if (all.some((r) => r.status !== 200)) {
+      let line;
+      try {
+        let stats = null;
+        try { const port = (await request(srv.port, "GET", "/api/backend-status")).json.port; stats = (await request(port, "GET", "/fake/stats")).json; } catch (_) {}
+        line = describeRollbackFailures(all, { t0, diag: fakeSdDiag(srv.root), stats, log: srv.log() });
+      } catch (_) { line = "description failed"; }
+      t.diagnostic(`rollback generations: ${line}`);
+    }
     for (const r of all) assert.equal(r.status, 200);
   });
 });
