@@ -17,6 +17,7 @@ const { createPipeline } = require("../server/http/pipeline.cjs");
 const { createRouter } = require("../server/http/router.cjs");
 const { createRequestPolicy } = require("../server/request-policy.cjs");
 const { createLanAuth, MAX_FAILURES } = require("../server/lan-auth.cjs");
+const { describeFailClosed } = require("./fixtures/failclosed-diag.cjs");
 const { closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, WATCH_BYTES, WATCH_MS, lingeringCount, resumedCount, closedReadingCount } = require("../server/http/refusal-close.cjs");
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
 const { rawRequest } = require("./fixtures/refusal-clients.cjs");
@@ -203,7 +204,7 @@ test("node: after an answer that leaves the body unread, Node resumes reading a 
   assert.ok(rec.closedAt - rec.answeredAt >= GRACE_MS - 200, `the grace period was kept (${rec.closedAt - rec.answeredAt} ms)`);
 });
 
-test("helper fails closed: a socket that still reads during its grace period (a runtime where it cannot be stopped) is closed well before its grace period ends", async () => {
+test("helper fails closed: a socket that still reads during its grace period (a runtime where it cannot be stopped) is closed well before its grace period ends", async (t) => {
   // Simulates a runtime on which the helper never sees Node resume the socket: the test (only) removes the helper's
   // 'resume' listener as soon as the answer is written, so Node's discard mode reads the body as before the fix.
   const failsafe0 = closedReadingCount();
@@ -211,12 +212,24 @@ test("helper fails closed: a socket that still reads during its grace period (a 
   // process not running, from the server closing before the client read, or from the client's own writes. Ticks of
   // this process every 10 ms and both sides' timestamps go into the failure messages; no assertion or bound changes.
   const ticks = []; const tick = setInterval(() => { if (ticks.length < 3000) ticks.push(Date.now()); }, 10);
+  // #151 timer diagnostics (messages only): when the socket was destroyed and by what, relative to the answer, and how
+  // many other sockets were in their grace period (the helper's one shared 100 ms check timer then already runs at an
+  // arbitrary phase). The destroy wrapper only records, then calls the original destroy.
+  const tm = { lingeringBefore: lingeringCount(), lingeringAtAnswer: null, destroyAt: null, destroyRead: null, closedReadingBefore: failsafe0, closedReadingAtDestroy: null };
   let flood;
   try {
-    flood = await floodRefusal((s, res) => res.once("finish", () => {
-      const helperListener = s.listeners("resume").at(-1); // added last, by the helper's grace period
-      if (helperListener) s.removeListener("resume", helperListener);
-    }));
+    flood = await floodRefusal((s, res) => {
+      const destroy = s.destroy;
+      s.destroy = function (...args) {
+        if (tm.destroyAt === null) { tm.destroyAt = Date.now(); tm.destroyRead = s.bytesRead; tm.closedReadingAtDestroy = closedReadingCount(); }
+        return destroy.apply(this, args);
+      };
+      res.once("finish", () => {
+        tm.lingeringAtAnswer = lingeringCount() - (s.__usapLingering ? 1 : 0);
+        const helperListener = s.listeners("resume").at(-1); // added last, by the helper's grace period
+        if (helperListener) s.removeListener("resume", helperListener);
+      });
+    });
   } finally { clearInterval(tick); }
   const { st, rec } = flood;
   const timeline = () => {
@@ -230,6 +243,8 @@ test("helper fails closed: a socket that still reads during its grace period (a 
       + `drains in [answer, close] ${(st.drainsAt || []).filter((t) => t >= a && t <= (rec.closedAt || a)).length}, sent ${st.sent} B; `
       + `process ticks near the close ${near.length ? `${near[0]}..${near[near.length - 1]} (${near.length})` : "none"}, gaps >= 100 ms ${gaps.slice(0, 5).join(",") || "none"}]`;
   };
+  let fc; try { fc = describeFailClosed(tm, rec, st, { watchMs: WATCH_MS, watchBytes: WATCH_BYTES }); } catch (_) { fc = "description failed"; }
+  t.diagnostic(`#151 fail-closed timing: ${fc}`); // printed in every run, so passing runs show how early checks come too
   assert.equal(st.status, 403, `answer (client error ${st.error})${timeline()}`);
   assert.equal(closedReadingCount(), failsafe0 + 1, `the fail-closed check closed the socket${timeline()}`);
   // closed within a few checks (WATCH_MS) instead of being read for the whole grace period
