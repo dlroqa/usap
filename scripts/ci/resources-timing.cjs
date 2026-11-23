@@ -3,7 +3,7 @@
 // the test-only preload scripts/tests/api-contract/resources-timing-preload.cjs, which writes the server's own times
 // for every GET /api/resources (connection accepted, request received, handler entry = scheduler.snapshot() start,
 // snapshot done, res.end, finish, socket close) and its event-loop gaps and delay to a per-server file in the logs
-// folder. When one of the validator's own /api/resources requests fails or takes >= SLOW_MS, the validator prints one
+// folder. When one of the validator's own /api/resources requests gets no answer or takes >= SLOW_MS, the validator prints one
 // bounded line describing what the server recorded for it; when the server is stopped, it prints the same for any
 // recorded request that was slow or never answered. Numbers and fixed words only. The validators' requests, client
 // timeouts and verdicts are unchanged: no retry, no longer timeout, and a missing record is said as missing.
@@ -71,10 +71,13 @@ function createResourcesTiming(logDir, prefix, print = (s) => console.log(s)) {
       const base = env.NODE_OPTIONS !== undefined ? env.NODE_OPTIONS : (process.env.NODE_OPTIONS || "");
       return { ...env, USAP_TEST_RESOURCES_TIMING: file, NODE_OPTIONS: `${base} --require "${PRELOAD.replace(/\\/g, "/")}"`.trim() };
     },
-    // After one of the validator's own GET /api/resources: prints only if it failed or was slow.
+    // After one of the validator's own GET /api/resources: prints only if no answer came (status 0 or none) or the
+    // request took >= SLOW_MS. A prompt answer of any status is not #181's subject (with USAP_SCHEDULER=off the route
+    // is left out and answers 404 at once, as before).
     note(sentAt, status, endedAt = Date.now()) {
-      if (status === 200 && endedAt - sentAt < SLOW_MS) return;
-      print(`#181 /api/resources timing (${status === 200 ? `HTTP 200 after ${endedAt - sentAt} ms` : `status ${Number.isFinite(status) ? status : "none"} after ${endedAt - sentAt} ms`}): ${safe(() => describeRequest(readRecords(file), sentAt, endedAt)).slice(0, 2400)}`);
+      const answered = Number.isFinite(status) && status > 0;
+      if (answered && endedAt - sentAt < SLOW_MS) return;
+      print(`#181 /api/resources timing (${answered ? `HTTP ${status} after ${endedAt - sentAt} ms` : `no answer (status ${Number.isFinite(status) ? status : "none"}) after ${endedAt - sentAt} ms`}): ${safe(() => describeRequest(readRecords(file), sentAt, endedAt)).slice(0, 2400)}`);
     },
     // After the server has exited (every record flushed).
     stopped(label) {

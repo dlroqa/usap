@@ -112,9 +112,10 @@ test("reader: missing, unloaded and unreadable records are said, never filled in
     assert.equal(env.A, "1");
     assert.match(env.NODE_OPTIONS, /^--max-old-space-size=64 --require ".*resources-timing-preload\.cjs"$/, "the caller's NODE_OPTIONS are kept");
     rt.note(T, 200, T + 40);
-    assert.equal(lines.length, 0, "a quick 200 prints nothing");
+    rt.note(T, 404, T + 2);
+    assert.equal(lines.length, 0, "a prompt answer of any status prints nothing (404: the route is left out with the scheduler off)");
     rt.note(T, 0, T + 10006);
-    assert.match(lines[0], /^#181 \/api\/resources timing \(status 0 after 10006 ms\): timing file unreadable$/);
+    assert.match(lines[0], /^#181 \/api\/resources timing \(no answer \(status 0\) after 10006 ms\): timing file unreadable$/);
     fs.writeFileSync(env.USAP_TEST_RESOURCES_TIMING, `${JSON.stringify({ e: "loaded", at: 1 })}\nnot json\n`);
     rt.note(T, 200, T + 2500);
     assert.match(lines[1], /HTTP 200 after 2500 ms\): times in ms from the client's send; no \/api\/resources record/);
