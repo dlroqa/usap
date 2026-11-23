@@ -30,6 +30,7 @@ async function waitFor(fn, ms = 20000, label = "condition") {
     await sleep(50);
   }
 }
+const { describeLegacyR3, imageRuntimeActive } = require("./fixtures/r3-legacy-diag.cjs"); // #175 diagnostics only
 const WEBUI_TEXT_BLOCK = /already loaded as a text model/i; // app/frontend/src/components/Generator.jsx
 
 // ── Unit: setting ────────────────────────────────────────────────────────────
@@ -1039,7 +1040,7 @@ test("server shutdown (slot on): SIGTERM to the server stops its engines", { ski
 
 // An empty value means "not set" (the default), even when the test run itself exports USAP_ENGINE_SLOT=on.
 const DEFAULT = { USAP_ENGINE_SLOT: "" };
-test("default off: no engineSlot report, and the earlier behaviour is kept (R3 still answers 500; R1 can still overlap)", async () => {
+test("default off: no engineSlot report, and the earlier behaviour is kept (R3 still answers 500; R1 can still overlap)", async (tc) => {
   await withServer(DEFAULT, async (srv) => {
     const r = await resources(srv);
     assert.equal("engineSlot" in r, false);
@@ -1057,9 +1058,22 @@ test("default off: no engineSlot report, and the earlier behaviour is kept (R3 s
     assert.deepEqual((await engines(srv)).map((e) => e.label).sort(), ["image", "llm"], "legacy overlap (no exclusivity guarantee when off)");
   });
   await withServer(DEFAULT, async (srv) => {
-    assert.equal((await imageLoad(srv)).status, 200);
+    // #175 diagnostics (fixtures/r3-legacy-diag.cjs): the 500 below relies on the server seeing the image runtime when
+    // the text load begins. What was seen before and after the text load is recorded and printed, then that
+    // precondition is asserted explicitly, then the unchanged contract.
+    const t0 = Date.now();
+    const img = await imageLoad(srv);
+    assert.equal(img.status, 200);
     await sleep(800);
+    const safe = async (fn) => { try { return await fn(); } catch (_) { return null; } };
+    const pre = { status: await safe(() => backendStatus(srv)), engines: await safe(() => engines(srv)), at: Date.now() };
+    const sentAt = Date.now();
     const t = await textLoad(srv, "plain.gguf");
+    const text = { status: t.status, code: t.json && t.json.code, errorNamesImage: !!(t.json && /already loaded as a Image model/.test(String(t.json.error || ""))), ms: Date.now() - sentAt, at: sentAt };
+    const post = { status: await safe(() => backendStatus(srv)), llm: await safe(() => llmStatus(srv)), engines: await safe(() => engines(srv)), at: Date.now() };
+    let d; try { d = describeLegacyR3({ t0, image: { status: img.status, code: img.json && img.json.code }, pre, text, post, diag: fakeSdDiag(root), log: srv.log() }); } catch (_) { d = "description failed"; }
+    tc.diagnostic(`#175 legacy R3 observation: ${d}`);
+    assert.equal(imageRuntimeActive(pre.status), true, "precondition: the image runtime (ready or running, with a model set) is seen just before the text load; without it the legacy 500 is not exercised");
     assert.equal(t.status, 500, "legacy R3 contract when off");
     assert.equal(t.json.code, "ENGINE_START_FAILED");
     assert.match(t.json.error, /already loaded as a Image model/);
