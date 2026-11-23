@@ -6,20 +6,28 @@
 // <file>.gc, it runs a full garbage collection, removes the trigger and writes a sample marked with that request's
 // id, so "after release" can be read with dead buffers collected: arrayBuffers then counts only buffers still
 // referenced. It never writes to stdout/stderr and its timer is unref'd.
+// The sample taken right after a forced GC is also kept as `lastGc` ({ id, pid, t, memory figures }) in every later
+// record until the next GC request replaces it, so a validator that reads the file late still finds it (the plain
+// per-tick record overwrites the GC-marked one 200 ms later). `lastGc` exists only when a GC actually ran.
 const out = process.env.USAP_IQ_MEMPROBE;
 const path = require("path");
 if (out && path.basename(process.argv[1] || "") === "serve.cjs") {
   const fs = require("fs");
   const trigger = `${out}.gc`;
+  let lastGc = null;
   const write = (extra) => {
     const m = process.memoryUsage();
-    const rec = { t: Date.now(), pid: process.pid, rss: m.rss, heapUsed: m.heapUsed, heapTotal: m.heapTotal, external: m.external, arrayBuffers: m.arrayBuffers, gcAvailable: typeof global.gc === "function", ...extra };
+    const rec = { t: Date.now(), pid: process.pid, rss: m.rss, heapUsed: m.heapUsed, heapTotal: m.heapTotal, external: m.external, arrayBuffers: m.arrayBuffers, gcAvailable: typeof global.gc === "function", ...(lastGc ? { lastGc } : {}), ...extra };
     try { fs.writeFileSync(`${out}.tmp`, JSON.stringify(rec)); fs.renameSync(`${out}.tmp`, out); } catch (_) { /* best effort */ }
   };
   const tick = () => {
     let gcId = null;
     try { gcId = fs.readFileSync(trigger, "utf8").trim() || "gc"; fs.unlinkSync(trigger); } catch (_) { gcId = null; }
-    if (gcId !== null && typeof global.gc === "function") { global.gc(); global.gc(); }
+    if (gcId !== null && typeof global.gc === "function") {
+      global.gc(); global.gc();
+      const m = process.memoryUsage();
+      lastGc = { id: gcId, pid: process.pid, t: Date.now(), rss: m.rss, heapUsed: m.heapUsed, heapTotal: m.heapTotal, external: m.external, arrayBuffers: m.arrayBuffers };
+    }
     write(gcId !== null ? { gcId } : {});
   };
   setInterval(tick, 200).unref();
