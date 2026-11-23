@@ -96,22 +96,40 @@ test("cpuDiag watchdog: its thread keeps running while the main thread is busy",
   assert.ok(res.maxGapMs < 900, `no gap as long as the busy period (${res.maxGapMs})`);
 });
 
-// Runs fixtures/refusal-clients.cjs against a server that answers after delayMs; optionally stops the client process.
+// Runs fixtures/refusal-clients.cjs against a server that answers after 1200 ms. With `stop`, the client process is
+// paused (SIGSTOP) for 400 ms only once (a) its watchdog thread has reported its first tick ("watchdog-ready" on
+// stderr) and (b) the server has accepted all n client connections: no fixed startup sleep, so a slow start can't put
+// the pause before the watchdog runs (macOS Intel CI, maxGapMs 13). The answers are then held until 200 ms after
+// SIGCONT, so the pause always falls inside a live run. A process that never reports ready fails the test.
 function runClients(cpuDiag, stop) {
   const net = require("node:net");
+  const n = 2;
   return new Promise((resolve, reject) => {
+    const socks = [];
+    let ready = false, injected = null, done = false;
+    const answer = () => { for (const s of socks.splice(0)) s.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"); };
+    let child = null;
+    const maybeStop = () => {
+      if (!stop || injected || !ready || socks.length < n) return;
+      injected = { stoppedAt: Date.now() };
+      child.kill("SIGSTOP");
+      setTimeout(() => { child.kill("SIGCONT"); injected.resumedAt = Date.now(); setTimeout(answer, 200); }, 400);
+    };
     const server = net.createServer((sock) => {
       sock.on("error", () => {});
-      setTimeout(() => sock.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"), 1200);
+      socks.push(sock);
+      if (stop) maybeStop(); else setTimeout(answer, 1200);
     });
     server.listen(0, "127.0.0.1", () => {
-      const arg = { port: server.address().port, n: 2, opts: { mode: "small", maxMs: 10000 } };
+      const arg = { port: server.address().port, n, opts: { mode: "small", maxMs: 10000 } };
       if (cpuDiag) arg.cpuDiag = true;
-      const child = spawn(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify(arg)], { stdio: ["ignore", "pipe", "ignore"] });
-      let out = "";
+      if (stop) arg.readySignal = true;
+      child = spawn(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify(arg)], { stdio: ["ignore", "pipe", stop ? "pipe" : "ignore"] });
+      let out = "", err = "";
       child.stdout.on("data", (d) => { out += d; });
-      if (stop) setTimeout(() => { child.kill("SIGSTOP"); setTimeout(() => child.kill("SIGCONT"), 400); }, 300);
-      child.on("exit", (code) => { server.close(); try { resolve({ code, res: JSON.parse(out) }); } catch (e) { reject(e); } });
+      if (stop) child.stderr.on("data", (d) => { err += d; if (!ready && err.includes("watchdog-ready\n")) { ready = true; maybeStop(); } });
+      const guard = stop ? setTimeout(() => { if (!injected) { done = true; child.kill("SIGKILL"); server.close(); reject(new Error(`the pause was never injected: watchdog ready ${ready}, connections ${socks.length} of ${n}`)); } }, 20000) : null;
+      child.on("exit", (code) => { clearTimeout(guard); server.close(); if (done) return; try { resolve({ code, res: JSON.parse(out), injected }); } catch (e) { reject(e); } });
     });
   });
 }
@@ -124,8 +142,9 @@ test("cpuDiag fixture: without the flag the output has exactly the previous fiel
 });
 
 test("cpuDiag fixture: a stopped client process shows a gap with little CPU time and a stopped watchdog", { skip: process.platform === "win32" ? "no SIGSTOP on Windows" : false }, async () => {
-  const { code, res } = await runClients(true, true);
+  const { code, res, injected } = await runClients(true, true);
   assert.equal(code, 0);
+  assert.ok(injected && injected.resumedAt - injected.stoppedAt >= 400, "the 400 ms pause was injected after the watchdog was running");
   assert.deepEqual(Object.keys(res).sort(), ["clients", "proc", "ticks"]);
   assert.ok(Array.isArray(res.proc.samples) && res.proc.samples.length > 10, "samples recorded");
   // one bytes value per started client (the first sample is taken before the clients start)

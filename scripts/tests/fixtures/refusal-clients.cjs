@@ -109,16 +109,20 @@ const WATCHDOG_SRC = `
 const { parentPort } = require("node:worker_threads");
 let last = Date.now(), samples = 0, maxGapMs = 0; const gaps = [];
 const iv = setInterval(() => { const now = Date.now(), g = now - last; samples += 1; if (g > maxGapMs) maxGapMs = g;
-  if (g >= 50 && gaps.length < 50) gaps.push([last, g]); last = now; }, 10);
+  if (g >= 50 && gaps.length < 50) gaps.push([last, g]); last = now; if (samples === 1) parentPort.postMessage({ ready: true }); }, 10);
 parentPort.on("message", () => { clearInterval(iv); parentPort.postMessage({ samples, maxGapMs, gaps }); parentPort.close(); });`;
-function startWatchdog() {
+// onReady (optional) runs once, when the watchdog thread's first timer tick has run: proof that it is measuring.
+function startWatchdog(onReady) {
   let w = null;
   try { w = new (require("node:worker_threads").Worker)(WATCHDOG_SRC, { eval: true }); w.on("error", () => {}); w.unref(); }
   catch (_) { return { stop: async () => null }; }
+  const onFirst = (m) => { if (m && m.ready) { w.off("message", onFirst); if (onReady) onReady(); } };
+  w.on("message", onFirst);
   return {
     stop: () => new Promise((resolve) => {
       const t = setTimeout(() => { try { w.terminate(); } catch (_) {} resolve(null); }, 2000);
-      w.once("message", (m) => { clearTimeout(t); resolve(m); });
+      const onResult = (m) => { if (m && m.ready) return; w.off("message", onResult); clearTimeout(t); resolve(m); };
+      w.on("message", onResult);
       w.once("exit", () => { clearTimeout(t); resolve(null); });
       try { w.postMessage("stop"); } catch (_) { clearTimeout(t); resolve(null); }
     }),
@@ -138,10 +142,11 @@ module.exports.startWatchdog = startWatchdog;
 module.exports.procSample = procSample;
 
 if (require.main === module) {
-  const { port, n, opts, cpuDiag } = JSON.parse(process.argv[2]);
+  const { port, n, opts, cpuDiag, readySignal } = JSON.parse(process.argv[2]);
   const live = cpuDiag ? [] : null;
   let proc = cpuDiag ? [] : null;
-  const watchdog = cpuDiag ? startWatchdog() : null;
+  // readySignal (test synchronization only): one line on stderr once the watchdog thread is running; stdout unchanged.
+  const watchdog = cpuDiag ? startWatchdog(readySignal ? () => process.stderr.write("watchdog-ready\n") : null) : null;
   const sample = () => { if (!proc || proc.length >= MAX_PROC_SAMPLES) return; const p = procSample(live); if (p) proc.push(p); else proc = null; };
   const ticks = [Date.now()];
   sample();
