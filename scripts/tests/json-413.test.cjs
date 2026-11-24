@@ -16,7 +16,9 @@ const test = require("node:test");
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
 const { GRACE_MS } = require("../server/http/refusal-close.cjs");
 const { execFile } = require("node:child_process");
-const { judgeRefusedClient } = require("./fixtures/refusal-judge.cjs");
+const { judgeRefusedClient, judgeRefusedClientMac } = require("./fixtures/refusal-judge.cjs");
+// #151 class B: on macOS the per-client judge is the v2b rule (fixtures/refusal-judge.cjs); elsewhere today's rule.
+const judgeLostClient = process.platform === "darwin" ? judgeRefusedClientMac : judgeRefusedClient;
 const { describeLostClient } = require("./fixtures/stall-diag.cjs");
 const { spawn } = require("node:child_process");
 const GRACE_TOLERANCE_MS = 100; // as fixtures/refusal-judge.cjs: the grace timer starts just before 'finish' is observed
@@ -190,7 +192,7 @@ test("concurrent over-limit declarations are each refused early; the server's to
       const rec = recs.find((x) => x.remotePort === st.localPort);
       const { conn, ev } = assertServerRefusal(rec, st, `client ${i}`);
       total += rec.bytesRead;
-      const v = judgeRefusedClient(st, conn, ticks, 413, ANSWER_BODY);
+      const v = judgeLostClient(st, conn, ticks, 413, ANSWER_BODY);
       assert.ok(v.ok, `client ${i}: ${v.why} ${ev}`);
       if (v.kind === "answered") assert.equal(st.connectionHeader, "close", `client ${i}: Connection: close ${ev}`);
       else { stalled += 1; excused.push(`client ${i}: ${v.why}`); }

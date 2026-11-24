@@ -21,7 +21,7 @@ const { describeFailClosed } = require("./fixtures/failclosed-diag.cjs");
 const { closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, WATCH_BYTES, WATCH_MS, lingeringCount, resumedCount, closedReadingCount } = require("../server/http/refusal-close.cjs");
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
 const { rawRequest } = require("./fixtures/refusal-clients.cjs");
-const { timeline: timelineOf } = require("./fixtures/refusal-judge.cjs");
+const { timeline: timelineOf, judgeRefusedClientMac } = require("./fixtures/refusal-judge.cjs");
 const { execFile } = require("node:child_process");
 
 const MiB = 1024 * 1024;
@@ -454,7 +454,8 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
     const stalled = [];
     all.forEach((st, i) => {
       const c = conns.find((x) => x.remotePort === st.localPort);
-      const v = judgeRefusedClient(st, c, ticks, 403);
+      // #151 class B: on macOS the v2b rule (fixtures/refusal-judge.cjs); elsewhere this file's rule, unchanged.
+      const v = process.platform === "darwin" ? judgeRefusedClientMac(st, c, ticks, 403) : judgeRefusedClient(st, c, ticks, 403);
       const tl = timelineOf(st, c, ticks); // #151 diagnostics: client activity relative to the server's answer (message only)
       assert.ok(v.ok, `client ${i}: ${v.why}${tl}; client error ${st.error}: ${record()}`);
       if (v.kind === "stalled") { stalled.push(`client ${i}: ${v.why}${tl}`); return; }

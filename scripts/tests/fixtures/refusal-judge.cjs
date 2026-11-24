@@ -74,4 +74,45 @@ function judgeRefusedClientProposed(st, conn, ticks, status, bodyMatch = null, p
   return { ok: true, kind: "stalled", why: `client process did not run past a single activity point while the server held the connection (macOS rule)${timeline(st, conn, ticks)}` };
 }
 
-module.exports = { judgeRefusedClient, judgeRefusedClientProposed, timeline };
+// ── macOS judge v2b (#151 class B; used on darwin only, by the json-413 concurrent and refusal-close 20-client tests) ──
+// Same server-side conditions as today's rule. On macOS, libuv's kqueue backend hands a socket's write and read results
+// to their callback as separate entries, so a write completion ('drain') can run before the read of an answer that has
+// already arrived, and a process that stops right after it loses the answer. A lost answer is excused only if:
+//   E0 the client's own ticks bracket the window (a tick at or before the answer, a tick at or after the close):
+//      missing scheduling evidence is never excused;
+//   D0 the client received no data before the close;
+//   T2 no two consecutive client ticks inside the window (no complete event-loop iteration);
+//   N1 at most one drain inside the window;
+//   C1 a drain whose check phase was recorded: that check phase ran at or after the close, with no margin (the
+//      iteration that handled the drain never finished while the server held the connection);
+//   C0 a drain without a recorded check phase: no tick at all inside the window;
+//   A1 no tick after the drain inside the window (no later iteration began);
+//   U  when a drain is inside the window: the server closed within GRACE_MS + MAC_SLACK_MS of the answer (a server far
+//      outside its close bound is not excused by this rule).
+// Without a drain in the window the verdict is today's rule (plus E0). Never used on Linux or Windows.
+const MAC_SLACK_MS = 2500; // the scheduling slack refusal-close.test.cjs already allows on top of the grace period
+function judgeRefusedClientMac(st, conn, ticks, status, bodyMatch = null) {
+  const base = judgeRefusedClientRule({ ...st, drainsAt: [] }, conn, ticks, status, bodyMatch);
+  if (base.kind === "answered") return base;
+  if (!base.ok) return { ...base, why: `${base.why}${timeline(st, conn, ticks)}` };
+  const fail = (why) => ({ ok: false, why: `${why} (macOS rule)${timeline(st, conn, ticks)}` });
+  const sorted = [...(ticks || [])].sort((a, b) => a - b);
+  const inWindow = (t) => t > conn.answeredAt + TICK_MARGIN_MS && t < conn.closedAt - TICK_MARGIN_MS;
+  if (!sorted.some((t) => t <= conn.answeredAt + TICK_MARGIN_MS) || !sorted.some((t) => t >= conn.closedAt - TICK_MARGIN_MS)) return fail("answer lost, and the client's ticks do not cover the window (no scheduling evidence)");
+  const io = st.io || {};
+  if (io.firstDataAt != null && io.firstDataAt <= conn.closedAt - TICK_MARGIN_MS) return fail(`answer lost although the client received data ${io.firstDataAt - conn.answeredAt} ms after the answer`);
+  const drainsAt = st.drainsAt || [], checks = io.drainChecksAt || [];
+  const drains = drainsAt.map((t, i) => ({ t, check: checks[i] == null ? null : checks[i] })).filter((d) => inWindow(d.t));
+  if (drains.length === 0) return { ...base, why: `${base.why}${timeline(st, conn, ticks)}` };
+  if (drains.length > 1) return fail(`answer lost although the client handled I/O on this connection ${drains.length} times while the server kept it open`);
+  const [d] = drains;
+  const inTicks = sorted.filter(inWindow);
+  if (d.check != null && d.check < conn.closedAt) return fail(`answer lost although the loop iteration that handled a drain at ${d.t - conn.answeredAt} ms reached its check phase at ${d.check - conn.answeredAt} ms, before the close`);
+  if (d.check == null && inTicks.length > 0) return fail(`answer lost; a drain at ${d.t - conn.answeredAt} ms without a check-phase record and a tick in the window`);
+  if (inTicks.some((t) => t > d.t)) return fail(`answer lost although the client ticked after its drain at ${d.t - conn.answeredAt} ms`);
+  const kept = conn.closedAt - conn.answeredAt;
+  if (kept > GRACE_MS + MAC_SLACK_MS) return fail(`answer lost, and the server closed ${kept} ms after the answer (more than grace ${GRACE_MS} + ${MAC_SLACK_MS} ms)`);
+  return { ok: true, kind: "stalled", why: `the client's loop did not complete an I/O phase after its drain at ${d.t - conn.answeredAt} ms before the close at ${kept} ms (macOS rule)${timeline(st, conn, ticks)}` };
+}
+
+module.exports = { judgeRefusedClient, judgeRefusedClientProposed, judgeRefusedClientMac, MAC_SLACK_MS, timeline };
