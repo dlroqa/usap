@@ -83,8 +83,26 @@ function makeRoot() {
 
 // readyPath: a route that answers 200 once the server is up (a sign-in-required server answers
 // /api/health with 401, so its tests wait on /api/auth/status instead).
+// #170-adjacent diagnostics (messages only): when the studio exits during start-up with EADDRINUSE on one of the ports
+// reserved above, describe that port (fixtures/port-range-diag.cjs: OS dynamic/excluded ranges, reservation locks,
+// current socket owners by kind). Appended to the unchanged error; never changes whether or how the start fails.
+async function earlyExitPortDiag(log, ports, reservedAt, serverPid) {
+  try {
+    const m = /EADDRINUSE[^\r\n]*?:(\d{2,5})\b/.exec(log);
+    const p = m ? Number(m[1]) : null;
+    if (!p) return "";
+    const roles = ["studio", "text engine", "image engine", "speech", "tts"];
+    const i = ports.indexOf(p);
+    const { describeStartFailure } = require("../fixtures/port-range-diag.cjs");
+    const { RANGE, LOCK_DIR } = require("../fixtures/test-ports.cjs");
+    const line = await describeStartFailure({ port: p, role: i >= 0 ? `reserved for the ${roles[i]}` : "not one of the reserved ports", reservedAt, failedAt: Date.now(), lockDir: LOCK_DIR, testRange: RANGE, serverPid });
+    return `\n[#170 test-port diagnostics] ${line}`;
+  } catch (_) { return "\n[#170 test-port diagnostics] description failed"; }
+}
+
 async function startServer(root, extraEnv = {}, { readyPath = "/api/health" } = {}) {
   const ports = await Promise.all([reservePort(), reservePort(), reservePort(), reservePort(), reservePort()]);
+  const reservedAt = Date.now(); // #170-adjacent diagnostics only (see earlyExitPortDiag)
   const [port, llm, sd, speech, tts] = ports;
   const env = {
     ...process.env,
@@ -103,7 +121,7 @@ async function startServer(root, extraEnv = {}, { readyPath = "/api/health" } = 
   proc.stderr.on("data", (d) => { log += d; });
   const deadline = Date.now() + 30000;
   for (;;) {
-    if (proc.exitCode !== null) throw new Error(`server exited early (${proc.exitCode}):\n${log}`);
+    if (proc.exitCode !== null) throw new Error(`server exited early (${proc.exitCode}):\n${log}${await earlyExitPortDiag(log, ports, reservedAt, proc.pid)}`);
     try { const r = await request(port, "GET", readyPath); if (r.status === 200) break; } catch (_) { /* not up yet */ }
     if (Date.now() > deadline) {
       stopServer({ proc }); // don't leave a half-started server holding the test process open
