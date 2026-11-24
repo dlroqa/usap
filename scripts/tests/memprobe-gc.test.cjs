@@ -26,11 +26,52 @@ function startProbe(dir, out, { exposeGc = true, diag = false } = {}) {
   const child = spawn(process.execPath, args, { env: { ...process.env, USAP_IQ_MEMPROBE: out, ...(diag ? { USAP_IQ_MEMPROBE_DIAG: "1" } : {}) }, stdio: "ignore" });
   return child;
 }
-const stop = (child) => new Promise((r) => { if (child.exitCode !== null) return r(); child.once("exit", r); child.kill(); });
+// A child that has already exited has exitCode set (normal exit) OR signalCode set (killed by a signal, exitCode null).
+// Checking only exitCode waited forever for an 'exit' event already emitted, so a probe killed by a signal turned the
+// test's real failure into "Promise resolution is still pending" (reproduced: SIGKILL and SIGTERM, Node 22.12.0).
+const stop = (child) => new Promise((r) => { if (child.exitCode !== null || child.signalCode !== null) return r(); child.once("exit", r); child.kill(); });
 
 let dir;
 test.before(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "usap-memprobe-")); });
 test.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* best effort */ } });
+
+// Measurement (messages only, every platform): does the probe's own record rename fail while a reader polls the file
+// every 5 ms, as the reproduction test does (#188 10ebb29 Windows: no GC-marked record within 5 s)? For about 3 s,
+// with 5 GC requests, it prints records published, the probe's write/rename errors by stage and code, how many
+// GC-marked records the reader saw, and the reader's own outcomes. It asserts only that the measurement ran.
+test("measurement: probe record write/rename errors while a reader polls every 5 ms (messages only)", async (t) => {
+  const out = path.join(dir, "measure.json");
+  const child = startProbe(dir, out, { diag: true });
+  try {
+    assert.ok(await until(() => { const p = read(out); return p && p.gcAvailable; }), "probe running");
+    const obs = observer(); const seenMarked = new Set(); const end = Date.now() + 3000; let k = 0, next = Date.now();
+    while (Date.now() < end) {
+      if (Date.now() >= next && k < 5) { k += 1; writeTrigger(`${out}.gc`, `gc-measure-${k}`); next = Date.now() + 550; }
+      const p = obs.read(out); if (p && p.gcId) seenMarked.add(p.gcId);
+      await sleep(5);
+    }
+    await sleep(450);
+    const last = read(out) || obs.last || {};
+    const d = last.diag || {};
+    const errs = Object.entries(d.errors || {}).map(([key, n]) => `${key.replace(/[^A-Za-z0-9:_-]/g, "")}x${n}`).join(",") || "none";
+    const rd = Object.entries(obs.errors).map(([c, n]) => `${c}x${n}`).join(",") || "none";
+    t.diagnostic(`D6 probe measurement (${process.platform}): requests ${k}; probe ticks ${d.ticks ?? "?"}, records published ${d.writesOk ?? "?"}, record write errors ${errs}; GC-marked records seen by the reader ${seenMarked.size} of ${k}; last record's lastGc ${last.lastGc && /^gc-measure-\d$/.test(last.lastGc.id) ? last.lastGc.id : "none"}; reader ${obs.reads} reads: ok ${obs.ok}, partial ${obs.parse}, errors ${rd}`);
+    assert.ok(Number.isFinite(d.writesOk) && d.writesOk > 5 && k === 5, "the measurement ran");
+  } finally { await stop(child); }
+});
+
+test("stop(): returns for a child that is running, exited normally, or was already killed by a signal", async () => {
+  const start = (code) => spawn(process.execPath, ["-e", code], { stdio: "ignore" });
+  const exited = (c) => new Promise((r) => (c.exitCode !== null || c.signalCode !== null ? r() : c.once("exit", r)));
+  const running = start("setInterval(() => {}, 1000)");
+  await stop(running); assert.ok(running.exitCode !== null || running.signalCode !== null, "stopped");
+  const normal = start("process.exit(3)"); await exited(normal); await stop(normal); assert.equal(normal.exitCode, 3);
+  for (const sig of ["SIGKILL", "SIGTERM"]) {
+    const killed = start("setInterval(() => {}, 1000)"); killed.kill(sig); await exited(killed);
+    assert.equal(killed.exitCode, null); assert.ok(killed.signalCode, `${sig}: ended by a signal`);
+    await stop(killed); // waited forever before (exitCode null, 'exit' already emitted)
+  }
+});
 
 test("rule: the right request, the right process, taken after the request; anything else is not yet", () => {
   const req = { id: "gc-ab12-3", pid: 100, requestedAt: 5000 };

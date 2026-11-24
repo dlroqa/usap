@@ -11,7 +11,8 @@
 // per-tick record overwrites the GC-marked one 200 ms later). `lastGc` exists only when a GC actually ran.
 // Diagnostics (test-only, opt-in with USAP_IQ_MEMPROBE_DIAG=1; without it every record is byte-for-byte as before):
 // each record then also carries `diag` = { ticks, writesOk, events }, where events (at most 32, oldest dropped) are
-// [time, kind, detail] for what the probe otherwise swallows: a trigger read or unlink error (its code; ENOENT, the
+// [time, kind, detail] for what the probe otherwise swallows, plus `errors`, cumulative counts of failed record writes by
+// "stage:code[:marked]" (not capped by the event window): a trigger read or unlink error (its code; ENOENT, the
 // normal "no request", is not recorded), an empty or invalid request (length only), an accepted request (its id, which
 // matched the id rule), the GC (id and duration ms), and a failed write or rename of a record (code, stage, and the
 // gcId if that record was GC-marked). An event noted while a write fails is carried by the next record that
@@ -22,14 +23,18 @@ if (out && path.basename(process.argv[1] || "") === "serve.cjs") {
   const fs = require("fs");
   const trigger = `${out}.gc`;
   let lastGc = null;
-  const diag = process.env.USAP_IQ_MEMPROBE_DIAG === "1" ? { ticks: 0, writesOk: 0, events: [] } : null;
+  const diag = process.env.USAP_IQ_MEMPROBE_DIAG === "1" ? { ticks: 0, writesOk: 0, errors: {}, events: [] } : null;
   const note = (kind, detail) => { if (!diag) return; if (diag.events.length >= 32) diag.events.shift(); diag.events.push([Date.now(), kind, detail]); };
   const write = (extra) => {
     const m = process.memoryUsage();
     const rec = { t: Date.now(), pid: process.pid, rss: m.rss, heapUsed: m.heapUsed, heapTotal: m.heapTotal, external: m.external, arrayBuffers: m.arrayBuffers, gcAvailable: typeof global.gc === "function", ...(lastGc ? { lastGc } : {}), ...extra, ...(diag ? { diag } : {}) };
     let stage = "write";
     try { fs.writeFileSync(`${out}.tmp`, JSON.stringify(rec)); stage = "rename"; fs.renameSync(`${out}.tmp`, out); if (diag) diag.writesOk += 1; }
-    catch (err) { note("write-error", { code: (err && err.code) || "?", stage, ...(extra.gcId ? { gcId: extra.gcId } : {}) }); /* best effort */ }
+    catch (err) {
+      const code = (err && err.code) || "?";
+      if (diag) { const k = `${stage}:${code}${extra.gcId ? ":marked" : ""}`; diag.errors[k] = (diag.errors[k] || 0) + 1; }
+      note("write-error", { code, stage, ...(extra.gcId ? { gcId: extra.gcId } : {}) }); /* best effort */
+    }
   };
   const tick = () => {
     let gcId = null;
