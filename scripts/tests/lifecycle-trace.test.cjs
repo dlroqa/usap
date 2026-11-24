@@ -98,7 +98,7 @@ test("preload: process start/exit by kind, the studio's guard spawn and its rest
   fs.writeFileSync(path.join(d, "engine-guard.cjs"), "setTimeout(() => process.exit(0), 50);\n");
   fs.writeFileSync(path.join(d, "serve.cjs"), `const http=require("node:http");const {spawn}=require("node:child_process");
 const s=http.createServer((req,res)=>{const g=spawn(process.execPath,[${JSON.stringify(path.join(d, "engine-guard.cjs"))}],{stdio:"ignore"});res.writeHead(200);res.end("{}");g.on("exit",()=>{s.close();});});
-s.listen(0,"127.0.0.1",()=>{const r=http.request({port:s.address().port,method:"POST",path:"/api/restart-backend"},(x)=>x.resume());r.end();});`);
+s.listen(0,"127.0.0.1",()=>{const r=http.request({host:"127.0.0.1",port:s.address().port,method:"POST",path:"/api/restart-backend"},(x)=>x.resume());r.end();});`);
   const r = spawnSync(process.execPath, [path.join(d, "serve.cjs")], { encoding: "utf8", timeout: 20000, env: { ...process.env, SD_BACKEND_PORT: "1", ...portTraceEnv(f) } });
   assert.equal(r.status, 0, r.stderr);
   const rows = readAll(f);
