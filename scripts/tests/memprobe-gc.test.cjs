@@ -133,3 +133,59 @@ test("trigger race (main caa546d, Windows): a request seen while still empty is 
     assert.ok(await until(() => matchGcSample(read(out), { id: "gc-race-2", pid: child.pid, requestedAt: 0 })));
   } finally { await stop(child); }
 });
+
+test("writeTrigger: complete publication by same-folder rename; bounded retry only for Windows sharing errors; no leftover file", () => {
+  const { GC_ID } = require("../ci/memprobe-gc.cjs");
+  const fakeFs = (failures, code = "EPERM") => {
+    const files = new Map(); let left = failures; const calls = [];
+    return { files, calls,
+      writeFileSync: (f, d) => { files.set(f, String(d)); calls.push(["write", f]); },
+      renameSync: (a, b) => { calls.push(["rename", a, b]); if (left > 0) { left -= 1; const e = new Error(code); e.code = code; throw e; } files.set(b, files.get(a)); files.delete(a); },
+      unlinkSync: (f) => { calls.push(["unlink", f]); files.delete(f); } };
+  };
+  const target = path.join("x", "probe.json.gc");
+  const ok = fakeFs(2);
+  assert.equal(writeTrigger(target, "gc-ab-1", { fs: ok, waitMs: 1 }), 2, "two EPERM, then the rename succeeded");
+  assert.equal(ok.files.get(target), "gc-ab-1"); assert.equal(ok.files.size, 1, "no temporary file left");
+  const [, tmp] = ok.calls[0]; assert.equal(path.dirname(tmp), path.dirname(target), "the temporary file is in the same folder (same filesystem)");
+  const stuck = fakeFs(1000, "EBUSY");
+  assert.throws(() => writeTrigger(target, "gc-ab-2", { fs: stuck, retries: 5, waitMs: 1 }), /EBUSY/, "bounded: gives up and raises");
+  assert.equal(stuck.files.size, 0, "temporary file removed after giving up"); assert.equal(stuck.calls.filter((c) => c[0] === "rename").length, 6);
+  const other = fakeFs(1, "ENOENT");
+  assert.throws(() => writeTrigger(target, "gc-ab-3", { fs: other, waitMs: 1 }), /ENOENT/, "other errors are not retried");
+  assert.equal(other.calls.filter((c) => c[0] === "rename").length, 1); assert.equal(other.files.size, 0);
+  for (const bad of ["", "has space", "x".repeat(129), "a/b", "id\n"]) assert.throws(() => writeTrigger(target, bad, { fs: fakeFs(0) }), /invalid GC request id/, JSON.stringify(bad));
+  assert.ok(GC_ID.test("gc-0123abcd-8") && GC_ID.test("x".repeat(128)));
+});
+
+test("probe: a malformed request is removed unanswered (no GC, no sample); a valid request after it is answered", async () => {
+  const out = path.join(dir, "bad.json");
+  const child = startProbe(dir, out);
+  try {
+    assert.ok(await until(() => { const p = read(out); return p && p.gcAvailable; }));
+    fs.writeFileSync(`${out}.tmp-bad`, "bad id with spaces"); fs.renameSync(`${out}.tmp-bad`, `${out}.gc`);
+    assert.ok(await until(() => !fs.existsSync(`${out}.gc`)), "removed");
+    await sleep(300);
+    const p = read(out);
+    assert.equal(p.lastGc, undefined, "no GC ran for it"); assert.equal(p.gcId, undefined);
+    const req = { id: "gc-bad-2", pid: child.pid, requestedAt: Date.now() };
+    writeTrigger(`${out}.gc`, req.id);
+    assert.ok(await until(() => matchGcSample(read(out), req)));
+  } finally { await stop(child); }
+});
+
+test("probe: a request left empty is never consumed and its wait ends as missing; the next valid request replaces it and is answered", async () => {
+  const out = path.join(dir, "empty.json");
+  const child = startProbe(dir, out);
+  try {
+    assert.ok(await until(() => { const p = read(out); return p && p.gcAvailable; }));
+    fs.writeFileSync(`${out}.gc`, ""); // a writer that never completes
+    const req1 = { id: "gc-empty-1", pid: child.pid, requestedAt: Date.now() };
+    assert.equal(await until(() => matchGcSample(read(out), req1), 1000), null, "missing (the validator's bounded wait then records FAIL)");
+    assert.ok(fs.existsSync(`${out}.gc`), "the empty request is still there, not consumed");
+    const req2 = { id: "gc-empty-2", pid: child.pid, requestedAt: Date.now() };
+    writeTrigger(`${out}.gc`, req2.id);
+    assert.ok(await until(() => matchGcSample(read(out), req2)), "answered after the atomic replacement");
+    assert.equal(fs.readdirSync(dir).filter((f) => f.startsWith("empty.json.gc.") && f.endsWith(".tmp")).length, 0, "no temporary file left");
+  } finally { await stop(child); }
+});

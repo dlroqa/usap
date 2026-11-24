@@ -22,8 +22,13 @@ if (out && path.basename(process.argv[1] || "") === "serve.cjs") {
   };
   const tick = () => {
     let gcId = null;
-    // An empty trigger is a request still being written (a non-atomic writer): leave it for the next tick.
-    try { const t = fs.readFileSync(trigger, "utf8").trim(); if (t) { gcId = t; fs.unlinkSync(trigger); } } catch (_) { gcId = null; }
+    // An empty trigger is a request still being written (a non-atomic writer): leave it for the next tick. A request
+    // that is not a valid id (1-128 of A-Z a-z 0-9 . _ -) is removed unanswered: the waiting validator records a
+    // missing sample (FAIL). Read errors (a rename in progress on Windows) are retried on the next tick.
+    try {
+      const t = fs.readFileSync(trigger, "utf8").trim();
+      if (t) { fs.unlinkSync(trigger); if (/^[A-Za-z0-9._-]{1,128}$/.test(t)) gcId = t; }
+    } catch (_) { gcId = null; }
     if (gcId !== null && typeof global.gc === "function") {
       global.gc(); global.gc();
       const m = process.memoryUsage();

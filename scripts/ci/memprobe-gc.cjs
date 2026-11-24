@@ -15,12 +15,27 @@ function matchGcSample(p, { id, pid, requestedAt }) {
   return null;
 }
 
-// Writes the GC request atomically (a temporary file, then rename), so the probe never reads a half-written request.
-function writeTrigger(file, id) {
-  const fs = require("fs");
+// Request ids the probe accepts; anything else is removed unanswered (the validator then records a missing sample).
+const GC_ID = /^[A-Za-z0-9._-]{1,128}$/;
+// Writes the GC request atomically: a temporary file in the same folder (same filesystem), then a rename, so the probe
+// never reads a half-written request. On Windows a rename onto a file another process has open for a moment (the
+// probe reading it) can fail with EPERM/EBUSY/EACCES; that is retried a bounded number of times (default 20 x 25 ms),
+// then the temporary file is removed and the error is raised (the D6 check then fails; nothing is skipped).
+const RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+function writeTrigger(file, id, { fs = require("fs"), retries = 20, waitMs = 25 } = {}) {
+  if (!GC_ID.test(String(id))) throw new Error("invalid GC request id");
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, id);
-  fs.renameSync(tmp, file);
+  for (let attempt = 0; ; attempt += 1) {
+    try { fs.renameSync(tmp, file); return attempt; } catch (err) {
+      if (!RETRY_CODES.has(err && err.code) || attempt >= retries) {
+        try { fs.unlinkSync(tmp); } catch (_) { /* already gone */ }
+        throw err;
+      }
+      sleepSync(waitMs);
+    }
+  }
 }
 
-module.exports = { matchGcSample, writeTrigger };
+module.exports = { matchGcSample, writeTrigger, GC_ID };
