@@ -406,6 +406,7 @@ test("queue: with the Core ML backend (apple-npu) requests pass through to today
 // ── Part 3: the real server with the fake sd-server ──────────────────────────────────────────────────────────────
 const { makeRoot, startServer, stopServer, request, installFakeSdServer, fakeSdDiag } = require("./api-contract/harness.cjs");
 const { describeRollbackFailures } = require("./fixtures/rollback-diag.cjs");
+const { describeQueueOnDelivery } = require("./fixtures/queue-delivery-diag.cjs"); // #179 diagnostics only
 function writeModel(dir, name) {
   const kv = (key, type, val) => {
     const k = Buffer.from(key); const head = Buffer.alloc(8 + k.length + 4); head.writeBigUInt64LE(BigInt(k.length)); k.copy(head, 8); head.writeUInt32LE(type, 8 + k.length);
@@ -492,16 +493,33 @@ test("server: USAP_SCHEDULER=off forces the queue off even with engineSlot and i
   });
 });
 
-test("server: on (with engineSlot) — one at a time, FIFO, 429 past the limit, reported in /api/resources; restart 409 while forwarded; stop refuses waiting", async () => {
+test("server: on (with engineSlot) — one at a time, FIFO, 429 past the limit, reported in /api/resources; restart 409 while forwarded; stop refuses waiting", async (t) => {
   await withServer({ USAP_ENGINE_SLOT: "on", USAP_IMAGE_QUEUE: "on" }, async (srv) => {
     assert.match(srv.log(), /Image queue on: 1 running, 2 waiting at most/);
     // Not ready yet: refused before any body byte.
     const early = await txt2img(srv.port, "too early");
     assert.equal(early.status, 503); assert.equal(early.json.code, "ENGINE_NOT_READY"); assert.match(early.json.detail, /^Generation failed: /);
     await load(srv);
+    const tLoad = Date.now(); // diagnostics: the three requests start 0, 150 and 300 ms after this
     const ps = [0, 1, 2].map(async (i) => { await sleep(i * 150); return txt2img(srv.port, `p${i}`); });
     await sleep(700);
     const rs = await resources(srv);
+    // #179 delivery diagnostics (record only; Windows, #190 e147fe1: one of the three answers had no HTTP status, i.e. a
+    // client-side error). From here, after the test's own first /api/resources call (on Windows the first call runs the
+    // GPU probe synchronously, #181), the queue and engine counts are sampled every 250 ms (at most 24) until all three
+    // answers are in. A line is printed only if an answer is not 200, before the unchanged assertions. Never throws.
+    const samples = []; let sampling = true;
+    const sampler = (async () => {
+      let enginePort = null;
+      try { enginePort = (await request(srv.port, "GET", "/api/backend-status")).json.port; } catch (_) { /* record only */ }
+      while (sampling && samples.length < 24) {
+        const s = { t: Date.now() };
+        try { const q = (await resources(srv)).engines.image.queue; s.running = q.running; s.waiting = q.waiting; } catch (_) { s.err = 1; }
+        try { if (enginePort) { const st = (await request(enginePort, "GET", "/fake/stats")).json; s.req = st.requests; s.done = st.completed; s.ab = st.aborted; } } catch (_) { /* record only */ }
+        samples.push(s);
+        await sleep(250);
+      }
+    })().catch(() => {});
     assert.equal(rs.limits.imageQueue, "on");
     assert.deepEqual({ ...rs.engines.image.queue, runningSeconds: 0 }, { running: 1, waiting: 2, limit: 2, known: true, abandoned: false, runningSeconds: 0, inactive: null });
     const full = await txt2img(srv.port, "p3");
@@ -509,6 +527,12 @@ test("server: on (with engineSlot) — one at a time, FIFO, 429 past the limit, 
     const restart = await request(srv.port, "POST", "/api/restart-backend", { body: { model: MODEL, backend_type: "cpu", use_gpu: false, width: 64, height: 64, steps: 5 } });
     assert.equal(restart.status, 409, `restart refused while a forwarded job is unsettled: ${restart.text}`);
     const res = await Promise.all(ps);
+    sampling = false; await sampler;
+    if (res.some((r) => r.status !== 200)) {
+      let line;
+      try { line = describeQueueOnDelivery(res, { tLoad, samples, sendGapMs: 150, diag: fakeSdDiag(srv.root), log: srv.log() }); } catch (_) { line = "description failed"; }
+      t.diagnostic(`queue-on delivery: ${line}`);
+    }
     for (const r of res) assert.equal(r.status, 200);
     const ms = res.map((r) => r.ms);
     assert.ok(ms[1] > ms[0] + 2000 && ms[2] > ms[1] + 2000, `one after another (${ms.join("/")} ms)`);

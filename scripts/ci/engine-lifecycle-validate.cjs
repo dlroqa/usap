@@ -18,6 +18,7 @@ const http = require("http");
 const net = require("net");
 const path = require("path");
 const { spawn } = require("child_process");
+const { describeR2 } = require("./r2-diag.cjs"); // #170 R2 diagnostics only
 
 const ROOT = path.resolve(__dirname, "..", "..");
 const APP = path.join(ROOT, "app");
@@ -74,8 +75,16 @@ function call(method, p, body, { timeoutMs = 600000 } = {}) {
 }
 const allPids = new Set(); // every engine PID seen, to check for orphans at the end
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) { return err.code === "EPERM"; } };
+// #170 R2 diagnostics (record only): while set, engines() also keeps the image entries of the /api/diagnostics answer it
+// already fetched (no extra request). Bounded to 300 samples.
+let r2Capture = null;
+const imageEntries = (p) => ({
+  sup: ((p && p.supervised) || []).filter((r) => r.label === "image").map((r) => ({ guardPid: r.guardPid, enginePid: r.enginePid, startedAt: r.startedAt })),
+  exits: ((p && p.recentExits) || []).filter((r) => r.label === "image").map((r) => ({ enginePid: r.enginePid, code: r.code, signal: r.signal, at: r.at })),
+});
 async function engines() {
   const d = (await call("GET", "/api/diagnostics", undefined, { timeoutMs: 10000 })).json;
+  if (r2Capture && r2Capture.samples.length < 300) { try { r2Capture.samples.push({ t: Date.now(), ...imageEntries(d && d.engines && d.engines.processes) }); } catch (_) { /* record only */ } }
   const sup = (d && d.engines && d.engines.processes && d.engines.processes.supervised) || [];
   const list = sup.filter((r) => r.label === "llm" || r.label === "image").map((r) => ({ label: r.label, pid: r.enginePid || r.guardPid }));
   for (const r of list) if (r.pid) allPids.add(r.pid);
@@ -208,14 +217,36 @@ const SLOT = { USAP_ENGINE_SLOT: "on" };
     });
 
     await scenario("R2 three image loads at once", async () => {
-      const done = sampler();
-      const rs = await Promise.all([1, 2, 3].map((steps) => imageLoad({ steps })));
-      await sleep(1500);
-      const seen = await done();
-      const live = await engines();
-      const tracked = (await call("GET", "/api/backend-status", undefined, { timeoutMs: 10000 })).json.running === true;
-      const ok = rs.every((r) => [200, 409].includes(r.status)) && seen.maxImage <= 1 && live.length === 1 && tracked;
-      record("R2 three image loads at once", ok ? "PASS" : "FAIL", `answers ${rs.map((r) => r.status).join("/")}; max image processes ${seen.maxImage}; live ${live.length}; tracked ${tracked}`);
+      // #170 diagnostics (record only): load send/answer times and the image entries the sampler already reads; after
+      // the verdict is recorded, one line on stderr (scripts/ci/r2-diag.cjs). The loads, the 1.5 s wait and the verdict
+      // are unchanged.
+      const t0 = Date.now(), loads = [];
+      r2Capture = { samples: [] };
+      let bsJson = null;
+      try {
+        const done = sampler();
+        const rs = await Promise.all([1, 2, 3].map(async (steps) => { const l = { steps, sentAt: Date.now() }; loads.push(l); const r = await imageLoad({ steps }); Object.assign(l, { answeredAt: Date.now(), status: r.status, code: r.json && r.json.code, error: r.json && r.json.error }); return r; }));
+        await sleep(1500);
+        const seen = await done();
+        const live = await engines();
+        bsJson = (await call("GET", "/api/backend-status", undefined, { timeoutMs: 10000 })).json;
+        const tracked = bsJson.running === true;
+        const ok = rs.every((r) => [200, 409].includes(r.status)) && seen.maxImage <= 1 && live.length === 1 && tracked;
+        record("R2 three image loads at once", ok ? "PASS" : "FAIL", `answers ${rs.map((r) => r.status).join("/")}; max image processes ${seen.maxImage}; live ${live.length}; tracked ${tracked}`);
+      } finally {
+        const samples = r2Capture ? r2Capture.samples : []; r2Capture = null;
+        let line;
+        try {
+          const d = (await call("GET", "/api/diagnostics", undefined, { timeoutMs: 10000 })).json;
+          const fin = imageEntries(d && d.engines && d.engines.processes);
+          const pids = new Set([...samples.flatMap((s) => [...s.sup.map((r) => r.enginePid), ...s.exits.map((x) => x.enginePid)]), ...fin.sup.map((r) => r.enginePid)].filter(Boolean));
+          const aliveMap = Object.fromEntries([...pids].map((p) => [p, alive(p)]));
+          const portIsOpen = bsJson && Number.isFinite(bsJson.port) ? await portOpen(bsJson.port) : null;
+          let log = ""; try { log = fs.readFileSync(srv.logPath, "utf8").slice(-20000); } catch (_) { /* record only */ }
+          line = describeR2({ t0, loads, samples, final: { status: bsJson || {}, sup: fin.sup, exits: fin.exits, alive: aliveMap, portOpen: portIsOpen }, log });
+        } catch (_) { line = "description failed"; }
+        process.stderr.write(`R2 diagnostics (#170): ${line}\n`);
+      }
     });
 
     await scenario("Image stop confirms the exit (no orphan)", async () => {
