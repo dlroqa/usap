@@ -19,6 +19,7 @@ const net = require("net");
 const path = require("path");
 const { spawn } = require("child_process");
 const { describeR2 } = require("./r2-diag.cjs"); // #170 R2 diagnostics only
+const { portOwners, describePortRelease } = require("./port-owner.cjs"); // #170 port evidence only (passive)
 
 const ROOT = path.resolve(__dirname, "..", "..");
 const APP = path.join(ROOT, "app");
@@ -222,6 +223,17 @@ const SLOT = { USAP_ENGINE_SLOT: "on" };
       // are unchanged.
       const t0 = Date.now(), loads = [];
       r2Capture = { samples: [] };
+      // #170 port evidence (record only, passive: the OS socket table is read, the port is never bound or connected to):
+      // every 250 ms, who holds the preferred image port, and whether each image engine PID seen so far is still alive.
+      const portSamples = []; let portPolling = true;
+      const portPoller = (async () => {
+        while (portPolling && portSamples.length < 80) {
+          const owners = await portOwners(SD_PORT);
+          const pids = new Set((r2Capture ? r2Capture.samples : []).flatMap((x) => [...x.sup.map((r) => r.enginePid), ...x.exits.map((e) => e.enginePid)]).filter(Boolean));
+          portSamples.push({ t: Date.now(), owners, alive: Object.fromEntries([...pids].map((p) => [p, alive(p)])) });
+          await sleep(250);
+        }
+      })().catch(() => {});
       let bsJson = null;
       try {
         const done = sampler();
@@ -234,6 +246,7 @@ const SLOT = { USAP_ENGINE_SLOT: "on" };
         const ok = rs.every((r) => [200, 409].includes(r.status)) && seen.maxImage <= 1 && live.length === 1 && tracked;
         record("R2 three image loads at once", ok ? "PASS" : "FAIL", `answers ${rs.map((r) => r.status).join("/")}; max image processes ${seen.maxImage}; live ${live.length}; tracked ${tracked}`);
       } finally {
+        portPolling = false; await portPoller;
         const samples = r2Capture ? r2Capture.samples : []; r2Capture = null;
         let line;
         try {
@@ -246,6 +259,17 @@ const SLOT = { USAP_ENGINE_SLOT: "on" };
           line = describeR2({ t0, loads, samples, final: { status: bsJson || {}, sup: fin.sup, exits: fin.exits, alive: aliveMap, portOpen: portIsOpen }, log });
         } catch (_) { line = "description failed"; }
         process.stderr.write(`R2 diagnostics (#170): ${line}\n`);
+        let pline;
+        try {
+          // names: engines e1, e2, ... and guards g1, ... in order of first appearance (as in the R2 line); no raw ids
+          const order = [], gorder = [];
+          for (const x of samples) for (const r of x.sup) { if (r.enginePid && !order.includes(r.enginePid)) order.push(r.enginePid); if (r.guardPid && !gorder.includes(r.guardPid)) gorder.push(r.guardPid); }
+          for (const x of samples) for (const e of x.exits) if (e.enginePid && !order.includes(e.enginePid)) order.push(e.enginePid);
+          const name = (pid) => (order.includes(pid) ? `engine e${order.indexOf(pid) + 1}` : gorder.includes(pid) ? `guard g${gorder.indexOf(pid) + 1}` : pid === srv.child.pid ? "studio server" : pid === process.pid ? "validator" : "another process");
+          const exits = {}; for (const x of samples) for (const e of x.exits) if (e.enginePid && !(e.enginePid in exits)) exits[e.enginePid] = Date.parse(e.at);
+          pline = describePortRelease({ t0, samples: portSamples, exits, name, label: "preferred image port" });
+        } catch (_) { pline = "description failed"; }
+        process.stderr.write(`R2 port (#170): ${pline}\n`);
       }
     });
 
