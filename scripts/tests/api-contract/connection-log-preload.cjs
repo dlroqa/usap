@@ -21,9 +21,18 @@
 //           delayP99Ms, delayMaxMs (perf_hooks event-loop delay since the server started) }
 // so a failure can show whether the server process was running when it should have closed the connection. One unref'd
 // 10 ms timer and the built-in delay histogram; nothing else changes.
+//
+// With USAP_TEST_CONN_LOG_TRACE=<file> (json-413 missing-record diagnostics, message only) the preload also appends, to
+// that SEPARATE file, one short JSON line per event of each traced request, written when the event happens (so a
+// request whose socket never closes still leaves its trail): arrive (request id, remotePort, declared length, over the
+// 64 MiB JSON limit), end (res.end called), finish (status), destroy (who called socket.destroy(): function names of
+// the first stack frames only, no paths), sockerr (error code), sockclose, and flush (the record write: ok, or its
+// error code). At most 400 lines per process. The record file and its format are unchanged; a failed record write was
+// and still is ignored by the server.
 "use strict";
 
 const file = process.env.USAP_TEST_CONN_LOG;
+const traceFile = process.env.USAP_TEST_CONN_LOG_TRACE || "";
 const prefix = process.env.USAP_TEST_CONN_LOG_PREFIX || "/api/speech/transcribe";
 const limit = /^\d+$/.test(process.env.USAP_TEST_CONN_LOG_LIMIT || "") ? Number(process.env.USAP_TEST_CONN_LOG_LIMIT) : null;
 const watchLoop = process.env.USAP_TEST_CONN_LOG_LOOP === "1";
@@ -40,6 +49,14 @@ if (file && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
       delayP99Ms: Math.round(hist.percentile(99) / 1e6), delayMaxMs: Math.round(hist.max / 1e6),
     });
   }
+  let traceLines = 0, traceSeq = 0;
+  const callers = () => String(new Error().stack || "").split("\n").slice(3, 9)
+    .map((l) => (l.match(/^\s*at (?:async )?([\w$.<>\[\] ]{1,60}?) \(/) || [])[1]).filter(Boolean).slice(0, 4);
+  const trace = (ev) => {
+    if (!traceFile || traceLines >= 400) return;
+    traceLines += 1;
+    try { fs.appendFileSync(traceFile, JSON.stringify({ ...ev, at: Date.now() }) + "\n"); } catch (_) { /* diagnostics only */ }
+  };
   const http = require("node:http");
   const create = http.createServer;
   http.createServer = function (...args) {
@@ -47,6 +64,16 @@ if (file && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
     server.prependListener("request", (req, res) => {
       if (!String(req.url || "").startsWith(prefix)) return;
       const rec = { url: String(req.url).slice(0, 200), remotePort: req.socket.remotePort, arrivedAt: Date.now(), status: null, body: "", finishAt: null, resCloseAt: null, sockCloseAt: null, bytesRead: null };
+      const id = traceFile ? (traceSeq += 1) : 0;
+      if (traceFile) {
+        const cl = Number((req.headers || {})["content-length"]);
+        trace({ ev: "arrive", id, rp: rec.remotePort, cl: Number.isFinite(cl) ? cl : null, te: req.headers["transfer-encoding"] !== undefined, over: Number.isFinite(cl) && cl > 64 * 1024 * 1024 });
+        const s0 = req.socket, d0 = s0.destroy;
+        let destroyed = false;
+        s0.destroy = function tracedDestroy(...a) { if (!destroyed) { destroyed = true; trace({ ev: "destroy", id, by: callers(), read: s0.bytesRead }); } return d0.apply(this, a); };
+        s0.on("error", (e) => trace({ ev: "sockerr", id, code: String((e && e.code) || "error").slice(0, 40) }));
+        res.once("finish", () => trace({ ev: "finish", id, status: res.statusCode }));
+      }
       const copy = (chunk) => { if (chunk && rec.body.length < 300 && typeof chunk !== "function") rec.body += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk); rec.body = rec.body.slice(0, 300); };
       if (limit !== null) {
         Object.assign(rec, { limitAt: null, bytesReadAtLimit: null, bodyAtAnswer: null, bodyBytes: 0 });
@@ -61,11 +88,11 @@ if (file && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
       }
       const write = res.write, end = res.end;
       res.write = function (chunk, ...rest) { copy(chunk); return write.call(this, chunk, ...rest); };
-      res.end = function (chunk, ...rest) { copy(chunk); if (limit !== null && rec.bodyAtAnswer === null) rec.bodyAtAnswer = rec.bodyBytes; return end.call(this, chunk, ...rest); };
+      res.end = function (chunk, ...rest) { if (id) trace({ ev: "end", id }); copy(chunk); if (limit !== null && rec.bodyAtAnswer === null) rec.bodyAtAnswer = rec.bodyBytes; return end.call(this, chunk, ...rest); };
       res.once("finish", () => { rec.status = res.statusCode; rec.finishAt = Date.now(); });
       res.once("close", () => { rec.resCloseAt = Date.now(); if (rec.status === null && res.headersSent) rec.status = res.statusCode; });
       const sock = req.socket;
-      const flush = () => { rec.sockCloseAt = Date.now(); rec.bytesRead = sock.bytesRead; if (watchLoop) { try { rec.loop = loopOf(rec.arrivedAt, rec.sockCloseAt); } catch (_) { rec.loop = null; } } try { fs.appendFileSync(file, JSON.stringify(rec) + "\n"); } catch (_) { /* best effort */ } };
+      const flush = () => { rec.sockCloseAt = Date.now(); rec.bytesRead = sock.bytesRead; if (watchLoop) { try { rec.loop = loopOf(rec.arrivedAt, rec.sockCloseAt); } catch (_) { rec.loop = null; } } if (id) trace({ ev: "sockclose", id, read: sock.bytesRead }); let wrote = "ok"; try { fs.appendFileSync(file, JSON.stringify(rec) + "\n"); } catch (e) { wrote = String((e && e.code) || "error").slice(0, 40); /* best effort */ } if (id) trace({ ev: "flush", id, rp: rec.remotePort, result: wrote }); };
       if (sock.destroyed) flush(); else sock.once("close", flush);
     });
     return server;
