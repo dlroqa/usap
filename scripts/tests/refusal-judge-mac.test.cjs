@@ -10,7 +10,11 @@ const { GRACE_MS } = require("../server/http/refusal-close.cjs");
 const { records } = require("./fixtures/refusal-judge-replay.json");
 
 const A = 100000; // the server's answer
-const conn = (closeMs, extra = {}) => ({ status: 413, answeredAt: A, closedAt: closeMs == null ? null : A + closeMs, ...extra });
+// The synthetic shapes in this file are historical-shaped records (no write or clock fields, like the pinned replay):
+// conn() marks them replayRecord: true, the judge's only exemption from W and K. live() removes the mark, so every
+// live-record test below runs W and K; the "fail closed" test pins that an unmarked record never gets an excuse
+// without them, whether or not requireWriteEvidence is set.
+const conn = (closeMs, extra = {}) => ({ status: 413, answeredAt: A, closedAt: closeMs == null ? null : A + closeMs, replayRecord: true, ...extra });
 const lost = (extra = {}) => ({ localPort: 1, status: null, body: "", error: "ECONNRESET", drainsAt: [], io: { firstDataAt: null, dataEvents: 0, drainChecksAt: [] }, ...extra });
 const withDrain = (d, check = null, extra = {}) => lost({ drainsAt: [A + d], io: { firstDataAt: null, dataEvents: 0, drainChecksAt: [check == null ? null : A + check] }, ...extra });
 const bracket = (closeMs) => [A - 10, A + closeMs + 200]; // last tick before the answer, first after the close
@@ -105,7 +109,7 @@ test("today's rule is untouched: the macOS rule is a separate function", () => {
 // ── J2 safety controls (2026-11-24): write evidence, ±5 ms boundaries, drain/check pairing, clock offsets ──────────
 // Live records (requireWriteEvidence) carry the server's first sight of the request (seenAt), its socket's byte count
 // at 'finish' (bytes accepted for writing, not proof of an OS hand-off), and the client's start (t0) and end (io.errorAt).
-const live = (closeMs, extra = {}) => conn(closeMs, { requireWriteEvidence: true, seenAt: A - 90, bytesWrittenAtFinish: 180, minAnswerBytes: 90, ...extra });
+const live = (closeMs, extra = {}) => { const c = conn(closeMs, { requireWriteEvidence: true, seenAt: A - 90, bytesWrittenAtFinish: 180, minAnswerBytes: 90, ...extra }); if (!("replayRecord" in extra)) delete c.replayRecord; return c; };
 const liveSt = (st, closeMs, endAfterClose = 50) => ({ ...st, t0: A - 100, io: { ...st.io, errorAt: A + closeMs + endAfterClose } });
 
 test("W: on live records the socket's byte count at finish must cover the answer body; missing values fail; replay records are not affected", () => {
@@ -118,7 +122,7 @@ test("W: on live records the socket's byte count at finish must cover the answer
   assert.equal(M(liveSt(lost(), 2002), live(2002, { bytesWrittenAtFinish: null }), bracket(2002)).ok, false, "also without a drain: a live loss needs write evidence on macOS");
   assert.equal(M(liveSt(lost(), 2002), live(2002), bracket(2002)).kind, "stalled");
   assert.equal(M({ ...lost(), status: 413, body: "{}" }, live(2002, { bytesWrittenAtFinish: null }), bracket(2002)).kind, "answered", "an answered client needs no write evidence");
-  assert.equal(M(withDrain(1978, 2221), conn(2002), ticks).kind, "stalled", "historical records (no flag) keep their replay classification");
+  assert.equal(M(withDrain(1978, 2221), conn(2002), ticks).kind, "stalled", "marked historical replay records keep their replay classification");
 });
 
 test("K: on live records, inconsistent or missing clock evidence fails", () => {
@@ -194,4 +198,37 @@ test("D: ±50 ms clock offsets on live records never excuse a genuine failure", 
   const okCase = L(withDrain(1978, 2221), 2002, [A - 13, A + 2222], 50);
   assert.equal(M(...okCase).kind, "stalled");
   assert.equal(M(...shift(okCase[0], okCase[2], 20).slice(0, 1), okCase[1], shift(okCase[0], okCase[2], 20)[1]).ok, false, "+20 ms: the client would have started after the server saw it");
+});
+
+test("fail closed: an unmarked record gets no excuse without complete write and clock evidence, whatever requireWriteEvidence says", () => {
+  // An excusable shape (one drain whose iteration reached its check phase only after the close, no later tick), as
+  // a live record with complete, consistent evidence: excused, with or without the flag.
+  const st = withDrain(149, 2210, { t0: A - 100, io: { firstDataAt: null, dataEvents: 0, drainChecksAt: [A + 2210], errorAt: A + 2004, closeAt: A + 2006 } });
+  const ticks = [A - 7, A + 2212];
+  const ev = { seenAt: A - 90, bytesWrittenAtFinish: 180, minAnswerBytes: 90 };
+  const unmarked = (extra = {}) => { const c = conn(2002, { ...ev, ...extra }); delete c.replayRecord; return c; };
+  assert.equal(M(st, unmarked({ requireWriteEvidence: true }), ticks).kind, "stalled", "complete evidence, flag set");
+  assert.equal(M(st, unmarked(), ticks).kind, "stalled", "complete evidence, flag omitted: the flag decides nothing");
+  // The same shape with any part of the evidence missing or contradicting fails, with the flag omitted or false.
+  for (const flag of [{}, { requireWriteEvidence: false }]) {
+    const f = (c, s2 = st, label) => { const v = M(s2, c, ticks); assert.equal(v.ok, false, `${label} (${JSON.stringify(flag)}): ${v.why}`); return v.why; };
+    assert.match(f(unmarked({ ...flag, seenAt: null, bytesWrittenAtFinish: null, minAnswerBytes: null }), st, "no evidence at all"), /clocks inconsistent/);
+    assert.match(f(unmarked({ ...flag, bytesWrittenAtFinish: null }), st, "missing write evidence"), /write of the answer is not shown/);
+    assert.match(f(unmarked({ ...flag, bytesWrittenAtFinish: 10 }), st, "write evidence below the body"), /write of the answer is not shown/);
+    assert.match(f(unmarked({ ...flag, minAnswerBytes: 0 }), st, "no answer body size"), /write of the answer is not shown/);
+    assert.match(f(unmarked({ ...flag }), { ...st, t0: undefined }, "missing client start"), /clocks inconsistent/);
+    assert.match(f(unmarked({ ...flag }), { ...st, t0: A + 50 }, "client start after the server saw it"), /clocks inconsistent/);
+    assert.match(f(unmarked({ ...flag }), { ...st, io: { ...st.io, errorAt: A + 1900, closeAt: A + 1900 } }, "client end before the close"), /clocks inconsistent or no end seen/);
+    assert.match(f(unmarked({ ...flag }), { ...st, io: { ...st.io, errorAt: null, closeAt: null } }, "no client end"), /no end seen/);
+    assert.match(f(unmarked({ ...flag }), { ...st, io: { ...st.io, drainChecksAt: [] } }, "malformed pairing"), /do not pair/);
+    assert.match(f(unmarked({ ...flag }), { ...st, io: { ...st.io, drainChecksAt: [A + 2210, A + 2210] } }, "malformed pairing (extra check)"), /do not pair/);
+  }
+  // Only the exact boolean mark exempts a record; anything else is treated as live.
+  for (const mark of ["true", 1, {}, false, null]) { const c = conn(2002, { replayRecord: mark }); assert.equal(M(st, c, ticks).ok, false, `replayRecord ${JSON.stringify(mark)} is not the mark`); }
+  // The real 8295 ms stalled-server record (#190 432d75d, macOS Intel, client 0; complete live evidence) stays failing.
+  const real = { status: null, error: "EPIPE", t0: A - 8, drainsAt: [], io: { drainChecksAt: [], firstDataAt: null, errorAt: A + 8273, closeAt: A + 8274 } };
+  const realConn = unmarked({ requireWriteEvidence: true, closedAt: A + 8295, seenAt: A - 2, bytesWrittenAtFinish: 250, minAnswerBytes: 89 });
+  const rv = M(real, realConn, [A - 9, A + 8272, A + 8282, A + 8506]);
+  assert.equal(rv.ok, false, rv.why); assert.match(rv.why, /completed 1 event-loop iteration/);
+  assert.equal(M(real, { ...realConn, requireWriteEvidence: undefined }, [A - 9, A + 8272, A + 8282, A + 8506]).ok, false, "also without the flag");
 });

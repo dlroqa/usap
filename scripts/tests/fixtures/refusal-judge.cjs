@@ -89,7 +89,7 @@ function judgeRefusedClientProposed(st, conn, ticks, status, bodyMatch = null, p
 //   A1 no tick after the drain inside the window (no later iteration began);
 //   U  when a drain is inside the window: the server closed within GRACE_MS + MAC_SLACK_MS of the answer (a server far
 //      outside its close bound is not excused by this rule);
-//   W  (live records, conn.requireWriteEvidence) when the answer finished, the server socket's byte count covered at
+//   W  (every record except a pinned historical replay record) when the answer finished, the server socket's byte count covered at
 //      least the answer body (conn.bytesWrittenAtFinish >= conn.minAnswerBytes); missing values fail. What this shows,
 //      and what it does not: the record is taken at the response's 'finish' event, which Node documents as emitted once
 //      the response's last segment was handed off to the operating system; that is the only evidence of an OS
@@ -97,7 +97,11 @@ function judgeRefusedClientProposed(st, conn, ticks, status, bodyMatch = null, p
 //      Node's buffers (verified on Node 22.12.0: a 64 MiB write to a non-reading peer reads 64 MiB at once), so the
 //      count alone proves no hand-off; it shows the answer was at least fully written to the socket. Neither shows
 //      that the bytes reached or were read by the client. The count includes headers, so it is a lower-bound check
-//      (single-request connections only). Historical replay records carry no such fields and no requireWriteEvidence
+//      (single-request connections only). W and K are required of EVERY record, whether or not a call site sets
+//      conn.requireWriteEvidence (that flag no longer decides anything): a call site that omitted it can never get an
+//      excuse without write and clock evidence. The only exception is a record explicitly marked conn.replayRecord ===
+//      true: the pinned historical replay (refusal-judge-replay.json), recorded before these fields existed; only its
+//      test sets the mark. Historical replay records carry no such fields and no requireWriteEvidence
 //      flag;
 //   K  (live records) the two processes' clocks are consistent with causality: the client started its request no later
 //      than the server first saw it (st.t0 <= conn.seenAt + 5 ms), and the client saw the connection end no earlier
@@ -119,7 +123,7 @@ function judgeRefusedClientMac(st, conn, ticks, status, bodyMatch = null) {
   if (!sorted.some((t) => t <= conn.answeredAt + TICK_MARGIN_MS) || !sorted.some((t) => t >= conn.closedAt - TICK_MARGIN_MS)) return fail("answer lost, and the client's ticks do not cover the window (no scheduling evidence)");
   const io = st.io || {};
   if (io.firstDataAt != null && io.firstDataAt <= conn.closedAt - TICK_MARGIN_MS) return fail(`answer lost although the client received data ${io.firstDataAt - conn.answeredAt} ms after the answer`);
-  if (conn.requireWriteEvidence) {
+  if (conn.replayRecord !== true) { // W and K: required unless the record is a marked historical replay record
     const end = io.errorAt != null ? io.errorAt : io.closeAt;
     if (!Number.isFinite(st.t0) || !Number.isFinite(conn.seenAt) || st.t0 > conn.seenAt + TICK_MARGIN_MS) return fail(`answer lost, and the client's start (${st.t0}) is not before the server saw the request (${conn.seenAt}): clocks inconsistent`);
     if (!Number.isFinite(end) || end < conn.closedAt - TICK_MARGIN_MS) return fail(`answer lost, and the client saw the end ${Number.isFinite(end) ? `${end - conn.closedAt} ms` : "never"} relative to the server's close: clocks inconsistent or no end seen`);

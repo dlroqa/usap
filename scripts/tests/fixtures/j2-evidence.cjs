@@ -7,9 +7,10 @@
 const { GRACE_MS } = require("../../server/http/refusal-close.cjs");
 const TOLERANCE_MS = 100, MARGIN_MS = 5, SLACK_MS = 2500; // the judge's documented values, restated independently
 
-// live (default true): a live record must carry write/clock evidence, so its absence fails; false only for historical
-// replay records, which never had it (the judge then does not check it either).
-function j2Evidence(st = {}, conn = {}, ticks = [], expectedStatus, judged = null, { live = true } = {}) {
+// Write and clock evidence (K1, K2, W) is required of every record except one marked conn.replayRecord === true (the
+// pinned historical replay, recorded before those fields existed), exactly as the judge requires it; whether a call
+// site set requireWriteEvidence decides nothing.
+function j2Evidence(st = {}, conn = {}, ticks = [], expectedStatus, judged = null) {
   const a = conn.answeredAt, c = conn.closedAt;
   const fin = Number.isFinite;
   const rel = (t) => (fin(t) && fin(a) ? Math.round(t - a) : "missing");
@@ -28,11 +29,11 @@ function j2Evidence(st = {}, conn = {}, ticks = [], expectedStatus, judged = nul
   add("I0 no complete loop iteration in window", iterations === 0, `${iterations} iterations, ${winTicks.length} ticks in window`);
   add("T2 ticks bracket the window", sorted.some((t) => t <= a + MARGIN_MS) && sorted.some((t) => t >= c - MARGIN_MS), `last before ${rel(sorted.filter((t) => t <= a + MARGIN_MS).pop())}, first after ${rel(sorted.find((t) => t >= c - MARGIN_MS))}`);
   add("D0 no data before the close", io.firstDataAt == null || io.firstDataAt > c - MARGIN_MS, `first data ${io.firstDataAt == null ? "none" : rel(io.firstDataAt)}`);
-  if (conn.requireWriteEvidence) {
+  if (conn.replayRecord !== true) {
     add("K1 client start <= server first sight + 5", fin(st.t0) && fin(conn.seenAt) && st.t0 <= conn.seenAt + MARGIN_MS, `t0 ${rel(st.t0)}, seen ${rel(conn.seenAt)}`);
     add("K2 client saw the end >= close - 5", fin(end) && end >= c - MARGIN_MS, `end ${rel(end)}, close ${rel(c)}`);
     add("W socket bytes at finish >= answer body (> 0)", fin(conn.bytesWrittenAtFinish) && fin(conn.minAnswerBytes) && conn.minAnswerBytes > 0 && conn.bytesWrittenAtFinish >= conn.minAnswerBytes, `${conn.bytesWrittenAtFinish ?? "missing"} >= ${conn.minAnswerBytes ?? "missing"}`);
-  } else if (live) add("K/W", false, "this live record does not carry write/clock evidence (requireWriteEvidence absent)");
+  } else add("K/W", true, "not required: marked historical replay record");
   add("P drains and check records pair", checks === null || checks.length === drainsAt.length, `${drainsAt.length} drains, ${checks === null ? "no" : checks.length} check records`);
   if (drains.length > 0) {
     add("N1 at most one drain in window", drains.length === 1, `${drains.length} at ${drains.map((d) => rel(d.t)).join(",")}`);

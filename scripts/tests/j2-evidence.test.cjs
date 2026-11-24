@@ -10,6 +10,7 @@ const { records } = require("./fixtures/refusal-judge-replay.json");
 
 const A = 100000;
 const conn = (closeMs, extra = {}) => ({ status: 413, answeredAt: A, closedAt: closeMs == null ? null : A + closeMs, ...extra });
+const replay = (closeMs) => conn(closeMs, { replayRecord: true }); // the pinned historical records
 const lost = (extra = {}) => ({ localPort: 1, status: null, body: "", error: "ECONNRESET", drainsAt: [], io: { firstDataAt: null, dataEvents: 0, drainChecksAt: [] }, ...extra });
 function fromRecord(r) {
   const ticks = [];
@@ -17,7 +18,7 @@ function fromRecord(r) {
   if (r.inside >= 1) { const f = A + (r.first ?? (r.lastBefore + 10)); for (let k = 0; k < r.inside; k += 1) ticks.push(f + 10 * k); }
   if (r.firstAfter != null) ticks.push(A + r.firstAfter);
   const st = lost({ drainsAt: r.drains.map((d) => A + d), io: { firstDataAt: r.firstData == null ? null : A + r.firstData, dataEvents: r.firstData == null ? 0 : 1, drainChecksAt: r.checks.map((c) => (c == null ? null : A + c)) } });
-  return { st, c: conn(r.serverClose), ticks };
+  return { st, c: replay(r.serverClose), ticks };
 }
 
 const verdictOf = (line) => line.match(/-> independent (\w+)/)[1];
@@ -28,7 +29,7 @@ test("J2 evidence: the independent evaluation agrees with the judge on all 254 p
   for (const r of records) {
     const { st, c, ticks } = fromRecord(r);
     const v = judgeRefusedClientMac(st, c, ticks, 413);
-    const line = j2Evidence(st, c, ticks, 413, v, { live: false });
+    const line = j2Evidence(st, c, ticks, 413, v);
     assert.match(line, /; agree$/, line);
     if (verdictOf(line) === "excused") excused += 1;
   }
@@ -51,11 +52,10 @@ const check = (st, c, ticks, want, at = null) => {
 test("J2 evidence: live records — every predicate shown; missing or contradicting evidence never reads as excused", () => {
   const ok = check(st188(), live(), ticks188, "excused");
   for (const p of ["S", "I0", "T2", "D0", "K1", "K2", "W", "P", "N1", "C1", "A1", "U"]) assert.match(ok, new RegExp(`(^|; )${p} ok \\(`), `${p} shown: ${ok}`);
-  // A live-shaped record WITHOUT the requireWriteEvidence flag: the judge reads it as a historical record and does not
-  // check W/K (it excuses); the independent evaluation fails it closed. Both live call sites set the flag, so this does
-  // not arise today; the line would show DISAGREE if a call site ever omitted it.
-  { const v = judgeRefusedClientMac(st188(), conn(2002), ticks188, 413); const line = j2Evidence(st188(), conn(2002), ticks188, 413, v);
-    assert.equal(v.kind, "stalled"); assert.match(line, /independent fail at K\/W; J2 judge excused; DISAGREE$/, line); }
+  // A record without write/clock evidence and without the requireWriteEvidence flag (the #188 run as recorded): both
+  // the judge and the independent evaluation fail it closed; the flag decides nothing.
+  check(st188(), conn(2002, { seenAt: null }), ticks188, "fail", "K1");
+  check(st188(), conn(2002, { seenAt: A - 1, bytesWrittenAtFinish: 250, minAnswerBytes: 89 }), ticks188, "excused");
   check(st188({ t0: undefined }), live({ seenAt: null }), ticks188, "fail", "K1");
   check(st188({ t0: A + 50 }), live(), ticks188, "fail", "K1");
   check(st188({ io: { drainChecksAt: [A + 2017], firstDataAt: null, errorAt: A + 1900, closeAt: A + 1900 } }), live(), ticks188, "fail", "K2");
