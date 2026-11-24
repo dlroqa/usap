@@ -81,4 +81,4 @@ function describeLostClient(st, rec, ticks, sampler, proc, index) {
   return parts.join("; ");
 }
 
-module.exports = { describeLostClient };
+module.exports = { describeLostClient, describeProcessGap };

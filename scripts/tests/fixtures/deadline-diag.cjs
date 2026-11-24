@@ -11,7 +11,14 @@
 //               [{ setAt, ms, dueAt, firedAt (null if not fired), clearedAt (null if not cleared) }]
 //   o.ticks     this process's 10 ms ticks during the test
 //   o.deadlineMs, o.boundMs   the configured deadline (2000) and the test's bound (2700)
+//   o.proc      optional (T1 evidence, E5/E6 signals): { samples, watchdog } with this process's CPU time and context
+//               switches at each tick (fixtures/refusal-clients.cjs procSample) and the in-process watchdog thread's
+//               gaps (startWatchdog). Described with stall-diag's describeProcessGap over the same window as the tick
+//               gap: whether the process executed (busy), its main thread waited while the process ran (synchronous
+//               sleep or child-process wait), or the whole process did not run. Omitted: the line is as before;
+//               null: said as not recorded. The reading names no cause and decides nothing.
 "use strict";
+const { describeProcessGap } = require("./stall-diag.cjs");
 const MAX_TIMERS = 8;
 const n = (v) => (Number.isFinite(v) ? Math.round(v) : "?");
 
@@ -34,7 +41,12 @@ function describeDeadline(o = {}) {
     if (ticks[i] >= from && ticks[i - 1] <= to && ticks[i] - ticks[i - 1] > gap) { gap = ticks[i] - ticks[i - 1]; gapAt = ticks[i - 1]; }
   }
   parts.push(ticks.length ? `test process ticks ${ticks.length}, longest gap around the deadline ${n(gap)} ms${gapAt != null ? ` from ${rel(gapAt)}` : ""}` : "test process ticks not recorded");
-  return parts.join("; ").slice(0, 1200);
+  if (o.proc !== undefined) {
+    let d;
+    try { d = describeProcessGap(o.proc, null, from, to, rel).replace(/client process/g, "test process"); } catch (_) { d = "test process CPU/watchdog: description failed"; }
+    parts.push(d);
+  }
+  return parts.join("; ").slice(0, 1600);
 }
 
 module.exports = { describeDeadline };

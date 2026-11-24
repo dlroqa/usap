@@ -18,6 +18,7 @@ const { transcriptionQueueSetting, createStorageLedger, prepareUploadDir, create
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const { describeDeadline } = require("./fixtures/deadline-diag.cjs"); // absolute-deadline evidence only
+const { startWatchdog, procSample } = require("./fixtures/refusal-clients.cjs"); // T1 CPU/watchdog evidence only
 async function waitFor(fn, ms = 10000, label = "condition") {
   const end = Date.now() + ms;
   for (;;) { const v = await fn(); if (v) return v; if (Date.now() > end) throw new Error(`timed out waiting for ${label}`); await sleep(25); }
@@ -601,11 +602,18 @@ test("service: bytes count once per request: a refusal after part of the upload 
 
 test("service: one absolute deadline from arrival covers the upload and any discarding after a refusal", async (t) => {
   await withService({ setting: { uploadIdleMs: 1500, uploadMaxMs: 2000 } }, async (s) => {
-    // Evidence (messages only, fixtures/deadline-diag.cjs): this process's 10 ms ticks and the service's timers.
-    const ticks = []; const tick = setInterval(() => { if (ticks.length < 2000) ticks.push(Date.now()); }, 10);
+    // Evidence (messages only, fixtures/deadline-diag.cjs): this process's 10 ms ticks and the service's timers, and
+    // (T1 E5/E6 signals) its CPU time at each tick and an in-process watchdog thread. The watchdog is started before
+    // the request and waited for at most 1 s; if it is not running, the line says so. Nothing here changes a verdict.
+    let wdReady = false;
+    const wd = startWatchdog(() => { wdReady = true; });
+    for (const end = Date.now() + 1000; !wdReady && Date.now() < end;) await sleep(10);
+    const proc = [];
+    const ticks = []; const tick = setInterval(() => { if (ticks.length < 2000) { ticks.push(Date.now()); const p = procSample([]); if (p) proc.push(p); } }, 10);
     // "RIFF" + 2 bytes, 1 s later 6 bytes that aren't "WAVE": refused at about 1 s; then 1 byte every 200 ms.
     let r;
-    try { r = await rawUpload(s.port, { steps: [{ data: Buffer.from("RIFF\0\0") }, { waitMs: 1000 }, { data: Buffer.from("\0\0NOPE") }], tail: "drip" }); } finally { clearInterval(tick); }
+    let wdRes = null;
+    try { r = await rawUpload(s.port, { steps: [{ data: Buffer.from("RIFF\0\0") }, { waitMs: 1000 }, { data: Buffer.from("\0\0NOPE") }], tail: "drip" }); } finally { clearInterval(tick); wdRes = await wd.stop(); }
     assert.equal(r.status, 500);
     assert.equal(r.json.error, "Speech transcription currently accepts WAV audio only.");
     await assertSettled(s);
@@ -613,7 +621,7 @@ test("service: one absolute deadline from arrival covers the upload and any disc
     try {
       const c = s.conns[0];
       line = describeDeadline({ arrival: c.t0, closeAt: c.closedMs == null ? null : c.t0 + c.closedMs, answerAt: r.answerMs == null ? null : r.t0 + r.answerMs,
-        timers: s.timerLog, ticks, deadlineMs: 2000, boundMs: 2700 });
+        timers: s.timerLog, ticks, deadlineMs: 2000, boundMs: 2700, proc: proc.length > 1 ? { samples: proc, watchdog: wdReady ? wdRes : null } : null });
     } catch (_) { line = "description failed"; }
     t.diagnostic(`absolute deadline evidence: ${line}`);
     assert.ok(s.conns[0].closedMs < 2700, `closed ${s.conns[0].closedMs} ms after arrival (deadline 2000 ms from arrival, not from the refusal)`);
