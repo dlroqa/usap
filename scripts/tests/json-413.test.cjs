@@ -131,9 +131,10 @@ test("a declared body over the 64 MiB limit is refused with today's 413 before i
 // period, and the closing reset discarded an answer it never read). The server is judged from its own records; the
 // client must have read the answer unless fixtures/refusal-judge.cjs shows it did not run (documented reset tradeoff).
 const ANSWER_BODY = /"error":"Request body is too large\. Limit is 64 MB\.","code":"BODY_TOO_LARGE"/;
-function concurrentClients(port, n, opts, cpuDiag = false) {
+// stackSample (#151 diagnostics, opt-in): passed only by the concurrent test on macOS (see fixtures/stack-sampler.cjs).
+function concurrentClients(port, n, opts, cpuDiag = false, stackSample = null) {
   return new Promise((resolve, reject) => {
-    execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify(cpuDiag ? { port, n, opts, cpuDiag } : { port, n, opts })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
+    execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify(cpuDiag ? { port, n, opts, cpuDiag, ...(stackSample ? { stackSample } : {}) } : { port, n, opts })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
       (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
   });
 }
@@ -173,12 +174,14 @@ test("concurrent over-limit declarations are each refused early; the server's to
     const sampler = startSampler(); // #151 diagnostics only
     // cpuDiag (#151 diagnostics only): the client process also records its CPU time, context switches and bytes sent
     // at each tick, and runs a watchdog thread; `proc` is used only in the description below
-    const { clients, ticks, proc } = await concurrentClients(port, 10, { url: URL, mode: "stream", contentLength: 100 * MiB, ignoreFin: true, capBytes: 96 * MiB, maxMs: GRACE_MS + 10000 }, true);
+    const { clients, ticks, proc } = await concurrentClients(port, 10, { url: URL, mode: "stream", contentLength: 100 * MiB, ignoreFin: true, capBytes: 96 * MiB, maxMs: GRACE_MS + 10000 }, true,
+      process.platform === "darwin" ? { seconds: 10, intervalMs: 10 } : null); // #151: main-thread stacks while the clients run (macOS)
     const until = Date.now() + GRACE_MS + SLACK_MS;
     while (records().length < clients.length && Date.now() < until) await sleep(50);
     const recs = records();
     // #151 diagnostics, printed before (and independent of) the assertions below: every client whose answer was lost.
     const samples = await sampler.stop();
+    if (proc && proc.stack !== undefined) t.diagnostic(`#151 client main-thread stacks: ${String(proc.stack).slice(0, 900)}`);
     for (const [i, st] of clients.entries()) {
       if (st.status !== null) continue;
       let d; try { d = describeLostClient(st, recs.find((x) => x.remotePort === st.localPort), ticks, samples, proc || null, i); } catch (_) { d = "description failed"; }

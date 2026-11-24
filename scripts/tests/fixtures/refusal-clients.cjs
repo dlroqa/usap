@@ -142,7 +142,11 @@ module.exports.startWatchdog = startWatchdog;
 module.exports.procSample = procSample;
 
 if (require.main === module) {
-  const { port, n, opts, cpuDiag, readySignal } = JSON.parse(process.argv[2]);
+  const { port, n, opts, cpuDiag, readySignal, stackSample } = JSON.parse(process.argv[2]);
+  // stackSample (#151 diagnostics, opt-in, macOS): main-thread stack sampling of this process, started and confirmed
+  // running BEFORE any request is sent (fixtures/stack-sampler.cjs); its summary goes into proc.stack. Absent: as before.
+  const stack = stackSample && cpuDiag ? require("./stack-sampler.cjs").startStackSampler({ pid: process.pid, ...stackSample }) : null;
+  const begin = () => {
   const live = cpuDiag ? [] : null;
   let proc = cpuDiag ? [] : null;
   // readySignal (test synchronization only): one line on stderr once the watchdog thread is running; stdout unchanged.
@@ -156,6 +160,9 @@ if (require.main === module) {
     if (!cpuDiag) { process.stdout.write(JSON.stringify({ clients, ticks })); return; }
     sample();
     const wd = await watchdog.stop();
-    process.stdout.write(JSON.stringify({ clients, ticks, proc: { samples: proc, watchdog: wd } }));
+    const st = stack ? await stack.finish().catch(() => "summary failed") : undefined;
+    process.stdout.write(JSON.stringify({ clients, ticks, proc: { samples: proc, watchdog: wd, ...(stack ? { stack: st } : {}) } }));
   });
+  };
+  if (stack) stack.ready.then(begin, begin); else begin();
 }
