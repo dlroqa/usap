@@ -26,10 +26,14 @@ function startServer() {
   const child = spawn(process.execPath, [path.join(DIR, "server.cjs"), String(ANSWER_MS), String(GRACE_MS)], { stdio: ["pipe", "pipe", "ignore"] });
   const lines = []; let buf = "", onLine = null;
   child.stdout.on("data", (d) => { buf += d; let i; while ((i = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); try { lines.push(JSON.parse(l)); } catch (_) { /* ignore */ } if (onLine) onLine(); } });
+  // One waiter at a time. Each waiter ends exactly once and then disarms its timer and its line callback, so an
+  // earlier waiter's timer can never take a later repetition's record or unhook the current waiter.
   const next = (pred, ms = 10000) => new Promise((resolve) => {
     const end = Date.now() + ms;
-    const check = () => { const i = lines.findIndex(pred); if (i >= 0) { onLine = null; resolve(lines.splice(i, 1)[0]); return true; } if (Date.now() > end) { onLine = null; resolve(null); return true; } return false; };
-    if (!check()) { onLine = check; setTimeout(check, ms + 10); }
+    let done = false, timer = null;
+    const finish = (v) => { done = true; clearTimeout(timer); if (onLine === check) onLine = null; resolve(v); };
+    const check = () => { if (done) return true; const i = lines.findIndex(pred); if (i >= 0) { finish(lines.splice(i, 1)[0]); return true; } if (Date.now() > end) { finish(null); return true; } return false; };
+    if (!check()) { onLine = check; timer = setTimeout(check, ms + 10); }
   });
   return { child, next, stop: () => { try { child.stdin.end(); } catch (_) {} } };
 }
