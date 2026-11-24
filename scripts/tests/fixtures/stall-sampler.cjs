@@ -4,8 +4,13 @@
 //   { startAt, endAt, samples, maxGapMs, gaps: [[atMs (wall clock, gap start), gapMs], ...] }
 // and exits. Bounded: at most MAX_GAPS gaps (the longest are kept), and it exits on its own after CAP_MS. It reads
 // nothing and writes nothing else.
+// Optional argument --ready-after=N (test synchronization only): once its interval timer has run N times, it writes
+// one line "sampler-ready" to stderr, so a test can act on a sampler proven to be running instead of guessing with a
+// fixed startup sleep. Without the argument nothing is written to stderr and the output is unchanged.
 "use strict";
 const GAP_MS = 50, MAX_GAPS = 50, CAP_MS = 120000;
+const readyArg = process.argv.slice(2).find((a) => a.startsWith("--ready-after="));
+const READY_AFTER = readyArg ? Number(readyArg.slice("--ready-after=".length)) : null;
 const startAt = Date.now();
 let last = startAt, samples = 0, maxGapMs = 0, done = false;
 const gaps = [];
@@ -17,6 +22,7 @@ const timer = setInterval(() => {
     if (gaps.length > MAX_GAPS) { gaps.sort((a, b) => b[1] - a[1]); gaps.length = MAX_GAPS; }
   }
   last = now;
+  if (READY_AFTER !== null && samples === READY_AFTER) process.stderr.write("sampler-ready\n");
 }, 10);
 function finish() {
   if (done) return; done = true; clearInterval(timer);
