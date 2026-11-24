@@ -10,6 +10,8 @@ const path = require("node:path");
 const test = require("node:test");
 const { staleFileReportSetting, createStaleFileReport, MAX_ENTRIES } = require("../server/services/stale-file-report.cjs");
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot, request } = require("./api-contract/harness.cjs");
+const { describeStaleReport } = require("./fixtures/stale-report-diag.cjs"); // diagnostics only
+const { LEGACY } = require("../server/services/stale-file-report.cjs");
 
 const IS_WIN = process.platform === "win32";
 const HOUR = 3600e3;
@@ -240,10 +242,24 @@ test("server: off by default — /api/diagnostics unchanged (no staleFiles), fil
   });
 });
 
-test("server: report — counts after listening, nothing removed, renamed or created, no names in the answer", async () => {
+// Diagnostics (messages only): this test twice found matched 0 instead of 1 (#176 macOS arm64, #194 Windows). Every run
+// prints one line (fixtures/stale-report-diag.cjs) with the report's full counts, state, truncation, error codes and
+// timings for the folder, and the test's own view of its files and of the folder, before the unchanged assertions.
+test("server: report — counts after listening, nothing removed, renamed or created, no names in the answer", async (t) => {
   await withServer({ USAP_STALE_FILE_REPORT: "report" }, async (srv, now, before) => {
     let s = null;
+    const w0 = Date.now();
     for (let i = 0; i < 100 && !(s && s.lastRunAt); i += 1) { s = (await diag(srv)).staleFiles; if (!s || !s.lastRunAt) await new Promise((r) => setTimeout(r, 100)); }
+    let line;
+    try {
+      const tx = path.join(srv.root, "app", "transcriptions"), cur = now();
+      const mine = Object.keys(before).filter((k) => k.startsWith(`transcriptions${path.sep}`) && before[k].kind === "file");
+      const files = mine.map((k) => ({ category: LEGACY.test(path.basename(k)) ? "legacy" : "transcript", present: Boolean(cur[k]), unchanged: JSON.stringify(cur[k]) === JSON.stringify(before[k]) }));
+      const entries = { legacy: 0, transcript: 0, other: 0 };
+      for (const n of fs.readdirSync(tx)) entries[LEGACY.test(n) ? "legacy" : /^transcript-/.test(n) ? "transcript" : "other"] += 1;
+      line = describeStaleReport(s, { files, entries, waitMs: Date.now() - w0, log: (srv.log().match(/\[stale-files\][^\r\n]*/) || [""])[0] });
+    } catch (_) { line = "description failed"; }
+    t.diagnostic(`stale-file report: ${line}`);
     assert.ok(s && s.lastRunAt, "the report ran");
     assert.equal(s.mode, "report"); assert.equal(s.removed, 0);
     assert.equal(s.legacyTranscriptionTemporaries.matched, 1);
