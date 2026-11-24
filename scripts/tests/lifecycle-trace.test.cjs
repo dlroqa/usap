@@ -16,7 +16,9 @@ const { portTraceEnv, createLifecycleTrace, describeLifecycle, parseHolders, PRE
 let dir;
 test.before(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "usap-lctrace-")); });
 test.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* best effort */ } });
-const readJsonl = (f) => { try { return fs.readFileSync(f, "utf8").split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l)); } catch (_) { return []; } };
+const readAll = (f) => { try { return fs.readFileSync(f, "utf8").split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l)); } catch (_) { return []; } };
+const BIND = new Set(["listen-attempt", "listening", "listen-error", "closed"]);
+const readJsonl = (f) => readAll(f).filter((r) => BIND.has(r.ev)); // bind records only
 const freePort = () => new Promise((r) => { const s = net.createServer().listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
 // A child Node process with the preload (through NODE_OPTIONS, as the tests set it) that listens on `port`.
 function child(port, traceFile, { withErrorListener = true, env = {} } = {}) {
@@ -80,11 +82,33 @@ test("line: roles in order, stand-in bind failure with its holders by role; no p
   now = t0 + 120; st.onDiagnostics({ engines: { processes: { supervised: [{ label: "image", guardPid: 701, enginePid: 801 }], recentExits: [] } } });
   now = t0 + 280; st.onDiagnostics({ engines: { processes: { supervised: [{ label: "image", guardPid: 702, enginePid: 802 }], recentExits: [{ label: "image", enginePid: 801, code: 1, signal: null, at: new Date(t0 + 250).toISOString() }] } } });
   const line = describeLifecycle(st, { proc: { pid: 500 }, sdPort: port }, { testPid: 1 });
-  assert.match(line, /^roles: studio, g1 e1 g2 e2 s1 s2;/);
+  assert.match(line, /^after the last restart-backend answer \(none written\): first loss 120 e1 gone \(first seen not alive\); roles: studio, g1 e1 g2 e2 s1 s2;/);
   assert.match(line, /10\.\.60 studio check preferred free x2/);
   assert.match(line, /250 supervisor exit recorded engine e1 code 1/);
   assert.match(line, /s2 listen-error EADDRINUSE preferred; holders LISTENING local s1/);
   assert.match(line, /100 s1 start \(parent e1\)/);
   assert.match(line, /120 e1 gone \(first seen not alive\)/);
   for (const bad of ["21147", "500", "701", "801", "901", "127.0.0.1", "\\"]) assert.ok(!line.includes(bad), `printed ${bad}: ${line}`);
+});
+
+test("preload: process start/exit by kind, the studio's guard spawn and its restart-backend answer, in order", async () => {
+  const d = fs.mkdtempSync(path.join(dir, "roles-"));
+  const f = path.join(d, "steps.jsonl");
+  // a stand-in "studio" (serve.cjs) that spawns a stand-in guard (engine-guard.cjs) and answers POST /api/restart-backend
+  fs.writeFileSync(path.join(d, "engine-guard.cjs"), "setTimeout(() => process.exit(0), 50);\n");
+  fs.writeFileSync(path.join(d, "serve.cjs"), `const http=require("node:http");const {spawn}=require("node:child_process");
+const s=http.createServer((req,res)=>{const g=spawn(process.execPath,[${JSON.stringify(path.join(d, "engine-guard.cjs"))}],{stdio:"ignore"});res.writeHead(200);res.end("{}");g.on("exit",()=>{s.close();});});
+s.listen(0,"127.0.0.1",()=>{const r=http.request({port:s.address().port,method:"POST",path:"/api/restart-backend"},(x)=>x.resume());r.end();});`);
+  const r = spawnSync(process.execPath, [path.join(d, "serve.cjs")], { encoding: "utf8", timeout: 20000, env: { ...process.env, SD_BACKEND_PORT: "1", ...portTraceEnv(f) } });
+  assert.equal(r.status, 0, r.stderr);
+  const rows = readAll(f);
+  const studio = rows.find((x) => x.ev === "process-start" && x.kind === "studio");
+  const spawned = rows.find((x) => x.ev === "spawned" && x.what === "guard");
+  const answer = rows.find((x) => x.ev === "answer");
+  const guard = rows.find((x) => x.ev === "process-start" && x.kind === "guard");
+  assert.ok(studio && spawned && answer && guard, JSON.stringify(rows));
+  assert.equal(spawned.child, guard.pid, "the spawned child is the guard that started");
+  assert.equal(answer.status, 200);
+  assert.ok(spawned.t <= answer.t, "spawn recorded before the answer the handler wrote after it");
+  assert.ok(rows.some((x) => x.ev === "process-exit" && x.kind === "guard" && x.code === 0));
 });
