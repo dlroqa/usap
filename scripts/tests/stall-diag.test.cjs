@@ -46,13 +46,27 @@ test("stall-diag: bounded, numbers-only output; missing records are said, not gu
   assert.equal(describeLostClient(lost([], []), null, [], null), "no server answer recorded");
 });
 
+// The sampler is stopped only once it has reported that its timer ran READY_SAMPLES times ("sampler-ready" on
+// stderr), not after a fixed startup sleep: under CPU load a 300 ms sleep could end before the sampler had started
+// sampling (locally 8/60 on a loaded machine: samples 1-10, the stop not seen). A sampler that never reports ready
+// fails the test. The stop is held for at least 250 monotonic ms (holdAtLeast).
+const READY_SAMPLES = 15;
+function waitSamplerReady(child, guardMs = 20000) {
+  return new Promise((resolve, reject) => {
+    let err = "";
+    const guard = setTimeout(() => { child.kill("SIGKILL"); reject(new Error(`the sampler never reported ready (stderr ${JSON.stringify(err.slice(0, 80))})`)); }, guardMs);
+    child.stderr.on("data", (d) => { err += d; if (err.includes("sampler-ready\n")) { clearTimeout(guard); resolve(); } });
+    child.once("exit", (code) => { clearTimeout(guard); reject(new Error(`the sampler exited (${code}) before it reported ready`)); });
+  });
+}
+
 test("stall-sampler: reports its own gaps, stops when its stdin closes, and its output is bounded", { skip: process.platform === "win32" ? "no SIGSTOP on Windows" : false }, async () => {
-  const child = spawn(process.execPath, [path.join(__dirname, "fixtures", "stall-sampler.cjs")], { stdio: ["pipe", "pipe", "ignore"] });
+  const child = spawn(process.execPath, [path.join(__dirname, "fixtures", "stall-sampler.cjs"), `--ready-after=${READY_SAMPLES}`], { stdio: ["pipe", "pipe", "pipe"] });
   let out = "";
   child.stdout.on("data", (d) => { out += d; });
-  await new Promise((r) => setTimeout(r, 300));
+  await waitSamplerReady(child);
   child.kill("SIGSTOP");
-  await new Promise((r) => setTimeout(r, 250));
+  await new Promise((r) => holdAtLeast(250, r));
   child.kill("SIGCONT");
   await new Promise((r) => setTimeout(r, 100));
   child.stdin.end();
