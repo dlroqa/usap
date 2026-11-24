@@ -14,7 +14,7 @@
 //
 //   node scripts/ci/image-queue-validate.cjs --image stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf --results out.jsonl --logs ci-logs
 "use strict";
-const { matchGcSample } = require("./memprobe-gc.cjs"); // D6 post-GC sample ownership
+const { matchGcSample, writeTrigger } = require("./memprobe-gc.cjs"); // D6 post-GC sample ownership
 
 const fs = require("fs");
 const http = require("http");
@@ -379,7 +379,7 @@ function engineMemory(pid) {
     const gcSample = async (pid) => {
       const id = `gc-${gcNonce}-${++gcSeq}`;
       const requestedAt = Date.now();
-      fs.writeFileSync(`${probeFile}.gc`, id);
+      writeTrigger(`${probeFile}.gc`, id);
       return waitUntil(() => matchGcSample(readProbe(), { id, pid, requestedAt }), 10000, 100);
     };
     const MB = (b) => (typeof b === "number" ? `${Math.round(b / MiB)} MiB` : "n/a");
@@ -472,7 +472,7 @@ function engineMemory(pid) {
         const m = engineMemory(eng.enginePid);
         record("D6 engine memory breakdown (verified engine process)", m ? "MEASURED" : "UNAVAILABLE", m ? m.detail : "no breakdown available on this OS");
       }
-    } finally { for (const u of uploads) u.abort(); await stopServer(srv); srv = null; try { fs.unlinkSync(`${probeFile}.gc`); } catch (_) { /* none */ } }
+    } finally { for (const u of uploads) u.abort(); await stopServer(srv); srv = null; try { fs.unlinkSync(`${probeFile}.gc`); } catch (_) { /* none */ } try { for (const f of fs.readdirSync(path.dirname(probeFile))) if (f.startsWith(`${path.basename(probeFile)}.gc.`) && f.endsWith(".tmp")) fs.unlinkSync(path.join(path.dirname(probeFile), f)); } catch (_) { /* none */ } }
   });
   await scenario("Default budget refuses a third 64 MiB body", async () => {
     srv = await startServer("budget", ON);
