@@ -58,7 +58,11 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
       st.io.dataEvents += 1; buf = Buffer.concat([buf, d]); parse();
     });
     s.on("end", () => { if (st.io.endAt === null) st.io.endAt = Date.now(); });
-    s.on("error", (e) => { if (st.io.errorAt === null) st.io.errorAt = Date.now(); st.error = e.code || e.message; });
+    s.on("error", (e) => {
+      if (st.io.errorAt === null) st.io.errorAt = Date.now(); st.error = e.code || e.message;
+      // #151 diagnostics (cpuDiag runs only): bytes this client had queued in Node but not yet written when the error came
+      if (Array.isArray(live) && st.io.pendingAtError === undefined) st.io.pendingAtError = s.writableLength;
+    });
     s.on("close", () => { st.io.closeAt = Date.now(); st.closedAt = Date.now() - st.t0; stopped = true; clearTimeout(timer); resolve(st); });
     const end = setTimeout(() => { stopped = true; st.clientGaveUp = true; s.destroy(); }, maxMs);
     s.on("close", () => clearTimeout(end));
@@ -148,6 +152,13 @@ if (require.main === module) {
   const stack = stackSample && cpuDiag ? require("./stack-sampler.cjs").startStackSampler({ pid: process.pid, ...stackSample }) : null;
   const begin = () => {
   const live = cpuDiag ? [] : null;
+  // #151 diagnostics (cpuDiag only): GC pauses of this process (>= 5 ms, at most 60) and the event loop's delay.
+  const gcs = [], perf = cpuDiag ? require("node:perf_hooks") : null;
+  let gcObs = null, eld = null;
+  if (perf) {
+    try { gcObs = new perf.PerformanceObserver((list) => { for (const e of list.getEntries()) if (e.duration >= 5 && gcs.length < 60) gcs.push([Math.round(perf.performance.timeOrigin + e.startTime), Math.round(e.duration), (e.detail && e.detail.kind) || e.kind || 0]); }); gcObs.observe({ entryTypes: ["gc"] }); } catch (_) { gcObs = null; }
+    try { eld = perf.monitorEventLoopDelay({ resolution: 10 }); eld.enable(); } catch (_) { eld = null; }
+  }
   let proc = cpuDiag ? [] : null;
   // readySignal (test synchronization only): one line on stderr once the watchdog thread is running; stdout unchanged.
   const watchdog = cpuDiag ? startWatchdog(readySignal ? () => process.stderr.write("watchdog-ready\n") : null) : null;
@@ -161,7 +172,9 @@ if (require.main === module) {
     sample();
     const wd = await watchdog.stop();
     const st = stack ? await stack.finish().catch(() => "summary failed") : undefined;
-    process.stdout.write(JSON.stringify({ clients, ticks, proc: { samples: proc, watchdog: wd, ...(stack ? { stack: st } : {}) } }));
+    try { if (gcObs) gcObs.disconnect(); if (eld) eld.disable(); } catch (_) { /* diagnostics only */ }
+    const loop = eld ? { maxMs: Math.round(eld.max / 1e6), p99Ms: Math.round(eld.percentile(99) / 1e6) } : null;
+    process.stdout.write(JSON.stringify({ clients, ticks, proc: { samples: proc, watchdog: wd, gc: gcs, loop, ...(stack ? { stack: st } : {}) } }));
   });
   };
   if (stack) stack.ready.then(begin, begin); else begin();
