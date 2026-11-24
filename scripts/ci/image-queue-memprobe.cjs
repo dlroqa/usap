@@ -24,12 +24,17 @@ if (out && path.basename(process.argv[1] || "") === "serve.cjs") {
   const trigger = `${out}.gc`;
   let lastGc = null;
   const diag = process.env.USAP_IQ_MEMPROBE_DIAG === "1" ? { ticks: 0, writesOk: 0, errors: {}, events: [] } : null;
+  let markedLive = null; // diagnostics only: id of the marked record currently published
   const note = (kind, detail) => { if (!diag) return; if (diag.events.length >= 32) diag.events.shift(); diag.events.push([Date.now(), kind, detail]); };
   const write = (extra) => {
     const m = process.memoryUsage();
     const rec = { t: Date.now(), pid: process.pid, rss: m.rss, heapUsed: m.heapUsed, heapTotal: m.heapTotal, external: m.external, arrayBuffers: m.arrayBuffers, gcAvailable: typeof global.gc === "function", ...(lastGc ? { lastGc } : {}), ...extra, ...(diag ? { diag } : {}) };
     let stage = "write";
-    try { fs.writeFileSync(`${out}.tmp`, JSON.stringify(rec)); stage = "rename"; fs.renameSync(`${out}.tmp`, out); if (diag) diag.writesOk += 1; }
+    try {
+      fs.writeFileSync(`${out}.tmp`, JSON.stringify(rec)); stage = "rename"; fs.renameSync(`${out}.tmp`, out);
+      // diagnostics only: when a GC-marked record became visible, and when a later record replaced it
+      if (diag) { diag.writesOk += 1; if (extra.gcId) note("published-marked", extra.gcId); else if (markedLive) note("replaced-marked", markedLive); markedLive = extra.gcId || null; }
+    }
     catch (err) {
       const code = (err && err.code) || "?";
       if (diag) { const k = `${stage}:${code}${extra.gcId ? ":marked" : ""}`; diag.errors[k] = (diag.errors[k] || 0) + 1; }
