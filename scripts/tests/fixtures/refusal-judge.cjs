@@ -88,7 +88,20 @@ function judgeRefusedClientProposed(st, conn, ticks, status, bodyMatch = null, p
 //   C0 a drain without a recorded check phase: no tick at all inside the window;
 //   A1 no tick after the drain inside the window (no later iteration began);
 //   U  when a drain is inside the window: the server closed within GRACE_MS + MAC_SLACK_MS of the answer (a server far
-//      outside its close bound is not excused by this rule).
+//      outside its close bound is not excused by this rule);
+//   W  (live records, conn.requireWriteEvidence) the server socket had handed at least the answer body's bytes to the
+//      OS when the answer finished (conn.bytesWrittenAtFinish >= conn.minAnswerBytes); missing values fail. Limitation:
+//      this shows the bytes reached the server's kernel send path, not that they reached or were read by the client,
+//      and it counts headers too, so it is a lower-bound check (single-request connections only). Historical replay
+//      records carry no such fields and no requireWriteEvidence flag;
+//   K  (live records) the two processes' clocks are consistent with causality: the client started its request no later
+//      than the server first saw it (st.t0 <= conn.seenAt + 5 ms), and the client saw the connection end no earlier
+//      than the server closed it (io.errorAt or io.closeAt >= closedAt - 5 ms). A record that violates either, or
+//      lacks the values, fails: an offset between the records' clocks never produces an excuse it detects. Limit: an
+//      offset smaller than the slack between those causal events is not detectable; both processes read the same
+//      machine's wall clock, so the real offset is the reading latency only;
+//   P  drain and check-phase records pair one to one (io.drainChecksAt has the same length as drainsAt when present):
+//      otherwise neither can be trusted and the loss fails.
 // Without a drain in the window the verdict is today's rule (plus E0). Never used on Linux or Windows.
 const MAC_SLACK_MS = 2500; // the scheduling slack refusal-close.test.cjs already allows on top of the grace period
 function judgeRefusedClientMac(st, conn, ticks, status, bodyMatch = null) {
@@ -101,7 +114,15 @@ function judgeRefusedClientMac(st, conn, ticks, status, bodyMatch = null) {
   if (!sorted.some((t) => t <= conn.answeredAt + TICK_MARGIN_MS) || !sorted.some((t) => t >= conn.closedAt - TICK_MARGIN_MS)) return fail("answer lost, and the client's ticks do not cover the window (no scheduling evidence)");
   const io = st.io || {};
   if (io.firstDataAt != null && io.firstDataAt <= conn.closedAt - TICK_MARGIN_MS) return fail(`answer lost although the client received data ${io.firstDataAt - conn.answeredAt} ms after the answer`);
+  if (conn.requireWriteEvidence) {
+    const end = io.errorAt != null ? io.errorAt : io.closeAt;
+    if (!Number.isFinite(st.t0) || !Number.isFinite(conn.seenAt) || st.t0 > conn.seenAt + TICK_MARGIN_MS) return fail(`answer lost, and the client's start (${st.t0}) is not before the server saw the request (${conn.seenAt}): clocks inconsistent`);
+    if (!Number.isFinite(end) || end < conn.closedAt - TICK_MARGIN_MS) return fail(`answer lost, and the client saw the end ${Number.isFinite(end) ? `${end - conn.closedAt} ms` : "never"} relative to the server's close: clocks inconsistent or no end seen`);
+    const w = conn.bytesWrittenAtFinish, need = conn.minAnswerBytes;
+    if (!Number.isFinite(w) || !Number.isFinite(need) || need <= 0 || w < need) return fail(`answer lost, and the server's write of the answer is not shown (bytes handed to the OS at finish ${w}, answer body ${need})`);
+  }
   const drainsAt = st.drainsAt || [], checks = io.drainChecksAt || [];
+  if (Array.isArray(io.drainChecksAt) && io.drainChecksAt.length !== drainsAt.length) return fail(`answer lost, and the drain and check-phase records do not pair (${drainsAt.length} drains, ${io.drainChecksAt.length} check records)`);
   const drains = drainsAt.map((t, i) => ({ t, check: checks[i] == null ? null : checks[i] })).filter((d) => inWindow(d.t));
   if (drains.length === 0) return { ...base, why: `${base.why}${timeline(st, conn, ticks)}` };
   if (drains.length > 1) return fail(`answer lost although the client handled I/O on this connection ${drains.length} times while the server kept it open`);

@@ -167,7 +167,8 @@ function assertServerRefusal(rec, st, label) {
   const clientClosedFirst = st.t0 + st.closedAt < rec.sockCloseAt && st.error === null;
   if (!clientClosedFirst) assert.ok(rec.sockCloseAt - rec.finishAt >= GRACE_MS - GRACE_TOLERANCE_MS, `${label}: the server closed ${rec.sockCloseAt - rec.finishAt} ms after the answer (grace ${GRACE_MS} ms) ${ev}`);
   assert.ok(rec.bytesRead <= EARLY_READ_BOUND, `${label}: the server read ${rec.bytesRead} bytes from this connection (bound ${EARLY_READ_BOUND}) ${ev}`);
-  return { conn: { status: rec.status, answeredAt: rec.finishAt, closedAt: rec.sockCloseAt }, ev };
+  // Write evidence for the macOS judge (#151 J2): bytes handed to the OS at finish vs the answer body's length.
+  return { conn: { status: rec.status, answeredAt: rec.finishAt, closedAt: rec.sockCloseAt, requireWriteEvidence: true, seenAt: rec.arrivedAt, bytesWrittenAtFinish: Number.isFinite(rec.bytesWrittenAtFinish) ? rec.bytesWrittenAtFinish : null, minAnswerBytes: Buffer.byteLength(rec.body || "") }, ev };
 }
 
 test("concurrent over-limit declarations are each refused early; the server's total read stays bounded", async (t) => {

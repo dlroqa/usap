@@ -101,3 +101,97 @@ test("today's rule is untouched: the macOS rule is a separate function", () => {
   assert.equal(judgeRefusedClient(withDrain(6), conn(2002), [A - 1, A + 7835], 413).ok, false, "a drain in the window still fails today's rule");
   assert.equal(judgeRefusedClient(withDrain(1978, 2221), conn(2002), [A - 13, A + 2222], 413).ok, false);
 });
+
+// ── J2 safety controls (2026-11-24): write evidence, ±5 ms boundaries, drain/check pairing, clock offsets ──────────
+// Live records (requireWriteEvidence) carry the server's first sight of the request (seenAt), its bytes handed to the
+// OS at finish, and the client's start (t0) and end (io.errorAt).
+const live = (closeMs, extra = {}) => conn(closeMs, { requireWriteEvidence: true, seenAt: A - 90, bytesWrittenAtFinish: 180, minAnswerBytes: 90, ...extra });
+const liveSt = (st, closeMs, endAfterClose = 50) => ({ ...st, t0: A - 100, io: { ...st.io, errorAt: A + closeMs + endAfterClose } });
+
+test("W: on live records the answer's bytes must have been handed to the OS at finish; missing values fail; replay records are not affected", () => {
+  const st = liveSt(withDrain(1978, 2221), 2002), ticks = [A - 13, A + 2222];
+  assert.equal(M(st, live(2002), ticks).kind, "stalled", "bytes written >= the answer body");
+  assert.equal(M(st, live(2002, { bytesWrittenAtFinish: 89 }), ticks).ok, false, "fewer bytes than the answer body");
+  assert.equal(M(st, live(2002, { bytesWrittenAtFinish: 0 }), ticks).ok, false, "nothing written");
+  assert.equal(M(st, live(2002, { bytesWrittenAtFinish: null }), ticks).ok, false, "not recorded");
+  assert.equal(M(st, live(2002, { minAnswerBytes: null }), ticks).ok, false, "answer size unknown");
+  assert.equal(M(liveSt(lost(), 2002), live(2002, { bytesWrittenAtFinish: null }), bracket(2002)).ok, false, "also without a drain: a live loss needs write evidence on macOS");
+  assert.equal(M(liveSt(lost(), 2002), live(2002), bracket(2002)).kind, "stalled");
+  assert.equal(M({ ...lost(), status: 413, body: "{}" }, live(2002, { bytesWrittenAtFinish: null }), bracket(2002)).kind, "answered", "an answered client needs no write evidence");
+  assert.equal(M(withDrain(1978, 2221), conn(2002), ticks).kind, "stalled", "historical records (no flag) keep their replay classification");
+});
+
+test("K: on live records, inconsistent or missing clock evidence fails", () => {
+  const ticks = [A - 13, A + 2222];
+  assert.equal(M({ ...liveSt(withDrain(1978, 2221), 2002), t0: undefined }, live(2002), ticks).ok, false, "no client start");
+  assert.equal(M(liveSt(withDrain(1978, 2221), 2002), live(2002, { seenAt: null }), ticks).ok, false, "no server first sight");
+  assert.equal(M({ ...liveSt(withDrain(1978, 2221), 2002), t0: A - 80 }, live(2002, { seenAt: A - 90 }), ticks).ok, false, "client started 10 ms after the server saw it");
+  assert.equal(M(liveSt(withDrain(1978, 2221), 2002, -10), live(2002), ticks).ok, false, "client saw the end 10 ms before the server closed");
+  assert.equal(M({ ...liveSt(withDrain(1978, 2221), 2002), io: { ...withDrain(1978, 2221).io, errorAt: null, closeAt: null } }, live(2002), ticks).ok, false, "client never saw the end");
+});
+
+test("B: ±5 ms boundaries of the window are pinned", () => {
+  // the window is (answer + 5, close - 5) exclusive (TICK_MARGIN_MS = 5)
+  const at = (d, check) => M(withDrain(d, check), conn(2002), [A - 10, A + 2210]);
+  assert.equal(at(5, null).kind, "stalled", "drain at answer + 5: outside the window, today's rule (no tick inside) applies");
+  assert.equal(at(6, null).kind, "stalled", "drain at answer + 6: inside; no check record and no tick inside, so C0 holds");
+  assert.equal(at(6, 6).ok, false, "drain at answer + 6 whose check ran at once (before the close): C1 fails");
+  assert.equal(at(1997, null).kind, "stalled", "drain at close - 5: outside the window");
+  assert.equal(at(1996, 2001).ok, false, "drain at close - 6 with check 1 ms before the close: C1 fails (no margin)");
+  assert.equal(at(1996, 2002).kind, "stalled", "check exactly at the close: C1 holds");
+  const ticks = (xs) => M(lost(), conn(2002), [A - 10, ...xs.map((x) => A + x), A + 2210]);
+  assert.equal(ticks([5, 15]).kind, "stalled", "ticks at +5 and +15: only one inside the window");
+  assert.equal(ticks([6, 16]).ok, false, "ticks at +6 and +16: two consecutive inside, T2 fails");
+  assert.equal(ticks([1987, 1997]).kind, "stalled", "ticks at close - 15 and close - 5: only one inside");
+  assert.equal(ticks([1986, 1996]).ok, false, "ticks at close - 16 and close - 6: two inside, T2 fails");
+  assert.equal(M(lost(), conn(2002), [A + 5, A + 2210]).kind, "stalled", "E0: a tick at answer + 5 counts as before the answer");
+  assert.equal(M(lost(), conn(2002), [A + 6, A + 2210]).ok, false, "E0: the first tick at answer + 6 leaves the start uncovered");
+  assert.equal(M(lost(), conn(2002), [A - 10, A + 1997]).kind, "stalled", "E0: a tick at close - 5 counts as after the close");
+  assert.equal(M(lost(), conn(2002), [A - 10, A + 1996]).ok, false, "E0: the last tick at close - 6 leaves the end uncovered");
+});
+
+test("P: drain and check-phase records must pair one to one", () => {
+  const ticks = [A - 13, A + 2222];
+  const st = (drains, checks) => lost({ drainsAt: drains.map((d) => A + d), io: { firstDataAt: null, dataEvents: 0, drainChecksAt: checks.map((c) => (c == null ? null : A + c)) } });
+  assert.equal(M(st([1978], [2221]), conn(2002), ticks).kind, "stalled", "paired");
+  assert.equal(M(st([1978], []), conn(2002), ticks).ok, false, "a drain without its check record slot");
+  assert.equal(M(st([1978], [2221, 2300]), conn(2002), ticks).ok, false, "an extra check record");
+  assert.equal(M(st([100, 1978], [2221]), conn(2002), ticks).ok, false, "a check record missing for an earlier drain (misaligned)");
+  assert.equal(M(st([1978], [null]), conn(2002), ticks).kind, "stalled", "a paired slot whose check has not run yet counts as no check record (C0)");
+});
+
+test("D: ±50 ms clock offsets on live records never excuse a genuine failure", () => {
+  // every client-side time moves together (ticks, drains, checks, data, start, end); server times stay
+  const shift = (st, ticks, d) => [{ ...st, t0: st.t0 + d, drainsAt: (st.drainsAt || []).map((t) => t + d), io: { ...st.io, firstDataAt: st.io.firstDataAt == null ? null : st.io.firstDataAt + d, errorAt: st.io.errorAt == null ? null : st.io.errorAt + d, drainChecksAt: (st.io.drainChecksAt || []).map((t) => (t == null ? null : t + d)) } }, ticks.map((t) => t + d)];
+  const every10 = (to) => Array.from({ length: Math.ceil((to + 300) / 10) }, (_, i) => A - 50 + i * 10);
+  const L = (st, close, ticks, endAfter = 5) => [liveSt(st, close, endAfter), live(close), ticks];
+  const genuine = [
+    L(withDrain(500), 2002, every10(2002)),
+    L(lost(), 2002, [A - 10, A + 500, A + 510, A + 2200]),
+    L(withDrain(300), 2002, [A - 10, A + 900, A + 2200]),
+    L(withDrain(300, 301), 2002, [A - 10, A + 2200]),
+    L(withDrain(300), 2002, [A - 10, A + 299, A + 2200]),
+    L(lost({ drainsAt: [A + 300, A + 400], io: { firstDataAt: null, dataEvents: 0, drainChecksAt: [A + 2100, A + 2100] } }), 2002, [A - 10, A + 2200]),
+    L(withDrain(300, 2100, { io: { firstDataAt: A + 301, dataEvents: 1, drainChecksAt: [A + 2100] } }), 2002, [A - 10, A + 2200]),
+    L(withDrain(149), 12770, [A - 7, A + 12780]),
+    L(withDrain(50), 300, bracket(300)),
+    L(withDrain(20), 100, [A - 10, A + 400]),
+    // the replay's C0 failures (a tick and a drain together soon after the answer), as live records whose client saw
+    // the reset at once: a -50 ms offset would move that activity before the answer; K catches it
+    L(withDrain(23), 3953, [A - 4, A + 23, A + 3958]),
+    L(withDrain(150), 2965, [A - 6, A + 150, A + 4413]),
+    L(withDrain(15), 4276, [A - 9, A + 13, A + 5916]),
+    L(withDrain(334), 2775, [A - 10, A + 333, A + 4191]),
+  ];
+  for (const [i, [st, c, ticks]] of genuine.entries()) {
+    assert.equal(M(st, c, ticks).ok, false, `case ${i} fails unshifted`);
+    for (const d of [-50, -20, 20, 50]) {
+      const [s2, t2] = shift(st, ticks, d);
+      assert.equal(M(s2, c, t2).ok, false, `case ${i} must still fail with the client's clock offset ${d} ms`);
+    }
+  }
+  // and a consistent live excuse stays excused at offsets within the causal slack only
+  const okCase = L(withDrain(1978, 2221), 2002, [A - 13, A + 2222], 50);
+  assert.equal(M(...okCase).kind, "stalled");
+  assert.equal(M(...shift(okCase[0], okCase[2], 20).slice(0, 1), okCase[1], shift(okCase[0], okCase[2], 20)[1]).ok, false, "+20 ms: the client would have started after the server saw it");
+});
