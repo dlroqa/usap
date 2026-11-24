@@ -10,7 +10,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
-const { matchGcSample } = require("../ci/memprobe-gc.cjs");
+const { matchGcSample, writeTrigger } = require("../ci/memprobe-gc.cjs");
 
 const PROBE = path.join(__dirname, "..", "ci", "image-queue-memprobe.cjs");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -54,7 +54,7 @@ test("reproduction: a read after the probe's next plain tick misses the sample w
     assert.ok(await until(() => { const p = read(out); return p && p.gcAvailable; }), "probe running");
     for (let k = 1; k <= 3; k += 1) {
       const id = `gc-late-${k}`; const requestedAt = Date.now();
-      fs.writeFileSync(`${out}.gc`, id);
+      writeTrigger(`${out}.gc`, id);
       // wait until the GC-marked record has been written AND overwritten by a later plain tick (the CI miss)
       const marked = await until(() => { const p = read(out); return p && p.gcId === id ? p : null; }, 5000, 5);
       assert.ok(marked, "the probe answered");
@@ -75,7 +75,7 @@ test("ownership: a sample left by an earlier server process or an earlier cycle 
   try {
     assert.ok(await until(() => { const p = read(out); return p && p.gcAvailable; }));
     aPid = a.pid;
-    fs.writeFileSync(`${out}.gc`, "gc-run1-1");
+    writeTrigger(`${out}.gc`, "gc-run1-1");
     aLast = await until(() => { const p = read(out); return p && p.lastGc && p.lastGc.id === "gc-run1-1" ? p : null; });
     assert.ok(aLast);
   } finally { await stop(a); }
@@ -89,12 +89,12 @@ test("ownership: a sample left by an earlier server process or an earlier cycle 
   const b = startProbe(dir, out);
   try {
     assert.ok(await until(() => { const p = read(out); return p && p.pid === b.pid; }));
-    fs.writeFileSync(`${out}.gc`, "gc-run2-1");
+    writeTrigger(`${out}.gc`, "gc-run2-1");
     const s1 = await until(() => matchGcSample(read(out), { id: "gc-run2-1", pid: b.pid, requestedAt: 0 }));
     assert.ok(s1);
     const req2 = { id: "gc-run2-2", pid: b.pid, requestedAt: Date.now() };
     assert.equal(matchGcSample(read(out), req2), null, "cycle 2 is not answered by cycle 1's sample");
-    fs.writeFileSync(`${out}.gc`, req2.id);
+    writeTrigger(`${out}.gc`, req2.id);
     const s2 = await until(() => matchGcSample(read(out), req2));
     assert.ok(s2 && s2.id === "gc-run2-2" && s2.t >= req2.requestedAt);
   } finally { await stop(b); }
@@ -106,9 +106,30 @@ test("negative control: without a GC (no --expose-gc) there is never a post-GC s
   try {
     assert.ok(await until(() => { const p = read(out); return p && p.gcAvailable === false; }));
     const req = { id: "gc-nogc-1", pid: child.pid, requestedAt: Date.now() };
-    fs.writeFileSync(`${out}.gc`, req.id);
+    writeTrigger(`${out}.gc`, req.id);
     assert.ok(await until(() => { const p = read(out); return p && p.gcId === req.id; }), "the probe saw the request");
     assert.equal(await until(() => matchGcSample(read(out), req), 1500), null, "no sample: missing stays missing (the validator then records FAIL)");
     assert.equal(read(out).lastGc, undefined);
+  } finally { await stop(child); }
+});
+
+test("trigger race (main caa546d, Windows): a request seen while still empty is not consumed as a generic one; it is answered once written", async () => {
+  const out = path.join(dir, "race.json");
+  const child = startProbe(dir, out);
+  try {
+    assert.ok(await until(() => { const p = read(out); return p && p.gcAvailable; }));
+    // a non-atomic write: the file exists empty for longer than one probe tick, then the id is written
+    const req = { id: "gc-race-1", pid: child.pid, requestedAt: Date.now() };
+    const fd = fs.openSync(`${out}.gc`, "w");
+    const seenEmpty = await until(() => { const p = read(out); return p && p.t > req.requestedAt + 250 ? p : null; });
+    assert.ok(seenEmpty, "the probe ticked while the trigger was empty");
+    assert.ok(fs.existsSync(`${out}.gc`), "the empty trigger was left in place");
+    assert.notEqual((read(out).lastGc || {}).id, "gc", "not consumed as a generic request");
+    fs.writeSync(fd, req.id); fs.closeSync(fd);
+    assert.ok(await until(() => matchGcSample(read(out), req)), "answered once the id is there");
+    // and the atomic writer leaves no temporary file behind
+    writeTrigger(`${out}.gc`, "gc-race-2");
+    assert.equal(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")).length, 0);
+    assert.ok(await until(() => matchGcSample(read(out), { id: "gc-race-2", pid: child.pid, requestedAt: 0 })));
   } finally { await stop(child); }
 });

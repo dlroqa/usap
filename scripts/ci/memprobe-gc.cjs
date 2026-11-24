@@ -15,4 +15,12 @@ function matchGcSample(p, { id, pid, requestedAt }) {
   return null;
 }
 
-module.exports = { matchGcSample };
+// Writes the GC request atomically (a temporary file, then rename), so the probe never reads a half-written request.
+function writeTrigger(file, id) {
+  const fs = require("fs");
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, id);
+  fs.renameSync(tmp, file);
+}
+
+module.exports = { matchGcSample, writeTrigger };
