@@ -14,7 +14,8 @@ const test = require("node:test");
 
 const { makeRoot, startServer, stopServer, request, installFakeSdServer, fakeSdDiag, fakeSdPath, IS_WIN, processesUnder } = require("./api-contract/harness.cjs");
 const os = require("node:os");
-const { portTraceEnv, createLifecycleTrace, describeLifecycle } = require("./fixtures/lifecycle-trace.cjs"); // #170 diagnostics only
+const { portTraceEnv, createLifecycleTrace, describeLifecycle, rolesFor } = require("./fixtures/lifecycle-trace.cjs"); // #170 diagnostics only
+const { describePortRecord } = require("./fixtures/r1b-port-record.cjs"); // #170 diagnostics only
 // #142: the fake sd-server's last start / listen / exit records, appended to failure messages.
 const sdDiag = () => JSON.stringify(fakeSdDiag(root).slice(-12));
 // Engine processes running from a test root, wherever their parent is (#136: a re-parented engine is invisible to the
@@ -416,10 +417,18 @@ function startTrace() {
   const traceFile = path.join(os.tmpdir(), `usap-port-trace-${process.pid}-${Date.now()}.jsonl`);
   const st = createLifecycleTrace({ traceFile, standInDiagFile: path.join(path.dirname(fakeSdPath(root)), "fake-sd-diag.jsonl") });
   traceHook = st.onDiagnostics;
-  const print = (t, srv) => {
+  // failed: the test body threw. The port record's holder lookups (slow on Windows) run only then, or after a
+  // stand-in bind failure; otherwise it shows the reservation sequence, locks and ranges only.
+  const print = async (t, srv, failed = false) => {
     traceHook = null;
     let line; try { line = describeLifecycle(st, srv); } catch (_) { line = "description failed"; }
-    t.diagnostic(`#170 lifecycle: ${line}`);
+    let rec;
+    try {
+      const sdDiag = path.join(path.dirname(fakeSdPath(root)), "fake-sd-diag.jsonl");
+      const bindFailed = fs.existsSync(sdDiag) && fs.readFileSync(sdDiag, "utf8").split("\n").some((l) => /"e":"listen-error"/.test(l) && (() => { try { return JSON.parse(l).t >= st.t0; } catch (_) { return false; } })());
+      rec = await describePortRecord({ port: srv.sdPort, t0: st.t0, roles: rolesFor(st, srv), standInDiagFile: sdDiag, full: failed || bindFailed });
+    } catch (_) { rec = "port record failed"; }
+    t.diagnostic(`#170 lifecycle: ${line} || port record (${failed ? "test failed" : "test passed"}): ${rec}`);
     try { fs.rmSync(traceFile, { force: true }); } catch (_) { /* best effort */ }
   };
   return { st, env: portTraceEnv(traceFile), print };
@@ -473,7 +482,7 @@ test("R1 (slot on): text load, image load 100 ms later while text is before its 
 
 test("R5 (slot on): image load, text load 100 ms later: text 409 (image loading), never both resident", async (t) => {
   const tr = startTrace(); // #170 diagnostics only
-  await withServer({ ...SLOT_ON, ...tr.env }, async (srv) => { try {
+  await withServer({ ...SLOT_ON, ...tr.env }, async (srv) => { let passed = false; try {
     const free = await holdTextPort(srv);
     const done = sampler(srv);
     tr.st.mark("image load sent");
@@ -493,7 +502,7 @@ test("R5 (slot on): image load, text load 100 ms later: text 409 (image loading)
     assert.ok(seen.max <= 1, `at most one heavy engine alive (saw ${seen.max})`);
     tr.st.mark("final engines check");
     assert.deepEqual((await engines(srv)).map((e) => e.label), ["image"]);
-  } finally { tr.print(t, srv); } });
+  passed = true; } finally { await tr.print(t, srv, !passed); } });
 });
 
 test("R2 (slot on): four image loads at once run one after another: never two image processes, the survivor is tracked, a stop leaves none", async () => {
@@ -602,7 +611,7 @@ test("crash during load (slot on): an image engine that fails to load releases t
 
 test("R1b (slot on): with an image engine loaded, a text load gets 409 and the image engine keeps running; a settings change still works", async (t) => {
   const tr = startTrace(); // #170 diagnostics only
-  await withServer({ ...SLOT_ON, ...tr.env }, async (srv) => { try {
+  await withServer({ ...SLOT_ON, ...tr.env }, async (srv) => { let passed = false; try {
     tr.st.mark("first image load sent");
     assert.equal((await imageLoad(srv)).status, 200);
     await imageReady(srv, 20000, "image ready");
@@ -627,7 +636,7 @@ test("R1b (slot on): with an image engine loaded, a text load gets 409 and the i
     assert.equal(after.length, 1);
     assert.notEqual(after[0].pid, before[0].pid, "replaced, after the old exit was confirmed");
     assert.equal(alive(before[0].pid), false);
-  } finally { tr.print(t, srv); } });
+  passed = true; } finally { await tr.print(t, srv, !passed); } });
 });
 
 test("R3 (slot on): a text load while an image model is loaded answers 409 MODEL_ALREADY_ACTIVE with the original body fields", async () => {

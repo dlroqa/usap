@@ -27,6 +27,11 @@ const path = require("node:path");
 const RANGE = { first: 21000, last: 23999 };
 const LOCK_DIR = path.join(os.tmpdir(), "usap-test-ports");
 const held = new Map(); // port -> own lock file, for this process (set before the bind probe)
+// #170 diagnostics (messages only): every process appends one line per reservation and release to a shared log in
+// the lock directory ("<ms> <pid> <port> reserve|release"), so a failure can show which test processes held a port
+// before. Appending never changes which port is chosen; a failed append is ignored.
+const LOG_NAME = "reservations.log";
+const logEvent = (lockDir, port, what) => { try { fs.appendFileSync(path.join(lockDir, LOG_NAME), `${Date.now()} ${process.pid} ${port} ${what}\n`); } catch (_) { /* diagnostics only */ } };
 const LOCK_RE = /^(\d+)\.(\d+)\.lock$/;
 
 function pidAlive(pid) {
@@ -83,8 +88,9 @@ async function reservePort({ host = "127.0.0.1", range = RANGE, lockDir = LOCK_D
     const file = claim(lockDir, port);
     if (!file) continue;
     held.set(port, file); // before the probe, so a concurrent call in this process skips it
-    if (!(await bindable(port, host))) { releasePort(port); continue; }
+    if (!(await bindable(port, host))) { logEvent(lockDir, port, "probe-busy"); releasePort(port); continue; }
     cursor = (cursor + i + 1) % span;
+    logEvent(lockDir, port, "reserve");
     return port;
   }
   throw new Error(`no free test port in ${range.first}-${range.last} (locks in ${lockDir})`);
@@ -94,9 +100,10 @@ function releasePort(port) {
   const file = held.get(port);
   if (!file) return;
   held.delete(port);
+  logEvent(path.dirname(file), port, "release");
   try { fs.unlinkSync(file); } catch (_) { /* already gone */ } // our own lock file: no other process uses this name
 }
 
 process.on("exit", () => { for (const port of [...held.keys()]) releasePort(port); });
 
-module.exports = { reservePort, releasePort, heldPorts: () => [...held.keys()], RANGE, LOCK_DIR };
+module.exports = { reservePort, releasePort, heldPorts: () => [...held.keys()], RANGE, LOCK_DIR, LOG_NAME };

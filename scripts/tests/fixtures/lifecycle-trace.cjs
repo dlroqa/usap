@@ -75,14 +75,9 @@ function createLifecycleTrace({ traceFile, standInDiagFile, now = Date.now, aliv
   return st;
 }
 
-// One bounded line. srv: { proc: { pid }, sdPort }.
-function describeLifecycle(st, srv, { testPid = process.pid } = {}) {
-  const rel = (t) => (Number.isFinite(t) ? Math.round(t - st.t0) : "?");
-  const all = readJsonl(st.traceFile);
-  const BIND = new Set(["listen-attempt", "listening", "listen-error", "closed"]);
-  const trace = all.filter((r) => BIND.has(r.ev));
-  const steps = all.filter((r) => !BIND.has(r.ev)).sort((a, b) => a.t - b.t);
-  const standIn = readJsonl(st.standInDiagFile).filter((r) => Number.isFinite(r.t) && r.t >= st.t0);
+// Process roles in order of first appearance: exact spawn records first (preload), then guards and engines from the
+// supervisor, stand-ins from their own records. Shared with fixtures/r1b-port-record.cjs.
+function roleMap(st, srv, steps, standIn, testPid = process.pid) {
   const roles = new Map([[srv && srv.proc && srv.proc.pid, "studio"], [testPid, "test"]]);
   const counters = { g: 0, l: 0, e: 0, s: 0 };
   const name = (prefix, pid) => { if (!pid) return "none"; if (!roles.has(pid)) { counters[prefix] += 1; roles.set(pid, `${prefix}${counters[prefix]}`); } return roles.get(pid); };
@@ -93,6 +88,24 @@ function describeLifecycle(st, srv, { testPid = process.pid } = {}) {
   const firsts = [...st.seen.entries()].sort((a, b) => a[1].at - b[1].at);
   for (const [pid, v] of firsts) if (v.kind === "guard") name("g", pid); else if (v.kind === "engine") name("e", pid);
   for (const r of standIn) if (r.e === "start" && !roles.has(r.pid)) name("s", r.pid);
+  return roles;
+}
+function rolesFor(st, srv, { testPid = process.pid } = {}) {
+  const all = readJsonl(st.traceFile);
+  const steps = all.filter((r) => !["listen-attempt", "listening", "listen-error", "closed"].includes(r.ev)).sort((a, b) => a.t - b.t);
+  const standIn = readJsonl(st.standInDiagFile).filter((r) => Number.isFinite(r.t) && r.t >= st.t0);
+  return roleMap(st, srv, steps, standIn, testPid);
+}
+
+// One bounded line. srv: { proc: { pid }, sdPort }.
+function describeLifecycle(st, srv, { testPid = process.pid } = {}) {
+  const rel = (t) => (Number.isFinite(t) ? Math.round(t - st.t0) : "?");
+  const all = readJsonl(st.traceFile);
+  const BIND = new Set(["listen-attempt", "listening", "listen-error", "closed"]);
+  const trace = all.filter((r) => BIND.has(r.ev));
+  const steps = all.filter((r) => !BIND.has(r.ev)).sort((a, b) => a.t - b.t);
+  const standIn = readJsonl(st.standInDiagFile).filter((r) => Number.isFinite(r.t) && r.t >= st.t0);
+  const roles = roleMap(st, srv, steps, standIn, testPid);
   const who = (pid) => (pid && roles.has(pid) ? roles.get(pid) : pid ? "other" : "none");
   const portName = (p) => (p === (srv && srv.sdPort) ? "preferred" : p >= 28088 && p <= 28120 ? `backup+${p - 28088}` : "other");
   const ev = [];
@@ -143,4 +156,4 @@ function describeLifecycle(st, srv, { testPid = process.pid } = {}) {
   return line.slice(0, 3500);
 }
 
-module.exports = { portTraceEnv, createLifecycleTrace, describeLifecycle, parseHolders, PRELOAD };
+module.exports = { portTraceEnv, createLifecycleTrace, describeLifecycle, parseHolders, rolesFor, readJsonl, PRELOAD };
