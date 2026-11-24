@@ -59,3 +59,34 @@ test("R2 diag: failed answers keep code words only; log lines sanitized; bounded
   assert.ok(describeR2({ t0: T, loads, samples: many, final: {} }).length <= 3000);
   assert.match(describeR2({}), /^loads none; image engines none recorded; after the check: backend running undefined/);
 });
+
+test("R2 diag: real-run shapes — loading objects, ports in log lines, and an engine replaced before it reported its PID", () => {
+  const status = { running: true, ready: true, loading: { active: false, phase: "Initializing model...", progress: 95 }, unloading: { active: false }, settings: { steps: 3 }, error: null, port: 28088 };
+  const samples = [
+    { t: T + 100, sup: [sup(9001, 8001, -5297)], exits: [] },
+    { t: T + 700, sup: [], exits: [exit(9001, 130, null, "SIGTERM"), exit(null, 5600, null, "SIGTERM")] },
+    { t: T + 6200, sup: [sup(9003, 8003, 6139)], exits: [exit(9001, 130, null, "SIGTERM"), exit(null, 5600, null, "SIGTERM")] },
+  ];
+  const log = "  [backend] Port 14962 was still busy 5001 ms after the previous image engine exited — using the backup range.\n  [backend] Preferred port 14962 is busy — using 28088 instead.";
+  const s = describeR2({ t0: T, loads, samples, final: { status, sup: [sup(9003, 8003, 6139)], exits: samples[2].exits, alive: { 9001: false, 9003: true }, portOpen: true }, log });
+  assert.match(s, /loading inactive \(Initializing model\.\.\.\), unloading inactive/);
+  assert.doesNotMatch(s, /object/);
+  assert.match(s, /an engine ended before reporting its PID: guard exited 5600 code none signal SIGTERM/);
+  assert.match(s, /Port N was still busy N ms after the previous image engine exited/);
+  assert.doesNotMatch(s, /14962|28088|9001|9003|8003/, s);
+  assert.match(s, /reading: an engine is alive and tracked/);
+  // only engines without a PID, all ended: not a failure to start
+  const gone = describeR2({ t0: T, loads, samples: [{ t: T + 700, sup: [], exits: [exit(null, 600, null, "SIGTERM")] }], final: { status: { running: false }, sup: [], exits: [], alive: {}, portOpen: false } });
+  assert.match(gone, /reading: every engine recorded during the check exited/);
+});
+
+test("R2 diag: one entry per engine, even when its PID was reported between two samples (Windows: a requested stop exits with code 1)", () => {
+  const samples = [
+    { t: T + 670, sup: [{ enginePid: null, guardPid: 8002, startedAt: iso(662) }], exits: [] },
+    { t: T + 788, sup: [{ enginePid: 9002, guardPid: 8002, startedAt: iso(662) }], exits: [] },
+    { t: T + 900, sup: [], exits: [exit(9002, 799, 1, null)] },
+  ];
+  const s = describeR2({ t0: T, loads, samples, final: { status: { running: false }, sup: [], exits: samples[2].exits, alive: { 9002: false }, portOpen: false } });
+  assert.match(s, /image engines e1\/g1 started 662, supervised 670\.\.788, exited 799 code 1 signal none; after the check/);
+  assert.doesNotMatch(s, /none\/g/);
+});
