@@ -22,6 +22,7 @@ const { closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, WATCH_BYTES
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
 const { rawRequest } = require("./fixtures/refusal-clients.cjs");
 const { timeline: timelineOf, judgeRefusedClientMac } = require("./fixtures/refusal-judge.cjs");
+const { j2Evidence } = require("./fixtures/j2-evidence.cjs"); // #151 J2 evidence line only
 const { execFile } = require("node:child_process");
 
 const MiB = 1024 * 1024;
@@ -467,6 +468,8 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
       // #151 class B: on macOS the v2b rule (fixtures/refusal-judge.cjs); elsewhere this file's rule, unchanged.
       const v = process.platform === "darwin" ? judgeRefusedClientMac(st, c, ticks, 403) : judgeRefusedClient(st, c, ticks, 403);
       const tl = timelineOf(st, c, ticks); // #151 diagnostics: client activity relative to the server's answer (message only)
+      // #151 J2 evidence (messages only, every platform): see json-413.test.cjs. The verdict used here is unchanged.
+      if (st.status !== 403) { let e; try { e = j2Evidence(st, c, ticks, 403, judgeRefusedClientMac(st, c, ticks, 403)); } catch (_) { e = "description failed"; } t.diagnostic(`J2 evidence, client ${i}: ${e}`); }
       assert.ok(v.ok, `client ${i}: ${v.why}${tl}; client error ${st.error}: ${record()}`);
       if (v.kind === "stalled") { stalled.push(`client ${i}: ${v.why}${tl}`); return; }
       assert.doesNotThrow(() => JSON.parse(st.body), `client ${i}: complete JSON answer, got ${JSON.stringify(st.body.slice(0, 80))}`);

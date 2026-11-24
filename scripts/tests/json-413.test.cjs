@@ -17,6 +17,7 @@ const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./
 const { GRACE_MS } = require("../server/http/refusal-close.cjs");
 const { execFile } = require("node:child_process");
 const { judgeRefusedClient, judgeRefusedClientMac } = require("./fixtures/refusal-judge.cjs");
+const { j2Evidence } = require("./fixtures/j2-evidence.cjs"); // #151 J2 evidence line only
 // #151 class B: on macOS the per-client judge is the v2b rule (fixtures/refusal-judge.cjs); elsewhere today's rule.
 const judgeLostClient = process.platform === "darwin" ? judgeRefusedClientMac : judgeRefusedClient;
 const { describeLostClient } = require("./fixtures/stall-diag.cjs");
@@ -194,6 +195,9 @@ test("concurrent over-limit declarations are each refused early; the server's to
       const { conn, ev } = assertServerRefusal(rec, st, `client ${i}`);
       total += rec.bytesRead;
       const v = judgeLostClient(st, conn, ticks, 413, ANSWER_BODY);
+      // #151 J2 evidence (messages only, every platform): each lost client's J2 inputs and predicates, evaluated
+      // independently of the judge, next to the J2 judge's own result. The verdict used below is unchanged.
+      if (st.status !== 413) { let e; try { e = j2Evidence(st, conn, ticks, 413, judgeRefusedClientMac(st, conn, ticks, 413, ANSWER_BODY)); } catch (_) { e = "description failed"; } t.diagnostic(`J2 evidence, client ${i}: ${e}`); }
       assert.ok(v.ok, `client ${i}: ${v.why} ${ev}`);
       if (v.kind === "answered") assert.equal(st.connectionHeader, "close", `client ${i}: Connection: close ${ev}`);
       else { stalled += 1; excused.push(`client ${i}: ${v.why}`); }
