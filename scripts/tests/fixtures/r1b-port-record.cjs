@@ -2,7 +2,7 @@
 // and R5, printed in the same line as the lifecycle trace (fixtures/lifecycle-trace.cjs). Windows CI failed R1b twice
 // with the stand-in's "listen EADDRINUSE" on the same reserved port (21147), right after the studio's own check had
 // found it free. This adds, for that port:
-//   - the reservation sequence across all test processes (fixtures/test-ports.cjs shared log): who reserved,
+//   - the reservation sequence across all test processes (fixtures/test-ports.cjs shared log, beside the lock dir): who reserved,
 //     released or found it busy, when (ms from the test's start), with process roles;
 //   - the reservation locks now;
 //   - whether the port lies in the OS dynamic or an excluded range (fixtures/port-range-diag.cjs);
@@ -13,11 +13,10 @@
 // Nothing binds or connects. Pids, paths and addresses are never printed; the port's own number is (it is a test port).
 "use strict";
 const fs = require("node:fs");
-const path = require("node:path");
 const { execFile } = require("node:child_process");
 const { portOwners } = require("../../ci/port-owner.cjs");
 const { portRanges, lockOwners, imageName } = require("./port-range-diag.cjs");
-const { LOCK_DIR, LOG_NAME } = require("./test-ports.cjs");
+const { LOCK_DIR, LOG_FILE } = require("./test-ports.cjs");
 const { parseHolders, readJsonl } = require("./lifecycle-trace.cjs");
 
 const MAX_LOG = 12, MAX_HOLDERS = 4;
@@ -36,8 +35,8 @@ async function parentOf(pid, platform = process.platform) {
 }
 
 // "<ms> <pid> <port> <what>" lines for `port` -> [{ t, pid, what }], last MAX_LOG.
-function reservationLog(port, lockDir = LOCK_DIR) {
-  let text = ""; try { text = fs.readFileSync(path.join(lockDir, LOG_NAME), "utf8"); } catch (_) { return []; }
+function reservationLog(port, logFile = LOG_FILE) {
+  let text = ""; try { text = fs.readFileSync(logFile, "utf8"); } catch (_) { return []; }
   const out = [];
   for (const l of text.split(/\r?\n/)) { const f = l.split(" "); if (f.length === 4 && Number(f[2]) === port) out.push({ t: Number(f[0]), pid: Number(f[1]), what: f[3].replace(/[^a-z-]/g, "") }); }
   return out.slice(-MAX_LOG);
@@ -46,9 +45,9 @@ function reservationLog(port, lockDir = LOCK_DIR) {
 /**
  * @param {object} o  port, t0, roles (Map pid -> role from the lifecycle trace), standInDiagFile, full, testPid, platform
  */
-async function describePortRecord({ port, t0, roles = new Map(), standInDiagFile = null, full = false, testPid = process.pid, platform = process.platform, lockDir = LOCK_DIR }) {
+async function describePortRecord({ port, t0, roles = new Map(), standInDiagFile = null, full = false, testPid = process.pid, platform = process.platform, lockDir = LOCK_DIR, logFile = LOG_FILE }) {
   const rel = (t) => (Number.isFinite(t) ? Math.round(t - t0) : "?");
-  const log = reservationLog(port, lockDir);
+  const log = reservationLog(port, logFile);
   const others = new Map();
   const procRole = (pid) => {
     if (pid === testPid) return "this test process";

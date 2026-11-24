@@ -13,22 +13,23 @@ const { describePortRecord, reservationLog } = require("./fixtures/r1b-port-reco
 const { reservePort, releasePort } = require("./fixtures/test-ports.cjs");
 
 const PORTS = path.join(__dirname, "fixtures", "test-ports.cjs");
-let lockDir;
-test.before(() => { lockDir = fs.mkdtempSync(path.join(os.tmpdir(), "usap-r1bpr-")); });
+let lockDir, logFile;
+test.before(() => { lockDir = fs.mkdtempSync(path.join(os.tmpdir(), "usap-r1bpr-")); logFile = path.join(lockDir, "..", `${path.basename(lockDir)}.log`); });
+test.after(() => { try { fs.rmSync(logFile, { force: true }); } catch (_) { /* best effort */ } });
 test.after(() => { try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch (_) { /* best effort */ } });
 const range = { first: 23900, last: 23999 };
 
 test("sequence: another test process reserved and released the port before this one; roles in order; lock now", async () => {
   const t0 = Date.now();
-  const port = Number(execFileSync(process.execPath, ["-e", `const p=require(${JSON.stringify(PORTS)});p.reservePort({range:${JSON.stringify(range)},lockDir:${JSON.stringify(lockDir)}}).then((x)=>{p.releasePort(x);console.log(x)})`], { encoding: "utf8" }).trim());
-  const mine = await reservePort({ range: { first: port, last: port }, lockDir });
+  const port = Number(execFileSync(process.execPath, ["-e", `const p=require(${JSON.stringify(PORTS)});p.reservePort({range:${JSON.stringify(range)},lockDir:${JSON.stringify(lockDir)},logFile:${JSON.stringify(logFile)}}).then((x)=>{p.releasePort(x);console.log(x)})`], { encoding: "utf8" }).trim());
+  const mine = await reservePort({ range: { first: port, last: port }, lockDir, logFile });
   assert.equal(mine, port);
   try {
-    const line = await describePortRecord({ port, t0, lockDir });
+    const line = await describePortRecord({ port, t0, lockDir, logFile });
     assert.match(line, new RegExp(`^port ${port} reservation sequence: -?\\d+ test process A reserve, -?\\d+ test process A release, -?\\d+ this test process reserve; locks now: this test process; in dynamic range (true|false|unknown), in an excluded range (true|false)$`));
-    assert.deepEqual(reservationLog(port, lockDir).map((e) => e.what), ["reserve", "release", "reserve"]);
+    assert.deepEqual(reservationLog(port, logFile).map((e) => e.what), ["reserve", "release", "reserve"]);
   } finally { releasePort(mine); }
-  assert.deepEqual(reservationLog(port, lockDir).map((e) => e.what), ["reserve", "release", "reserve", "release"]);
+  assert.deepEqual(reservationLog(port, logFile).map((e) => e.what), ["reserve", "release", "reserve", "release"]);
 });
 
 test("locks: a lock left by a process that is gone is marked dead", async () => {

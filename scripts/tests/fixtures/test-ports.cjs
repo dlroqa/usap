@@ -27,11 +27,13 @@ const path = require("node:path");
 const RANGE = { first: 21000, last: 23999 };
 const LOCK_DIR = path.join(os.tmpdir(), "usap-test-ports");
 const held = new Map(); // port -> own lock file, for this process (set before the bind probe)
-// #170 diagnostics (messages only): every process appends one line per reservation and release to a shared log in
-// the lock directory ("<ms> <pid> <port> reserve|release"), so a failure can show which test processes held a port
-// before. Appending never changes which port is chosen; a failed append is ignored.
-const LOG_NAME = "reservations.log";
-const logEvent = (lockDir, port, what) => { try { fs.appendFileSync(path.join(lockDir, LOG_NAME), `${Date.now()} ${process.pid} ${port} ${what}\n`); } catch (_) { /* diagnostics only */ } };
+// #170 diagnostics (messages only): every process using the shared lock directory appends one line per reservation,
+// release and busy probe to a shared log BESIDE it ("<ms> <pid> <port> reserve|release|probe-busy"), so a failure can
+// show which test processes held a port before. Tests with their own lock directory log only if they pass logFile.
+// Appending never changes which port is chosen; a failed append is ignored.
+const LOG_FILE = path.join(os.tmpdir(), "usap-test-ports.log");
+const logs = new Map(); // port -> log file for this reservation (or null)
+const logEvent = (file, port, what) => { if (!file) return; try { fs.appendFileSync(file, `${Date.now()} ${process.pid} ${port} ${what}\n`); } catch (_) { /* diagnostics only */ } };
 const LOCK_RE = /^(\d+)\.(\d+)\.lock$/;
 
 function pidAlive(pid) {
@@ -79,7 +81,7 @@ let cursor = 0;
  * A port this process owns until releasePort(port) or exit.
  * @param {{ host?: string, range?: { first: number, last: number }, lockDir?: string }} [o] range/lockDir: tests only
  */
-async function reservePort({ host = "127.0.0.1", range = RANGE, lockDir = LOCK_DIR } = {}) {
+async function reservePort({ host = "127.0.0.1", range = RANGE, lockDir = LOCK_DIR, logFile = lockDir === LOCK_DIR ? LOG_FILE : null } = {}) {
   fs.mkdirSync(lockDir, { recursive: true });
   const span = range.last - range.first + 1;
   for (let i = 0; i < span; i += 1) {
@@ -88,9 +90,9 @@ async function reservePort({ host = "127.0.0.1", range = RANGE, lockDir = LOCK_D
     const file = claim(lockDir, port);
     if (!file) continue;
     held.set(port, file); // before the probe, so a concurrent call in this process skips it
-    if (!(await bindable(port, host))) { logEvent(lockDir, port, "probe-busy"); releasePort(port); continue; }
+    if (!(await bindable(port, host))) { logEvent(logFile, port, "probe-busy"); releasePort(port); continue; }
     cursor = (cursor + i + 1) % span;
-    logEvent(lockDir, port, "reserve");
+    logs.set(port, logFile); logEvent(logFile, port, "reserve");
     return port;
   }
   throw new Error(`no free test port in ${range.first}-${range.last} (locks in ${lockDir})`);
@@ -100,10 +102,10 @@ function releasePort(port) {
   const file = held.get(port);
   if (!file) return;
   held.delete(port);
-  logEvent(path.dirname(file), port, "release");
+  logEvent(logs.get(port) || null, port, "release"); logs.delete(port);
   try { fs.unlinkSync(file); } catch (_) { /* already gone */ } // our own lock file: no other process uses this name
 }
 
 process.on("exit", () => { for (const port of [...held.keys()]) releasePort(port); });
 
-module.exports = { reservePort, releasePort, heldPorts: () => [...held.keys()], RANGE, LOCK_DIR, LOG_NAME };
+module.exports = { reservePort, releasePort, heldPorts: () => [...held.keys()], RANGE, LOCK_DIR, LOG_FILE };
