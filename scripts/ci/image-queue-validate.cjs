@@ -14,6 +14,7 @@
 //
 //   node scripts/ci/image-queue-validate.cjs --image stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf --results out.jsonl --logs ci-logs
 "use strict";
+const { matchGcSample, writeTrigger } = require("./memprobe-gc.cjs"); // D6 post-GC sample ownership
 
 const fs = require("fs");
 const http = require("http");
@@ -371,10 +372,15 @@ function engineMemory(pid) {
     let stopped = null;
     const readProbe = () => { try { return JSON.parse(fs.readFileSync(probeFile, "utf8")); } catch (_) { return null; } };
     let gcSeq = 0;
-    const gcSample = async () => {
-      const id = `gc-${++gcSeq}`;
-      fs.writeFileSync(`${probeFile}.gc`, id);
-      return waitUntil(() => { const p = readProbe(); return p && p.gcId === id ? p : null; }, 10000, 100);
+    // Each request has its own id (this run's nonce + sequence); the answer must come from the studio process being
+    // measured, taken after the request (scripts/ci/memprobe-gc.cjs). The probe keeps its last post-GC sample until the
+    // next request, so a late read still finds it. Same 10 s bound; a sample that never comes is still missing.
+    const gcNonce = require("crypto").randomBytes(4).toString("hex");
+    const gcSample = async (pid) => {
+      const id = `gc-${gcNonce}-${++gcSeq}`;
+      const requestedAt = Date.now();
+      writeTrigger(`${probeFile}.gc`, id);
+      return waitUntil(() => matchGcSample(readProbe(), { id, pid, requestedAt }), 10000, 100);
     };
     const MB = (b) => (typeof b === "number" ? `${Math.round(b / MiB)} MiB` : "n/a");
     try {
@@ -391,7 +397,7 @@ function engineMemory(pid) {
       const overLimit = (s) => (s.studio && s.studio > STOP_STUDIO_RSS_KIB) || s.free < STOP_FREE_BYTES;
       await sleep(2000);
       const probeOk = Boolean(await waitUntil(() => { const p = readProbe(); return p && p.pid === sPid && p.gcAvailable; }, 10000, 200));
-      const baseGc = probeOk ? await gcSample() : null;
+      const baseGc = probeOk ? await gcSample(sPid) : null;
       const base = sample();
       const before = (await queueNow()).iq.counts;
       // One cycle: A has the running turn with 63 of 64 MiB sent (its upload stays open), B and C complete and waiting;
@@ -417,7 +423,7 @@ function engineMemory(pid) {
         const released = await waitUntil(async () => { const { iq, q } = await queueNow(); return iq.memory.reservedBytes === 0 && iq.memory.heldJobs === 0 && q.running === 0 && q.waiting === 0 ? iq : null; }, 30000, 200);
         await sleep(1000);
         const after = sample();
-        const afterGc = probeOk ? await gcSample() : null;
+        const afterGc = probeOk ? await gcSample(sPid) : null;
         return { held, peak, released: Boolean(released), after, afterGc };
       };
       const c1 = await holdCycle();
@@ -456,7 +462,7 @@ function engineMemory(pid) {
         await sleep(1000);
         const s = sample(); if (overLimit(s)) stopped = s;
         const pre = s.probe;
-        const post = probeOk ? await gcSample() : null;
+        const post = probeOk ? await gcSample(sPid) : null;
         const images = rf.json && Array.isArray(rf.json.images) ? rf.json.images.length : 0;
         const fwdOk = rf.status === 200 && images >= 1 && (await queueNow()).iq.counts.forwarded - before2 === 1 && gcOk(post) && !stopped;
         record("D6 valid 64 MiB request forwarded and released", fwdOk ? "PASS" : "FAIL",
@@ -466,7 +472,7 @@ function engineMemory(pid) {
         const m = engineMemory(eng.enginePid);
         record("D6 engine memory breakdown (verified engine process)", m ? "MEASURED" : "UNAVAILABLE", m ? m.detail : "no breakdown available on this OS");
       }
-    } finally { for (const u of uploads) u.abort(); await stopServer(srv); srv = null; try { fs.unlinkSync(`${probeFile}.gc`); } catch (_) { /* none */ } }
+    } finally { for (const u of uploads) u.abort(); await stopServer(srv); srv = null; try { fs.unlinkSync(`${probeFile}.gc`); } catch (_) { /* none */ } try { for (const f of fs.readdirSync(path.dirname(probeFile))) if (f.startsWith(`${path.basename(probeFile)}.gc.`) && f.endsWith(".tmp")) fs.unlinkSync(path.join(path.dirname(probeFile), f)); } catch (_) { /* none */ } }
   });
   await scenario("Default budget refuses a third 64 MiB body", async () => {
     srv = await startServer("budget", ON);
