@@ -11,7 +11,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
 const { closeAfterAnswer } = require("../server/http/refusal-close.cjs");
-const { startGraceTrace, classify, wall } = require("./fixtures/grace-trace.cjs");
+const { startGraceTrace, classify, phaseTimers, timerText, LATE_MS, wall } = require("./fixtures/grace-trace.cjs");
 
 const GRACE = 300;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -22,8 +22,9 @@ function observer() {
   return { stop: () => new Promise((r) => { c.once("close", () => { try { r(JSON.parse(out)); } catch (_) { r(null); } }); c.stdin.end(); }) };
 }
 // One refused request through the real helper; `during(sock)` runs right after 'finish' (to disturb the grace period).
-async function refuseOnce({ during = () => {}, onSocket = () => {} } = {}) {
-  const trace = startGraceTrace({ graceMs: GRACE });
+// shared: an already started trace (kept running; the caller stops it), for multi-phase controls.
+async function refuseOnce({ during = () => {}, onSocket = () => {}, shared = null } = {}) {
+  const trace = shared || startGraceTrace({ graceMs: GRACE });
   const obs = observer();
   await sleep(250); // the observer's first samples
   const conn = {};
@@ -41,10 +42,11 @@ async function refuseOnce({ during = () => {}, onSocket = () => {} } = {}) {
   c.on("connect", () => { c.write("POST /x HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 10485760\r\n\r\n"); c.write(Buffer.alloc(64 * 1024, 0x61)); });
   const end = Date.now() + 10000; while (!conn.closedAt && Date.now() < end) await sleep(20);
   await sleep(100);
-  trace.stop();
+  if (!shared) trace.stop();
   const o = await obs.stop();
   c.destroy(); await new Promise((r) => server.close(r));
-  return classify({ conn, trace, socketTrace: trace.destroyOf(conn.s), observer: o, cpuMs: trace.cpuMs });
+  const r = classify({ conn, trace, socketTrace: trace.destroyOf(conn.s), observer: o, cpuMs: trace.cpuMs });
+  return shared ? { ...r, conn } : r;
 }
 const block = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const busy = (ms) => { const e = Date.now() + ms; while (Date.now() < e) { /* spin */ } };
@@ -100,4 +102,61 @@ test("trace: timers keep their behavior (unref, clearTimeout, other delays untou
     assert.equal(ran, 10, "a cleared timer did not run; the other ran once");
   } finally { trace.stop(); }
   assert.equal(globalThis.setTimeout, origST); assert.equal(net.Socket.prototype.destroy, origD);
+});
+
+// Phase accounting (refusal-close prints one summary per phase): each phase reports only its own timers and lateness.
+test("phase accounting (synthetic): phase 2 excludes phase 1's timers and lateness (cumulative accounting is caught)", () => {
+  const mono = (w) => w - performance.timeOrigin, b = 2_000_000;
+  const late1 = { armedAt: mono(b), dueAt: mono(b + 2000), firedAt: mono(b + 2900) };      // phase 1: 900 ms late
+  const ok2 = { armedAt: mono(b + 5000), dueAt: mono(b + 7000), firedAt: mono(b + 7004) }; // phase 2: 4 ms late
+  const s1 = {}, s2 = {}, rec = new Map([[s1, { timer: late1 }], [s2, { timer: ok2 }]]);
+  const trace = { timers: [late1, ok2], dropped: 0, destroyOf: (s) => rec.get(s) || null };
+  const p1 = phaseTimers({ trace, conns: [{ s: s1 }], from: 0, to: 1 });
+  const p2 = phaseTimers({ trace, conns: [{ s: s2 }], from: 1, to: 2 });
+  assert.deepEqual(p1, { traced: 1, fired: 1, latenessMaxMs: 900, own: 1, other: 0, fromAnotherWindow: 0, dropped: 0 });
+  assert.deepEqual(p2, { traced: 1, fired: 1, latenessMaxMs: 4, own: 1, other: 0, fromAnotherWindow: 0, dropped: 0 });
+  assert.match(timerText(p2), /^grace timers traced 1 in this phase \(1 for its connections, 0 other, 0 of its connections closed by a timer from another phase\), callback lateness max 4 ms in this phase \(1 fired\)$/);
+  // the old cumulative reading of phase 2 would be "traced 2, lateness max 900": it differs from both phases' own values
+  const cumulative = phaseTimers({ trace, conns: [{ s: s2 }], from: 0, to: 2 });
+  assert.notEqual(cumulative.traced, p2.traced); assert.notEqual(cumulative.latenessMaxMs, p2.latenessMaxMs);
+  // an unfired timer counts as traced, not fired, and adds no lateness
+  const pending = { armedAt: mono(b + 8000), dueAt: mono(b + 10000), firedAt: null };
+  const p3 = phaseTimers({ trace: { ...trace, timers: [late1, ok2, pending] }, conns: [], from: 2 });
+  assert.deepEqual([p3.traced, p3.fired, p3.latenessMaxMs, p3.other], [1, 0, null, 1]);
+  assert.match(timerText(p3), /callback lateness max none ms in this phase \(0 fired\)$/);
+  assert.match(timerText({ ...p3, dropped: 7 }), /; 7 not recorded \(cap\)\)/);
+});
+
+test("phase accounting (synthetic): cross-phase contamination is reported, not hidden", () => {
+  const mono = (w) => w - performance.timeOrigin, b = 3_000_000;
+  const t1 = { armedAt: mono(b), dueAt: mono(b + 2000), firedAt: mono(b + 2001) };
+  const t2 = { armedAt: mono(b + 5000), dueAt: mono(b + 7000), firedAt: mono(b + 7001) };
+  const s1 = {}, sX = {}, rec = new Map([[s1, { timer: t1 }], [sX, { timer: t1 }]]); // sX (phase 2) closed by phase 1's timer
+  const trace = { timers: [t1, t2], dropped: 0, destroyOf: (s) => rec.get(s) || null };
+  const p2 = phaseTimers({ trace, conns: [{ s: sX }], from: 1, to: 2 });
+  assert.deepEqual([p2.traced, p2.own, p2.other, p2.fromAnotherWindow], [1, 0, 1, 1]);
+  assert.match(timerText(p2), /0 for its connections, 1 other, 1 of its connections closed by a timer from another phase/);
+  // a phase connection with no traced timer (destroyed by another path) is neither own nor contamination
+  const p1 = phaseTimers({ trace, conns: [{ s: s1 }, { s: {} }], from: 0, to: 1 });
+  assert.deepEqual([p1.traced, p1.own, p1.other, p1.fromAnotherWindow], [1, 1, 0, 0]);
+});
+
+test("phase accounting (real helper, one trace, two phases): a late phase 1 does not leak into phase 2", { timeout: 60000 }, async () => {
+  const trace = startGraceTrace({ graceMs: GRACE });
+  try {
+    const from1 = trace.mark();
+    const r1 = await refuseOnce({ shared: trace, during: () => setTimeout(() => block(900), 50) });
+    const to1 = trace.mark();
+    const r2 = await refuseOnce({ shared: trace });
+    const to2 = trace.mark();
+    const p1 = phaseTimers({ trace, conns: [r1.conn], from: from1, to: to1 });
+    const p2 = phaseTimers({ trace, conns: [r2.conn], from: to1, to: to2 });
+    assert.match(r1.verdict, /^late timer/, r1.line); // per-connection readings unchanged by phase accounting
+    assert.equal(r2.verdict, "on time", r2.line);
+    assert.deepEqual([p1.traced, p1.own, p1.other, p1.fromAnotherWindow], [1, 1, 0, 0], timerText(p1));
+    assert.deepEqual([p2.traced, p2.own, p2.other, p2.fromAnotherWindow], [1, 1, 0, 0], timerText(p2));
+    assert.ok(p1.latenessMaxMs >= LATE_MS, timerText(p1));
+    assert.ok(p2.latenessMaxMs < LATE_MS, `phase 2 must not carry phase 1's lateness: ${timerText(p2)}`);
+    assert.equal(trace.timers.length, 2, "both phases' timers are still recorded (nothing dropped or overwritten)");
+  } finally { trace.stop(); }
 });

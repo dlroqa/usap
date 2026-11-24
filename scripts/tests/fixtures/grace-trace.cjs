@@ -11,7 +11,8 @@
 // The test keeps its own per-connection records (res.end called, 'finish' = handed to the OS, 'close' observed).
 // classify() reads one connection with fixed rules: timer armed late, callback late (and why, with the independent
 // observer's main-thread states: GC, busy, descheduled, synchronous block, kernel wait), destroy on time but close
-// observed late, or destroyed by something other than the grace timer. stop() restores everything.
+// observed late, or destroyed by something other than the grace timer. phaseTimers() reports one phase's own timers
+// (window between two mark() cursors) and their attribution. stop() restores everything.
 "use strict";
 const net = require("node:net");
 const perf = require("node:perf_hooks");
@@ -21,11 +22,12 @@ const now = () => perf.performance.now();
 const wall = (mono) => Math.round(perf.performance.timeOrigin + mono);
 
 function startGraceTrace({ graceMs }) {
-  const t = { graceMs, timers: [], gaps: [], gcs: [], cpu: [], active: null, stopped: false };
+  const t = { graceMs, timers: [], dropped: 0, gaps: [], gcs: [], cpu: [], active: null, stopped: false };
   const cpuNow = () => { try { const r = process.cpuUsage(); return Math.round((r.user + r.system) / 1000); } catch (_) { return null; } };
   const origSetTimeout = globalThis.setTimeout;
   const origDestroy = net.Socket.prototype.destroy;
   globalThis.setTimeout = function tracedSetTimeout(fn, delay, ...args) {
+    if (delay === graceMs && typeof fn === "function" && t.timers.length >= 500) t.dropped += 1;
     if (delay === graceMs && typeof fn === "function" && t.timers.length < 500) {
       const rec = { armedAt: now(), dueAt: now() + delay, firedAt: null, endedAt: null };
       t.timers.push(rec);
@@ -50,6 +52,7 @@ function startGraceTrace({ graceMs }) {
   let gcObs = null;
   try { gcObs = new perf.PerformanceObserver((list) => { for (const e of list.getEntries()) if (e.duration >= 5 && t.gcs.length < 60) t.gcs.push([e.startTime, e.duration]); }); gcObs.observe({ entryTypes: ["gc"] }); } catch (_) { gcObs = null; }
   t.destroyOf = (socket) => (socket && socket[DESTROY]) || null;
+  t.mark = () => t.timers.length; // phase cursor: timers armed from here on belong to the next phase window
   t.loopNow = () => { try { return eld ? { maxMs: Math.round(eld.max / 1e6), p99Ms: Math.round(eld.percentile(99) / 1e6) } : t.loop || null; } catch (_) { return null; } };
   // process CPU over the heartbeats that bracket wall window [a, b] (last at or before a, first at or after b; a
   // stalled main thread takes no heartbeats, so the bracket spans the stall) -> { cpu, span } or null
@@ -83,6 +86,25 @@ function statesIn(runs, a, b) {
   for (const [k, v] of dur) share[k[0]] = (share[k[0]] || 0) + v / total;
   return { text: [...dur.entries()].sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${Math.round(v)} ms`).join(", ") || "no sample in window", share };
 }
+
+/**
+ * Timers of ONE phase (not cumulative): those armed in the window [from, to) of trace.timers (cursors from
+ * trace.mark()), with their own count and callback lateness. Attribution: a window timer whose callback destroyed one
+ * of this phase's connections is "own"; any other window timer is "other" (armed in this window for something else);
+ * a phase connection destroyed by a timer armed OUTSIDE the window is counted as "from another window" (cross-phase
+ * contamination). conns: [{ s }]; destroyOf(socket) -> the trace's destroy record.
+ */
+function phaseTimers({ trace, conns, from, to = trace.timers.length, destroyOf = trace.destroyOf }) {
+  const win = trace.timers.slice(from, to), inWin = new Set(win);
+  const ownAll = new Set();
+  for (const c of conns) { const d = destroyOf ? destroyOf(c.s) : null; if (d && d.timer) ownAll.add(d.timer); }
+  const fired = win.filter((x) => x.firedAt !== null);
+  const late = fired.map((x) => x.firedAt - x.dueAt);
+  let own = 0, foreign = 0; for (const x of ownAll) { if (inWin.has(x)) own += 1; else foreign += 1; }
+  return { traced: win.length, fired: fired.length, latenessMaxMs: late.length ? Math.round(Math.max(...late)) : null,
+    own, other: win.length - own, fromAnotherWindow: foreign, dropped: trace.dropped || 0 };
+}
+const timerText = (p) => `grace timers traced ${p.traced} in this phase (${p.own} for its connections, ${p.other} other, ${p.fromAnotherWindow} of its connections closed by a timer from another phase${p.dropped ? `; ${p.dropped} not recorded (cap)` : ""}), callback lateness max ${p.latenessMaxMs === null ? "none" : p.latenessMaxMs} ms in this phase (${p.fired} fired)`;
 
 const LATE_MS = 200; // a timer callback, a destroy or a close event this much after its cause counts as late
 
@@ -125,4 +147,4 @@ function classify({ conn, trace, socketTrace, observer = null, pid = process.pid
   return { verdict, line: `${verdict}: ${parts.join("; ")}`.slice(0, 900) };
 }
 
-module.exports = { startGraceTrace, classify, statesIn, LATE_MS, wall };
+module.exports = { startGraceTrace, classify, statesIn, phaseTimers, timerText, LATE_MS, wall };

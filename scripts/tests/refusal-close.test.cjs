@@ -23,7 +23,7 @@ const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./
 const { rawRequest } = require("./fixtures/refusal-clients.cjs");
 const { timeline: timelineOf } = require("./fixtures/refusal-judge.cjs");
 const { execFile, spawn } = require("node:child_process");
-const { startGraceTrace, classify, LATE_MS } = require("./fixtures/grace-trace.cjs"); // #151 diagnostics only
+const { startGraceTrace, classify, phaseTimers, timerText, LATE_MS } = require("./fixtures/grace-trace.cjs"); // #151 diagnostics only
 
 const MiB = 1024 * 1024;
 const CHUNK = Buffer.alloc(64 * 1024, 0x61);
@@ -51,15 +51,17 @@ function startThreadObserver(pids) {
     try { return JSON.parse(out); } catch (_) { return null; }
   } };
 }
-function graceDiagnostics(t, label, conns, trace, observer) {
+// from: the trace.mark() cursor where this phase's window starts; returns the cursor where the next one starts.
+function graceDiagnostics(t, label, conns, trace, observer, from) {
+  const to = trace.mark();
   try {
     const rows = conns.map((c) => ({ c, r: classify({ conn: c, trace, socketTrace: trace.destroyOf(c.s), observer, cpuMs: trace.cpuMs }) }));
     const kept = rows.map(({ c }) => (c.closedAt && c.answeredAt ? c.closedAt - c.answeredAt : null)).filter((x) => x !== null);
-    const lateness = trace.timers.filter((x) => x.firedAt !== null).map((x) => x.firedAt - x.dueAt);
     const counts = {}; for (const { r } of rows) counts[r.verdict] = (counts[r.verdict] || 0) + 1;
-    t.diagnostic(`#151 grace close (${label}): ${conns.length} connections, kept ${kept.length ? `${Math.min(...kept)}..${Math.max(...kept)}` : "none"} ms after 'finish'; grace timers traced ${trace.timers.length}, callback lateness max ${lateness.length ? Math.round(Math.max(...lateness)) : "none"} ms; readings ${Object.entries(counts).map(([k, v]) => `${k} x${v}`).join(", ")}; loop delay so far ${(() => { const l = trace.loopNow(); return l ? `max ${l.maxMs} p99 ${l.p99Ms} ms` : "not recorded"; })()}; GC pauses >= 5 ms ${trace.gcs.length}; main-thread gaps >= 100 ms ${trace.gaps.length} (max ${Math.round(Math.max(0, ...trace.gaps.map((g) => g[1])))} ms); observer ${observer ? `${observer.platform} ${((observer.procs[process.pid] || {}).samples) || 0} samples` : "not run"}`);
+    t.diagnostic(`#151 grace close (${label}): ${conns.length} connections, kept ${kept.length ? `${Math.min(...kept)}..${Math.max(...kept)}` : "none"} ms after 'finish'; ${timerText(phaseTimers({ trace, conns, from, to }))}; readings ${Object.entries(counts).map(([k, v]) => `${k} x${v}`).join(", ")}; loop delay so far ${(() => { const l = trace.loopNow(); return l ? `max ${l.maxMs} p99 ${l.p99Ms} ms` : "not recorded"; })()}; since trace start: GC pauses >= 5 ms ${trace.gcs.length}, main-thread gaps >= 100 ms ${trace.gaps.length} (max ${Math.round(Math.max(0, ...trace.gaps.map((g) => g[1])))} ms); observer ${observer ? `${observer.platform} ${((observer.procs[process.pid] || {}).samples) || 0} samples` : "not run"}`);
     for (const { c, r } of rows.filter(({ c }) => !c.closedAt || !c.answeredAt || c.closedAt - c.answeredAt > GRACE_MS + LATE_MS).slice(0, 5)) t.diagnostic(`#151 grace close (${label}), late connection: ${r.line}`);
   } catch (_) { t.diagnostic(`#151 grace close (${label}): description failed`); }
+  return to;
 }
 
 // ── in-process server: real pipeline, request policy and sign-in ─────────────────────────────────────────────────
@@ -467,7 +469,7 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
         (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
     });
     const lingeringAfter = await noneLingering();
-    graceDiagnostics(t, "refused clients", [...srv.conns], trace, await observer.stop()); // #151 diagnostics only
+    const phase2From = graceDiagnostics(t, "refused clients", [...srv.conns], trace, await observer.stop(), 0); // #151 diagnostics only
     observer = startThreadObserver([process.pid]);
     assert.equal(lingeringAfter, 0);
     const conns = [...srv.conns];
@@ -504,7 +506,7 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
         (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
     });
     const hLingeringAfter = await noneLingering();
-    graceDiagnostics(t, "clients that ignore the answer", [...srv.conns].filter((c) => !seen.has(c)), trace, await observer.stop()); // #151 diagnostics only
+    graceDiagnostics(t, "clients that ignore the answer", [...srv.conns].filter((c) => !seen.has(c)), trace, await observer.stop(), phase2From); // #151 diagnostics only
     observer = null;
     assert.equal(hLingeringAfter, 0);
     const hConns = [...srv.conns].filter((c) => !seen.has(c));
