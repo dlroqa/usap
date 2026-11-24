@@ -78,12 +78,18 @@ function createLifecycleTrace({ traceFile, standInDiagFile, now = Date.now, aliv
 // One bounded line. srv: { proc: { pid }, sdPort }.
 function describeLifecycle(st, srv, { testPid = process.pid } = {}) {
   const rel = (t) => (Number.isFinite(t) ? Math.round(t - st.t0) : "?");
-  const trace = readJsonl(st.traceFile);
+  const all = readJsonl(st.traceFile);
+  const BIND = new Set(["listen-attempt", "listening", "listen-error", "closed"]);
+  const trace = all.filter((r) => BIND.has(r.ev));
+  const steps = all.filter((r) => !BIND.has(r.ev)).sort((a, b) => a.t - b.t);
   const standIn = readJsonl(st.standInDiagFile).filter((r) => Number.isFinite(r.t) && r.t >= st.t0);
   const roles = new Map([[srv && srv.proc && srv.proc.pid, "studio"], [testPid, "test"]]);
   const counters = { g: 0, l: 0, e: 0, s: 0 };
   const name = (prefix, pid) => { if (!pid) return "none"; if (!roles.has(pid)) { counters[prefix] += 1; roles.set(pid, `${prefix}${counters[prefix]}`); } return roles.get(pid); };
-  // Fix roles in order of first appearance: guards and engines from the supervisor, stand-ins from their own records.
+  // Fix roles in order of first appearance: exact spawn records first (preload), then guards and engines from the
+  // supervisor, stand-ins from their own records.
+  for (const r of steps) if (r.ev === "spawned") name(r.what === "guard" ? "g" : "e", r.child);
+  for (const r of steps) if (r.ev === "process-start" && r.kind === "stand-in" && !roles.has(r.pid)) name("s", r.pid);
   const firsts = [...st.seen.entries()].sort((a, b) => a[1].at - b[1].at);
   for (const [pid, v] of firsts) if (v.kind === "guard") name("g", pid); else if (v.kind === "engine") name("e", pid);
   for (const r of standIn) if (r.e === "start" && !roles.has(r.pid)) name("s", r.pid);
@@ -104,6 +110,12 @@ function describeLifecycle(st, srv, { testPid = process.pid } = {}) {
     ev.push([t, `${w} bind ${port} ${res === "free" ? "ok" : res}${w === "other" ? ` (parent ${who(b.ppid)})` : ""}`]);
     if (b.closed) ev.push([b.closed.t, `${w} closed ${port}`]);
   }
+  for (const r of steps) {
+    if (r.ev === "spawned") ev.push([r.t, `${who(r.pid)} spawned ${r.what} ${who(r.child)}`]);
+    else if (r.ev === "process-start" && r.kind !== "other") ev.push([r.t, `${who(r.pid)} process started (${r.kind})`]);
+    else if (r.ev === "process-exit" && r.kind !== "other") ev.push([r.t, `${who(r.pid)} process exited ${Number.isInteger(r.code) ? r.code : "?"} (${r.kind})`]);
+    else if (r.ev === "answer") ev.push([r.t, `studio wrote restart-backend answer ${Number(r.status) || "?"}`]);
+  }
   for (const r of standIn) {
     if (r.e === "start") ev.push([r.t, `${who(r.pid)} start (parent ${who(r.ppid)}) port ${portName(r.port)}`]);
     else if (r.e === "listening") { if (!traced.has(r.pid)) ev.push([r.t, `${who(r.pid)} listening (own record)`]); }
@@ -121,8 +133,13 @@ function describeLifecycle(st, srv, { testPid = process.pid } = {}) {
   const folded = [];
   for (const [t, s] of ev) { const last = folded[folded.length - 1]; if (last && last.s === s) { last.n += 1; last.to = t; } else folded.push({ t, s, n: 1, to: t }); }
   const shown = folded.slice(0, MAX_EVENTS).map((e) => (e.n > 1 ? `${rel(e.t)}..${rel(e.to)} ${e.s} x${e.n}` : `${rel(e.t)} ${e.s}`));
+  // Causal summary: the first loss event after the last restart-backend answer the studio wrote (or after the start).
+  const lastAnswer = [...ev].reverse().find(([, x]) => /^studio wrote restart-backend answer/.test(x));
+  const LOSS = /(bind \S+ busy|listen-error|process exited|exit recorded|gone \(first seen not alive\))/;
+  const loss = ev.find(([t, x]) => (!lastAnswer || t >= lastAnswer[0]) && !/^studio /.test(x) && LOSS.test(x));
+  const cause = `after the last restart-backend answer${lastAnswer ? ` (${rel(lastAnswer[0])})` : " (none written)"}: ${loss ? `first loss ${rel(loss[0])} ${loss[1]}` : "no loss event"}`;
   const fin = (st.lastSup || []).map((r) => `${who(r.guardPid)}/${who(r.enginePid)}`).join(" ") || "none";
-  const line = `roles: studio, ${[...new Set([...roles.values()].filter((v) => !["studio", "test"].includes(v)))].join(" ") || "no engines"}; samples ${st.samples}; last image records ${fin}; events ${shown.join("; ")}${folded.length > MAX_EVENTS ? `; +${folded.length - MAX_EVENTS} more` : ""}`;
+  const line = `${cause}; roles: studio, ${[...new Set([...roles.values()].filter((v) => !["studio", "test"].includes(v)))].join(" ") || "no engines"}; samples ${st.samples}; last image records ${fin}; events ${shown.join("; ")}${folded.length > MAX_EVENTS ? `; +${folded.length - MAX_EVENTS} more` : ""}`;
   return line.slice(0, 3500);
 }
 
