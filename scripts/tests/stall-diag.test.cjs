@@ -5,7 +5,19 @@ const assert = require("node:assert/strict");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
+const { performance } = require("node:perf_hooks");
 const { describeLostClient } = require("./fixtures/stall-diag.cjs");
+
+// The injected pause is measured on the monotonic clock (performance.now), never the wall clock (Date.now), and
+// SIGCONT is held until that clock shows at least `ms`. setTimeout alone does not guarantee it: libuv truncates its
+// loop time to whole milliseconds, so a 400 ms timer can fire up to 1 ms early (measured: 1697/3000 timers fired
+// below 400 monotonic ms, and 31/3000 read 399 by Date.now, with no clock adjustment). `now` and `later` are
+// parameters only so the test below can drive them.
+function holdAtLeast(ms, done, now = () => performance.now(), later = setTimeout) {
+  const start = now();
+  const check = () => { const left = ms - (now() - start); if (left > 0) later(check, Math.ceil(left)); else done(start, now()); };
+  later(check, ms);
+}
 
 const rec = { finishAt: 10000, sockCloseAt: 12965, loop: { gaps: [[10100, 2000]], delayP99Ms: 30, delayMaxMs: 2010 } };
 const lost = (drainsAt, drainChecksAt) => ({ status: null, drainsAt, io: { drainChecksAt, firstDataAt: null, firstDataCheckAt: null } });
@@ -101,6 +113,7 @@ test("cpuDiag watchdog: its thread keeps running while the main thread is busy",
 // stderr) and (b) the server has accepted all n client connections: no fixed startup sleep, so a slow start can't put
 // the pause before the watchdog runs (macOS Intel CI, maxGapMs 13). The answers are then held until 200 ms after
 // SIGCONT, so the pause always falls inside a live run. A process that never reports ready fails the test.
+const PAUSE_MS = 400;
 function runClients(cpuDiag, stop) {
   const net = require("node:net");
   const n = 2;
@@ -111,9 +124,14 @@ function runClients(cpuDiag, stop) {
     let child = null;
     const maybeStop = () => {
       if (!stop || injected || !ready || socks.length < n) return;
-      injected = { stoppedAt: Date.now() };
+      // Conservative bracket: the pause is counted from after SIGSTOP was sent to before SIGCONT is sent.
       child.kill("SIGSTOP");
-      setTimeout(() => { child.kill("SIGCONT"); injected.resumedAt = Date.now(); setTimeout(answer, 200); }, 400);
+      injected = { wallStoppedAt: Date.now(), connections: socks.length };
+      holdAtLeast(PAUSE_MS, (stoppedAt, resumedAt) => {
+        Object.assign(injected, { stoppedAt, resumedAt, wallResumedAt: Date.now() });
+        child.kill("SIGCONT");
+        setTimeout(answer, 200);
+      });
     };
     const server = net.createServer((sock) => {
       sock.on("error", () => {});
@@ -134,6 +152,29 @@ function runClients(cpuDiag, stop) {
   });
 }
 
+test("cpuDiag pause: held until the monotonic clock shows the full pause, whatever the timer or the wall clock do", async () => {
+  // A timer that fires 0.4 ms early (libuv's millisecond truncation: always less than 1 ms) is re-armed instead of
+  // ending the pause short.
+  let t = 1000.6;
+  const arms = [];
+  const early = (fn, ms) => { arms.push(ms); t += ms - 0.4; fn(); };
+  let got = null;
+  holdAtLeast(400, (s, e) => { got = e - s; }, () => t, early);
+  assert.ok(got >= 400, `held ${got} ms`);
+  assert.deepEqual(arms, [400, 1]);
+  // A real pause, with the wall clock stepped forward 300 ms while it runs: the measured pause is unaffected (it
+  // agrees with an independent monotonic measure; a wall-clock measure would report about 700 ms).
+  const realNow = Date.now;
+  try {
+    const m0 = performance.now();
+    const r = await new Promise((resolve) => {
+      holdAtLeast(400, (s, e) => resolve({ reported: e - s, independent: performance.now() - m0 }));
+      setTimeout(() => { const off = realNow() + 300; const base = realNow(); Date.now = () => off + (realNow() - base); }, 100);
+    });
+    assert.ok(r.independent >= 400 && r.reported >= 400 && Math.abs(r.reported - r.independent) < 50, JSON.stringify(r));
+  } finally { Date.now = realNow; }
+});
+
 test("cpuDiag fixture: without the flag the output has exactly the previous fields", async () => {
   const { code, res } = await runClients(false, false);
   assert.equal(code, 0);
@@ -144,7 +185,8 @@ test("cpuDiag fixture: without the flag the output has exactly the previous fiel
 test("cpuDiag fixture: a stopped client process shows a gap with little CPU time and a stopped watchdog", { skip: process.platform === "win32" ? "no SIGSTOP on Windows" : false }, async () => {
   const { code, res, injected } = await runClients(true, true);
   assert.equal(code, 0);
-  assert.ok(injected && injected.resumedAt - injected.stoppedAt >= 400, "the 400 ms pause was injected after the watchdog was running");
+  assert.ok(injected && injected.resumedAt - injected.stoppedAt >= 400, `the 400 ms pause was injected after the watchdog was running (${injected ? `monotonic ${(injected.resumedAt - injected.stoppedAt).toFixed(1)} ms, wall ${injected.wallResumedAt - injected.wallStoppedAt} ms` : "not injected"})`);
+  assert.equal(injected.connections, 2, "both client connections were established before the pause");
   assert.deepEqual(Object.keys(res).sort(), ["clients", "proc", "ticks"]);
   assert.ok(Array.isArray(res.proc.samples) && res.proc.samples.length > 10, "samples recorded");
   // one bytes value per started client (the first sample is taken before the clients start)
