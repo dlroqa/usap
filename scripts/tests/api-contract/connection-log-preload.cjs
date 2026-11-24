@@ -62,7 +62,8 @@ if (file && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
       const write = res.write, end = res.end;
       res.write = function (chunk, ...rest) { copy(chunk); return write.call(this, chunk, ...rest); };
       res.end = function (chunk, ...rest) { copy(chunk); if (limit !== null && rec.bodyAtAnswer === null) rec.bodyAtAnswer = rec.bodyBytes; return end.call(this, chunk, ...rest); };
-      // bytesWrittenAtFinish (#151 J2 write evidence): the socket's bytes handed to the OS when the answer finished.
+      // bytesWrittenAtFinish (#151 J2 write evidence): socket.bytesWritten read at 'finish'. It counts bytes accepted for
+      // writing (queued bytes included), not bytes the OS took; any OS hand-off rests on 'finish' itself.
       res.once("finish", () => { rec.status = res.statusCode; rec.finishAt = Date.now(); rec.bytesWrittenAtFinish = req.socket ? req.socket.bytesWritten : null; });
       res.once("close", () => { rec.resCloseAt = Date.now(); if (rec.status === null && res.headersSent) rec.status = res.statusCode; });
       const sock = req.socket;

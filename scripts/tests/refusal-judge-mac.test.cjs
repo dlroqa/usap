@@ -103,12 +103,12 @@ test("today's rule is untouched: the macOS rule is a separate function", () => {
 });
 
 // ── J2 safety controls (2026-11-24): write evidence, ±5 ms boundaries, drain/check pairing, clock offsets ──────────
-// Live records (requireWriteEvidence) carry the server's first sight of the request (seenAt), its bytes handed to the
-// OS at finish, and the client's start (t0) and end (io.errorAt).
+// Live records (requireWriteEvidence) carry the server's first sight of the request (seenAt), its socket's byte count
+// at 'finish' (bytes accepted for writing, not proof of an OS hand-off), and the client's start (t0) and end (io.errorAt).
 const live = (closeMs, extra = {}) => conn(closeMs, { requireWriteEvidence: true, seenAt: A - 90, bytesWrittenAtFinish: 180, minAnswerBytes: 90, ...extra });
 const liveSt = (st, closeMs, endAfterClose = 50) => ({ ...st, t0: A - 100, io: { ...st.io, errorAt: A + closeMs + endAfterClose } });
 
-test("W: on live records the answer's bytes must have been handed to the OS at finish; missing values fail; replay records are not affected", () => {
+test("W: on live records the socket's byte count at finish must cover the answer body; missing values fail; replay records are not affected", () => {
   const st = liveSt(withDrain(1978, 2221), 2002), ticks = [A - 13, A + 2222];
   assert.equal(M(st, live(2002), ticks).kind, "stalled", "bytes written >= the answer body");
   assert.equal(M(st, live(2002, { bytesWrittenAtFinish: 89 }), ticks).ok, false, "fewer bytes than the answer body");

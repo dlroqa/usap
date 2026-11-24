@@ -89,11 +89,16 @@ function judgeRefusedClientProposed(st, conn, ticks, status, bodyMatch = null, p
 //   A1 no tick after the drain inside the window (no later iteration began);
 //   U  when a drain is inside the window: the server closed within GRACE_MS + MAC_SLACK_MS of the answer (a server far
 //      outside its close bound is not excused by this rule);
-//   W  (live records, conn.requireWriteEvidence) the server socket had handed at least the answer body's bytes to the
-//      OS when the answer finished (conn.bytesWrittenAtFinish >= conn.minAnswerBytes); missing values fail. Limitation:
-//      this shows the bytes reached the server's kernel send path, not that they reached or were read by the client,
-//      and it counts headers too, so it is a lower-bound check (single-request connections only). Historical replay
-//      records carry no such fields and no requireWriteEvidence flag;
+//   W  (live records, conn.requireWriteEvidence) when the answer finished, the server socket's byte count covered at
+//      least the answer body (conn.bytesWrittenAtFinish >= conn.minAnswerBytes); missing values fail. What this shows,
+//      and what it does not: the record is taken at the response's 'finish' event, which Node documents as emitted once
+//      the response's last segment was handed off to the operating system; that is the only evidence of an OS
+//      hand-off here. socket.bytesWritten itself counts bytes accepted for writing, including bytes still queued in
+//      Node's buffers (verified on Node 22.12.0: a 64 MiB write to a non-reading peer reads 64 MiB at once), so the
+//      count alone proves no hand-off; it shows the answer was at least fully written to the socket. Neither shows
+//      that the bytes reached or were read by the client. The count includes headers, so it is a lower-bound check
+//      (single-request connections only). Historical replay records carry no such fields and no requireWriteEvidence
+//      flag;
 //   K  (live records) the two processes' clocks are consistent with causality: the client started its request no later
 //      than the server first saw it (st.t0 <= conn.seenAt + 5 ms), and the client saw the connection end no earlier
 //      than the server closed it (io.errorAt or io.closeAt >= closedAt - 5 ms). A record that violates either, or
@@ -119,7 +124,7 @@ function judgeRefusedClientMac(st, conn, ticks, status, bodyMatch = null) {
     if (!Number.isFinite(st.t0) || !Number.isFinite(conn.seenAt) || st.t0 > conn.seenAt + TICK_MARGIN_MS) return fail(`answer lost, and the client's start (${st.t0}) is not before the server saw the request (${conn.seenAt}): clocks inconsistent`);
     if (!Number.isFinite(end) || end < conn.closedAt - TICK_MARGIN_MS) return fail(`answer lost, and the client saw the end ${Number.isFinite(end) ? `${end - conn.closedAt} ms` : "never"} relative to the server's close: clocks inconsistent or no end seen`);
     const w = conn.bytesWrittenAtFinish, need = conn.minAnswerBytes;
-    if (!Number.isFinite(w) || !Number.isFinite(need) || need <= 0 || w < need) return fail(`answer lost, and the server's write of the answer is not shown (bytes handed to the OS at finish ${w}, answer body ${need})`);
+    if (!Number.isFinite(w) || !Number.isFinite(need) || need <= 0 || w < need) return fail(`answer lost, and the server's write of the answer is not shown (socket bytes counted at finish ${w}, answer body ${need})`);
   }
   const drainsAt = st.drainsAt || [], checks = io.drainChecksAt || [];
   if (Array.isArray(io.drainChecksAt) && io.drainChecksAt.length !== drainsAt.length) return fail(`answer lost, and the drain and check-phase records do not pair (${drainsAt.length} drains, ${io.drainChecksAt.length} check records)`);
