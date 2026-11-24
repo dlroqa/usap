@@ -23,23 +23,48 @@ const MAX_LOG = 12, MAX_HOLDERS = 4;
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
 const run = (cmd, args, timeout = 6000) => new Promise((resolve) => { try { execFile(cmd, args, { timeout, windowsHide: true }, (err, out) => resolve(err && !out ? "" : String(out || ""))); } catch (_) { resolve(""); } });
 
-// Parent pid of a process, or null (Windows: one CIM query; Linux: /proc; macOS: ps).
-async function parentOf(pid, platform = process.platform) {
+// A process's parent pid and start time (ms since the epoch), each null if unknown. Windows: one CIM query (keeps the
+// ORIGINAL parent's id even after that parent exited); Linux: /proc (a survivor is re-parented, so its parent then is
+// init or a subreaper); macOS: ps (likewise re-parented; start time has 1 s resolution).
+let clkTck = null;
+async function procInfo(pid, platform = process.platform) {
   try {
-    if (platform === "linux") { const st = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); return Number(st.slice(st.lastIndexOf(")") + 2).split(" ")[1]) || null; }
-    const out = platform === "win32"
-      ? await run("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter 'ProcessId=${Number(pid)}').ParentProcessId`])
-      : await run("ps", ["-o", "ppid=", "-p", String(pid)]);
-    return Number(out.trim()) || null;
-  } catch (_) { return null; }
+    if (platform === "linux") {
+      const st = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); const f = st.slice(st.lastIndexOf(")") + 2).split(" ");
+      if (clkTck === null) clkTck = Number((await run("getconf", ["CLK_TCK"])).trim()) || 100;
+      // start = now - (uptime - starttime/CLK_TCK); /proc/uptime has 10 ms resolution (btime in /proc/stat only 1 s)
+      const uptime = Number(fs.readFileSync("/proc/uptime", "utf8").split(" ")[0]);
+      const startedAt = Number.isFinite(uptime) ? Date.now() - (uptime - Number(f[19]) / clkTck) * 1000 : null;
+      return { ppid: Number(f[1]) || null, startedAt, resolutionMs: Math.ceil(1000 / clkTck) + 10 };
+    }
+    if (platform === "win32") {
+      const out = await run("powershell", ["-NoProfile", "-NonInteractive", "-Command", `$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${Number(pid)}'; if ($p) { "$($p.ParentProcessId) $($p.CreationDate.ToUniversalTime().ToString('o'))" }`]);
+      const [pp, iso] = out.trim().split(/\s+/);
+      return { ppid: Number(pp) || null, startedAt: iso ? Date.parse(iso) || null : null, resolutionMs: 16 };
+    }
+    const out = await run("ps", ["-o", "ppid=,lstart=", "-p", String(pid)]);
+    const m = /^\s*(\d+)\s+(.+)$/.exec(out.trim());
+    return { ppid: m ? Number(m[1]) : null, startedAt: m ? Date.parse(m[2]) || null : null, resolutionMs: 1000 };
+  } catch (_) { return { ppid: null, startedAt: null, resolutionMs: null }; }
 }
+const parentOf = async (pid, platform) => (await procInfo(pid, platform)).ppid;
 
 // "<ms> <pid> <port> <what>" lines for `port` -> [{ t, pid, what }], last MAX_LOG.
-function reservationLog(port, logFile = LOG_FILE) {
-  let text = ""; try { text = fs.readFileSync(logFile, "utf8"); } catch (_) { return []; }
+function reservationLog(port, logFile = LOG_FILE, max = MAX_LOG) {
+  let text = "";
+  for (const f of [`${logFile}.1`, logFile]) { try { text += fs.readFileSync(f, "utf8"); } catch (_) { /* absent */ } }
   const out = [];
   for (const l of text.split(/\r?\n/)) { const f = l.split(" "); if (f.length === 4 && Number(f[2]) === port) out.push({ t: Number(f[0]), pid: Number(f[1]), what: f[3].replace(/[^a-z-]/g, "") }); }
-  return out.slice(-MAX_LOG);
+  return out.slice(-max);
+}
+// Reservation windows [{ pid, from, to|null }] from the full log of one port (a reserve until the same pid's release).
+function windowsOf(entries) {
+  const open = new Map(), out = [];
+  for (const e of entries) {
+    if (e.what === "reserve") open.set(e.pid, { pid: e.pid, from: e.t, to: null });
+    else if (e.what === "release" && open.has(e.pid)) { const w = open.get(e.pid); w.to = e.t; out.push(w); open.delete(e.pid); }
+  }
+  return [...out, ...open.values()];
 }
 
 /**
@@ -61,7 +86,8 @@ async function describePortRecord({ port, t0, roles = new Map(), standInDiagFile
   const ranges = await portRanges(platform);
   const inDyn = ranges.dynamic ? port >= ranges.dynamic.first && port <= ranges.dynamic.last : "unknown";
   const inEx = ranges.excluded.some(([a, b]) => port >= a && port <= b);
-  const parts = [`port ${port} reservation sequence: ${seq}`, `locks now: ${locks}`, `in dynamic range ${inDyn}, in an excluded range ${inEx}`];
+  // Reservations and locks are the tests' bookkeeping; only "holders" (the OS socket table) say who owns the port.
+  const parts = [`port ${port} reservation sequence (bookkeeping, not socket ownership): ${seq}`, `locks now: ${locks}`, `in dynamic range ${inDyn}, in an excluded range ${inEx}`];
   if (full) {
     const seen = new Map(); // pid -> [source/state]
     for (const r of readJsonl(standInDiagFile).filter((x) => x.e === "listen-error" && x.t >= t0)) {
@@ -75,8 +101,17 @@ async function describePortRecord({ port, t0, roles = new Map(), standInDiagFile
     const holders = [];
     for (const [pid, how] of [...seen.entries()].slice(0, MAX_HOLDERS)) {
       if (!pid) { holders.push(`${how.join(" + ")} with no owning process (pid 0)`); continue; }
-      const [img, ppid] = await Promise.all([imageName(pid, platform), parentOf(pid, platform)]);
-      holders.push(`${procRoleOrOther(pid, roles, testPid, others)} ${img} ${alive(pid) ? "alive" : "gone"}, parent ${ppid ? procRoleOrOther(ppid, roles, testPid, others) : "unknown"}: ${how.join(" + ")}`);
+      const [img, info] = await Promise.all([imageName(pid, platform), procInfo(pid, platform)]);
+      const ppid = info.ppid;
+      const parent = ppid ? `${procRoleOrOther(ppid, roles, testPid, others)}${alive(ppid) ? "" : " (gone)"}` : "unknown";
+      // which test process held the reservation when this holder started (start-time resolution allowed for)
+      let during = "start time unknown";
+      if (info.startedAt) {
+        const tol = info.resolutionMs || 0;
+        const w = windowsOf(reservationLog(port, logFile, 1000)).filter((x) => info.startedAt >= x.from - tol && info.startedAt <= (x.to === null ? Infinity : x.to + tol));
+        during = `started ${rel(info.startedAt)} (+-${tol} ms) ${w.length ? `during ${w.map((x) => `${procRole(x.pid)}'s reservation`).join(" and ")}` : "outside every reservation in the log"}`;
+      }
+      holders.push(`${procRoleOrOther(pid, roles, testPid, others)} ${img} ${alive(pid) ? "alive" : "gone"}, parent ${parent}, ${during}: ${how.join(" + ")}`);
     }
     parts.push(`holders: ${holders.join(" | ") || "none seen"}`);
   }
@@ -84,4 +119,4 @@ async function describePortRecord({ port, t0, roles = new Map(), standInDiagFile
 }
 const procRoleOrOther = (pid, roles, testPid, others) => (pid === testPid ? "this test process" : roles.has(pid) ? roles.get(pid) : others.has(pid) ? others.get(pid) : "another process");
 
-module.exports = { describePortRecord, reservationLog, parentOf };
+module.exports = { describePortRecord, reservationLog, parentOf, procInfo, windowsOf };

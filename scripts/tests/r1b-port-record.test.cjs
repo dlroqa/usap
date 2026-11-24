@@ -10,7 +10,9 @@ const path = require("node:path");
 const { spawn, execFileSync } = require("node:child_process");
 const test = require("node:test");
 const { describePortRecord, reservationLog } = require("./fixtures/r1b-port-record.cjs");
-const { reservePort, releasePort } = require("./fixtures/test-ports.cjs");
+const { reservePort, releasePort, LOG_MAX } = require("./fixtures/test-ports.cjs");
+const net = require("node:net");
+const { lockOwners } = require("./fixtures/port-range-diag.cjs");
 
 const PORTS = path.join(__dirname, "fixtures", "test-ports.cjs");
 let lockDir, logFile;
@@ -26,7 +28,7 @@ test("sequence: another test process reserved and released the port before this 
   assert.equal(mine, port);
   try {
     const line = await describePortRecord({ port, t0, lockDir, logFile });
-    assert.match(line, new RegExp(`^port ${port} reservation sequence: -?\\d+ test process A reserve, -?\\d+ test process A release, -?\\d+ this test process reserve; locks now: this test process; in dynamic range (true|false|unknown), in an excluded range (true|false)$`));
+    assert.match(line, new RegExp(`^port ${port} reservation sequence \\(bookkeeping, not socket ownership\\): -?\\d+ test process A reserve, -?\\d+ test process A release, -?\\d+ this test process reserve; locks now: this test process; in dynamic range (true|false|unknown), in an excluded range (true|false)$`));
     assert.deepEqual(reservationLog(port, logFile).map((e) => e.what), ["reserve", "release", "reserve"]);
   } finally { releasePort(mine); }
   assert.deepEqual(reservationLog(port, logFile).map((e) => e.what), ["reserve", "release", "reserve", "release"]);
@@ -51,7 +53,69 @@ test("holders (full): a listener started by a known role's child is named with i
     const brief = await describePortRecord({ port, t0: Date.now(), roles, lockDir });
     assert.doesNotMatch(brief, /holders/);
     const full = await describePortRecord({ port, t0: Date.now(), roles, lockDir, full: true });
-    assert.match(full, /holders: another process node\S* alive, parent g1: LISTEN now/);
+    assert.match(full, /holders: another process node\S* alive, parent g1, started -?\d+ \(\+-\d+ ms\) outside every reservation in the log: LISTEN now/);
     assert.ok(!full.includes(String(child)) && !full.includes(String(g.pid)), "no pids printed");
   } finally { g.kill(); await new Promise((r) => g.once("exit", r)); }
+});
+
+// Kill a process by pid and wait (bounded) until it is gone; Windows: taskkill /F (no signals there).
+async function killAndWait(pid, ms = 10000) {
+  const isAlive = () => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+  if (!isAlive()) return true;
+  try { if (process.platform === "win32") execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", timeout: 5000 }); else process.kill(pid, "SIGKILL"); } catch (_) { /* already gone */ }
+  const end = Date.now() + ms; while (isAlive() && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+  return !isAlive();
+}
+const bindResult = (port) => new Promise((resolve) => { const s = net.createServer(); s.once("error", (e) => resolve(e.code || "error")); s.listen(port, "127.0.0.1", () => s.close(() => resolve("free"))); });
+
+test("surviving child: a listener that outlives its reserving parent keeps the port; the released lock is not taken as availability; the holder and its origin are named; once it is gone the port is free", { timeout: 60000 }, async () => {
+  const port = 23980, t0 = Date.now();
+  const pidFile = path.join(lockDir, "survivor.pid");
+  // Parent "test process": reserves the port through test-ports, starts a detached child that listens on it, waits
+  // until it listens, then exits normally - which releases its reservation (exit handler) while the child keeps the socket.
+  // child: listens on argv[1], writes its pid to argv[2] once listening, ends itself after 45 s at the latest
+  const CHILD = "const [port,pidFile]=process.argv.slice(1);require('node:net').createServer().listen(Number(port),'127.0.0.1',()=>require('node:fs').writeFileSync(pidFile,String(process.pid)));setTimeout(()=>process.exit(0),45000);";
+  const parentSrc = `const p=require(${JSON.stringify(PORTS)});const fs=require("node:fs");const {spawn}=require("node:child_process");
+p.reservePort({range:{first:${port},last:${port}},lockDir:${JSON.stringify(lockDir)},logFile:${JSON.stringify(logFile)}}).then(()=>{
+ const c=spawn(process.execPath,["-e",${JSON.stringify(CHILD)},"${port}",${JSON.stringify(pidFile)}],{detached:true,stdio:"ignore",windowsHide:true});
+ c.unref(); const end=Date.now()+15000; const w=()=>{ if(fs.existsSync(${JSON.stringify(pidFile)})) process.exit(0); if(Date.now()>end) process.exit(2); setTimeout(w,20); }; w(); });`;
+  const parent = spawn(process.execPath, ["-e", parentSrc], { stdio: "ignore" });
+  const parentCode = await new Promise((r) => parent.once("exit", r));
+  let child = null;
+  try {
+    assert.equal(parentCode, 0, "parent reserved, started the listener and exited");
+    child = Number(fs.readFileSync(pidFile, "utf8"));
+    // bookkeeping says released ...
+    assert.deepEqual(lockOwners(lockDir, port), [], "no lock after the parent's exit");
+    assert.deepEqual(reservationLog(port, logFile).map((e) => e.what), ["reserve", "release"]);
+    // ... but the port is still occupied
+    assert.equal(await bindResult(port), "EADDRINUSE", "the port is still in use although its reservation was released");
+    const line = await describePortRecord({ port, t0, lockDir, logFile, full: true });
+    assert.match(line, /reservation sequence \(bookkeeping, not socket ownership\): -?\d+ test process A reserve, -?\d+ test process A release; locks now: none;/);
+    // the actual listener, alive, attributed to the reservation that was open when it started
+    assert.match(line, /holders: another process node\S* alive, parent ([^,]+), started -?\d+ \(\+-\d+ ms\) during test process A's reservation: (LISTEN|LISTENING) now/);
+    // parentage: Windows keeps the original parent id (the gone test process); Linux/macOS re-parent the survivor
+    const parentRole = /parent ([^,]+), started/.exec(line)[1];
+    if (process.platform === "win32") assert.equal(parentRole, "test process A (gone)", line);
+    else assert.notEqual(parentRole, "unknown", line);
+    assert.ok(!line.includes(String(child)) && !line.includes(String(parent.pid)), "no pids printed");
+    // missing owner: once the survivor is gone the port is free and no live holder is reported
+    assert.equal(await killAndWait(child), true, "survivor terminated");
+    child = null;
+    assert.equal(await bindResult(port), "free");
+    const after = await describePortRecord({ port, t0, lockDir, logFile, full: true });
+    assert.doesNotMatch(after, / alive, parent /);
+  } finally { if (child) await killAndWait(child); }
+});
+
+test("log bound: past LOG_MAX the reservation log moves to .1; both parts are still read", async () => {
+  const f = path.join(lockDir, "..", `${path.basename(lockDir)}-rot.log`);
+  try {
+    fs.writeFileSync(f, `${Date.now()} 1 23990 reserve\n`.padEnd(LOG_MAX + 10, "#"));
+    const port = await reservePort({ range: { first: 23991, last: 23991 }, lockDir, logFile: f });
+    releasePort(port);
+    assert.ok(fs.statSync(`${f}.1`).size > LOG_MAX, "old log moved aside");
+    assert.ok(fs.statSync(f).size < 200, "new log started small");
+    assert.deepEqual(reservationLog(23991, f).map((e) => e.what), ["reserve", "release"]);
+  } finally { for (const x of [f, `${f}.1`]) { try { fs.rmSync(x, { force: true }); } catch (_) { /* best effort */ } } }
 });

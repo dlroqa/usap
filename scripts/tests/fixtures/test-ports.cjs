@@ -33,7 +33,12 @@ const held = new Map(); // port -> own lock file, for this process (set before t
 // Appending never changes which port is chosen; a failed append is ignored.
 const LOG_FILE = path.join(os.tmpdir(), "usap-test-ports.log");
 const logs = new Map(); // port -> log file for this reservation (or null)
-const logEvent = (file, port, what) => { if (!file) return; try { fs.appendFileSync(file, `${Date.now()} ${process.pid} ${port} ${what}\n`); } catch (_) { /* diagnostics only */ } };
+const LOG_MAX = 1 << 20; // bound: past 1 MiB the log moves to <log>.1 (replacing the older one), best effort
+const logEvent = (file, port, what) => {
+  if (!file) return;
+  try { if (fs.statSync(file).size > LOG_MAX) fs.renameSync(file, `${file}.1`); } catch (_) { /* absent, or another process rotated it */ }
+  try { fs.appendFileSync(file, `${Date.now()} ${process.pid} ${port} ${what}\n`); } catch (_) { /* diagnostics only */ }
+};
 const LOCK_RE = /^(\d+)\.(\d+)\.lock$/;
 
 function pidAlive(pid) {
@@ -108,4 +113,4 @@ function releasePort(port) {
 
 process.on("exit", () => { for (const port of [...held.keys()]) releasePort(port); });
 
-module.exports = { reservePort, releasePort, heldPorts: () => [...held.keys()], RANGE, LOCK_DIR, LOG_FILE };
+module.exports = { reservePort, releasePort, heldPorts: () => [...held.keys()], RANGE, LOCK_DIR, LOG_FILE, LOG_MAX };
