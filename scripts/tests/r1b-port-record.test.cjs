@@ -9,7 +9,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn, execFileSync } = require("node:child_process");
 const test = require("node:test");
-const { describePortRecord, reservationLog } = require("./fixtures/r1b-port-record.cjs");
+const { describePortRecord, reservationLog, logHistory, windowsOf } = require("./fixtures/r1b-port-record.cjs");
 const { reservePort, releasePort, LOG_MAX } = require("./fixtures/test-ports.cjs");
 const net = require("node:net");
 const { lockOwners } = require("./fixtures/port-range-diag.cjs");
@@ -140,4 +140,34 @@ test("log bound: past LOG_MAX the reservation log moves to .1; both parts are st
     assert.deepEqual(reservationLog(held, f).map((e) => e.what), ["reserve", "release"]);
     releasePort(held);
   } finally { /* removed in test.after */ }
+});
+
+test("log bound: when older entries are lost (a second rotation replaced .1) the record says the history is possibly incomplete", async () => {
+  const f = freshLog(), port = 23987, t0 = Date.now() - 60000;
+  try {
+    // generation 1 (lost): process 11 reserved the port; generation 2 (.1) and the current log keep only its release
+    fs.writeFileSync(`${f}.1`, `${t0 + 1000} 12 23001 reserve\n${t0 + 2000} 12 23001 release\n`);
+    fs.writeFileSync(f, `${t0 + 3000} 11 ${port} release\n${t0 + 4000} 13 ${port} reserve\n`);
+    const h = logHistory(port, f);
+    assert.deepEqual([h.rotated, h.orphans, h.total, h.firstKept], [true, 1, 2, t0 + 1000]);
+    const line = await describePortRecord({ port, t0, lockDir, logFile: f });
+    assert.match(line, /; reservation history possibly incomplete \(1 release\(s\) whose reserve was lost, log rotated: entries before 1000 may be lost\); locks now: /, line);
+    const w = windowsOf(h.entries);
+    assert.deepEqual(w.map((x) => [x.pid, x.from, x.to, !!x.lost]), [[11, -Infinity, t0 + 3000, true], [13, t0 + 4000, null, false]]);
+    // a rotation alone (nothing provably lost) still says entries before the kept history may be lost
+    fs.writeFileSync(f, `${t0 + 4000} 13 ${port} reserve\n`);
+    assert.match(await describePortRecord({ port, t0, lockDir, logFile: f }), /reservation history possibly incomplete \(log rotated: entries before 1000 may be lost\)/);
+    // more entries than shown
+    fs.rmSync(`${f}.1`, { force: true });
+    fs.writeFileSync(f, Array.from({ length: 20 }, (_, i) => `${t0 + i} ${100 + Math.floor(i / 2)} ${port} ${i % 2 ? "release" : "reserve"}`).join("\n") + "\n");
+    assert.match(await describePortRecord({ port, t0, lockDir, logFile: f }), /reservation history possibly incomplete \(showing the last 12 of 20 entries\)/);
+  } finally { /* removed in test.after */ }
+});
+
+test("log bound: a complete kept log (no rotation, every release after its reserve, within the shown bound) has no incompleteness note", async () => {
+  const f = freshLog(), port = 23986, t0 = Date.now() - 60000;
+  fs.writeFileSync(f, `${t0 + 1} 21 ${port} reserve\n${t0 + 2} 21 ${port} release\n${t0 + 3} 22 ${port} reserve\n`);
+  const line = await describePortRecord({ port, t0, lockDir, logFile: f });
+  assert.doesNotMatch(line, /possibly incomplete/, line);
+  assert.deepEqual(logHistory(port, f), { entries: reservationLog(port, f), total: 3, rotated: false, firstKept: t0 + 1, orphans: 0 });
 });

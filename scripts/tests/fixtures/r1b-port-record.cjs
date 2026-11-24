@@ -49,20 +49,42 @@ async function procInfo(pid, platform = process.platform) {
 }
 const parentOf = async (pid, platform) => (await procInfo(pid, platform)).ppid;
 
-// "<ms> <pid> <port> <what>" lines for `port` -> [{ t, pid, what }], last MAX_LOG.
-function reservationLog(port, logFile = LOG_FILE, max = MAX_LOG) {
-  let text = "";
-  for (const f of [`${logFile}.1`, logFile]) { try { text += fs.readFileSync(f, "utf8"); } catch (_) { /* absent */ } }
-  const out = [];
-  for (const l of text.split(/\r?\n/)) { const f = l.split(" "); if (f.length === 4 && Number(f[2]) === port) out.push({ t: Number(f[0]), pid: Number(f[1]), what: f[3].replace(/[^a-z-]/g, "") }); }
-  return out.slice(-max);
+// The kept log for `port` and what it cannot show. Only the current log and one older generation (.1) are kept: a
+// second rotation, or two processes rotating at once, replaces .1, so once a .1 exists entries older than its first
+// line may be lost. -> { entries (last `max`), total, rotated, firstKept (earliest kept line, any port), orphans
+// (releases with no kept reserve by the same pid before them) }
+function logHistory(port, logFile = LOG_FILE, max = MAX_LOG) {
+  let text = "", rotated = false;
+  for (const f of [`${logFile}.1`, logFile]) { try { const t = fs.readFileSync(f, "utf8"); if (f !== logFile) rotated = true; text += t; } catch (_) { /* absent */ } }
+  const all = []; let firstKept = null;
+  for (const l of text.split(/\r?\n/)) {
+    const f = l.split(" ");
+    if (f.length === 4 && firstKept === null && Number.isFinite(Number(f[0]))) firstKept = Number(f[0]);
+    if (f.length === 4 && Number(f[2]) === port) all.push({ t: Number(f[0]), pid: Number(f[1]), what: f[3].replace(/[^a-z-]/g, "") });
+  }
+  const open = new Set(); let orphans = 0;
+  for (const e of all) { if (e.what === "reserve") open.add(e.pid); else if (e.what === "release") { if (open.has(e.pid)) open.delete(e.pid); else orphans += 1; } }
+  return { entries: all.slice(-max), total: all.length, rotated, firstKept, orphans };
 }
-// Reservation windows [{ pid, from, to|null }] from the full log of one port (a reserve until the same pid's release).
+// "<ms> <pid> <port> <what>" lines for `port` -> [{ t, pid, what }], last MAX_LOG.
+const reservationLog = (port, logFile = LOG_FILE, max = MAX_LOG) => logHistory(port, logFile, max).entries;
+// "" when the kept log can be complete for this port, else why it may not be (messages only)
+function historyNote(h, rel) {
+  const why = [];
+  if (h.orphans) why.push(`${h.orphans} release(s) whose reserve was lost`);
+  if (h.rotated) why.push(`log rotated: entries before ${rel(h.firstKept)} may be lost`);
+  if (h.total > h.entries.length) why.push(`showing the last ${h.entries.length} of ${h.total} entries`);
+  return why.length ? `reservation history possibly incomplete (${why.join(", ")})` : "";
+}
+// Reservation windows [{ pid, from, to|null, lost }] from the full log of one port (a reserve until the same pid's
+// release; a release whose reserve is not in the kept log opens at -Infinity with lost: true, so a holder that started
+// then is not read as "outside every reservation").
 function windowsOf(entries) {
   const open = new Map(), out = [];
   for (const e of entries) {
     if (e.what === "reserve") open.set(e.pid, { pid: e.pid, from: e.t, to: null });
     else if (e.what === "release" && open.has(e.pid)) { const w = open.get(e.pid); w.to = e.t; out.push(w); open.delete(e.pid); }
+    else if (e.what === "release") out.push({ pid: e.pid, from: -Infinity, to: e.t, lost: true });
   }
   return [...out, ...open.values()];
 }
@@ -72,7 +94,8 @@ function windowsOf(entries) {
  */
 async function describePortRecord({ port, t0, roles = new Map(), standInDiagFile = null, full = false, testPid = process.pid, platform = process.platform, lockDir = LOCK_DIR, logFile = LOG_FILE }) {
   const rel = (t) => (Number.isFinite(t) ? Math.round(t - t0) : "?");
-  const log = reservationLog(port, logFile);
+  const hist = logHistory(port, logFile);
+  const log = hist.entries;
   const others = new Map();
   const procRole = (pid) => {
     if (pid === testPid) return "this test process";
@@ -87,7 +110,8 @@ async function describePortRecord({ port, t0, roles = new Map(), standInDiagFile
   const inDyn = ranges.dynamic ? port >= ranges.dynamic.first && port <= ranges.dynamic.last : "unknown";
   const inEx = ranges.excluded.some(([a, b]) => port >= a && port <= b);
   // Reservations and locks are the tests' bookkeeping; only "holders" (the OS socket table) say who owns the port.
-  const parts = [`port ${port} reservation sequence (bookkeeping, not socket ownership): ${seq}`, `locks now: ${locks}`, `in dynamic range ${inDyn}, in an excluded range ${inEx}`];
+  const note = historyNote(hist, rel);
+  const parts = [`port ${port} reservation sequence (bookkeeping, not socket ownership): ${seq}`, ...(note ? [note] : []), `locks now: ${locks}`, `in dynamic range ${inDyn}, in an excluded range ${inEx}`];
   if (full) {
     const seen = new Map(); // pid -> [source/state]
     for (const r of readJsonl(standInDiagFile).filter((x) => x.e === "listen-error" && x.t >= t0)) {
@@ -109,7 +133,7 @@ async function describePortRecord({ port, t0, roles = new Map(), standInDiagFile
       if (info.startedAt) {
         const tol = info.resolutionMs || 0;
         const w = windowsOf(reservationLog(port, logFile, 1000)).filter((x) => info.startedAt >= x.from - tol && info.startedAt <= (x.to === null ? Infinity : x.to + tol));
-        during = `started ${rel(info.startedAt)} (+-${tol} ms) ${w.length ? `during ${w.map((x) => `${procRole(x.pid)}'s reservation`).join(" and ")}` : "outside every reservation in the log"}`;
+        during = `started ${rel(info.startedAt)} (+-${tol} ms) ${w.length ? `during ${w.map((x) => `${procRole(x.pid)}'s reservation${x.lost ? " (its start lost)" : ""}`).join(" and ")}` : `outside every reservation in the log${note ? " (history possibly incomplete)" : ""}`}`;
       }
       holders.push(`${procRoleOrOther(pid, roles, testPid, others)} ${img} ${alive(pid) ? "alive" : "gone"}, parent ${parent}, ${during}: ${how.join(" + ")}`);
     }
@@ -119,4 +143,4 @@ async function describePortRecord({ port, t0, roles = new Map(), standInDiagFile
 }
 const procRoleOrOther = (pid, roles, testPid, others) => (pid === testPid ? "this test process" : roles.has(pid) ? roles.get(pid) : others.has(pid) ? others.get(pid) : "another process");
 
-module.exports = { describePortRecord, reservationLog, parentOf, procInfo, windowsOf };
+module.exports = { describePortRecord, reservationLog, logHistory, parentOf, procInfo, windowsOf };
