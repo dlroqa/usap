@@ -150,16 +150,22 @@ if (model.includes("exit-when-told")) {
     process.exit(Number.isInteger(code) ? code : 0);
   }, 25);
 }
+// #170 R1b bind trace: tCall = just before listen(), tErr = when the error arrives, BEFORE the (synchronous, up to 3 s)
+// holder lookup; the record's own `t` stays as before (after the lookup). tp = performance.timeOrigin + now() (sub-ms).
+const wallp = () => ({ t: Date.now(), tp: Math.round((performance.timeOrigin + performance.now()) * 1000) / 1000 });
+let listenCall = null;
 server.on("error", (err) => {
+  const atErr = wallp();
   const holders = err.code === "EADDRINUSE" ? portHolders(port) : "";
-  diag("listen-error", { code: err.code, message: err.message, port, holders });
+  diag("listen-error", { code: err.code, message: err.message, port, holders, tCall: listenCall && listenCall.t, tpCall: listenCall && listenCall.tp, tErr: atErr.t, tpErr: atErr.tp });
   console.error(`[ERROR] fake: listen on 127.0.0.1:${port} failed: ${err.code || err.message} (pid ${process.pid}, ppid ${process.ppid})`);
   process.exit(1);
 });
-const listenNow = () => server.listen(port, "127.0.0.1", () => {
-  diag("listening", { address: server.address() });
+const listenNow = () => { listenCall = wallp(); return server.listen(port, "127.0.0.1", () => {
+  const atOk = wallp();
+  diag("listening", { address: server.address(), tCall: listenCall.t, tpCall: listenCall.tp, tOk: atOk.t, tpOk: atOk.tp });
   console.log(`[INFO ] main.cpp:500 - listening on: 127.0.0.1:${port}`);
-});
+}); };
 const lingerMatch = /linger(\d+|held)/.exec(model);
 if (lingerMatch && process.platform !== "win32") {
   let handing = false;

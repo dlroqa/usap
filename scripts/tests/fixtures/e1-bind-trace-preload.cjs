@@ -5,7 +5,8 @@
 // With USAP_TEST_E1_INJECT=<ms> (control only): when the studio spawns a process whose arguments contain
 // "--listen-port <that port>" (every such spawn after the first), the preload itself binds the port at once and holds it for <ms>, like a diagnostics
 // probe landing at the worst moment. It is recorded as kind "inject". Nothing else changes; in other processes, or
-// without the variable, it does nothing.
+// without the variable, it does nothing. Lines carry t (Date.now) and tp (sub-ms); engine-spawn carries the child's pid (cpid,
+// the guard or launcher, not the engine).
 "use strict";
 const file = process.env.USAP_TEST_E1_TRACE;
 const port = Number(process.env.SD_BACKEND_PORT || process.env.BACKEND_PORT || 0);
@@ -13,7 +14,18 @@ if (file && port && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
   const fs = require("node:fs");
   const net = require("node:net");
   let n = 0, lines = 0;
-  const log = (ev) => { if (lines >= 3000) return; lines += 1; try { fs.appendFileSync(file, JSON.stringify({ ...ev, t: Date.now() }) + "\n"); } catch (_) { /* diagnostics only */ } };
+  // tp = performance.timeOrigin + now() (sub-ms, same clock as the fake engine's tp fields; #170 R1b bind trace).
+  // USAP_TEST_E1_BUFFERED=1 (R1b): lines are kept in memory and appended every 100 ms (async) and at exit, so the
+  // studio makes no synchronous file write inside a port check. Without it: one synchronous append per event (E1).
+  const buffered = process.env.USAP_TEST_E1_BUFFERED === "1";
+  let pending = [];
+  const flush = (sync) => { if (!pending.length) return; const text = pending.join(""); pending = [];
+    try { if (sync) fs.appendFileSync(file, text); else fs.appendFile(file, text, () => {}); } catch (_) { /* diagnostics only */ } };
+  if (buffered) { setInterval(() => flush(false), 100).unref(); process.on("exit", () => flush(true)); }
+  const log = (ev) => { if (lines >= 3000) return; lines += 1;
+    const line = JSON.stringify({ ...ev, t: Date.now(), tp: Math.round((performance.timeOrigin + performance.now()) * 1000) / 1000 }) + "\n";
+    if (buffered) { pending.push(line); return; }
+    try { fs.appendFileSync(file, line); } catch (_) { /* diagnostics only */ } };
   const callers = () => String(new Error().stack || "").split("\n").slice(3, 10)
     .map((l) => (l.match(/^\s*at (?:async )?([\w$.<>]{1,60}) \(/) || [])[1]).filter((x) => x && !/^(Server|listen|net)/.test(x)).slice(0, 3);
   const portOf = (a) => (typeof a[0] === "number" ? a[0] : a[0] && typeof a[0] === "object" ? Number(a[0].port) : NaN);
@@ -36,8 +48,8 @@ if (file && port && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
   cp.spawn = function tracedSpawn(cmd, args, ...rest) {
     const i = Array.isArray(args) ? args.indexOf("--listen-port") : -1;
     const target = i >= 0 && Number(args[i + 1]) === port;
-    if (target) { spawns += 1; log({ ev: "engine-spawn", port, n: spawns }); }
     const child = spawn.call(this, cmd, args, ...rest);
+    if (target) { spawns += 1; log({ ev: "engine-spawn", port, n: spawns, cpid: child && child.pid }); }
     if (target && holdMs > 0 && spawns > 1) {
       const s = net.createServer(); s.__e1kind = "inject"; s.on("error", () => {});
       s.listen(port, "127.0.0.1", () => setTimeout(() => s.close(), holdMs));
