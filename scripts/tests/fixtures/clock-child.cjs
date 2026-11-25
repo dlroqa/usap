@@ -29,6 +29,6 @@ if (mode === "pingpong") {
     });
     s.listen(port, "127.0.0.1");
   });
-  (async () => { for (let i = 0; i < n; i += 1) { out.push(await once()); if (mode === "try") await new Promise((r) => setImmediate(r)); } process.stdout.write(JSON.stringify(out) + "\n"); process.exit(0); })();
+  (async () => { for (let i = 0; i < n; i += 1) { out.push(await once()); if (mode === "try") await new Promise((r) => setImmediate(r)); } process.stdout.write(JSON.stringify(out) + "\n", () => process.exit(0)); })(); // exit only once the (~100 KB) line is flushed
   setTimeout(() => process.exit(3), 20000).unref();
 }
