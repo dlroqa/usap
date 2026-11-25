@@ -15,7 +15,8 @@ const safeId = (v) => (typeof v === "string" && GC_ID.test(v) ? v : v == null ? 
 // not read while the marked record was there.
 const MAX_SEEN = 16;
 function observer() {
-  const o = { reads: 0, ok: 0, missing: 0, errors: {}, parse: 0, last: null, seen: [], seenMore: 0, prevAt: null, firstAt: null, maxGap: 0, maxGapFrom: null };
+  const o = { reads: 0, ok: 0, missing: 0, errors: {}, parse: 0, last: null, seen: [], seenMore: 0, prevAt: null, firstAt: null, maxGap: 0, maxGapFrom: null, failAt: [] };
+  const failed = (now) => { if (o.failAt.length < 32) o.failAt.push(now); }; // C1: when reads failed (no I/O)
   const remember = (p, now) => {
     const key = `${p.pid}:${p.t}`;
     const e = o.seen.length ? o.seen[o.seen.length - 1] : null;
@@ -30,8 +31,8 @@ function observer() {
     o.prevAt = now;
     o.reads += 1;
     let text;
-    try { text = fs.readFileSync(f, "utf8"); } catch (err) { const c = (err && err.code) || "?"; if (c === "ENOENT") o.missing += 1; else o.errors[c] = (o.errors[c] || 0) + 1; return null; }
-    try { const p = JSON.parse(text); o.ok += 1; o.last = p; try { remember(p, now); } catch (_) { /* messages only */ } return p; } catch (_) { o.parse += 1; return null; }
+    try { text = fs.readFileSync(f, "utf8"); } catch (err) { const c = (err && err.code) || "?"; if (c === "ENOENT") o.missing += 1; else o.errors[c] = (o.errors[c] || 0) + 1; failed(now); return null; }
+    try { const p = JSON.parse(text); o.ok += 1; o.last = p; try { remember(p, now); } catch (_) { /* messages only */ } return p; } catch (_) { o.parse += 1; failed(now); return null; }
   };
   return o;
 }
@@ -70,6 +71,8 @@ function describeProbeWait({ req = {}, attempts = null, obs = null, child = null
         return `${rel(t)} ${kind} ${detail}`;
       });
       parts.push(`probe ticks ${d.ticks}, records published before this one ${d.writesOk}; probe events ${ev.length ? ev.join("; ") : "none"}`);
+      const sw = d.errors && typeof d.errors === "object" ? Object.entries(d.errors).map(([k, n]) => `${String(k).slice(0, 40)}x${n}`).join(",") : "";
+      parts.push(`probe write errors swallowed (cumulative) ${sw || "none"}`); // C1
     } else parts.push("probe diagnostics: not recorded");
   }
   if (obs) parts.push(describeSeen(obs, req, child ? child.pid : null, rel));
@@ -77,4 +80,33 @@ function describeProbeWait({ req = {}, attempts = null, obs = null, child = null
   return parts.join("; ").slice(0, 2500);
 }
 
-module.exports = { observer, describeProbeWait, describeSeen, MAX_SEEN };
+// C1 (round 15): one fixed reading of an exact-id wait, rules in order (messages only; never a verdict). Inputs: req
+// { id, requestedAt }, attempts (writeTrigger's retries, null when it threw), obs (observer), probeRunning, triggerPresent,
+// record (the last record, with diag): its events [t, kind, detail] and errors.
+function readProbeWait({ req = {}, attempts = null, obs = null, probeRunning = true, triggerPresent = false, record = null } = {}) {
+  const d = record && record.diag;
+  const ev = d && Array.isArray(d.events) ? d.events : [];
+  const has = (kind, id) => ev.filter(([, k, x]) => k === kind && (id === undefined || x === id || (x && x.gcId === id)));
+  const pub = has("published-marked", req.id), rep = has("replaced-marked", req.id);
+  const accepted = obs && obs.seen.some((e) => e.gcId !== undefined && e.gcId === req.id);
+  if (attempts === null) return "request not published (writeTrigger failed)";
+  if (!probeRunning) return "probe dead";
+  if (accepted) return "marked record seen by the reader";
+  if (!d) return "undecidable: probe diagnostics not recorded";
+  if (!has("request", req.id).length) {
+    const terr = ev.filter(([, k]) => /^trigger-.*-error$/.test(k)).map(([, k, x]) => `${k} ${x}`).slice(0, 4).join(",");
+    return triggerPresent ? `request never consumed (trigger still present${terr ? `; ${terr}` : ""})` : `request taken but not traced (trigger gone, no request event${terr ? `; ${terr}` : ""})`;
+  }
+  const markedErr = Object.keys(d.errors || {}).some((k) => /:marked$/.test(k)) || ev.some(([, k, x]) => k === "write-error" && x && x.gcId === req.id);
+  if (!pub.length) return markedErr ? "lost marked write (F1: the marked record's write failed)" : "request seen, marked record not published (unexplained)";
+  const t1 = pub[pub.length - 1][0], t2 = rep.length ? rep[rep.length - 1][0] : Infinity;
+  if (!obs) return `marked record published at ${t1}; reader view not recorded`;
+  const inWin = (t) => t >= t1 && t <= t2;
+  const readsIn = obs.seen.filter((e) => Number.isFinite(e.t) && e.t < t1 && e.lastAt > t1 && e.lastAt < t2); // an OLDER record read after the marked one was published
+  const failsIn = (obs.failAt || []).filter(inWin).length;
+  if (readsIn.length) return "R2 published but unseen: reads inside the marked window returned other records (visibility anomaly)";
+  if (failsIn) return `read errors: ${failsIn} read(s) failed inside the marked window`;
+  return `R1 reader gap: no read inside the marked window (${Number.isFinite(t2) ? t2 - t1 : "open"} ms; largest gap ${obs.maxGap} ms)`;
+}
+
+module.exports = { observer, describeProbeWait, describeSeen, readProbeWait, MAX_SEEN };

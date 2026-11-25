@@ -11,7 +11,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
 const { matchGcSample, writeTrigger } = require("../ci/memprobe-gc.cjs");
-const { observer, describeProbeWait } = require("./fixtures/memprobe-diag.cjs"); // diagnostics only
+const { observer, describeProbeWait, readProbeWait } = require("./fixtures/memprobe-diag.cjs"); // diagnostics only
 
 const PROBE = path.join(__dirname, "..", "ci", "image-queue-memprobe.cjs");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -149,14 +149,27 @@ test("ownership: a sample left by an earlier server process or an earlier cycle 
   } finally { await stop(b); }
 });
 
-test("negative control: without a GC (no --expose-gc) there is never a post-GC sample, so the request stays unanswered", async () => {
+// C1 (round 15, messages only): the exact-id wait below gets the reader's view and the probe's own events (diag), and
+// one reading (fixtures/memprobe-diag.cjs readProbeWait) printed BEFORE its unchanged assertion: request not published /
+// probe dead / never consumed / lost marked write (F1) / R1 reader gap / read errors / R2 published but unseen. The wait
+// keeps its limits (5000 ms, every 20 ms). diag makes each record a little larger (more bytes per write).
+test("negative control: without a GC (no --expose-gc) there is never a post-GC sample, so the request stays unanswered", async (t) => {
   const out = path.join(dir, "nogc.json");
-  const child = startProbe(dir, out, { exposeGc: false });
+  const child = startProbe(dir, out, { exposeGc: false, diag: true });
   try {
     assert.ok(await until(() => { const p = read(out); return p && p.gcAvailable === false; }));
     const req = { id: "gc-nogc-1", pid: child.pid, requestedAt: Date.now() };
-    writeTrigger(`${out}.gc`, req.id);
-    assert.ok(await until(() => { const p = read(out); return p && p.gcId === req.id; }), "the probe saw the request");
+    const obs = observer();
+    let attempts = null;
+    try { attempts = writeTrigger(`${out}.gc`, req.id); } catch (err) { attempts = null; t.diagnostic(`C1 negative control: request not published (${(err && err.code) || "error"})`); throw err; }
+    const saw = await until(() => { const p = obs.read(out); return p && p.gcId === req.id; });
+    try {
+      const line = describeProbeWait({ req, attempts, obs, child, triggerFile: `${out}.gc`, recordFile: out });
+      let rec = null; try { rec = JSON.parse(fs.readFileSync(out, "utf8")); } catch (_) { rec = obs.last; }
+      const reading = readProbeWait({ req, attempts, obs, probeRunning: child.exitCode === null && child.signalCode === null, triggerPresent: fs.existsSync(`${out}.gc`), record: rec });
+      t.diagnostic(`C1 negative control (${saw ? "marked record seen" : "marked record NOT seen"}): reading ${reading}; ${line}`);
+    } catch (_) { t.diagnostic("C1 negative control: description failed"); }
+    assert.ok(saw, "the probe saw the request");
     assert.equal(await until(() => matchGcSample(read(out), req), 1500), null, "no sample: missing stays missing (the validator then records FAIL)");
     assert.equal(read(out).lastGc, undefined);
   } finally { await stop(child); }
