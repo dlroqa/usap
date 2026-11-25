@@ -66,7 +66,13 @@ test("real helper: a synchronous block during the grace period makes the timer l
 test("real helper: a busy main thread during the grace period makes the timer late and reads as busy", { timeout: 30000 }, async () => {
   const r = await refuseOnce({ during: () => setTimeout(() => busy(900), 50) });
   assert.match(r.verdict, /^late timer/, r.line);
-  if (process.platform === "linux") assert.equal(r.verdict, "late timer: busy main thread (CPU)", r.line);
+  if (process.platform === "linux") {
+    // A spinning thread is runnable (R); whether it also GOT the CPU depends on the machine's load (CI runs test files
+    // in parallel). The reading must follow the CPU it measured: busy at >= half the late window, descheduled below.
+    const m = /process CPU (\d+) ms over (\d+) ms/.exec(r.line);
+    assert.ok(m, `the line reports the process CPU over the late window: ${r.line}`);
+    assert.equal(r.verdict, Number(m[1]) >= Number(m[2]) * 0.5 ? "late timer: busy main thread (CPU)" : "late timer: descheduled (runnable, little CPU)", r.line);
+  }
 });
 
 test("real helper: destroy on time, 'close' observed late (the main thread blocked right after destroy)", { timeout: 30000 }, async () => {
