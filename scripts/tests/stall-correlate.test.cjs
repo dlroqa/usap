@@ -53,3 +53,14 @@ test("observer (Linux): a real busy loop, a synchronous block and an idle loop r
   assert.ok(iR >= 0 && iF > iR, runs.join(" "));
   assert.ok(runs.slice(iF).some((x) => /ep_poll/.test(x)), runs.join(" "));
 });
+
+test("write accounting (DD-201-PEND): with io.writes the line adds the callback counts and names the old field's defect; without it the line is unchanged", () => {
+  const withW = base();
+  withW.st.io.writes = { subBytes: 196619, subCalls: 9, okBytes: 65536, okCalls: 4, failBytes: 131083, failCalls: 5, failCodes: { EPIPE: 5 },
+    atFirstFail: { seq: 1, t: T + 2279, code: "EPIPE", syscall: "write", queuedInNode: 65547, notAcceptedBytes: 131083, callbackPendingBytes: 131083, failCalls: 0 },
+    atError: { seq: 2, t: T + 2280, code: "EPIPE", syscall: "write", queuedInNode: 0, notAcceptedBytes: 131083, callbackPendingBytes: 0, failCalls: 5 } };
+  const line = describeStallCorrelates(withW);
+  assert.match(line, /drains 1; write callbacks \(the "still queued in Node" figure above is writableLength at 'error', known to read 0 after failed callbacks\): submitted 196619 B in 9, accepted by the kernel 65536 B, failed 131083 B in 5 \[EPIPEx5\]; first failed callback EPIPE\/write at 2279: queued in Node 65547 B, not accepted by the kernel 131083 B/);
+  assert.match(line, /at 'error' EPIPE\/write at 2280: queued in Node 0 B, not accepted by the kernel 131083 B, callbacks pending 0 B, failed callbacks 5; first failure before 'error'/);
+  assert.doesNotMatch(describeStallCorrelates(base()), /write callbacks/, "earlier records read exactly as before");
+});

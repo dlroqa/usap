@@ -51,6 +51,11 @@ function describeStallCorrelates({ st, rec, ticks = [], proc = null, observer = 
   const io = (st && st.io) || {};
   const head = [`server answer handed to the kernel 0 (not client receipt), server close ${r(rec.sockCloseAt)}`,
     `client first data ${r(io.firstDataAt)}, error ${st.error || "none"} at ${r(io.errorAt)} with ${io.pendingAtError === undefined ? "?" : io.pendingAtError} B still queued in Node, close ${r(io.closeAt)}, drains ${Array.isArray(st.drainsAt) ? st.drainsAt.length : 0}`];
+  const w = io.writes; // #151 write accounting (DD-201-PEND); absent in earlier records, then the line is as before
+  if (w) {
+    const at = (x) => (x ? `${x.code || "?"}/${x.syscall || "?"} at ${r(x.t)}: queued in Node ${x.queuedInNode} B, not accepted by the kernel ${x.notAcceptedBytes} B, callbacks pending ${x.callbackPendingBytes} B, failed callbacks ${x.failCalls}` : "none");
+    head.push(`write callbacks (the "still queued in Node" figure above is writableLength at 'error', known to read 0 after failed callbacks): submitted ${w.subBytes} B in ${w.subCalls}, accepted by the kernel ${w.okBytes} B, failed ${w.failBytes} B in ${w.failCalls} [${Object.entries(w.failCodes || {}).map(([k, v]) => `${k}x${v}`).join(",") || "none"}]; first failed callback ${at(w.atFirstFail)}; at 'error' ${at(w.atError)}${w.atFirstFail && w.atError ? `; first failure ${w.atFirstFail.seq < w.atError.seq ? "before" : "after"} 'error'` : ""}`);
+  }
   const end = Math.max(rec.sockCloseAt || t0, io.closeAt || t0) + 100;
   const wins = [];
   for (let i = 1; i < ticks.length && wins.length < MAX_WINDOWS; i += 1) {
@@ -67,7 +72,7 @@ function describeStallCorrelates({ st, rec, ticks = [], proc = null, observer = 
     return `client main thread silent ${r(w[0])}..${r(w[1])} (${w[1] - w[0]} ms): process CPU ${cpu === null ? "?" : `${cpu} ms`}; GC ${gcs.length} pauses ${gcMs} ms; observer client ${c.text}; studio ${s.text}; reading: ${observer ? reading(w, gcMs, c, cpu) : gcMs >= (w[1] - w[0]) * 0.5 ? "GC pause" : "no observer"}`;
   });
   const loop = proc && proc.loop ? `client loop delay max ${proc.loop.maxMs} ms p99 ${proc.loop.p99Ms} ms` : "loop delay not recorded";
-  return [...head, ...(parts.length ? parts : ["no client silent window >= 200 ms around the answer"]), loop, observer ? `observer ${observer.platform} every ${observer.intervalMs} ms${observer.unsupported ? " (unsupported)" : ""}` : "observer not run"].join("; ").slice(0, 2000);
+  return [...head, ...(parts.length ? parts : ["no client silent window >= 200 ms around the answer"]), loop, observer ? `observer ${observer.platform} every ${observer.intervalMs} ms${observer.unsupported ? " (unsupported)" : ""}` : "observer not run"].join("; ").slice(0, 2600);
 }
 
 module.exports = { describeStallCorrelates, statesIn, reading, cpuIn };

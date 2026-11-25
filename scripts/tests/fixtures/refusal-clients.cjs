@@ -44,6 +44,30 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
         // means the loop got past the I/O phase that handled the drain, where a ready read would also have run.
         drainChecksAt: [], firstDataCheckAt: null } };
     if (Array.isArray(live)) live.push(st);
+    // #151 write accounting (diagnostics runs only; DD-201-PEND): `pendingAtError` (writableLength in 'error', below) is
+    // known to read 0 once write callbacks have failed, because Node empties its queue and fails every callback before
+    // it emits 'error'. Counted here from the write callbacks instead: bytes submitted to s.write, bytes whose callback
+    // succeeded (libuv wrote them into the kernel's send buffer: accepted by the kernel, NOT acknowledged or received)
+    // and bytes whose callback failed. Snapshots at the first failed callback and at 'error' (before any other listener).
+    // Kernel send-buffer occupancy is not visible from Node. Backpressure is unchanged: s.write's own result is returned.
+    if (Array.isArray(live)) {
+      const W = st.io.writes = { subBytes: 0, subCalls: 0, okBytes: 0, okCalls: 0, failBytes: 0, failCalls: 0, failCodes: {}, atFirstFail: null, atError: null };
+      let seq = 0;
+      const snap = (e) => ({ seq: (seq += 1), t: Date.now(), code: (e && e.code) || null, syscall: (e && e.syscall) || null, queuedInNode: s.writableLength,
+        notAcceptedBytes: W.subBytes - W.okBytes, callbackPendingBytes: W.subBytes - W.okBytes - W.failBytes, failCalls: W.failCalls });
+      const write = s.write;
+      s.write = function accountedWrite(chunk, enc, cb) {
+        if (typeof enc === "function") { cb = enc; enc = undefined; }
+        const n = typeof chunk === "string" ? Buffer.byteLength(chunk, enc) : chunk.length;
+        W.subBytes += n; W.subCalls += 1;
+        return write.call(this, chunk, enc, (e) => {
+          if (e) { if (!W.atFirstFail) W.atFirstFail = snap(e); W.failBytes += n; W.failCalls += 1; const k = String(e.code || "error").slice(0, 20); W.failCodes[k] = (W.failCodes[k] || 0) + 1; }
+          else { W.okBytes += n; W.okCalls += 1; }
+          if (cb) cb(e);
+        });
+      };
+      s.prependListener("error", (e) => { if (!W.atError) W.atError = snap(e); });
+    }
     let buf = Buffer.alloc(0), stopped = false, timer = null;
     const parse = () => {
       const text = buf.toString("latin1"); const i = text.indexOf("\r\n\r\n");
@@ -60,7 +84,9 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
     s.on("end", () => { if (st.io.endAt === null) st.io.endAt = Date.now(); });
     s.on("error", (e) => {
       if (st.io.errorAt === null) st.io.errorAt = Date.now(); st.error = e.code || e.message;
-      // #151 diagnostics (cpuDiag runs only): bytes this client had queued in Node but not yet written when the error came
+      // #151 diagnostics (cpuDiag runs only): bytes this client had queued in Node but not yet written when the error came.
+      // KNOWN INVALID (DD-201-PEND): reads 0 after failed write callbacks; kept unchanged for comparison with earlier
+      // records. Use io.writes (above) instead.
       if (Array.isArray(live) && st.io.pendingAtError === undefined) st.io.pendingAtError = s.writableLength;
     });
     s.on("close", () => { st.io.closeAt = Date.now(); st.closedAt = Date.now() - st.t0; stopped = true; clearTimeout(timer); resolve(st); });
