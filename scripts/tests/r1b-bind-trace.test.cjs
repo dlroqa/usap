@@ -14,7 +14,7 @@ const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
 const test = require("node:test");
-const { makeRoot, startServer, stopServer, removeTestRoot, request, installFakeSdServer, fakeSdDiag } = require("./api-contract/harness.cjs");
+const { makeRoot, startServer, stopServer, removeTestRoot, request, installFakeSdServer, fakeSdDiag, processesUnder } = require("./api-contract/harness.cjs");
 const { readBindTrace } = require("./fixtures/r1b-bind-trace.cjs");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -123,19 +123,28 @@ test("real R-G: a studio-side bind held across the replacement's spawn reads G (
 });
 
 test("real R-U: a bind by another process between the engine's spawn and its listen reads U, not G", { timeout: 90000 }, async (t) => {
-  let holder = null;
-  const r = await withTraced({}, async (srv) => {
-    const before = fakeSdDiag(root).length;
-    const load = imageLoad(srv, "sd1-hold-load-q4_0.gguf", 4);
-    assert.ok(await waitFor(async () => fakeSdDiag(root).slice(before).some((x) => x.e === "start"), 15000), "hold-load engine started");
-    holder = net.createServer(); holder.on("error", () => {});
-    await new Promise((res) => holder.listen(srv.sdPort, "127.0.0.1", res));
-    fs.writeFileSync(path.join(root, "app", "models", "sd1-hold-load-q4_0.gguf.release"), "");
-    await waitFor(async () => fakeSdDiag(root).slice(before).some((x) => x.e === "listen-error"), 10000);
-    await load;
-  });
-  if (holder) await new Promise((res) => holder.close(res));
-  fs.rmSync(path.join(root, "app", "models", "sd1-hold-load-q4_0.gguf.release"), { force: true });
+  // Lifecycle (round 15): the holder's listen error rejects (it used to be swallowed, leaving the promise and the studio
+  // pending); the holder, the release file and any fake engine of this file's root are cleaned up on every path, after
+  // withTraced (closing the holder earlier could let the studio start another generation and change the reading).
+  let holder = null, r = null;
+  const release = path.join(root, "app", "models", "sd1-hold-load-q4_0.gguf.release");
+  try {
+    r = await withTraced({}, async (srv) => {
+      const before = fakeSdDiag(root).length;
+      const load = imageLoad(srv, "sd1-hold-load-q4_0.gguf", 4);
+      load.catch(() => {}); // awaited below; a failure before that must not become an unhandled rejection
+      assert.ok(await waitFor(async () => fakeSdDiag(root).slice(before).some((x) => x.e === "start"), 15000), "hold-load engine started");
+      holder = net.createServer();
+      await new Promise((res, rej) => { holder.once("error", rej); holder.listen(srv.sdPort, "127.0.0.1", () => { holder.off("error", rej); res(); }); });
+      fs.writeFileSync(release, "");
+      await waitFor(async () => fakeSdDiag(root).slice(before).some((x) => x.e === "listen-error"), 10000);
+      await load;
+    });
+  } finally {
+    if (holder && holder.listening) await new Promise((res) => holder.close(res));
+    fs.rmSync(release, { force: true });
+    for (const p of processesUnder(root).filter((x) => /sd-server|sd-cpu/i.test(x.cmd))) { try { process.kill(p.pid, "SIGKILL"); } catch (_) { /* gone */ } }
+  }
   t.diagnostic(r.line.slice(0, 900));
   const last = r.rows.slice(-1)[0] || {};
   assert.equal(last.result, "EADDRINUSE", r.line);
