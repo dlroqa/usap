@@ -245,8 +245,12 @@ test("server: off by default — /api/diagnostics unchanged (no staleFiles), fil
 // Diagnostics (messages only): this test twice found matched 0 instead of 1 (#176 macOS arm64, #194 Windows). Every run
 // prints one line (fixtures/stale-report-diag.cjs) with the report's full counts, state, truncation, error codes and
 // timings for the folder, and the test's own view of its files and of the folder, before the unchanged assertions.
+// #197 scan trace (messages only): this test's studio alone runs fixtures/stale-scan-trace.cjs, which prints one
+// "[sf-trace]" line (listening, first requests, synchronous child-process calls, the scan's opendir / first entry /
+// done, event-loop gaps) once the scan has finished; it is printed after the report line, before the assertions.
+const SF_TRACE = path.join(__dirname, "fixtures", "stale-scan-trace.cjs").replace(/\\/g, "/");
 test("server: report — counts after listening, nothing removed, renamed or created, no names in the answer", async (t) => {
-  await withServer({ USAP_STALE_FILE_REPORT: "report" }, async (srv, now, before) => {
+  await withServer({ USAP_STALE_FILE_REPORT: "report", USAP_TEST_SF_TRACE: "1", NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require "${SF_TRACE}"`.trim() }, async (srv, now, before) => {
     let s = null;
     const w0 = Date.now();
     for (let i = 0; i < 100 && !(s && s.lastRunAt); i += 1) { s = (await diag(srv)).staleFiles; if (!s || !s.lastRunAt) await new Promise((r) => setTimeout(r, 100)); }
@@ -260,6 +264,9 @@ test("server: report — counts after listening, nothing removed, renamed or cre
       line = describeStaleReport(s, { files, entries, waitMs: Date.now() - w0, log: (srv.log().match(/\[stale-files\][^\r\n]*/) || [""])[0] });
     } catch (_) { line = "description failed"; }
     t.diagnostic(`stale-file report: ${line}`);
+    let trace = (srv.log().match(/\[sf-trace\][^\r\n]*/) || [""])[0];
+    for (let i = 0; i < 10 && !trace; i += 1) { await new Promise((r) => setTimeout(r, 50)); trace = (srv.log().match(/\[sf-trace\][^\r\n]*/) || [""])[0]; }
+    t.diagnostic(`stale-file scan trace: ${trace ? trace.slice(11, 2500) : "none"}`);
     assert.ok(s && s.lastRunAt, "the report ran");
     assert.equal(s.mode, "report"); assert.equal(s.removed, 0);
     assert.equal(s.legacyTranscriptionTemporaries.matched, 1);
