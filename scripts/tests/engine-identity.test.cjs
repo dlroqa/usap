@@ -47,6 +47,9 @@ test("new process after a real kill: reads 'new process'; the listener owner is 
     const before = await id.snapshot({ label: "before", enginePort: port });
     if (before.lookup !== "unavailable") assert.ok(before.owners.some((o) => o.pid === a.pid), `owner lookup finds A: ${JSON.stringify(before.owners)}`);
     const kill = { pid: a.pid, at: Date.now(), status: hardKill(a.pid), aliveAfter: null }; await exited(a); kill.aliveAfter = id.alive(a.pid);
+    // OS creation times have a resolution (macOS ps: 1 s): start B only once A's and B's can differ by more than it
+    const resA = (before.procs[a.pid] && before.procs[a.pid].resMs) || 0, aAt = before.procs[a.pid] && before.procs[a.pid].startedAt;
+    if (aAt) { const wait = aAt + 2 * resA + 1100 - Date.now(); if (wait > 0) await sleep(Math.min(wait, 5000)); }
     const b = startFake(port); await until(async () => { const s = await id.engineStats(port); return s && s.pid === b.pid; }, 10000, "B up");
     const after = await id.snapshot({ label: "after", enginePort: port });
     const r = id.readEngineIdentity({ before, after, kill });
