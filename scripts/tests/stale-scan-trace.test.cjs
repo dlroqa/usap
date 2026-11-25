@@ -53,6 +53,15 @@ test("negative: without a block the trace is well formed; a slow first entry is 
   });
 });
 
+test("a block that ends right before the trace is published is still recorded as a gap", { timeout: 60000 }, async () => {
+  // a 300 ms block right after the scan finished, with a slow (1 s) gap sampler: the 50 ms publish timer is then due
+  // first when the block ends, so only publish()'s own final check can record the gap (the round-16 macOS Intel shape)
+  await withStudio({ USAP_STALE_FILE_REPORT: "report", USAP_TEST_SF_TRACE: "1", USAP_TEST_SF_TRACE_BLOCK_DONE: "300", USAP_TEST_SF_TRACE_LAG: "1000" }, async (srv) => {
+    assert.ok(await report(srv)); const tr = await trace(srv);
+    assert.ok(tr.gaps.some((g) => g.ms >= 250), `the 300 ms block is a recorded gap: ${JSON.stringify(tr.gaps)}`);
+  });
+});
+
 test("fallback: with no scan the trace is still published once, with no scan entries; inert without the variable", { timeout: 60000 }, async () => {
   await withStudio({ USAP_STALE_FILE_REPORT: "", USAP_TEST_SF_TRACE: "1", USAP_TEST_SF_TRACE_FALLBACK: "800" }, async (srv) => {
     const tr = await trace(srv, 5000);

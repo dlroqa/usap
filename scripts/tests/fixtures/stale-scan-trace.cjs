@@ -14,7 +14,9 @@
 // "[sf-trace] {...}" about 50 ms after the scan's directory iterator finished (fallback: 10 s), then every timer of this
 // preload stops. Bounded (40 events per kind). No names, no paths. It never changes what the studio does.
 // Controls only (stale-scan-trace.test.cjs): USAP_TEST_SF_TRACE_BLOCK=<ms> blocks the event loop for <ms> right after
-// the scan's opendir is called (the failing run's shape); USAP_TEST_SF_TRACE_FALLBACK=<ms> shortens the 10 s fallback.
+// the scan's opendir is called (the failing run's shape); USAP_TEST_SF_TRACE_FALLBACK=<ms> shortens the 10 s fallback;
+// USAP_TEST_SF_TRACE_BLOCK_DONE=<ms> blocks right after the scan's iterator finished and USAP_TEST_SF_TRACE_LAG=<ms>
+// slows the gap sampler, so the publish timer deterministically runs before it after that block.
 "use strict";
 if (process.env.USAP_TEST_SF_TRACE === "1" && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
   const fs = require("node:fs"), path = require("node:path"), cp = require("node:child_process"), http = require("node:http");
@@ -60,7 +62,9 @@ if (process.env.USAP_TEST_SF_TRACE === "1" && /[\\/]serve\.cjs$/.test(process.ar
     const iter = dir[Symbol.asyncIterator].bind(dir);
     dir[Symbol.asyncIterator] = function tracedEntries() {
       const it = iter();
-      const finish = () => { if (s.done === null) { s.done = now(); schedulePublish(); } };
+      const finish = () => { if (s.done === null) { s.done = now(); schedulePublish();
+        const bd = Number(process.env.USAP_TEST_SF_TRACE_BLOCK_DONE || 0); // control only
+        if (bd > 0) setImmediate(() => { const end = performance.now() + bd; while (performance.now() < end) { /* injected block */ } }); } };
       return {
         async next() { if (s.first === null) s.first = now(); const r = await it.next(); if (s.firstAt === null) s.firstAt = now(); if (r.done) finish(); else s.entries += 1; return r; },
         async return(v) { finish(); return it.return ? it.return(v) : { done: true, value: v }; },
@@ -71,10 +75,13 @@ if (process.env.USAP_TEST_SF_TRACE === "1" && /[\\/]serve\.cjs$/.test(process.ar
   };
   // event-loop gaps and delay
   let last = performance.now();
-  const lag = setInterval(() => { const n = performance.now(); const g = n - last; last = n; if (g >= 50) add(rec.gaps, { from: Math.round((n - g) * 10) / 10, ms: Math.round(g) }); }, 10);
+  const lag = setInterval(() => { const n = performance.now(); const g = n - last; last = n; if (g >= 50) add(rec.gaps, { from: Math.round((n - g) * 10) / 10, ms: Math.round(g) }); }, Number(process.env.USAP_TEST_SF_TRACE_LAG || 10));
   const h = monitorEventLoopDelay({ resolution: 10 }); h.enable();
   function publish() {
     if (published) return; published = true;
+    // the lag sampler and this timer can be due together after a block: record the pending gap before stopping the
+    // sampler (round-16 macOS Intel CI: a 342 ms execSync ending just before publish was missed as a gap)
+    { const n = performance.now(); const g = n - last; if (g >= 50) add(rec.gaps, { from: Math.round((n - g) * 10) / 10, ms: Math.round(g), atPublish: true }); }
     clearInterval(lag); clearTimeout(pubTimer); clearTimeout(fallback);
     rec.loopMax = Math.round(h.max / 1e6); h.disable(); rec.published = now();
     try { process.stderr.write(`[sf-trace] ${JSON.stringify(rec)}\n`); } catch (_) { /* diagnostics only */ }
