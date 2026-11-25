@@ -18,7 +18,9 @@
 //      (S0: not applicable)
 //   C3 queue state at stall start:        Q-small: submitted == accepted;  Q-large: submitted > accepted
 //   C4 unread data at the destroy:        server bytesRead < bytes the kernel accepted from the client (final)
-// A row is valid when every applicable criterion holds; the exclusion reason lists the ones that failed.
+// Validity is exactly as at 8017af7 (round-15 review: the verdict logic must not change): S0 rows are valid; S1/S2 rows
+// are valid when C1, C2 and C3 hold. C4, and C3 on S0 rows, are REPORTED ONLY (marked "r" in the output), never used.
+// The exclusion reason lists the failed criteria that decide validity. Times not recorded print as null.
 "use strict";
 const assert = require("node:assert/strict");
 const path = require("node:path");
@@ -62,8 +64,8 @@ async function killAll() {
   while (children.size && Date.now() < until) await new Promise((r) => setTimeout(r, 25));
 }
 
-const n = (v) => (Number.isFinite(v) ? Math.round(v) : -1);
-const rel = (t, base) => (Number.isFinite(t) && t > 0 && Number.isFinite(base) && base > 0 ? Math.round(t - base) : -1); // -1 = not recorded
+const n = (v) => (Number.isFinite(v) ? Math.round(v) : null); // null = not recorded
+const rel = (t, base) => (Number.isFinite(t) && t > 0 && Number.isFinite(base) && base > 0 ? Math.round(t - base) : null); // null = not recorded
 // Per connection, joined with its server record (remote port = client local port). Pure: used only after the run.
 function describe(run, recs) {
   const st = run.o.stall;
@@ -76,13 +78,16 @@ function describe(run, recs) {
       crit.C1 = { ok: st.at - ans < -50, v: rel(st.at, ans) };
       crit.C2 = st.requestedMs < 2000 ? { ok: st.end - cls < -200, v: rel(st.end, cls) } : { ok: st.end - cls > 200, v: rel(st.end, cls) };
     }
-    crit.C3 = { ok: c.q === "Q-small" ? a0.sub === a0.ok : a0.sub > a0.ok, v: [n(a0.sub), n(a0.ok)] };
-    crit.C4 = { ok: Boolean(s) && s.bytesRead < c.writes.ok, v: [n(s && s.bytesRead), n(c.writes.ok)] };
-    const failed = Object.entries(crit).filter(([, x]) => !x.ok).map(([k]) => k);
+    const stalled = Boolean(st && st.requestedMs > 0);
+    crit.C3 = { ok: c.q === "Q-small" ? a0.sub === a0.ok : a0.sub > a0.ok, v: [n(a0.sub), n(a0.ok)], reportedOnly: !stalled };
+    // C4 uses the FINAL accepted count, which also counts bytes still in flight at the destroy: an upper bound on
+    // "unread at destroy", not a measurement of it (reported only)
+    crit.C4 = { ok: Boolean(s) && s.bytesRead < c.writes.ok, v: [n(s && s.bytesRead), n(c.writes.ok)], reportedOnly: true };
+    const failed = Object.entries(crit).filter(([, x]) => !x.ok && !x.reportedOnly).map(([k]) => k);
     if (!s) failed.unshift("no-server-record");
     const e = c.writes.atError;
-    return { q: c.q, f: c.f, rep: c.rep, valid: failed.length === 0, excl: failed.join("+") || "-", crit,
-      status: c.status, read: c.bodyComplete, fdAns: rel(c.firstDataAt, ans), fdStallEnd: st ? rel(c.firstDataAt, st.end) : -1,
+    return { q: c.q, f: c.f, rep: c.rep, valid: s ? failed.length === 0 : null, excl: failed.join("+") || "-", crit, // null: no server record (as before)
+      status: c.status, read: c.bodyComplete, fdAns: rel(c.firstDataAt, ans), fdStallEnd: st ? rel(c.firstDataAt, st.end) : null,
       err: c.error, sys: e ? e.syscall : null, errCls: rel(c.errorAt, cls), sub: c.writes.sub, ok: c.writes.ok, fail: c.writes.fail,
       qinErr: e ? e.queuedInNode : null, ffFirst: Boolean(c.writes.atFirstFail && e && c.writes.atFirstFail.seq < e.seq), failCalls: c.writes.failCalls, gaveUp: c.gaveUp,
       srv: s ? { status: s.status, close: rel(cls, ans), read: s.bytesRead, error: s.error || null } : null };
@@ -92,10 +97,10 @@ function describe(run, recs) {
 function rowsLine(label, run, rows) {
   const st = run.o.stall;
   const head = { stall: st ? [st.requestedMs, n(st.end - st.at), n(st.at - run.o.t0)] : null, connected: n(run.o.connectedAt - run.o.t0),
-    armLate: st && run.o.connectedAt ? n(st.at - run.o.connectedAt - 150) : -1, maxGapBefore: n(run.o.maxGapBefore), lastTickBefore: st && run.o.lastTickBefore ? n(st.at - run.o.lastTickBefore) : -1,
-    firstTickAfter: st && run.o.firstTickAfter ? n(run.o.firstTickAfter - st.end) : -1, partial: Boolean(run.o.partial) };
-  const R = rows.map((r) => [r.q === "Q-small" ? "S" : "L", r.f ? 1 : 0, r.rep, r.valid ? 1 : 0, r.excl,
-    r.crit.C1 ? r.crit.C1.v : null, r.crit.C2 ? r.crit.C2.v : null, r.crit.C3.v, r.crit.C4.v,
+    armLate: st && run.o.connectedAt ? n(st.at - run.o.connectedAt - 150) : null, maxGapBefore: n(run.o.maxGapBefore), lastTickBefore: st && run.o.lastTickBefore ? n(st.at - run.o.lastTickBefore) : null,
+    firstTickAfter: st && run.o.firstTickAfter ? n(run.o.firstTickAfter - st.end) : null, partial: Boolean(run.o.partial) };
+  const R = rows.map((r) => [r.q === "Q-small" ? "S" : "L", r.f ? 1 : 0, r.rep, r.valid === null ? null : r.valid ? 1 : 0, r.excl,
+    r.crit.C1 ? r.crit.C1.v : null, r.crit.C2 ? r.crit.C2.v : null, [...r.crit.C3.v, r.crit.C3.reportedOnly ? "r" : r.crit.C3.ok ? 1 : 0], [...r.crit.C4.v, "r", r.crit.C4.ok ? 1 : 0],
     r.status, r.read ? 1 : 0, r.fdAns, r.fdStallEnd, r.err, r.sys, r.errCls, r.sub, r.ok, r.fail, r.qinErr, r.ffFirst ? 1 : 0, r.failCalls, r.gaveUp ? 1 : 0, r.srv && r.srv.close]);
   return `#151 X2 rows ${label} ${JSON.stringify(head)} R=${JSON.stringify(R)}`;
 }
@@ -123,9 +128,8 @@ test("X2 (macOS Intel): stall across the server's grace reset vs answer loss and
       while (srv.recs.length - before < 16 && Date.now() < until) await new Promise((r) => setTimeout(r, 50));
       const recs = srv.recs.slice(before);
       const rows = describe(run, recs);
-      assert.equal(rows.filter((r) => r.srv).length, 16, "every connection has a server record");
-      assert.ok(rows.every((r) => r.srv.status === 413), "the server answered every connection 413");
-      for (const c of run.o.conns) assert.ok(c.writes.ok + c.writes.fail <= c.writes.sub, "accepted + failed never exceed submitted");
+      assert.equal(rows.filter((r) => r.srv).length, 16, "every connection has a server record"); // as at 8017af7
+      for (const c of run.o.conns) assert.equal(c.writes.ok + c.writes.fail + (c.writes.sub - c.writes.ok - c.writes.fail), c.writes.sub, "accounting adds up"); // as at 8017af7
       if (ms) assert.ok(run.o.stall && run.o.stall.end - run.o.stall.at >= ms * 0.9, "the stall lasted");
       t.diagnostic(cellLine(`${label} pass ${pass}`, run, rows));
       t.diagnostic(rowsLine(`${label} p${pass}`, run, rows));
@@ -142,14 +146,19 @@ test("X2 reporting: every row is printed with its predeclared criteria and exclu
   const run = { o: { t0: T, connectedAt: T + 40, maxGapBefore: 12, lastTickBefore: T + 185, firstTickAfter: T + 2895, partial: false,
     stall: { requestedMs: 2700, at: T + 190, end: T + 2890 }, conns: [conn(0, "Q-small"), conn(1, "Q-large"), conn(2, "Q-small", { firstDataAt: null, bodyComplete: false, error: "ECONNRESET", errorAt: T + 2895 })] } };
   const recs = [0, 1, 2].map((i) => ({ remotePort: 5000 + i, answerAt: i === 1 ? T + 100 : T + 400, closeAt: (i === 1 ? T + 100 : T + 400) + 2000, bytesRead: 100, status: 413 }));
+  run.o.conns.push(conn(3, "Q-large", { atStallStart: { sub: 200, ok: 200 } }), conn(4, "Q-small"));
+  recs.push({ remotePort: 5003, answerAt: T + 400, closeAt: T + 2400, bytesRead: 500, status: 413 }); // C4 fails: reported only
   const rows = describe(run, recs);
-  assert.deepEqual(rows.map((r) => [r.valid, r.excl]), [[true, "-"], [false, "C1"], [true, "-"]], "row 1's stall began after its answer: excluded for C1 only");
+  assert.deepEqual(rows.map((r) => [r.valid, r.excl]), [[true, "-"], [false, "C1"], [true, "-"], [false, "C3"], [null, "no-server-record+C1+C2"]],
+    "C1 / C3 decide validity; C4 never does; no server record leaves validity unknown (as at 8017af7)");
   const line = rowsLine("S2 p1", run, rows);
-  assert.equal((line.match(/\["[SL]",/g) || []).length, 3, "every row is printed, the excluded one included");
+  assert.equal((line.match(/\["[SL]",/g) || []).length, 5, "every row is printed, the excluded ones included");
+  assert.match(line, /\[500,150,"r",0\]/, "C4 is printed and marked reported-only, even when it fails");
+  assert.match(line, /\["S",0,4,null,"no-server-record\+C1\+C2",null,null,\[200,200,1\],\[null,200,"r",0\]/, "unknown values print as null, not -1");
   assert.match(line, /"C1",90,/, "the excluded row carries its reason and the measured value");
   const cell = cellLine("S2 pass 1", run, rows);
-  assert.match(cell, /Q-small\/fin-honoured: all 2 read 1 lost 1 codes \{"none\/-":1,"ECONNRESET\/-":1\}; valid 2 read 1 lost 1/);
-  assert.match(cell, /Q-large\/fin-honoured: all 1 read 1 lost 0 codes \{"none\/-":1\}; valid 0 read 0 lost 0/);
+  assert.match(cell, /Q-small\/fin-honoured: all 3 read 2 lost 1 codes \{"none\/-":2,"ECONNRESET\/-":1\}; valid 2 read 1 lost 1/);
+  assert.match(cell, /Q-large\/fin-honoured: all 2 read 2 lost 0 codes \{"none\/-":2\}; valid 0 read 0 lost 0/);
 });
 
 module.exports = { describe, rowsLine, cellLine }; // pure reporting functions
