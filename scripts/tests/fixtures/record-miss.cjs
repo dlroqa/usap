@@ -11,12 +11,25 @@
 // Readings: never seen by the record listener / identity mismatch (arrived with another port) / never generated
 // (socket not closed by the end of collection, or the record write failed) / published but unreadable / overwritten
 // / published after the collection deadline (delayed) / published and present but not matched / unexplained.
+// C3 (#205 follow-up, round 15): server  the studio process at the miss: { atMiss, afterLook } snapshots of
+//   { pid, running, exit: { code, signal, at, before } , tail } (tail already sanitized by the caller: no paths, no
+//   bodies). Checked FIRST: a server that was not running at the miss, with no successful record write traced for the
+//   connection, reads "server dead" (its exit code/signal/time relative to the client's start). A trail that hit the
+//   preload's 400-line cap, or has unparsable lines, makes the trail-based readings undecidable ("trail incomplete").
+//   polls.readStats counts the collector's failed reads by kind (ENOENT / parse), so "parse failure" is visible.
 // Only numbers, codes and function names are printed: no paths, no bodies.
 "use strict";
 
 const ARRIVE_SLACK_MS = 1000; // an arrival this close to the client's start counts as "near" for the identity reading
 
-function describeRecordMiss({ st, port, events = [], polls = {} }) {
+const TRAIL_CAP = 400; // lines; the preload stops tracing silently there (api-contract/connection-log-preload.cjs)
+function describeServer(server, rel) {
+  if (!server) return "";
+  const one = (x) => (!x ? "?" : x.running ? `running (pid ${x.pid})` : `exited (pid ${x.pid}, code ${x.exit && x.exit.code !== undefined ? x.exit.code : "?"}, signal ${(x.exit && x.exit.signal) || "none"}, at ${rel(x.exit && x.exit.at)}${x.exit && x.exit.before ? ", before the test's stop" : ""})`);
+  const tail = server.afterLook && server.afterLook.tail ? `, log tail [${server.afterLook.tail}]` : "";
+  return `studio at the miss ${one(server.atMiss)}, after the late look ${one(server.afterLook)}${tail}`;
+}
+function describeRecordMiss({ st, port, events = [], polls = {}, server = null, trailBad = 0 }) {
   const t0 = st.t0;
   const rel = (w) => (Number.isFinite(w) ? Math.round(w - t0) : "none");
   const arrives = events.filter((e) => e.ev === "arrive");
@@ -25,7 +38,16 @@ function describeRecordMiss({ st, port, events = [], polls = {} }) {
   const client = `client answer ${st.answeredAt ?? "none"}, error ${st.error || "none"} ${st.errorAt ?? ""}, close ${st.closedAt ?? "none"}`.replace(/ +,/g, ",");
   const coll = `collection ${polls.count || 0} reads ${rel(polls.first)}..${rel(polls.last)} (deadline ${rel(polls.deadline)})${polls.log ? `, last read ${polls.log.lines} lines, ${polls.log.bad} unparsable, ports ${(polls.log.ports || []).slice(0, 8).join("/") || "none"}` : ""}${polls.shrank ? ", log shrank" : ""}`;
   let verdict, trail = "";
-  if (!mine.length) {
+  const flushedOk = mine.some((a) => of(a.id, "flush").some((f) => f.result === "ok"));
+  const dead = server && server.atMiss && !server.atMiss.running;
+  const rs = polls.readStats || {};
+  const reads = Object.keys(rs).length ? `; collector read failures ${Object.entries(rs).map(([k, v]) => `${k}x${v}`).join(",")}` : "";
+  if (dead && !flushedOk) {
+    const x = server.atMiss.exit || {};
+    verdict = `server dead: the studio had exited (code ${x.code !== undefined ? x.code : "?"}, signal ${x.signal || "none"}) at ${rel(x.at)}${x.before ? " (before the test stopped it)" : ""}, with no record write traced for this connection`;
+  } else if (events.length >= TRAIL_CAP || trailBad > 0) {
+    verdict = `trail incomplete (${events.length} lines${events.length >= TRAIL_CAP ? ", the preload's cap" : ""}, ${trailBad} unparsable): undecidable from the trail`;
+  } else if (!mine.length) {
     const near = arrives.filter((e) => e.at >= t0 - ARRIVE_SLACK_MS && e.at <= t0 + (st.closedAt ?? 0) + ARRIVE_SLACK_MS);
     verdict = near.length ? `identity mismatch: a request arrived near this client with remotePort ${near.map((e) => e.rp ?? "none").slice(0, 3).join("/")} (client local port ${port})`
       : `never seen by the record listener (${arrives.length} traced arrivals, none for port ${port})`;
@@ -44,7 +66,8 @@ function describeRecordMiss({ st, port, events = [], polls = {} }) {
     else verdict = "published before the last read but not seen (unexplained)";
   }
   const late = polls.late ? `; record appeared after the deadline at ${rel(polls.late.at)}` : "; record not seen after the deadline either";
-  return { verdict, line: `${verdict}: ${[client, trail, coll].filter(Boolean).join("; ")}${late}`.slice(0, 900) };
+  const srv = describeServer(server, rel);
+  return { verdict, line: `${verdict}: ${[srv, client, trail, coll + reads].filter(Boolean).join("; ")}${late}`.slice(0, server ? 1600 : 900) }; // 900 as before; room for the studio part only when it is given
 }
 
 // Parse a trail file's text (bounded; bad lines skipped and counted) -> { events, bad }
@@ -61,9 +84,10 @@ function parseTrail(text, max = 400) {
  * again (once) and gets st.recordMiss (one reading) after one extra look of at most lateLookMs (diagnostic only: the
  * returned value is still the miss, so the required-record assertion fails exactly as before).
  */
-function makeRecordCollector({ fs = require("node:fs"), log, trail = null, trace = false, deadlineMs, lateLookMs = 3000 }) {
+function makeRecordCollector({ fs = require("node:fs"), log, trail = null, trace = false, deadlineMs, lateLookMs = 3000, server = null }) {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const records = () => { try { return fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch (_) { return []; } };
+  const readStats = {}; // C3: failed reads by kind (ENOENT / parse); counting adds no I/O
+  const records = () => { try { return fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch (e) { const k = e instanceof SyntaxError ? "parse" : String(e.code || "error").slice(0, 12); readStats[k] = (readStats[k] || 0) + 1; return []; } };
   const logInfo = () => { try { const text = fs.readFileSync(log, "utf8"); const p = parseTrail(text, 10000); return { size: text.length, lines: p.events.length + p.bad, bad: p.bad, ports: p.events.map((x) => x.remotePort) }; } catch (e) { return { size: 0, lines: 0, bad: 0, ports: [], error: String(e.code || "error") }; } };
   const recordFor = async (st) => {
     const until = Date.now() + deadlineMs;
@@ -76,9 +100,14 @@ function makeRecordCollector({ fs = require("node:fs"), log, trail = null, trace
         if (!r && trace) {
           try {
             polls.log = logInfo(); // what the log held at the deadline
+            const srv = server ? { atMiss: null, afterLook: null } : null;
+            if (srv) { try { srv.atMiss = server(); } catch (_) { /* diagnostics only */ } }
             for (const end = Date.now() + lateLookMs; Date.now() < end && !polls.late; await sleep(100)) if (records().find((x) => x.remotePort === st.localPort)) polls.late = { at: Date.now() };
+            if (srv) { try { srv.afterLook = server(); } catch (_) { /* diagnostics only */ } } // stderr has had time to drain
+            polls.readStats = { ...readStats };
             let text = ""; try { text = fs.readFileSync(trail, "utf8"); } catch (_) { /* none */ }
-            st.recordMiss = describeRecordMiss({ st, port: st.localPort, events: parseTrail(text).events, polls }).line;
+            const pt = parseTrail(text);
+            st.recordMiss = describeRecordMiss({ st, port: st.localPort, events: pt.events, polls, server: srv, trailBad: pt.bad }).line;
           } catch (_) { st.recordMiss = "description failed"; }
         }
         return r;
@@ -89,4 +118,15 @@ function makeRecordCollector({ fs = require("node:fs"), log, trail = null, trace
   return { records, recordFor };
 }
 
-module.exports = { describeRecordMiss, parseTrail, makeRecordCollector };
+// C3: a bounded, sanitized log tail: root/temp/home paths and drive paths replaced, lines with JSON bodies dropped.
+function sanitizeTail(text, { root = "", maxLines = 20, maxChars = 1024 } = {}) {
+  const os = require("node:os");
+  const esc = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let t = String(text || "");
+  for (const p of [root, os.tmpdir(), os.homedir()].filter(Boolean)) t = t.replace(new RegExp(esc(p).replace(/\\\\/g, "[\\\\/]"), "gi"), "<path>");
+  t = t.replace(/[A-Za-z]:\\[^\s"']*/g, "<path>").replace(/(^|[\s"'(])\/(?:[\w.-]+\/)+[\w.-]*/g, "$1<path>");
+  const lines = t.split(/\r?\n/).filter((l) => l.trim() && !l.includes('{"')).slice(-maxLines);
+  return lines.join(" | ").slice(-maxChars);
+}
+
+module.exports = { describeRecordMiss, parseTrail, makeRecordCollector, sanitizeTail };

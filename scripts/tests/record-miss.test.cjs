@@ -12,7 +12,7 @@ const net = require("node:net");
 const path = require("node:path");
 const test = require("node:test");
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
-const { describeRecordMiss, parseTrail, makeRecordCollector } = require("./fixtures/record-miss.cjs");
+const { describeRecordMiss, parseTrail, makeRecordCollector, sanitizeTail } = require("./fixtures/record-miss.cjs");
 const { GRACE_MS } = require("../server/http/refusal-close.cjs");
 
 const MiB = 1024 * 1024;
@@ -49,8 +49,13 @@ async function withTraced(fn, { log: logOverride = null } = {}) {
   const trail = path.join(root, "conn-trail.jsonl");
   const srv = await startServer(root, { USAP_TEST_CONN_LOG: log, USAP_TEST_CONN_LOG_PREFIX: URL, USAP_TEST_CONN_LOG_TRACE: trail, NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require "${preload}"`.trim() });
   const events = () => { try { return parseTrail(fs.readFileSync(trail, "utf8")).events; } catch (_) { return []; } };
-  const collector = (deadlineMs, lateLookMs = 0) => makeRecordCollector({ log, trail, trace: true, deadlineMs, lateLookMs });
-  try { return await fn({ port: srv.port, log, trail, events, collector }); }
+  // C3: the same server snapshot json-413 passes (exit seen while the test runs; sanitized tail)
+  const exit = { code: null, signal: null, at: null };
+  srv.proc.once("exit", (code, signal) => { exit.code = code; exit.signal = signal; exit.at = Date.now(); });
+  const server = () => { const running = srv.proc.exitCode === null && srv.proc.signalCode === null;
+    return { pid: srv.proc.pid, running, exit: running ? null : { ...exit, before: true }, tail: sanitizeTail(srv.log(), { root }) }; };
+  const collector = (deadlineMs, lateLookMs = 0, withServer = false) => makeRecordCollector({ log, trail, trace: true, deadlineMs, lateLookMs, server: withServer ? server : null });
+  try { return await fn({ port: srv.port, log, trail, events, collector, srv, root }); }
   finally { await stopServerAndWait(srv); removeTestRoot(root); }
 }
 
@@ -180,4 +185,51 @@ test("without USAP_TEST_CONN_LOG_TRACE the preload writes no trail and the recor
     assert.deepEqual(Object.keys(rec), ["url", "remotePort", "arrivedAt", "status", "body", "finishAt", "resCloseAt", "sockCloseAt", "bytesRead"]);
     assert.deepEqual(fs.readdirSync(root).filter((f) => /trail/.test(f)), []);
   } finally { await stopServerAndWait(srv); removeTestRoot(root); }
+});
+
+// ── C3 (round 15): dead server, trail cap, read-failure counts, sanitized tail ──────────────────────────────────────
+test("C3 real: the studio dies after its answer; the miss reads 'server dead' with the exit seen before any test stop", { timeout: 30000 }, async () => {
+  await withTraced(async ({ port, collector, srv, root }) => {
+    const st = await overLimit(port);
+    srv.proc.kill("SIGKILL"); // Windows: TerminateProcess (exit code 1); POSIX: SIGKILL
+    await closed(st);
+    assert.equal(await collector(300, 200, true).recordFor(st), undefined, "a miss (the required-record lookup is unchanged)");
+    assert.match(st.recordMiss, /^server dead: the studio had exited \(code (1|null), signal (SIGKILL|none)\) at -?\d+ \(before the test stopped it\), with no record write traced for this connection/, st.recordMiss);
+    assert.match(st.recordMiss, /studio at the miss exited \(pid \d+/);
+    assert.ok(!st.recordMiss.includes(root) && !st.recordMiss.includes(require("node:os").tmpdir()), "no paths in the reading");
+  });
+});
+
+test("C3 real: a healthy studio's record is found; the server snapshot adds nothing to a hit", { timeout: 30000 }, async () => {
+  await withTraced(async ({ port, collector }) => {
+    const st = await overLimit(port);
+    await closed(st);
+    const rec = await collector(GRACE_MS + 2500, 0, true).recordFor(st);
+    assert.ok(rec, "found"); assert.equal(st.recordMiss, undefined);
+  });
+});
+
+test("C3 synthetic: rule order - dead without a write, dead WITH a write (not 'dead'), trail cap, read-failure counts", () => {
+  const st = { t0: 1000, answeredAt: 2, error: "ECANCELED", errorAt: 1774, closedAt: 1775 };
+  const ev = (id, rp, list) => [{ ev: "arrive", id, rp, at: 1001, cl: 100 }, ...list.map(([e, at, extra]) => ({ ev: e, id, at, ...(extra || {}) }))];
+  const dead = { atMiss: { pid: 7, running: false, exit: { code: 1, signal: null, at: 2770, before: true } }, afterLook: { pid: 7, running: false, exit: { code: 1, signal: null, at: 2770, before: true }, tail: "TypeError: boom" } };
+  const r1 = describeRecordMiss({ st, port: 5, events: ev(1, 5, [["end", 1002], ["finish", 1003, { status: 413 }]]), polls: {}, server: dead });
+  assert.match(r1.verdict, /^server dead: the studio had exited \(code 1, signal none\) at 1770 \(before the test stopped it\)/);
+  assert.match(r1.line, /log tail \[TypeError: boom\]/);
+  const r2 = describeRecordMiss({ st, port: 5, events: ev(1, 5, [["sockclose", 1500], ["flush", 1501, { result: "ok" }]]), polls: { last: 1400 }, server: dead });
+  assert.doesNotMatch(r2.verdict, /^server dead/, "a record write succeeded: a reader-side miss, not a dead server");
+  const cap = Array.from({ length: 400 }, (_, i) => ({ ev: "arrive", id: i + 10, rp: 9000 + i, at: 1001 }));
+  assert.match(describeRecordMiss({ st, port: 5, events: cap, polls: {} }).verdict, /^trail incomplete \(400 lines, the preload's cap, 0 unparsable\)/);
+  assert.match(describeRecordMiss({ st, port: 5, events: [], polls: {}, trailBad: 2 }).verdict, /^trail incomplete \(0 lines, 2 unparsable\)/);
+  const running = { atMiss: { pid: 7, running: true }, afterLook: { pid: 7, running: true, tail: "" } };
+  assert.match(describeRecordMiss({ st, port: 5, events: ev(1, 5, [["end", 1002]]), polls: { readStats: { parse: 3 } }, server: running }).line, /^never generated: .*studio at the miss running \(pid 7\).*collector read failures parsex3/);
+});
+
+test("C3 sanitizer: no root, temp or home path and no JSON body survive; bounded", () => {
+  const os = require("node:os");
+  const root = path.join(os.tmpdir(), "usap-contract-abc");
+  const text = [`[backend] start ${path.join(root, "app", "m.gguf")}`, `{"error":"a body"}`, "C:\\Users\\someone\\x.exe failed", `at f (${path.join(os.homedir(), "repo", "serve.cjs")}:1:2)`, ...Array.from({ length: 50 }, (_, i) => `line ${i}`)].join("\n");
+  const t = sanitizeTail(text, { root });
+  for (const bad of [root, os.tmpdir(), os.homedir(), "a body", "Users\\someone"]) assert.ok(!t.includes(bad), `${bad} removed: ${t}`);
+  assert.ok(t.length <= 1024 && t.split(" | ").length <= 20, "bounded");
 });

@@ -19,7 +19,7 @@ const { execFile } = require("node:child_process");
 const { judgeRefusedClient } = require("./fixtures/refusal-judge.cjs");
 const { describeLostClient } = require("./fixtures/stall-diag.cjs");
 const { spawn } = require("node:child_process");
-const { makeRecordCollector } = require("./fixtures/record-miss.cjs"); // missing-record diagnostics only
+const { makeRecordCollector, sanitizeTail } = require("./fixtures/record-miss.cjs"); // missing-record diagnostics only
 const GRACE_TOLERANCE_MS = 100; // as fixtures/refusal-judge.cjs: the grace timer starts just before 'finish' is observed
 
 const MiB = 1024 * 1024;
@@ -88,7 +88,15 @@ async function withServer(fn, extra = {}, { trace = false } = {}) {
   const trail = path.join(root, "conn-trail.jsonl");
   const srv = await startServer(root, { USAP_TEST_CONN_LOG: log, USAP_TEST_CONN_LOG_PREFIX: URL, NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require "${preload}"`.trim(), ...(trace ? { USAP_TEST_CONN_LOG_TRACE: trail } : {}), ...extra });
   // the server's record for a client connection (written when the server's socket closes)
-  const { records, recordFor } = makeRecordCollector({ log, trail, trace, deadlineMs: GRACE_MS + SLACK_MS, lateLookMs: LATE_LOOK_MS });
+  // C3 (messages only): the studio's own exit, seen by the test while the test still runs. The reading is made inside
+  // fn, before the finally stops the server, so any exit seen at a miss came before the test's stop (taskkill /F's
+  // exit code 1 can't be confused with it). Snapshot: pid, running, exit code/signal/time, sanitized log tail.
+  const exit = { code: srv.proc.exitCode, signal: srv.proc.signalCode, at: null };
+  if (exit.code === null && exit.signal === null) srv.proc.once("exit", (code, signal) => { exit.code = code; exit.signal = signal; exit.at = Date.now(); });
+  else exit.at = Date.now();
+  const server = () => { const running = srv.proc.exitCode === null && srv.proc.signalCode === null;
+    return { pid: srv.proc.pid, running, exit: running ? null : { ...exit, before: true }, tail: sanitizeTail(srv.log(), { root }) }; };
+  const { records, recordFor } = makeRecordCollector({ log, trail, trace, deadlineMs: GRACE_MS + SLACK_MS, lateLookMs: LATE_LOOK_MS, server: trace ? server : null });
   try { return await fn({ port: srv.port, recordFor, records }); }
   finally { await stopServerAndWait(srv); removeTestRoot(root); }
 }
