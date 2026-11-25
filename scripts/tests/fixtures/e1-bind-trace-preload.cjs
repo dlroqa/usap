@@ -23,7 +23,8 @@ if (file && port && /[\\/]serve\.cjs$/.test(process.argv[1] || "")) {
     try { if (sync) fs.appendFileSync(file, text); else fs.appendFile(file, text, () => {}); } catch (_) { /* diagnostics only */ } };
   if (buffered) { setInterval(() => flush(false), 100).unref(); process.on("exit", () => flush(true)); }
   const log = (ev) => { if (lines >= 3000) return; lines += 1;
-    const line = JSON.stringify({ ...ev, t: Date.now(), tp: Math.round((performance.timeOrigin + performance.now()) * 1000) / 1000 }) + "\n";
+    // th = process.hrtime.bigint() in ms: one machine-wide monotonic counter (comparable across processes; round 16)
+    const line = JSON.stringify({ ...ev, t: Date.now(), tp: Math.round((performance.timeOrigin + performance.now()) * 1000) / 1000, th: Math.round(Number(process.hrtime.bigint()) / 1000) / 1000 }) + "\n";
     if (buffered) { pending.push(line); return; }
     try { fs.appendFileSync(file, line); } catch (_) { /* diagnostics only */ } };
   const callers = () => String(new Error().stack || "").split("\n").slice(3, 10)

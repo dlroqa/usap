@@ -31,9 +31,9 @@ function studioBinds(trace) {
   for (const e of trace) {
     if (!e || !e.id) continue;
     const b = binds.get(e.id) || { id: e.id, kind: e.kind, by: (e.by || []).slice(0, 3).join("<") };
-    if (e.ev === "bind-start") { b.start = e.t; b.tpStart = e.tp; }
-    if (e.ev === "bound") { b.bound = e.t; b.tpBound = e.tp; }
-    if (e.ev === "closed") b.closed = e.t;
+    if (e.ev === "bind-start") { b.start = e.t; b.tpStart = e.tp; b.thStart = e.th; }
+    if (e.ev === "bound") { b.bound = e.t; b.tpBound = e.tp; b.thBound = e.th; }
+    if (e.ev === "closed") { b.closed = e.t; b.thClosed = e.th; }
     if (e.ev === "bind-error") { b.error = e.code; b.errorAt = e.t; }
     binds.set(e.id, b);
   }
@@ -50,8 +50,8 @@ function generations(diag, port) {
     if (r.e === "start") gens.push({ pid: r.pid, ppid: r.ppid, port: r.port, startAt: r.t });
     const g = [...gens].reverse().find((x) => x.pid === r.pid);
     if (!g) continue;
-    if (r.e === "listening") Object.assign(g, { result: "listening", tCall: r.tCall, tRes: r.tOk, tpRes: r.tpOk });
-    if (r.e === "listen-error") Object.assign(g, { result: r.code || "error", tCall: r.tCall, tRes: r.tErr, tpRes: r.tpErr, holders: String(r.holders || "").replace(/\s+/g, " ").slice(0, 160), lateStamp: r.t });
+    if (r.e === "listening") Object.assign(g, { result: "listening", tCall: r.tCall, tRes: r.tOk, tpRes: r.tpOk, thCall: r.thCall, thRes: r.thOk });
+    if (r.e === "listen-error") Object.assign(g, { result: r.code || "error", tCall: r.tCall, tRes: r.tErr, tpRes: r.tpErr, thCall: r.thCall, thRes: r.thErr, holders: String(r.holders || "").replace(/\s+/g, " ").slice(0, 160), lateStamp: r.t });
     if (r.e === "exit") g.exitAt = r.t;
   }
   return gens.map((g, i) => ({ ...g, n: i + 1, traced: g.port === port }));
@@ -73,13 +73,17 @@ function readBindTrace({ trace = [], diag = [], port, from = -Infinity, to = Inf
     const w0 = g.tCall, w1 = g.tRes;
     const scored = held.map((b) => ({ b, d: gap(b.a, b.z, w0, w1) })).sort((x, y) => x.d - y.d);
     const tpGap = (b) => (Number.isFinite(b.tpStart) && Number.isFinite(g.tpRes) ? Math.round((b.tpStart - g.tpRes) * 1000) / 1000 : null);
-    const nearest = scored[0] ? { id: scored[0].b.id, kind: scored[0].b.kind, by: scored[0].b.by, gapMs: scored[0].d, start: scored[0].b.a - w0, bound: scored[0].b.bound - w0, closed: scored[0].b.z - w0, tpGap: tpGap(scored[0].b) } : null;
+    // round 16, printed only (the reading rules above are unchanged): the studio bind's start/bound/closed and the
+    // engine's listen call on the machine-wide hrtime clock, in ms relative to the engine's result (tRes)
+    const r3 = (x) => Math.round(x * 1000) / 1000;
+    const th = (b) => (Number.isFinite(g.thRes) && Number.isFinite(b.thStart) ? { start: r3(b.thStart - g.thRes), bound: Number.isFinite(b.thBound) ? r3(b.thBound - g.thRes) : null, closed: Number.isFinite(b.thClosed) ? r3(b.thClosed - g.thRes) : null, engineCall: Number.isFinite(g.thCall) ? r3(g.thCall - g.thRes) : null } : null);
+    const nearest = scored[0] ? { id: scored[0].b.id, kind: scored[0].b.kind, by: scored[0].b.by, gapMs: scored[0].d, start: scored[0].b.a - w0, bound: scored[0].b.bound - w0, closed: scored[0].b.z - w0, tpGap: tpGap(scored[0].b), th: th(scored[0].b) } : null;
     const prevExit = prev && prev.exitAt !== undefined ? prev.exitAt - w0 : null;
     if (g.result === "EADDRINUSE") {
       const G = held.filter((b) => b.a <= w1 - U && b.z >= w0 + U);
       const T = held.filter((b) => !G.includes(b) && gap(b.a, b.z, w0, w1) <= U);
       const reading = G.length ? "G overlap, studio bind won" : T.length ? "T touch, inconclusive" : "U unrelated to studio binds";
-      const who = (G.length ? G : T).slice(0, 3).map((b) => `${b.kind}#${b.id} ${b.by || "?"} start ${b.a - w0} bound ${b.bound - w0} closed ${b.z - w0} tpGap ${tpGap(b)}`);
+      const who = (G.length ? G : T).slice(0, 3).map((b) => `${b.kind}#${b.id} ${b.by || "?"} start ${b.a - w0} bound ${b.bound - w0} closed ${b.z - w0} tpGap ${tpGap(b)} th ${JSON.stringify(th(b))}`);
       rows.push({ ...base, reading, window: `0..${w1 - w0}`, binds: who, nearest: G.length || T.length ? undefined : nearest, prevExit, holders: g.holders, lookupMs: g.lateStamp - w1 });
     } else if (g.result === "listening") {
       const stop = g.exitAt !== undefined ? g.exitAt : end;
