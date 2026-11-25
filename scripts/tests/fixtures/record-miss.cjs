@@ -57,8 +57,9 @@ function parseTrail(text, max = 400) {
 /**
  * The json-413 record lookup (moved here unchanged so the controls exercise the same code): records() reads the log
  * (any unparsable line -> none, as before); recordFor(st) polls every 50 ms until the record for st.localPort is found
- * or deadlineMs has passed. With trace, a miss also gets st.recordMiss (one reading) after one extra look of at most
- * lateLookMs (diagnostic only: the returned value is still the miss).
+ * or deadlineMs has passed. With trace, each poll also notes the log's size (one stat); only a miss reads the log
+ * again (once) and gets st.recordMiss (one reading) after one extra look of at most lateLookMs (diagnostic only: the
+ * returned value is still the miss, so the required-record assertion fails exactly as before).
  */
 function makeRecordCollector({ fs = require("node:fs"), log, trail = null, trace = false, deadlineMs, lateLookMs = 3000 }) {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -69,10 +70,12 @@ function makeRecordCollector({ fs = require("node:fs"), log, trail = null, trace
     const polls = { count: 0, first: null, last: null, deadline: until, log: null, shrank: false, late: null }; let size = 0;
     for (;;) {
       const r = records().find((x) => x.remotePort === st.localPort);
-      if (trace) { const n = Date.now(); polls.count += 1; if (polls.first === null) polls.first = n; polls.last = n; polls.log = logInfo(); if (polls.log.size < size) polls.shrank = true; size = polls.log.size; }
+      // per poll only the log's size (one stat, for shrink detection); the log itself is read and parsed only after a miss
+      if (trace) { const n = Date.now(); polls.count += 1; if (polls.first === null) polls.first = n; polls.last = n; let sz = 0; try { sz = fs.statSync(log).size; } catch (_) { sz = 0; } if (sz < size) polls.shrank = true; size = sz; }
       if (r || Date.now() > until) {
         if (!r && trace) {
           try {
+            polls.log = logInfo(); // what the log held at the deadline
             for (const end = Date.now() + lateLookMs; Date.now() < end && !polls.late; await sleep(100)) if (records().find((x) => x.remotePort === st.localPort)) polls.late = { at: Date.now() };
             let text = ""; try { text = fs.readFileSync(trail, "utf8"); } catch (_) { /* none */ }
             st.recordMiss = describeRecordMiss({ st, port: st.localPort, events: parseTrail(text).events, polls }).line;
