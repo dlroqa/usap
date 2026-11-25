@@ -16,12 +16,13 @@ const safeId = (v) => (typeof v === "string" && GC_ID.test(v) ? v : v == null ? 
 const MAX_SEEN = 16;
 function observer() {
   const o = { reads: 0, ok: 0, missing: 0, errors: {}, parse: 0, last: null, seen: [], seenMore: 0, prevAt: null, firstAt: null, maxGap: 0, maxGapFrom: null, failAt: [] };
-  const failed = (now) => { if (o.failAt.length < 32) o.failAt.push(now); }; // C1: when reads failed (no I/O)
+  const failed = (now) => { if (o.failAt.length >= 32) o.failAt.shift(); o.failAt.push(now); }; // C1: the LAST 32 failed reads (no I/O)
   const remember = (p, now) => {
     const key = `${p.pid}:${p.t}`;
     const e = o.seen.length ? o.seen[o.seen.length - 1] : null;
     if (e && e.key === key) { e.reads += 1; e.lastAt = now; return; }
-    if (o.seen.some((x) => x.key === key)) return; // an older record read again (not expected): already listed
+    const older = o.seen.find((x) => x.key === key);
+    if (older) { older.reads += 1; older.lastAt = now; return; } // an older record read again (not expected): its last read counts (C1 R2)
     if (o.seen.length >= MAX_SEEN) { o.seenMore += 1; return; }
     o.seen.push({ key, t: p.t, pid: p.pid, gcId: p.gcId, lastGcId: p.lastGc ? p.lastGc.id : undefined, firstAt: now, lastAt: now, reads: 1 });
   };
@@ -102,7 +103,7 @@ function readProbeWait({ req = {}, attempts = null, obs = null, probeRunning = t
   const t1 = pub[pub.length - 1][0], t2 = rep.length ? rep[rep.length - 1][0] : Infinity;
   if (!obs) return `marked record published at ${t1}; reader view not recorded`;
   const inWin = (t) => t >= t1 && t <= t2;
-  const readsIn = obs.seen.filter((e) => Number.isFinite(e.t) && e.t < t1 && e.lastAt > t1 && e.lastAt < t2); // an OLDER record read after the marked one was published
+  const readsIn = obs.seen.filter((e) => Number.isFinite(e.t) && e.t < t1 && e.lastAt > t1); // an OLDER record read after the marked one was published (also across the whole window)
   const failsIn = (obs.failAt || []).filter(inWin).length;
   if (readsIn.length) return "R2 published but unseen: reads inside the marked window returned other records (visibility anomaly)";
   if (failsIn) return `read errors: ${failsIn} read(s) failed inside the marked window`;

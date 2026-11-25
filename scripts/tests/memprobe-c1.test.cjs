@@ -43,6 +43,20 @@ test("synthetic: every rule, in order", () => {
   assert.equal(R({ record: win, obs: obs([{ t: 900, firstAt: 950, lastAt: 1200 }]) }), "R2 published but unseen: reads inside the marked window returned other records (visibility anomaly)");
   assert.equal(R({ record: win, obs: obs([{ t: 900, firstAt: 950, lastAt: 1090 }], [1150, 1160]) }), "read errors: 2 read(s) failed inside the marked window");
   assert.match(R({ record: win, obs: obs([{ t: 900, firstAt: 950, lastAt: 1090 }, { t: 1300, firstAt: 1350, lastAt: 1400 }]) }), /^R1 reader gap: no read inside the marked window \(200 ms; largest gap 30 ms\)$/);
+  // round-15 review edges: an older record read across the whole window is R2 (not R1)
+  assert.match(R({ record: win, obs: obs([{ t: 900, firstAt: 950, lastAt: 1400 }]) }), /^R2 published but unseen/);
+});
+
+test("observer: an older record read again after a newer one updates its last read; failed reads keep the last 32", () => {
+  const fs2 = require("node:fs"); const f = path.join(dir, "obs.json");
+  const o = observer();
+  fs2.writeFileSync(f, JSON.stringify({ t: 1, pid: 1 })); o.read(f);
+  fs2.writeFileSync(f, JSON.stringify({ t: 2, pid: 1 })); o.read(f);
+  fs2.writeFileSync(f, JSON.stringify({ t: 1, pid: 1 })); const before = Date.now(); o.read(f); // the old record again
+  assert.ok(o.seen.find((e) => e.t === 1).lastAt >= before, "last read of the older record updated");
+  for (let i = 0; i < 40; i += 1) o.read(path.join(dir, "missing.json"));
+  assert.equal(o.failAt.length, 32);
+  assert.ok(o.failAt[31] >= before, "the latest failures are kept");
 });
 
 test("real: a normal wait reads 'seen'; a reader asleep across the marked window reads R1; a probe killed first reads 'probe dead'", { timeout: 60000 }, async () => {
