@@ -60,6 +60,14 @@ function holderPid(port) { // a fake engine answers /fake/stats with its pid; an
     req.on("timeout", () => { req.destroy(); fin("other"); }); req.on("error", () => fin("other"));
   })));
 }
+// The port's lock in the SHARED directory under this process's pid (the same file reservePort would write), so other
+// test files skip the port while these controls bind it; returns its release (removes only a file it created).
+function sharedLock(port) {
+  const f = path.join(LOCK_DIR, `${port}.${process.pid}.lock`);
+  let mine = false;
+  try { fs.mkdirSync(LOCK_DIR, { recursive: true }); fs.writeFileSync(f, "", { flag: "wx" }); mine = true; } catch (_) { /* already ours */ }
+  return () => { if (mine) { try { fs.unlinkSync(f); } catch (_) { /* gone */ } } };
+}
 // lockDir: the directory the refused reservation used. Returns { reason, lockOwners, probe, holder }.
 async function attribute(port, { lockDir = LOCK_DIR, enginePid = null } = {}) {
   const lockOwners = liveLockOwners(lockDir, port);
@@ -75,7 +83,9 @@ async function attribute(port, { lockDir = LOCK_DIR, enginePid = null } = {}) {
 
 // ── isolated attribution controls (every OS; no studio) ────────────────────────────────────────────────────────
 test("attribution controls: a listener reads 'probe', a live lock owner reads 'lock', an unrelated holder reads 'probe' (unidentified), a free port reads 'gone'", { timeout: 60000 }, async (t) => {
-  const port = await reservePort(); releasePort(port); // a free port from the shared range, released for the controls
+  // a free port from the shared range; its shared lock is kept (as a file under this pid) for the whole control, so no
+  // other test file can be handed this port while the controls listen on it (pre-push review: #142 failure class)
+  const port = await reservePort(); releasePort(port); const unlock = sharedLock(port);
   const children = [];
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "usap-attr-"));
   try {
@@ -83,7 +93,7 @@ test("attribution controls: a listener reads 'probe', a live lock owner reads 'l
     assert.deepEqual(await attribute(port, { lockDir: dir }), { reason: "gone", lockOwners: 0, probe: "granted", holder: "none" });
     // probe: this process listens on the port; the lock directory is empty
     const own = net.createServer((c) => c.destroy()); // destroys what the probes connect, so own.close() can complete
-    await new Promise((r) => own.listen(port, "127.0.0.1", r));
+    await new Promise((r, j) => { own.once("error", j); own.listen(port, "127.0.0.1", () => { own.off("error", j); r(); }); });
     try {
       await assert.rejects(reservePort({ range: { first: port, last: port }, lockDir: dir }), /no free test port/, "refused");
       const a = await attribute(port, { lockDir: dir, enginePid: -1 });
@@ -107,6 +117,7 @@ test("attribution controls: a listener reads 'probe', a live lock owner reads 'l
   } finally {
     for (const ch of children) { try { ch.kill("SIGKILL"); } catch (_) {} }
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+    unlock();
   }
 });
 
@@ -114,6 +125,8 @@ test("released studio ports: a port still listened on by the stopped studio's en
   const lines = [];
   let nonVacuous = 0, cycle = 0;
   const POSIX = process.platform !== "win32";
+  // polls from the decision on, independently of the attribution (pre-push review: the gone time must not include it)
+  const pollGone = async (enginePid, port, from) => { for (const end = Date.now() + 10000; Date.now() < end; await sleep(20)) if (!alive(enginePid) && !(await listening(port))) return Date.now() - from; return null; };
   while (cycle < 3 || (POSIX && nonVacuous === 0 && cycle < 6)) {
     cycle += 1;
     const root = makeRoot();
@@ -134,15 +147,16 @@ test("released studio ports: a port still listened on by the stopped studio's en
           .then(async (r) => {
             rec.granted = r.granted; rec.listeningAtDecision = await listening(port); rec.decidedMs = Date.now() - rec.at;
             if (r.granted) releasePort(port);
-            // attribution of a refusal (after the unchanged decision above; a few ms later)
-            if (!r.granted) { try { rec.attr = await attribute(port, { enginePid }); } catch (_) { rec.attr = { reason: "attribution failed" }; } }
+            rec.gone = pollGone(enginePid, port, rec.at); // starts now, in parallel with the attribution
+            // attribution of a refusal (after the unchanged decision above; a few ms later), under the port's shared lock
+            // so the probe-only bind can never hand the port to another file (pre-push review)
+            if (!r.granted) { const unlock = sharedLock(port); try { rec.attr = await attribute(port, { enginePid }); } catch (_) { rec.attr = { reason: "attribution failed" }; } finally { unlock(); } }
             resolve(rec);
           });
       }));
       stopServer(srv);
       const rec = await atRelease;
-      let goneMs = null;
-      for (const end = Date.now() + 10000; Date.now() < end; await sleep(20)) if (!alive(enginePid) && !(await listening(port))) { goneMs = Date.now() - rec.at; break; }
+      const goneMs = await rec.gone; // measured from the release, as before (bound 10 s)
       const nv = rec.engineAlive && rec.listeningAtDecision && !rec.granted && rec.attr && /^probe/.test(rec.attr.reason);
       if (nv) nonVacuous += 1;
       lines.push(`cycle ${cycle}: released ${rec.released}, engine alive at release ${rec.engineAlive}, re-reservation ${rec.granted ? "granted" : "refused"} (${rec.decidedMs} ms), port listened on right after the decision ${rec.listeningAtDecision}, refusal attributed ${rec.attr ? JSON.stringify(rec.attr) : "-"}, ${nv ? "NON-VACUOUS" : "vacuous"}, old engine gone and port free ${goneMs === null ? "NOT within 10 s" : `+${goneMs} ms`}`);
