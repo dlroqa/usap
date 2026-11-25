@@ -134,7 +134,7 @@ test("real R-U: a bind by another process between the engine's spawn and its lis
       const load = imageLoad(srv, "sd1-hold-load-q4_0.gguf", 4);
       load.catch(() => {}); // awaited below; a failure before that must not become an unhandled rejection
       assert.ok(await waitFor(async () => fakeSdDiag(root).slice(before).some((x) => x.e === "start"), 15000), "hold-load engine started");
-      holder = net.createServer();
+      holder = net.createServer((c) => c.destroy()); // the studio's readiness probes connect to the engine port: an accepted, unhandled connection would keep holder.close() from ever completing (round-16 macOS Intel CI)
       await new Promise((res, rej) => { holder.once("error", rej); holder.listen(srv.sdPort, "127.0.0.1", () => { holder.off("error", rej); res(); }); });
       fs.writeFileSync(release, "");
       await waitFor(async () => fakeSdDiag(root).slice(before).some((x) => x.e === "listen-error"), 10000);
