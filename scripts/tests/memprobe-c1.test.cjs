@@ -54,9 +54,11 @@ test("observer: an older record read again after a newer one updates its last re
   fs2.writeFileSync(f, JSON.stringify({ t: 2, pid: 1 })); o.read(f);
   fs2.writeFileSync(f, JSON.stringify({ t: 1, pid: 1 })); const before = Date.now(); o.read(f); // the old record again
   assert.ok(o.seen.find((e) => e.t === 1).lastAt >= before, "last read of the older record updated");
-  for (let i = 0; i < 40; i += 1) o.read(path.join(dir, "missing.json"));
+  for (let i = 0; i < 8; i += 1) o.read(path.join(dir, "missing.json"));
+  const mid = Date.now() + 1; while (Date.now() < mid + 1) { /* step past the 8 early failures' millisecond */ }
+  for (let i = 0; i < 32; i += 1) o.read(path.join(dir, "missing.json"));
   assert.equal(o.failAt.length, 32);
-  assert.ok(o.failAt[31] >= before, "the latest failures are kept");
+  assert.ok(o.failAt[0] > mid, `the oldest kept failure (${o.failAt[0]}) is after the 8 early ones (${mid}): the last 32 are kept`);
 });
 
 test("real: a normal wait reads 'seen'; a reader asleep across the marked window reads R1; a probe killed first reads 'probe dead'", { timeout: 60000 }, async () => {
