@@ -19,6 +19,7 @@ const { execFile } = require("node:child_process");
 const { judgeRefusedClient } = require("./fixtures/refusal-judge.cjs");
 const { describeLostClient } = require("./fixtures/stall-diag.cjs");
 const { spawn } = require("node:child_process");
+const { makeRecordCollector } = require("./fixtures/record-miss.cjs"); // missing-record diagnostics only
 const GRACE_TOLERANCE_MS = 100; // as fixtures/refusal-judge.cjs: the grace timer starts just before 'finish' is observed
 
 const MiB = 1024 * 1024;
@@ -76,13 +77,18 @@ function raw(port, { framing = {}, send = "stream", capBytes = 96 * MiB, headers
 }
 
 const preload = path.join(__dirname, "api-contract", "connection-log-preload.cjs").replace(/\\/g, "/");
-async function withServer(fn, extra = {}) {
+// trace (missing-record diagnostics, messages only): the preload also writes its event trail (USAP_TEST_CONN_LOG_TRACE)
+// and a missed record gets one reading (fixtures/record-miss.cjs) in its failure message. Lookup, deadline and
+// assertions are unchanged; only after a miss does the test look once more (at most LATE_LOOK_MS) to tell "delayed"
+// from "never written".
+const LATE_LOOK_MS = 3000;
+async function withServer(fn, extra = {}, { trace = false } = {}) {
   const root = makeRoot();
   const log = path.join(root, "conn-log.jsonl");
-  const srv = await startServer(root, { USAP_TEST_CONN_LOG: log, USAP_TEST_CONN_LOG_PREFIX: URL, NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require "${preload}"`.trim(), ...extra });
-  const records = () => { try { return fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch (_) { return []; } };
+  const trail = path.join(root, "conn-trail.jsonl");
+  const srv = await startServer(root, { USAP_TEST_CONN_LOG: log, USAP_TEST_CONN_LOG_PREFIX: URL, NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require "${preload}"`.trim(), ...(trace ? { USAP_TEST_CONN_LOG_TRACE: trail } : {}), ...extra });
   // the server's record for a client connection (written when the server's socket closes)
-  const recordFor = async (st) => { const until = Date.now() + GRACE_MS + SLACK_MS; for (;;) { const r = records().find((x) => x.remotePort === st.localPort); if (r || Date.now() > until) return r; await sleep(50); } };
+  const { records, recordFor } = makeRecordCollector({ log, trail, trace, deadlineMs: GRACE_MS + SLACK_MS, lateLookMs: LATE_LOOK_MS });
   try { return await fn({ port: srv.port, recordFor, records }); }
   finally { await stopServerAndWait(srv); removeTestRoot(root); }
 }
@@ -94,7 +100,7 @@ function evidence(st, rec) {
     firstDataAt: st.firstDataAt, endAt: st.endAt, errorAt: st.errorAt, closedAt: st.closedAt, localPort: st.localPort };
   const s = rec ? { status: rec.status, bytesRead: rec.bytesRead, answerMs: rec.finishAt && rec.finishAt - rec.arrivedAt,
     closeAfterAnswerMs: rec.finishAt && rec.sockCloseAt && rec.sockCloseAt - rec.finishAt, body: String(rec.body || "").slice(0, 80) } : null;
-  return `[client ${JSON.stringify(c)} server ${JSON.stringify(s)}]`;
+  return `[client ${JSON.stringify(c)} server ${JSON.stringify(s)}]${!rec && st.recordMiss ? ` record miss: ${st.recordMiss}` : ""}`;
 }
 function assertEarly413(st, rec, label) {
   const ev = evidence(st, rec);
@@ -122,7 +128,7 @@ test("a declared body over the 64 MiB limit is refused with today's 413 before i
     assertEarly413(partial, await recordFor(partial), "partial");
     // grace period kept for a client that keeps the connection open (F0 refusal-close)
     assert.ok(silent.closedAt - silent.answeredAt <= GRACE_MS + SLACK_MS, `silent: closed ${silent.closedAt - silent.answeredAt} ms after the answer`);
-  });
+  }, {}, { trace: true });
 });
 
 // The concurrent clients run in their own process (fixtures/refusal-clients.cjs), which records its event-loop ticks
