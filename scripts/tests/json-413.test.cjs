@@ -245,8 +245,7 @@ test("concurrent over-limit declarations are each refused early; the server's to
 test("observer cleanup: the sampler and the thread observer end their child processes when stopped, also after a failed client run; stop() is idempotent", { timeout: 30000 }, async () => {
   const sampler = startSampler(); const observer = startThreadObserver([process.pid]);
   const alive = (pid) => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
-  assert.ok(alive(sampler.pid), "the sampler child runs");
-  try { await assert.rejects(Promise.reject(new Error("client run failed (injected)"))); }
+  try { assert.ok(alive(sampler.pid), "the sampler child runs"); await assert.rejects(Promise.reject(new Error("client run failed (injected)"))); }
   finally {
     const a = sampler.stop(), b = sampler.stop(); assert.equal(a, b, "sampler stop() is idempotent (same promise)");
     await a; await observer.stop(); await observer.stop();
