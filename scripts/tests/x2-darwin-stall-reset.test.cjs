@@ -7,9 +7,18 @@
 //   client child (fixtures/x2-client.cjs): 16 rawRequest connections (Q-small 128 KiB / Q-large 96 MiB cap x
 //     ignoreFin false/true x 4), corrected write accounting (io.writes), main thread blocked from ~150 ms after connect:
 //     S0 no stall, S1 1800 ms (ends before the RST), S2 2700 ms (spans the RST). Each S twice, sequentially.
-// It cannot show what stalls a real client, or how often. Assertions are instrument sanity only: both children ran,
-// every connection has a server record with 413, the accounting adds up, and the stall lasted. Answer loss, error
+// It cannot show what stalls a real client, or how often. Assertions are instrument sanity only. Answer loss, error
 // codes and validity are printed, never asserted. Elsewhere it is skipped (USAP_TEST_X2_ANY=1 runs it anywhere).
+//
+// Reporting (round 15): EVERY row is printed, valid or not, with each predeclared validity criterion, its measured
+// values and the exclusion reason. All of it is computed here, after the client child has exited; the children are
+// unchanged apart from emitting a few more already-measured times. Predeclared criteria (times in ms):
+//   C1 stall began before the answer:     stallAt - answerAt < -50
+//   C2 S1: stall ended before the close:  stallEnd - closeAt < -200;  S2: ended after it: stallEnd - closeAt > 200
+//      (S0: not applicable)
+//   C3 queue state at stall start:        Q-small: submitted == accepted;  Q-large: submitted > accepted
+//   C4 unread data at the destroy:        server bytesRead < bytes the kernel accepted from the client (final)
+// A row is valid when every applicable criterion holds; the exclusion reason lists the ones that failed.
 "use strict";
 const assert = require("node:assert/strict");
 const path = require("node:path");
@@ -18,63 +27,93 @@ const test = require("node:test");
 
 const ON = (process.platform === "darwin" && process.arch === "x64") || process.env.USAP_TEST_X2_ANY === "1";
 const FIX = path.join(__dirname, "fixtures");
+const children = new Set(); // every child this file starts; all are killed in the test's finally
+const own = (child) => { children.add(child); child.once("exit", () => children.delete(child)); return child; };
 
-function startServer() {
+function startServer(ms = 10000) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [path.join(FIX, "x2-server.cjs")], { stdio: ["ignore", "pipe", "pipe"] });
-    const recs = []; let buf = "", info = null;
+    const child = own(spawn(process.execPath, [path.join(FIX, "x2-server.cjs")], { stdio: ["ignore", "pipe", "pipe"] }));
+    const recs = []; let buf = "", info = null, errTail = "";
+    const fail = (why) => { if (info) return; clearTimeout(timer); child.kill(); reject(new Error(`x2 server: ${why} (${errTail.slice(-200)})`)); };
+    const timer = setTimeout(() => fail(`no port within ${ms} ms`), ms);
+    child.on("error", (e) => fail(String(e.code || e.message)));
+    child.stderr.on("data", (d) => { errTail = (errTail + d).slice(-2000); }); // drained, so it can never block the child
     child.stdout.on("data", (d) => {
       buf += d; let i;
       while ((i = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); let o; try { o = JSON.parse(l); } catch (_) { continue; }
-        if (o.port && !info) { info = o; resolve({ child, info, recs }); } else recs.push(o); }
+        if (o.port && !info) { info = o; clearTimeout(timer); resolve({ child, info, recs }); } else recs.push(o); }
     });
-    child.once("exit", (c) => { if (!info) reject(new Error(`x2 server exited ${c}`)); });
+    child.once("exit", (c) => fail(`exited ${c}`));
   });
 }
 function runClient(port, stallMs) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [path.join(FIX, "x2-client.cjs"), String(port), String(stallMs)], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = own(spawn(process.execPath, [path.join(FIX, "x2-client.cjs"), String(port), String(stallMs)], { stdio: ["ignore", "pipe", "pipe"] }));
     let out = "", err = "";
-    child.stdout.on("data", (d) => { out += d; }); child.stderr.on("data", (d) => { err += d; });
+    child.stdout.on("data", (d) => { out += d; }); child.stderr.on("data", (d) => { err = (err + d).slice(-2000); });
     const kill = setTimeout(() => child.kill(), 30000);
-    child.once("exit", (code) => { clearTimeout(kill); let o = null; try { o = JSON.parse(out); } catch (_) {} resolve({ code, o, err: err.slice(-300) }); });
+    child.on("error", () => {});
+    child.once("close", (code) => { clearTimeout(kill); let o = null; try { o = JSON.parse(out); } catch (_) {} resolve({ code, o, err: err.slice(-300) }); }); // 'close': stdout fully read
   });
 }
+async function killAll() {
+  for (const c of [...children]) { try { c.kill("SIGKILL"); } catch (_) {} }
+  const until = Date.now() + 5000;
+  while (children.size && Date.now() < until) await new Promise((r) => setTimeout(r, 25));
+}
 
-// Per connection, joined with its server record (remote port = client local port), times relative to the answer.
+const n = (v) => (Number.isFinite(v) ? Math.round(v) : -1);
+const rel = (t, base) => (Number.isFinite(t) && t > 0 && Number.isFinite(base) && base > 0 ? Math.round(t - base) : -1); // -1 = not recorded
+// Per connection, joined with its server record (remote port = client local port). Pure: used only after the run.
 function describe(run, recs) {
-  const rows = [];
-  for (const c of run.o.conns) {
+  const st = run.o.stall;
+  return run.o.conns.map((c) => {
     const s = recs.find((r) => r.remotePort === c.localPort) || null;
-    const ans = s && s.answerAt, cls = s && s.closeAt;
-    const rel = (t) => (Number.isFinite(t) && Number.isFinite(ans) ? t - ans : null);
-    const st = run.o.stall;
-    const valid = !st || !s ? null : st.requestedMs === 0 ? true
-      : st.at < ans - 50 && (st.requestedMs === 1800 ? st.end < cls - 200 : st.end > cls + 200)
-        && (c.q === "Q-small" ? c.atStallStart && c.atStallStart.sub === c.atStallStart.ok : c.atStallStart && c.atStallStart.sub > c.atStallStart.ok);
-    rows.push({ q: c.q, f: c.f, rep: c.rep, valid, server: s ? { status: 413, close: rel(cls), bytesRead: s.bytesRead, error: s.error || null } : null,
-      read: c.bodyComplete, firstData: rel(c.firstDataAt), firstDataVsStallEnd: st && c.firstDataAt ? c.firstDataAt - st.end : null, error: c.error,
-      syscall: c.writes.atError && c.writes.atError.syscall, errorAt: rel(c.errorAt), firstFailBeforeError: Boolean(c.writes.atFirstFail && c.writes.atError && c.writes.atFirstFail.seq < c.writes.atError.seq),
-      failCalls: c.writes.failCalls, atStallStart: c.atStallStart, notAcceptedAtError: c.writes.atError && c.writes.atError.notAccepted, pendingAtError: c.pendingAtError, gaveUp: c.gaveUp });
-  }
-  return rows;
+    const ans = s ? s.answerAt : NaN, cls = s ? s.closeAt : NaN;
+    const a0 = c.atStallStart || {};
+    const crit = {};
+    if (st && st.requestedMs > 0) {
+      crit.C1 = { ok: st.at - ans < -50, v: rel(st.at, ans) };
+      crit.C2 = st.requestedMs < 2000 ? { ok: st.end - cls < -200, v: rel(st.end, cls) } : { ok: st.end - cls > 200, v: rel(st.end, cls) };
+    }
+    crit.C3 = { ok: c.q === "Q-small" ? a0.sub === a0.ok : a0.sub > a0.ok, v: [n(a0.sub), n(a0.ok)] };
+    crit.C4 = { ok: Boolean(s) && s.bytesRead < c.writes.ok, v: [n(s && s.bytesRead), n(c.writes.ok)] };
+    const failed = Object.entries(crit).filter(([, x]) => !x.ok).map(([k]) => k);
+    if (!s) failed.unshift("no-server-record");
+    const e = c.writes.atError;
+    return { q: c.q, f: c.f, rep: c.rep, valid: failed.length === 0, excl: failed.join("+") || "-", crit,
+      status: c.status, read: c.bodyComplete, fdAns: rel(c.firstDataAt, ans), fdStallEnd: st ? rel(c.firstDataAt, st.end) : -1,
+      err: c.error, sys: e ? e.syscall : null, errCls: rel(c.errorAt, cls), sub: c.writes.sub, ok: c.writes.ok, fail: c.writes.fail,
+      qinErr: e ? e.queuedInNode : null, ffFirst: Boolean(c.writes.atFirstFail && e && c.writes.atFirstFail.seq < e.seq), failCalls: c.writes.failCalls, gaveUp: c.gaveUp,
+      srv: s ? { status: s.status, close: rel(cls, ans), read: s.bytesRead, error: s.error || null } : null };
+  });
+}
+// one compact line per S x pass with every row: [q,f,rep, valid,excl, C1,C2,C3,C4 values, answer, error, writes]
+function rowsLine(label, run, rows) {
+  const st = run.o.stall;
+  const head = { stall: st ? [st.requestedMs, n(st.end - st.at), n(st.at - run.o.t0)] : null, connected: n(run.o.connectedAt - run.o.t0),
+    armLate: st && run.o.connectedAt ? n(st.at - run.o.connectedAt - 150) : -1, maxGapBefore: n(run.o.maxGapBefore), lastTickBefore: st && run.o.lastTickBefore ? n(st.at - run.o.lastTickBefore) : -1,
+    firstTickAfter: st && run.o.firstTickAfter ? n(run.o.firstTickAfter - st.end) : -1, partial: Boolean(run.o.partial) };
+  const R = rows.map((r) => [r.q === "Q-small" ? "S" : "L", r.f ? 1 : 0, r.rep, r.valid ? 1 : 0, r.excl,
+    r.crit.C1 ? r.crit.C1.v : null, r.crit.C2 ? r.crit.C2.v : null, r.crit.C3.v, r.crit.C4.v,
+    r.status, r.read ? 1 : 0, r.fdAns, r.fdStallEnd, r.err, r.sys, r.errCls, r.sub, r.ok, r.fail, r.qinErr, r.ffFirst ? 1 : 0, r.failCalls, r.gaveUp ? 1 : 0, r.srv && r.srv.close]);
+  return `#151 X2 rows ${label} ${JSON.stringify(head)} R=${JSON.stringify(R)}`;
 }
 function cellLine(label, run, rows) {
-  const st = run.o.stall, ans = Math.min(...rows.map((r) => (r.server ? 0 : Infinity)));
+  const st = run.o.stall;
   const groups = {};
   for (const r of rows) { const k = `${r.q}/fin-${r.f ? "ignored" : "honoured"}`; (groups[k] = groups[k] || []).push(r); }
   const parts = Object.entries(groups).map(([k, g]) => {
     const v = g.filter((r) => r.valid);
-    const codes = {}; for (const r of v) { const key = `${r.error || "none"}/${r.syscall || "-"}`; codes[key] = (codes[key] || 0) + 1; }
-    return `${k}: valid ${v.length}/${g.length}, answer read ${v.filter((r) => r.read).length}, lost ${v.filter((r) => !r.read).length}, codes ${JSON.stringify(codes)}, first failed callback before 'error' ${v.filter((r) => r.firstFailBeforeError).length}`;
+    const codes = (list) => { const o = {}; for (const r of list) { const key = `${r.err || "none"}/${r.sys || "-"}`; o[key] = (o[key] || 0) + 1; } return JSON.stringify(o); };
+    return `${k}: all ${g.length} read ${g.filter((r) => r.read).length} lost ${g.filter((r) => !r.read).length} codes ${codes(g)}; valid ${v.length} read ${v.filter((r) => r.read).length} lost ${v.filter((r) => !r.read).length} codes ${codes(v)}`;
   });
-  return `#151 X2 ${label} (${process.platform}/${process.arch} ${process.version}): stall ${st ? `${st.requestedMs} ms, ${st.end - st.at} ms measured` : "none"}; first tick after ${run.o.firstTickAfter && st ? run.o.firstTickAfter - st.end : "-"} ms; ${parts.join(" | ")}${Number.isFinite(ans) ? "" : ""}`;
+  return `#151 X2 ${label} (${process.platform}/${process.arch} ${process.version}): stall ${st ? `${st.requestedMs} ms, ${st.end - st.at} ms measured` : "none"}; max tick gap before the stall ${n(run.o.maxGapBefore)} ms; ${parts.join(" | ")}`;
 }
 
 test("X2 (macOS Intel): stall across the server's grace reset vs answer loss and EPIPE/ECONNRESET, measured only", { skip: !ON && "macOS Intel only (USAP_TEST_X2_ANY=1 to run elsewhere)", timeout: 120000 }, async (t) => {
-  const srv = await startServer();
   try {
-    const all = [];
+    const srv = await startServer();
     for (const pass of [1, 2]) for (const [label, ms] of [["S0", 0], ["S1", 1800], ["S2", 2700]]) {
       const before = srv.recs.length;
       const run = await runClient(srv.info.port, ms);
@@ -82,18 +121,35 @@ test("X2 (macOS Intel): stall across the server's grace reset vs answer loss and
       assert.ok(run.o && Array.isArray(run.o.conns) && run.o.conns.length === 16, "client output parsed");
       const until = Date.now() + 5000; // the server writes a record when each socket has closed
       while (srv.recs.length - before < 16 && Date.now() < until) await new Promise((r) => setTimeout(r, 50));
-      const rows = describe(run, srv.recs.slice(before));
-      assert.equal(rows.filter((r) => r.server).length, 16, "every connection has a server record");
-      for (const c of run.o.conns) assert.equal(c.writes.ok + c.writes.fail + (c.writes.sub - c.writes.ok - c.writes.fail), c.writes.sub, "accounting adds up");
+      const recs = srv.recs.slice(before);
+      const rows = describe(run, recs);
+      assert.equal(rows.filter((r) => r.srv).length, 16, "every connection has a server record");
+      assert.ok(rows.every((r) => r.srv.status === 413), "the server answered every connection 413");
+      for (const c of run.o.conns) assert.ok(c.writes.ok + c.writes.fail <= c.writes.sub, "accepted + failed never exceed submitted");
       if (ms) assert.ok(run.o.stall && run.o.stall.end - run.o.stall.at >= ms * 0.9, "the stall lasted");
-      const line = cellLine(`${label} pass ${pass}`, run, rows);
-      t.diagnostic(line);
-      all.push({ label, pass, rows });
+      t.diagnostic(cellLine(`${label} pass ${pass}`, run, rows));
+      t.diagnostic(rowsLine(`${label} p${pass}`, run, rows));
     }
-    // bounded event order of up to 6 rows per S (lost answers first), for the record
-    for (const label of ["S0", "S1", "S2"]) {
-      const rows = all.filter((a) => a.label === label).flatMap((a) => a.rows).sort((a, b) => Number(a.read) - Number(b.read)).slice(0, 6);
-      t.diagnostic(`#151 X2 ${label} detail: ${JSON.stringify(rows)}`.slice(0, 2500));
-    }
-  } finally { srv.child.kill(); }
+  } finally { await killAll(); }
 });
+
+// Reporting control (every OS; pure, no sockets): every row is printed with its criteria and exclusion reason, and an
+// excluded row is counted in "all" but not in "valid". Rows come from a hand-made run, so nothing here can affect X2.
+test("X2 reporting: every row is printed with its predeclared criteria and exclusion reason", () => {
+  const T = 1_000_000;
+  const conn = (i, q, extra = {}) => ({ q, f: false, rep: i, localPort: 5000 + i, status: 413, bodyComplete: true, firstDataAt: T + 2700, errorAt: null, error: null, gaveUp: false,
+    writes: { sub: 200, ok: q === "Q-small" ? 200 : 150, fail: 0, failCalls: 0, atFirstFail: null, atError: null }, atStallStart: { sub: 200, ok: q === "Q-small" ? 200 : 150 }, ...extra });
+  const run = { o: { t0: T, connectedAt: T + 40, maxGapBefore: 12, lastTickBefore: T + 185, firstTickAfter: T + 2895, partial: false,
+    stall: { requestedMs: 2700, at: T + 190, end: T + 2890 }, conns: [conn(0, "Q-small"), conn(1, "Q-large"), conn(2, "Q-small", { firstDataAt: null, bodyComplete: false, error: "ECONNRESET", errorAt: T + 2895 })] } };
+  const recs = [0, 1, 2].map((i) => ({ remotePort: 5000 + i, answerAt: i === 1 ? T + 100 : T + 400, closeAt: (i === 1 ? T + 100 : T + 400) + 2000, bytesRead: 100, status: 413 }));
+  const rows = describe(run, recs);
+  assert.deepEqual(rows.map((r) => [r.valid, r.excl]), [[true, "-"], [false, "C1"], [true, "-"]], "row 1's stall began after its answer: excluded for C1 only");
+  const line = rowsLine("S2 p1", run, rows);
+  assert.equal((line.match(/\["[SL]",/g) || []).length, 3, "every row is printed, the excluded one included");
+  assert.match(line, /"C1",90,/, "the excluded row carries its reason and the measured value");
+  const cell = cellLine("S2 pass 1", run, rows);
+  assert.match(cell, /Q-small\/fin-honoured: all 2 read 1 lost 1 codes \{"none\/-":1,"ECONNRESET\/-":1\}; valid 2 read 1 lost 1/);
+  assert.match(cell, /Q-large\/fin-honoured: all 1 read 1 lost 0 codes \{"none\/-":1\}; valid 0 read 0 lost 0/);
+});
+
+module.exports = { describe, rowsLine, cellLine }; // pure reporting functions

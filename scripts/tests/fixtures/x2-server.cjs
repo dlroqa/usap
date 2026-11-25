@@ -15,7 +15,7 @@ const srv = http.createServer((req, res) => {
     closeAfterAnswer(req, res);
     const body = JSON.stringify({ error: "payload too large" });
     res.writeHead(413, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
-    res.end(body, () => { rec.answerAt = Date.now(); });
+    res.end(body, () => { rec.answerAt = Date.now(); rec.status = res.statusCode; });
   }, ANSWER_MS);
   s.once("close", () => { rec.closeAt = Date.now(); rec.bytesRead = s.bytesRead; process.stdout.write(JSON.stringify(rec) + "\n"); });
 });
