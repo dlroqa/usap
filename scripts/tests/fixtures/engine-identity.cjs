@@ -24,13 +24,19 @@ const run = (cmd, args, ms = 5000) => new Promise((resolve) => {
 });
 const clean = (s, n = 40) => String(s == null ? "" : s).replace(/[^A-Za-z0-9_.+-]/g, "").slice(0, n);
 
+// Settles exactly once, always within ms + 500: a response cut after its headers ('aborted'/'error'/'close' without
+// 'end') resolves null instead of leaving the promise, and every sampler awaiting it, pending forever.
 function getJson(port, urlPath, ms = 1500) {
   return new Promise((resolve) => {
-    const req = http.get({ host: "127.0.0.1", port, path: urlPath, timeout: ms }, (res) => {
+    let done = false, req = null;
+    const settle = (v) => { if (done) return; done = true; clearTimeout(hard); resolve(v); };
+    const hard = setTimeout(() => { if (req) req.destroy(); settle(null); }, ms + 500);
+    req = http.get({ host: "127.0.0.1", port, path: urlPath, timeout: ms }, (res) => {
       let text = ""; res.on("data", (c) => { if (text.length < 65536) text += c; });
-      res.on("end", () => { try { resolve(JSON.parse(text)); } catch (_) { resolve(null); } });
+      res.on("end", () => { try { settle(JSON.parse(text)); } catch (_) { settle(null); } });
+      res.on("aborted", () => settle(null)); res.on("error", () => settle(null)); res.on("close", () => settle(null));
     });
-    req.on("timeout", () => req.destroy()); req.on("error", () => resolve(null));
+    req.on("timeout", () => req.destroy()); req.on("error", () => settle(null));
   });
 }
 const engineStats = async (port) => {
@@ -120,18 +126,24 @@ async function snapshot({ label, enginePort, studio = null, extraPids = [], plat
   return { label, at, stats, studio: st, supervised: sup, exits, ...os };
 }
 
-/** Polls the engine's identity and the studio's state every intervalMs until stop(); keeps transitions only (<= 60). */
-function startSampler({ enginePort, status = null, intervalMs = 100, t0 = Date.now() }) {
-  const out = []; let last = "", stopped = false;
+/** Polls the engine's identity and the studio's state every intervalMs until stop(); keeps transitions only (<= 60).
+ * Bounded on its own (#170 lifecycle fix): it ends after maxMs even if stop() is never called (one "sampler bound"
+ * entry), an iteration that throws is recorded as no answer instead of rejecting the loop, and stop() cancels the
+ * pending sleep. The timer is not unref'd: an awaited stop() must keep the process alive until the loop has ended. */
+function startSampler({ enginePort, status = null, intervalMs = 100, t0 = Date.now(), maxMs = 180000 }) {
+  const out = []; let last = "", stopped = false, sleepTimer = null, wake = null;
   const loop = (async () => {
     while (!stopped && out.length < 60) {
-      const [s, st] = await Promise.all([engineStats(enginePort), status ? status().catch(() => null) : null]);
+      if (Date.now() - t0 >= maxMs) { out.push(`${Date.now() - t0} sampler bound`); break; }
+      let s = null, st = null;
+      try { [s, st] = await Promise.all([engineStats(enginePort), status ? Promise.resolve().then(status).catch(() => null) : null]); } catch (_) { /* recorded as no answer */ }
       const key = `${s ? `${s.instance || "?"}/${s.pid}` : "no answer"} ${st ? `${(st.engine && st.engine.state) || "?"}${st.ready ? " ready" : ""}` : ""}`.trim();
       if (key !== last) { out.push(`${Date.now() - t0} ${key}`); last = key; }
-      await new Promise((r) => setTimeout(r, intervalMs));
+      if (stopped) break;
+      await new Promise((r) => { wake = r; sleepTimer = setTimeout(r, intervalMs); });
     }
   })();
-  return { stop: async () => { stopped = true; await loop; return out; } };
+  return { stop: async () => { stopped = true; clearTimeout(sleepTimer); if (wake) wake(); await loop; return out; } };
 }
 
 const sameProc = (a, b) => a && b && !a.gone && !b.gone && a.startedAt && b.startedAt && Math.abs(a.startedAt - b.startedAt) <= Math.max(a.resMs || 0, b.resMs || 0, 1) * 2;

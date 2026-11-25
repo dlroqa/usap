@@ -25,7 +25,10 @@ function hardKill(pid) {
   if (process.platform === "win32") return spawnSync("taskkill", ["/PID", String(pid), "/F"], { stdio: "ignore" }).status;
   try { process.kill(pid, "SIGKILL"); return "sent"; } catch (e) { return e.code; }
 }
-const exited = (p) => (p.exitCode !== null || p.signalCode !== null ? Promise.resolve() : new Promise((r) => p.once("exit", r)));
+// Bounded (#170 lifecycle fix): a process that does not exit within ms fails the test here instead of letting it run on
+// past its timeout (and past test.after) and start the next fake after cleanup.
+const exited = (p, ms = 10000) => (p.exitCode !== null || p.signalCode !== null ? Promise.resolve()
+  : new Promise((resolve, reject) => { const t = setTimeout(() => reject(new Error(`pid ${p.pid} did not exit within ${ms} ms`)), ms); p.once("exit", () => { clearTimeout(t); resolve(); }); }));
 test.after(async () => { for (const p of procs) { try { p.kill("SIGKILL"); } catch (_) { /* gone */ } } });
 
 test("fake stats carry a per-start instance id, start time and parent pid", { timeout: 30000 }, async () => {
@@ -130,4 +133,33 @@ test("sampler: transitions only, bounded, stopped cleanly", { timeout: 30000 }, 
     assert.deepEqual(out.map((x) => x.replace(/^\d+ /, "").replace(/^[0-9a-f]+\/\d+$/, "ANSWER")), ["no answer", "ANSWER", "no answer"], JSON.stringify(out));
     assert.ok(out.length <= 60);
   } finally { releasePort(port); }
+});
+
+// #170 lifecycle controls (round 15): every observer in fixtures/engine-identity.cjs ends on its own.
+test("lifecycle: a response cut after its headers settles null; a throwing status, a never-stopped sampler and a stop() mid-sleep all end", { timeout: 30000 }, async () => {
+  const cut = net.createServer((c) => { c.on("error", () => {}); c.once("data", () => { c.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{"); setTimeout(() => c.destroy(), 50); }); });
+  await new Promise((r) => cut.listen(0, "127.0.0.1", r));
+  try {
+    const t0 = Date.now();
+    assert.equal(await id.engineStats(cut.address().port), null, "a cut response reads as no answer");
+    assert.ok(Date.now() - t0 < 2500, `settled in ${Date.now() - t0} ms (bound 1500 + 500)`);
+  } finally { await new Promise((r) => cut.close(r)); }
+  const port = await reservePort();
+  try {
+    const thrower = id.startSampler({ enginePort: port, intervalMs: 20, status: () => { throw new Error("injected"); } });
+    await sleep(100);
+    const out1 = await thrower.stop();
+    assert.ok(out1.length >= 1 && out1.every((x) => /no answer/.test(x)), JSON.stringify(out1));
+    const bounded = id.startSampler({ enginePort: port, intervalMs: 20, maxMs: 300 }); // never stopped by the caller
+    await sleep(700);
+    const t1 = Date.now(); const out2 = await bounded.stop();
+    assert.ok(out2.some((x) => /sampler bound$/.test(x)), `ended at its bound: ${JSON.stringify(out2)}`);
+    assert.ok(Date.now() - t1 < 100, "stop() after the bound returns at once");
+    const slow = id.startSampler({ enginePort: port, intervalMs: 5000 });
+    await sleep(100);
+    const t2 = Date.now(); await slow.stop();
+    assert.ok(Date.now() - t2 < 1000, `stop() cancels a pending 5 s sleep (${Date.now() - t2} ms)`);
+  } finally { releasePort(port); }
+  const stuck = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)"], { stdio: "ignore" }); procs.push(stuck);
+  try { await assert.rejects(exited(stuck, 300), /did not exit within 300 ms/); } finally { stuck.kill("SIGKILL"); }
 });
