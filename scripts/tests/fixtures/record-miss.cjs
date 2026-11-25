@@ -44,7 +44,7 @@ function describeRecordMiss({ st, port, events = [], polls = {}, server = null, 
   const reads = Object.keys(rs).length ? `; collector read failures ${Object.entries(rs).map(([k, v]) => `${k}x${v}`).join(",")}` : "";
   if (dead && !flushedOk) {
     const x = server.atMiss.exit || {};
-    verdict = `server dead: the studio had exited (code ${x.code !== undefined ? x.code : "?"}, signal ${x.signal || "none"}) at ${rel(x.at)}${x.before ? " (before the test stopped it)" : ""}, with no record write traced for this connection`;
+    verdict = `server dead: the studio had exited (code ${x.code !== undefined ? x.code : "?"}, signal ${x.signal || "none"}) at ${rel(x.at)}${x.before ? " (before the test stopped it)" : " (after the test began stopping it)"}, with no record write traced for this connection`;
   } else if (events.length >= TRAIL_CAP || trailBad > 0) {
     verdict = `trail incomplete (${events.length} lines${events.length >= TRAIL_CAP ? ", the preload's cap" : ""}, ${trailBad} unparsable): undecidable from the trail`;
   } else if (!mine.length) {
@@ -124,8 +124,12 @@ function sanitizeTail(text, { root = "", maxLines = 20, maxChars = 1024 } = {}) 
   const esc = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   let t = String(text || "");
   for (const p of [root, os.tmpdir(), os.homedir()].filter(Boolean)) t = t.replace(new RegExp(esc(p).replace(/\\\\/g, "[\\\\/]"), "gi"), "<path>");
-  t = t.replace(/[A-Za-z]:\\[^\s"']*/g, "<path>").replace(/(^|[\s"'(])\/(?:[\w.-]+\/)+[\w.-]*/g, "$1<path>");
-  const lines = t.split(/\r?\n/).filter((l) => l.trim() && !l.includes('{"')).slice(-maxLines);
+  t = t.replace(/file:\/\/\/?[^\s"')]*/gi, "<path>") // file URLs
+    .replace(/\\\\[^\s"'\\]+\\[^\s"']*/g, "<path>") // UNC \\host\share\...
+    .replace(/[A-Za-z]:[\\/][^\s"']*/g, "<path>") // drive paths, either slash
+    .replace(/(^|[\s"'(=:])\/(?:[^\s"'/]+\/)+[^\s"']*/g, "$1<path>"); // absolute POSIX paths, also after = or :
+  // drop lines carrying bodies: JSON ({"), util.inspect objects/arrays ({ key: / [{)
+  const lines = t.split(/\r?\n/).filter((l) => l.trim() && !/\{"|\{\s*[\w$]+:|\[\{/.test(l)).slice(-maxLines);
   return lines.join(" | ").slice(-maxChars);
 }
 

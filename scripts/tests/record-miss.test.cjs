@@ -50,13 +50,15 @@ async function withTraced(fn, { log: logOverride = null } = {}) {
   const srv = await startServer(root, { USAP_TEST_CONN_LOG: log, USAP_TEST_CONN_LOG_PREFIX: URL, USAP_TEST_CONN_LOG_TRACE: trail, NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require "${preload}"`.trim() });
   const events = () => { try { return parseTrail(fs.readFileSync(trail, "utf8")).events; } catch (_) { return []; } };
   // C3: the same server snapshot json-413 passes (exit seen while the test runs; sanitized tail)
+  let stopAt = null; // when the test begins stopping the server; "before" compares the exit with it
   const exit = { code: null, signal: null, at: null };
   srv.proc.once("exit", (code, signal) => { exit.code = code; exit.signal = signal; exit.at = Date.now(); });
   const server = () => { const running = srv.proc.exitCode === null && srv.proc.signalCode === null;
-    return { pid: srv.proc.pid, running, exit: running ? null : { ...exit, before: true }, tail: sanitizeTail(srv.log(), { root }) }; };
+    return { pid: srv.proc.pid, running, exit: running ? null : { ...exit, before: stopAt === null || (exit.at !== null && exit.at < stopAt) }, tail: sanitizeTail(srv.log(), { root }) }; };
   const collector = (deadlineMs, lateLookMs = 0, withServer = false) => makeRecordCollector({ log, trail, trace: true, deadlineMs, lateLookMs, server: withServer ? server : null });
-  try { return await fn({ port: srv.port, log, trail, events, collector, srv, root }); }
-  finally { await stopServerAndWait(srv); removeTestRoot(root); }
+  const stopNow = async () => { stopAt = Date.now(); await stopServerAndWait(srv); };
+  try { return await fn({ port: srv.port, log, trail, events, collector, srv, root, stopNow }); }
+  finally { if (stopAt === null) stopAt = Date.now(); await stopServerAndWait(srv); removeTestRoot(root); }
 }
 
 test("normal: the trail is complete and in order, the grace timer destroys, and the record is found", { timeout: 30000 }, async () => {
@@ -191,11 +193,14 @@ test("without USAP_TEST_CONN_LOG_TRACE the preload writes no trail and the recor
 test("C3 real: the studio dies after its answer; the miss reads 'server dead' with the exit seen before any test stop", { timeout: 30000 }, async () => {
   await withTraced(async ({ port, collector, srv, root }) => {
     const st = await overLimit(port);
+    const killAt = Date.now();
     srv.proc.kill("SIGKILL"); // Windows: TerminateProcess (exit code 1); POSIX: SIGKILL
     await closed(st);
     assert.equal(await collector(300, 200, true).recordFor(st), undefined, "a miss (the required-record lookup is unchanged)");
     assert.match(st.recordMiss, /^server dead: the studio had exited \(code (1|null), signal (SIGKILL|none)\) at -?\d+ \(before the test stopped it\), with no record write traced for this connection/, st.recordMiss);
     assert.match(st.recordMiss, /studio at the miss exited \(pid \d+/);
+    const exitRel = Number(/had exited \([^)]*\) at (-?\d+)/.exec(st.recordMiss)[1]);
+    assert.ok(exitRel >= killAt - st.t0 - 1, `the exit time (${exitRel}) is the kill's (${killAt - st.t0}), not a constant`);
     assert.ok(!st.recordMiss.includes(root) && !st.recordMiss.includes(require("node:os").tmpdir()), "no paths in the reading");
   });
 });
@@ -232,4 +237,21 @@ test("C3 sanitizer: no root, temp or home path and no JSON body survive; bounded
   const t = sanitizeTail(text, { root });
   for (const bad of [root, os.tmpdir(), os.homedir(), "a body", "Users\\someone"]) assert.ok(!t.includes(bad), `${bad} removed: ${t}`);
   assert.ok(t.length <= 1024 && t.split(" | ").length <= 20, "bounded");
+});
+
+test("C3 real: a studio stopped by the test itself before the reading does not read 'before the test stopped it'", { timeout: 30000 }, async () => {
+  await withTraced(async ({ port, collector, stopNow }) => {
+    const st = await overLimit(port);
+    await stopNow(); // the test's own stop (taskkill /F on Windows: exit code 1, like a crash)
+    await closed(st);
+    assert.equal(await collector(300, 200, true).recordFor(st), undefined);
+    assert.doesNotMatch(st.recordMiss, /before the test stopped it/, st.recordMiss);
+  });
+});
+
+test("C3 sanitizer: forward-slash drive paths, file URLs, UNC, paths after = or :, inspect bodies", () => {
+  const t = sanitizeTail(["opening C:/Users/someone/models/m.gguf", "url file:///C:/x/y.json done", "share \\\\fileserver\\share\\dir\\f.txt", "--model=/mnt/data/models/m.gguf",
+    "cwd:/srv/app/x ok", "{ error: 'body text' }", "[{ id: 1 }]", "kept line"].join("\n"));
+  for (const bad of ["someone", "C:/x", "fileserver", "/mnt/data", "/srv/app", "body text", "id: 1"]) assert.ok(!t.includes(bad), `${bad} removed: ${t}`);
+  assert.match(t, /kept line/);
 });

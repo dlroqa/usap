@@ -91,14 +91,15 @@ async function withServer(fn, extra = {}, { trace = false } = {}) {
   // C3 (messages only): the studio's own exit, seen by the test while the test still runs. The reading is made inside
   // fn, before the finally stops the server, so any exit seen at a miss came before the test's stop (taskkill /F's
   // exit code 1 can't be confused with it). Snapshot: pid, running, exit code/signal/time, sanitized log tail.
+  let stopAt = null; // when the test begins stopping the server (finally); "before" compares the exit with it
   const exit = { code: srv.proc.exitCode, signal: srv.proc.signalCode, at: null };
   if (exit.code === null && exit.signal === null) srv.proc.once("exit", (code, signal) => { exit.code = code; exit.signal = signal; exit.at = Date.now(); });
   else exit.at = Date.now();
   const server = () => { const running = srv.proc.exitCode === null && srv.proc.signalCode === null;
-    return { pid: srv.proc.pid, running, exit: running ? null : { ...exit, before: true }, tail: sanitizeTail(srv.log(), { root }) }; };
+    return { pid: srv.proc.pid, running, exit: running ? null : { ...exit, before: stopAt === null || (exit.at !== null && exit.at < stopAt) }, tail: sanitizeTail(srv.log(), { root }) }; };
   const { records, recordFor } = makeRecordCollector({ log, trail, trace, deadlineMs: GRACE_MS + SLACK_MS, lateLookMs: LATE_LOOK_MS, server: trace ? server : null });
   try { return await fn({ port: srv.port, recordFor, records }); }
-  finally { await stopServerAndWait(srv); removeTestRoot(root); }
+  finally { stopAt = Date.now(); await stopServerAndWait(srv); removeTestRoot(root); }
 }
 
 // Both sides of one connection, for failure messages: tells "the server never saw the request" (no record), "the
