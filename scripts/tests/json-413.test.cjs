@@ -137,7 +137,7 @@ const ANSWER_BODY = /"error":"Request body is too large\. Limit is 64 MB\.","cod
 function concurrentClients(port, n, opts, cpuDiag = false, stackSample = null, onSpawn = null) {
   return new Promise((resolve, reject) => {
     const child = execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify(cpuDiag ? { port, n, opts, cpuDiag, ...(stackSample ? { stackSample } : {}) } : { port, n, opts })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
-      (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
+      (err, stdout) => { if (err) return reject(err); try { resolve(JSON.parse(stdout)); } catch (e) { reject(e); } }); // round 17: unparsable output rejects (was an uncaught throw)
     if (onSpawn && child && child.pid) { try { onSpawn(child.pid); } catch (_) { /* diagnostics only */ } }
   });
 }
@@ -150,11 +150,12 @@ function startThreadObserver(pids) {
   child.on("error", () => {}); child.stdin.on("error", () => {});
   child.stdout.on("data", (d) => { if (out.length < 1 << 20) out += d; });
   const exited = new Promise((r) => child.once("exit", r));
-  return { stop: async () => {
+  let stopped = null; // stop() is idempotent (round 17: the test's finally also calls it)
+  return { pid: child.pid, stop: () => stopped || (stopped = (async () => {
     try { child.stdin.end(); } catch (_) {}
-    if (await Promise.race([exited.then(() => "exit"), sleep(5000).then(() => "timeout")]) === "timeout") { try { child.kill(); } catch (_) {} return null; }
+    if (await Promise.race([exited.then(() => "exit"), sleep(5000).then(() => "timeout")]) === "timeout") { try { child.kill("SIGKILL"); } catch (_) {} return null; }
     try { return JSON.parse(out); } catch (_) { return null; }
-  } };
+  })()) };
 }
 // Server side of one connection, from the connection-log preload: the 413 with its body, promptly, the whole grace
 // period (unless the client closed first), reads within the bound. Returns the judge's view of the connection.
@@ -166,13 +167,15 @@ function startSampler() {
   child.on("error", () => {}); child.stdin.on("error", () => {});
   child.stdout.on("data", (d) => { if (out.length < 65536) out += d; });
   const exited = new Promise((r) => child.once("exit", r));
+  let stopped = null; // stop() is idempotent (round 17: the test's finally also calls it)
   return {
-    stop: async () => {
+    pid: child.pid,
+    stop: () => stopped || (stopped = (async () => {
       try { child.stdin.end(); } catch (_) {}
       const t = await Promise.race([exited.then(() => "exit"), sleep(5000).then(() => "timeout")]);
-      if (t === "timeout") { try { child.kill(); } catch (_) {} return null; }
+      if (t === "timeout") { try { child.kill("SIGKILL"); } catch (_) {} return null; }
       try { return JSON.parse(out); } catch (_) { return null; }
-    },
+    })()),
   };
 }
 function assertServerRefusal(rec, st, label) {
@@ -191,6 +194,10 @@ test("concurrent over-limit declarations are each refused early; the server's to
   await withServer(async ({ port, records, serverPid }) => {
     let observer = null, clientPid = null; // #151 diagnostics only
     const sampler = startSampler(); // #151 diagnostics only
+    // round 17 (S151-J413-HANG-201): the observers are stopped on EVERY path. When the client process is killed at its
+    // exec timeout, concurrentClients rejects and the stops below were skipped; both observer children kept their stdin
+    // pipes open and the file ran into its 600 s timeout. The stops are idempotent; verdicts are unchanged.
+    try {
     // cpuDiag (#151 diagnostics only): the client process also records its CPU time, context switches and bytes sent
     // at each tick, and runs a watchdog thread; `proc` is used only in the description below
     const { clients, ticks, proc } = await concurrentClients(port, 10, { url: URL, mode: "stream", contentLength: 100 * MiB, ignoreFin: true, capBytes: 96 * MiB, maxMs: GRACE_MS + 10000 }, true,
@@ -228,7 +235,25 @@ test("concurrent over-limit declarations are each refused early; the server's to
     if (excused.length) t.diagnostic(`${excused.length}/${clients.length} clients excused (documented reset tradeoff): ${excused.join(" | ")}`);
     assert.ok(stalled < clients.length, `at least one client read its answer (a run where none did proves nothing about delivery); excused: ${excused.join(" | ")}`);
     assert.ok(total <= 10 * EARLY_READ_BOUND, `total read ${total}`);
+    } finally { await sampler.stop(); if (observer) await observer.stop(); } // round 17: every path (see above)
   }, { USAP_TEST_CONN_LOG_LOOP: "1" }); // #151 diagnostics: the server's loop summary in each record
+});
+
+// round 17 (S151-J413-HANG-201) control: both observers end their children when stopped, also when the client run
+// fails, and stop() is idempotent (the concurrent test's finally calls it again). The concurrent test itself keeps its
+// verdicts; this only checks the cleanup it now relies on.
+test("observer cleanup: the sampler and the thread observer end their child processes when stopped, also after a failed client run; stop() is idempotent", { timeout: 30000 }, async () => {
+  const sampler = startSampler(); const observer = startThreadObserver([process.pid]);
+  const alive = (pid) => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+  assert.ok(alive(sampler.pid), "the sampler child runs");
+  try { await assert.rejects(Promise.reject(new Error("client run failed (injected)"))); }
+  finally {
+    const a = sampler.stop(), b = sampler.stop(); assert.equal(a, b, "sampler stop() is idempotent (same promise)");
+    await a; await observer.stop(); await observer.stop();
+  }
+  await sleep(200);
+  assert.equal(alive(sampler.pid), false, "the sampler child is gone");
+  if (observer.pid) assert.equal(alive(observer.pid), false, "the thread observer child is gone");
 });
 
 test("judge rules for this test: an answer is required unless the client provably did not run while the server held the connection", () => {
