@@ -122,9 +122,11 @@ test("sampler: transitions only, bounded, stopped cleanly", { timeout: 30000 }, 
   const port = await reservePort();
   try {
     const t0 = Date.now(); const s = id.startSampler({ enginePort: port, intervalMs: 30, t0 });
-    await sleep(150); const a = startFake(port); await until(() => id.engineStats(port), 10000, "A up"); await sleep(150);
-    a.kill("SIGKILL"); await exited(a); await sleep(150);
-    const out = await s.stop();
+    let out = null, a = null;
+    try { // stop the sampler and the fake on every path: a failed wait must not leave the loop running (#125)
+      await sleep(150); a = startFake(port); await until(() => id.engineStats(port), 10000, "A up"); await sleep(150);
+      a.kill("SIGKILL"); await exited(a); a = null; await sleep(150);
+    } finally { if (a) { try { a.kill("SIGKILL"); } catch (_) {} } out = await s.stop(); }
     assert.deepEqual(out.map((x) => x.replace(/^\d+ /, "").replace(/^[0-9a-f]+\/\d+$/, "ANSWER")), ["no answer", "ANSWER", "no answer"], JSON.stringify(out));
     assert.ok(out.length <= 60);
   } finally { releasePort(port); }
