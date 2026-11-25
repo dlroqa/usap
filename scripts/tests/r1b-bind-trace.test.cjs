@@ -143,7 +143,9 @@ test("real R-U: a bind by another process between the engine's spawn and its lis
   } finally {
     if (holder && holder.listening) await new Promise((res) => holder.close(res));
     fs.rmSync(release, { force: true });
-    for (const p of processesUnder(root).filter((x) => /sd-server|sd-cpu/i.test(x.cmd))) { try { process.kill(p.pid, "SIGKILL"); } catch (_) { /* gone */ } }
+    // every process still running from this file's private root (the studio is already stopped by withTraced): no name
+    // pattern, so the macOS fake (app/backend/mac/sd) is covered too (round-15 review: /sd-server|sd-cpu/ missed it)
+    for (const p of processesUnder(root)) { try { process.kill(p.pid, "SIGKILL"); } catch (_) { /* gone */ } }
   }
   t.diagnostic(r.line.slice(0, 900));
   const last = r.rows.slice(-1)[0] || {};
