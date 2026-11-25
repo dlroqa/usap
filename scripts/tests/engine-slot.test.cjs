@@ -19,6 +19,7 @@ const sdDiag = () => JSON.stringify(fakeSdDiag(root).slice(-12));
 // server's own process list).
 const enginesUnder = (root) => processesUnder(root).filter((p) => /sd-server|llama-server/i.test(p.cmd));
 const { engineSlotSetting, createEngineSlot, stopProcess } = require("../server/services/engine-slot.cjs");
+const { readBindTrace } = require("./fixtures/r1b-bind-trace.cjs"); // #170 R1b bind trace (messages only)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitFor(fn, ms = 20000, label = "condition") {
@@ -577,8 +578,17 @@ test("crash during load (slot on): an image engine that fails to load releases t
   });
 });
 
+// #170 R1b bind trace (test-only, messages only): the studio's own binds on the image port (preload) and each image
+// engine's listen attempt (fake records) are read only when this test fails, appended to the unchanged assertion's
+// message (fixtures/r1b-bind-trace.cjs). No request, port, wait, retry or assertion is added or changed.
+const R1B_PRELOAD = path.join(__dirname, "fixtures", "e1-bind-trace-preload.cjs").replace(/\\/g, "/");
+const r1bTraceEnv = (file) => ({ USAP_TEST_E1_TRACE: file, USAP_TEST_E1_BUFFERED: "1", NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require "${R1B_PRELOAD}"`.trim() });
+const readJsonl = (f) => { try { return fs.readFileSync(f, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch (_) { return {}; } }); } catch (_) { return []; } };
 test("R1b (slot on): with an image engine loaded, a text load gets 409 and the image engine keeps running; a settings change still works", async () => {
-  await withServer(SLOT_ON, async (srv) => {
+  const traceFile = path.join(root, `r1b-bind-trace-${Date.now()}.jsonl`);
+  const t0 = Date.now();
+  await withServer({ ...SLOT_ON, ...r1bTraceEnv(traceFile) }, async (srv) => {
+   try {
     assert.equal((await imageLoad(srv)).status, 200);
     await imageReady(srv, 20000, "image ready");
     const before = await engines(srv);
@@ -599,6 +609,11 @@ test("R1b (slot on): with an image engine loaded, a text load gets 409 and the i
     assert.equal(after.length, 1);
     assert.notEqual(after[0].pid, before[0].pid, "replaced, after the old exit was confirmed");
     assert.equal(alive(before[0].pid), false);
+   } catch (err) {
+    await sleep(250); // the preload appends its buffered lines every 100 ms
+    try { err.message = `${err.message}\n${readBindTrace({ trace: readJsonl(traceFile), diag: fakeSdDiag(root), port: srv.sdPort, from: t0 }).line}`; } catch (_) { /* diagnostics only */ }
+    throw err;
+   }
   });
 });
 
