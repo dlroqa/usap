@@ -44,6 +44,30 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
         // means the loop got past the I/O phase that handled the drain, where a ready read would also have run.
         drainChecksAt: [], firstDataCheckAt: null } };
     if (Array.isArray(live)) live.push(st);
+    // #151 write accounting (diagnostics runs only; DD-201-PEND): `pendingAtError` (writableLength in 'error', below) is
+    // known to read 0 once write callbacks have failed, because Node empties its queue and fails every callback before
+    // it emits 'error'. Counted here from the write callbacks instead: bytes submitted to s.write, bytes whose callback
+    // succeeded (libuv wrote them into the kernel's send buffer: accepted by the kernel, NOT acknowledged or received)
+    // and bytes whose callback failed. Snapshots at the first failed callback and at 'error' (before any other listener).
+    // Kernel send-buffer occupancy is not visible from Node. Backpressure is unchanged: s.write's own result is returned.
+    if (Array.isArray(live)) {
+      const W = st.io.writes = { subBytes: 0, subCalls: 0, okBytes: 0, okCalls: 0, failBytes: 0, failCalls: 0, failCodes: {}, atFirstFail: null, atError: null };
+      let seq = 0;
+      const snap = (e) => ({ seq: (seq += 1), t: Date.now(), code: (e && e.code) || null, syscall: (e && e.syscall) || null, queuedInNode: s.writableLength,
+        notAcceptedBytes: W.subBytes - W.okBytes, callbackPendingBytes: W.subBytes - W.okBytes - W.failBytes, failCalls: W.failCalls });
+      const write = s.write;
+      s.write = function accountedWrite(chunk, enc, cb) {
+        if (typeof enc === "function") { cb = enc; enc = undefined; }
+        const n = typeof chunk === "string" ? Buffer.byteLength(chunk, enc) : chunk.length;
+        W.subBytes += n; W.subCalls += 1;
+        return write.call(this, chunk, enc, (e) => {
+          if (e) { if (!W.atFirstFail) W.atFirstFail = snap(e); W.failBytes += n; W.failCalls += 1; const k = String(e.code || "error").slice(0, 20); W.failCodes[k] = (W.failCodes[k] || 0) + 1; }
+          else { W.okBytes += n; W.okCalls += 1; }
+          if (cb) cb(e);
+        });
+      };
+      s.prependListener("error", (e) => { if (!W.atError) W.atError = snap(e); });
+    }
     let buf = Buffer.alloc(0), stopped = false, timer = null;
     const parse = () => {
       const text = buf.toString("latin1"); const i = text.indexOf("\r\n\r\n");
@@ -58,7 +82,13 @@ function rawRequest(port, { method = "POST", url = "/api/echo", headers = "", mo
       st.io.dataEvents += 1; buf = Buffer.concat([buf, d]); parse();
     });
     s.on("end", () => { if (st.io.endAt === null) st.io.endAt = Date.now(); });
-    s.on("error", (e) => { if (st.io.errorAt === null) st.io.errorAt = Date.now(); st.error = e.code || e.message; });
+    s.on("error", (e) => {
+      if (st.io.errorAt === null) st.io.errorAt = Date.now(); st.error = e.code || e.message;
+      // #151 diagnostics (cpuDiag runs only): bytes this client had queued in Node but not yet written when the error came.
+      // KNOWN INVALID (DD-201-PEND): reads 0 after failed write callbacks; kept unchanged for comparison with earlier
+      // records. Use io.writes (above) instead.
+      if (Array.isArray(live) && st.io.pendingAtError === undefined) st.io.pendingAtError = s.writableLength;
+    });
     s.on("close", () => { st.io.closeAt = Date.now(); st.closedAt = Date.now() - st.t0; stopped = true; clearTimeout(timer); resolve(st); });
     const end = setTimeout(() => { stopped = true; st.clientGaveUp = true; s.destroy(); }, maxMs);
     s.on("close", () => clearTimeout(end));
@@ -142,8 +172,19 @@ module.exports.startWatchdog = startWatchdog;
 module.exports.procSample = procSample;
 
 if (require.main === module) {
-  const { port, n, opts, cpuDiag, readySignal } = JSON.parse(process.argv[2]);
+  const { port, n, opts, cpuDiag, readySignal, stackSample } = JSON.parse(process.argv[2]);
+  // stackSample (#151 diagnostics, opt-in, macOS): main-thread stack sampling of this process, started and confirmed
+  // running BEFORE any request is sent (fixtures/stack-sampler.cjs); its summary goes into proc.stack. Absent: as before.
+  const stack = stackSample && cpuDiag ? require("./stack-sampler.cjs").startStackSampler({ pid: process.pid, ...stackSample }) : null;
+  const begin = () => {
   const live = cpuDiag ? [] : null;
+  // #151 diagnostics (cpuDiag only): GC pauses of this process (>= 5 ms, at most 60) and the event loop's delay.
+  const gcs = [], perf = cpuDiag ? require("node:perf_hooks") : null;
+  let gcObs = null, eld = null;
+  if (perf) {
+    try { gcObs = new perf.PerformanceObserver((list) => { for (const e of list.getEntries()) if (e.duration >= 5 && gcs.length < 60) gcs.push([Math.round(perf.performance.timeOrigin + e.startTime), Math.round(e.duration), (e.detail && e.detail.kind) || e.kind || 0]); }); gcObs.observe({ entryTypes: ["gc"] }); } catch (_) { gcObs = null; }
+    try { eld = perf.monitorEventLoopDelay({ resolution: 10 }); eld.enable(); } catch (_) { eld = null; }
+  }
   let proc = cpuDiag ? [] : null;
   // readySignal (test synchronization only): one line on stderr once the watchdog thread is running; stdout unchanged.
   const watchdog = cpuDiag ? startWatchdog(readySignal ? () => process.stderr.write("watchdog-ready\n") : null) : null;
@@ -156,6 +197,11 @@ if (require.main === module) {
     if (!cpuDiag) { process.stdout.write(JSON.stringify({ clients, ticks })); return; }
     sample();
     const wd = await watchdog.stop();
-    process.stdout.write(JSON.stringify({ clients, ticks, proc: { samples: proc, watchdog: wd } }));
+    const st = stack ? await stack.finish().catch(() => "summary failed") : undefined;
+    try { if (gcObs) gcObs.disconnect(); if (eld) eld.disable(); } catch (_) { /* diagnostics only */ }
+    const loop = eld ? { maxMs: Math.round(eld.max / 1e6), p99Ms: Math.round(eld.percentile(99) / 1e6) } : null;
+    process.stdout.write(JSON.stringify({ clients, ticks, proc: { samples: proc, watchdog: wd, gc: gcs, loop, ...(stack ? { stack: st } : {}) } }));
   });
+  };
+  if (stack) stack.ready.then(begin, begin); else begin();
 }
