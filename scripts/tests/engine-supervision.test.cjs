@@ -20,6 +20,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // A port a child process binds later: owned by this test process (#142; scripts/tests/fixtures/test-ports.cjs).
 const { reservePort: freePort } = require("./fixtures/test-ports.cjs");
+const engineId = require("./fixtures/engine-identity.cjs"); // #170 identity diagnostics only (messages)
 
 function get(port, urlPath) {
   return new Promise((resolve) => {
@@ -40,9 +41,10 @@ function pidAlive(pid) {
 }
 
 // Hard kill of exactly one process: no handlers run, children are not touched.
+// Returns what the kill reported (#170 diagnostics): taskkill's exit status on Windows, "sent" elsewhere.
 function hardKill(pid) {
-  if (IS_WIN) spawnSync(path.join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe"), ["/PID", String(pid), "/F"], { stdio: "ignore" });
-  else process.kill(pid, "SIGKILL");
+  if (IS_WIN) { const r = spawnSync(path.join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe"), ["/PID", String(pid), "/F"], { stdio: "ignore" }); return r.error ? String(r.error.code || "error") : r.status; }
+  process.kill(pid, "SIGKILL"); return "sent";
 }
 
 async function waitFor(check, ms, what) {
@@ -262,19 +264,32 @@ test("server: an engine crash after loading is detected and restarted with backo
     let st = await llmStatus(srv);
     assert.equal(st.engine.state, "ready");
     assert.equal(st.engine.supervised, true);
+    // #170 diagnostics (messages only): identity before the kill, what the kill reported, transitions until the
+    // restart is ready, and on a same-PID answer one reading (fixtures/engine-identity.cjs). The assertions are unchanged.
+    const studio = async () => ({ status: await llmStatus(srv), diagnostics: (await request(srv.port, "GET", "/api/diagnostics")).json });
     for (let n = 1; n <= 3; n++) {
       const pid = await enginePid(st.port);
-      hardKill(pid);
-      await waitFor(async () => (await llmStatus(srv)).engine.state === "restarting", 10000, `crash ${n} detected`);
-      const chat = await request(srv.port, "POST", "/api/llm/chat", { body: { messages: [{ role: "user", content: "hi" }] } });
-      assert.equal(chat.status, 409);
-      assert.match(chat.json.code, /^ENGINE_(RESTARTING|STARTING)$/);
-      st = await waitFor(async () => { const s = await llmStatus(srv); return s.ready && s.engine.state === "ready" ? s : null; }, 30000, `restart ${n}`);
-      assert.equal(st.engine.restartsInWindow, n);
-      assert.equal(st.engine.lastExit.unexpected, true);
-      assert.notEqual(await enginePid(st.port), pid, "a new engine process");
-      const ok = await request(srv.port, "POST", "/api/llm/chat", { body: { messages: [{ role: "user", content: "hi" }], stream: false } });
-      assert.notEqual(ok.status, 409, `chat works after restart ${n}`);
+      const idBefore = await engineId.snapshot({ label: `crash ${n}`, enginePort: st.port, studio });
+      const sampler = engineId.startSampler({ enginePort: st.port, status: () => llmStatus(srv), t0: idBefore.at });
+      let samples = null;
+      const kill = { pid, at: Date.now(), status: null, aliveAfter: null };
+      try {
+        kill.status = hardKill(pid); kill.aliveAfter = engineId.alive(pid);
+        await waitFor(async () => (await llmStatus(srv)).engine.state === "restarting", 10000, `crash ${n} detected`);
+        const chat = await request(srv.port, "POST", "/api/llm/chat", { body: { messages: [{ role: "user", content: "hi" }] } });
+        assert.equal(chat.status, 409);
+        assert.match(chat.json.code, /^ENGINE_(RESTARTING|STARTING)$/);
+        st = await waitFor(async () => { const s = await llmStatus(srv); return s.ready && s.engine.state === "ready" ? s : null; }, 30000, `restart ${n}`);
+        assert.equal(st.engine.restartsInWindow, n);
+        assert.equal(st.engine.lastExit.unexpected, true);
+        const nowPid = await enginePid(st.port);
+        samples = await sampler.stop();
+        let why = "";
+        if (nowPid === pid) { try { why = ` [#170 identity, crash ${n}: ${engineId.readEngineIdentity({ before: idBefore, after: await engineId.snapshot({ label: `restart ${n}`, enginePort: st.port, studio }), kill, samples }).line}]`; } catch (_) { why = " [#170 identity: description failed]"; } }
+        assert.notEqual(nowPid, pid, `a new engine process${why}`);
+        const ok = await request(srv.port, "POST", "/api/llm/chat", { body: { messages: [{ role: "user", content: "hi" }], stream: false } });
+        assert.notEqual(ok.status, 409, `chat works after restart ${n}`);
+      } finally { if (samples === null) await sampler.stop(); }
     }
     // A 4th crash within 10 minutes is not restarted: a clear, structured error instead.
     hardKill(await enginePid(st.port));

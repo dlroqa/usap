@@ -23,7 +23,9 @@
 // GET /metrics answers like llama-server's (Prometheus text, Process-Start-Time-Unix header): requests_processing
 // is the number of chat requests still open, plus POST /fake/busy {"ms": N} extra time after one closes ("engine
 // still computing after the abort"); POST /fake/metrics {"mode":"hang"|"missing"|"no-header"|"normal"} breaks it.
-// GET /fake/stats reports {requests, completed, aborted, pid, held, holdTimeouts} so tests can observe aborts;
+// GET /fake/stats reports {requests, completed, aborted, pid, held, holdTimeouts} so tests can observe aborts, and
+// (#170 identity diagnostics) instance (random per process start), startedAt (wall ms) and ppid, so a test can tell
+// "the same process still answering" from "a new process that got the same PID";
 // POST /fake/release ends every held request now (and is harmless when nothing is held);
 // GET /fake/last returns the last chat request body as received (prompt order and role checks).
 //
@@ -53,7 +55,8 @@ if (args.includes("--version")) { console.log("version: 0 (contract-test fake ll
 if (args.includes("--help") || args.includes("--list-devices")) { console.log("contract-test fake llama-server" + (process.env.FAKE_LLAMA_HELP_LOAD_MODE === "1" && args.includes("--help") ? "\n  --load-mode MODE" : "")); process.exit(0); }
 const model = path.basename(arg("--model", "fake.gguf"));
 const WORDS = ["Contract", " test", " reply."];
-const stats = { requests: 0, completed: 0, aborted: 0, pid: process.pid, held: 0, holdTimeouts: 0, open: 0, metricsRequests: 0 };
+const stats = { requests: 0, completed: 0, aborted: 0, pid: process.pid, held: 0, holdTimeouts: 0, open: 0, metricsRequests: 0,
+  instance: require("node:crypto").randomBytes(6).toString("hex"), startedAt: Date.now(), ppid: process.ppid };
 const START = String(Math.floor(Date.now() / 1000));
 let metricsMode = "normal";
 let busyTailMs = 0;
