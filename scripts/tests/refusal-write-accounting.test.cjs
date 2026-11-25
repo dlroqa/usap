@@ -3,7 +3,8 @@
 // were outstanding, because Node fails every write callback and empties its queue before it emits 'error'. io.writes
 // counts from the write callbacks instead. Real 127.0.0.1 sockets, the real rawRequest:
 //   (a) backpressure: a peer that never reads -> bytes not yet accepted by the kernel > 0, no error
-//   (b) peer destroy with unread data -> the X1 case: pendingAtError 0 while notAcceptedBytes > 0 at 'error'
+//   (b) 413 + FIN, the client keeps sending (ignoreFin, as json-413), RST 300 ms later -> the X1 case: pendingAtError 0
+//       while notAcceptedBytes > 0 at 'error'
 //   (c) RST while established (resetAndDestroy) -> an error is recorded with its code and syscall
 //   (d) clean small request -> every submitted byte accepted, no failed callback, atError null (absent, not 0)
 //   (d') small request completed, then a reset -> error with notAcceptedBytes 0 (a valid zero)
@@ -45,7 +46,9 @@ test("(b) peer destroy with unread data: at 'error' the old pendingAtError reads
     const srv = await server((c) => { c.write("HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"); c.end(); setTimeout(() => c.destroy(), 300); });
     const live = [];
     try {
-      const st = await rawRequest(srv.port, { capBytes: 64 * MiB, maxMs: 4000 }, live);
+      // ignoreFin: keep sending after the server's FIN, as json-413's clients do; without it the client ends on the FIN
+      // and (macOS, Windows) never writes into the RST (first CI attempt a494c9a: no error on those 3 runners)
+      const st = await rawRequest(srv.port, { capBytes: 64 * MiB, maxMs: 4000, ignoreFin: true }, live);
       const w = st.io.writes;
       lines.push(`${st.error}/${w.atError && w.atError.syscall} failCalls ${w.failCalls} notAccepted@error ${w.atError && w.atError.notAcceptedBytes} pendingAtError ${st.io.pendingAtError}`);
       assert.ok(st.error, `an error is recorded (${lines.at(-1)})`);
@@ -60,7 +63,9 @@ test("(b) peer destroy with unread data: at 'error' the old pendingAtError reads
     } finally { await srv.close(); }
   }
   t.diagnostic(`#151 write accounting (b) ${process.platform}: ${lines.join(" | ")}`);
-  assert.ok(seenX1 >= 1, `the X1 case (failed callbacks, pendingAtError 0, notAccepted > 0) occurred at least once in 5: ${lines.join(" | ")}`);
+  // Linux (X1) and macOS (N2 controls) fail write callbacks before 'error' in this shape; Windows is not established, so
+  // there the case is recorded above, not required (the invariants above still hold for every run)
+  if (process.platform !== "win32") assert.ok(seenX1 >= 1, `the X1 case (failed callbacks, pendingAtError 0, notAccepted > 0) occurred at least once in 5: ${lines.join(" | ")}`);
 });
 
 test("(c) RST while established: the error's code and syscall are recorded", async () => {
