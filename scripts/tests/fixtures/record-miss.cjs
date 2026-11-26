@@ -160,7 +160,7 @@ function sanitizeTail(text, { root = "", maxLines = 20, maxChars = 1024 } = {}) 
   t = t.replace(new RegExp(String.raw`file:\/\/\/?[^\s"')]*?` + LC, "gim"), "<path>$1") // file URLs
     .replace(new RegExp(String.raw`\\\\[^\s"'\\]+\\[^\s"']*?` + LC, "gm"), "<path>$1") // UNC \\host\share\...
     .replace(new RegExp(String.raw`[A-Za-z]:[\\/][^\s"']*?` + LC, "gm"), "<path>$1") // drive paths, either slash
-    .replace(new RegExp(String.raw`(^|[\s"'(=:])\/(?:[^\s"'/]+\/)+[^\s"']*?` + LC, "gm"), "$1<path>$2") // absolute POSIX paths, also after = or :
+    .replace(new RegExp(String.raw`(^|[\s"'(=:\[,;])\/(?:[^\s"'/]+\/)+[^\s"']*?` + LC, "gm"), "$1<path>$2") // absolute POSIX paths, also after = : [ , ;
     .replace(/<path>(?:[^\s"')]*?<path>)+/g, "<path>"); // a path whose pieces were replaced twice
   // drop lines carrying bodies: JSON ({"), util.inspect objects/arrays ({ key: / [{); E: their error code is kept
   const codeOf = (l) => (l.match(/\bcode:\s*'([A-Z][A-Z0-9_]{1,39})'/) || l.match(/"code"\s*:\s*"([A-Z][A-Z0-9_]{1,39})"/) || [])[1];

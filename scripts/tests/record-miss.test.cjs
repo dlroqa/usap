@@ -344,6 +344,8 @@ test("E: the tail keeps :line:col and error codes, leaks no path or body, reads 
   assert.match(t, /<path>:12:5\)/, t); assert.match(t, /<path>:345:17\)/); assert.match(t, /<path>:9\)/);
   assert.match(t, /\[obj code=ECONNRESET\]/); assert.match(t, /\[obj code=EPERM\]/);
   for (const bad of ["C:\\x", "/srv/app", "C:/a", "/a/secret", "user text", "id: 1", os.tmpdir()]) assert.ok(!t.includes(bad), `${bad} removed: ${t}`);
+  const edge = sanitizeTail(["list [/srv/app/a.cjs] end", "p=/srv/app/b.cjs;q", "x,/srv/app/c.cjs", "open /srv/app/secret/x.cjs, then"].join("\n")); // paths after [ , ; =
+  assert.ok(!/srv|secret/.test(edge), `no path after [ , ; =: ${edge}`);
   const big = "x".repeat(200 * 1024) + "\nlast line kept";
   assert.match(sanitizeTail(big), /last line kept$/);
   const srvSnap = { atMiss: { pid: 7, running: false, exit: { code: 1, signal: null, at: 2000, before: true }, tail: "Error A" }, afterLook: { pid: 7, running: false, exit: { code: 1, signal: null, at: 2000, before: true }, tail: "Error A | Error B" } };
