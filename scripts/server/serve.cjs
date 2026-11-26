@@ -1715,11 +1715,12 @@ async function getDiagnostics() {
       backend: speech.getSpeechBackend(),
       transcription: speech.getTranscriptionState(),
     },
-    hardware: getHardwareSpecs(),
+    // #197/#181: on macOS, how the GPU information was obtained (nested here, so the top-level shape is the same on
+    // every platform and /api/hardware-specs is unchanged)
+    hardware: osPlatform === "darwin" ? { ...getHardwareSpecs(), gpuDiscovery: gpuDiscoverySummary() } : getHardwareSpecs(),
     telemetry: getTelemetry(),
     engines: { llm: llmLifecycleSnapshot(), processes: supervisor.snapshot() }, // additive (Step 9.6)
     ...(staleFileReport.snapshot() ? { staleFiles: staleFileReport.snapshot() } : {}), // only when the report is on (R1)
-    ...(osPlatform === "darwin" ? { gpuDiscovery: gpuDiscoverySummary() } : {}), // #197/#181: macOS only, additive
   };
 }
 // #197/#181 (round 20): how the macOS GPU information was obtained, as enums only: state (pending, ready, fallback,

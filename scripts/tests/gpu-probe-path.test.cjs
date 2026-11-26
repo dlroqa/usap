@@ -29,15 +29,25 @@ test("request routes never run system_profiler synchronously; macOS runs it once
     assert.equal(sync, 0, "no synchronous (or shell) system_profiler in the studio");
     if (process.platform === "darwin") assert.equal(counts.execFile || 0, 1, "macOS: exactly one asynchronous probe for all routes");
     else assert.equal(lines.length, 0, "other platforms: system_profiler is never started");
-    // round 20: /api/diagnostics reports how the macOS GPU information was obtained (enums only); nothing elsewhere
+    // round 20: /api/diagnostics hardware.gpuDiscovery reports how the macOS GPU information was obtained (enums only)
     const diag = (await request(srv.port, "GET", "/api/diagnostics")).json;
-    t.diagnostic(`#197 gpu discovery (${process.platform}/${process.arch}): ${JSON.stringify(diag.gpuDiscovery === undefined ? "absent" : diag.gpuDiscovery)}; gpu ${JSON.stringify({ name: diag.hardware.gpu_name, vram_gb: diag.hardware.gpu_vram_gb })}`);
+    const gd = diag.hardware.gpuDiscovery;
+    t.diagnostic(`#197 gpu discovery (${process.platform}/${process.arch}): ${JSON.stringify(gd === undefined ? "absent" : gd)}; gpu ${JSON.stringify({ name: diag.hardware.gpu_name, vram_gb: diag.hardware.gpu_vram_gb })}`);
     if (process.platform === "darwin") {
-      assert.deepEqual(Object.keys(diag.gpuDiscovery).sort(), ["reason", "source", "state"]);
-      assert.ok(["ready", "fallback"].includes(diag.gpuDiscovery.state), `settled: ${diag.gpuDiscovery.state}`);
-      assert.ok(["measured", "inferred", "unavailable"].includes(diag.gpuDiscovery.source));
-      assert.ok([null, "timeout", "overflow", "spawn", "exit", "guard", "cancelled", "parse", "none-listed"].includes(diag.gpuDiscovery.reason));
-      if (diag.gpuDiscovery.source === "unavailable") assert.equal(diag.hardware.gpu_vram_gb, 0, "GPU memory not known is reported as 0, never RAM");
-    } else assert.equal(diag.gpuDiscovery, undefined, "other platforms: no gpuDiscovery key (byte-identical diagnostics)");
+      assert.deepEqual(Object.keys(gd).sort(), ["reason", "source", "state"]);
+      assert.ok(["ready", "fallback"].includes(gd.state), `settled: ${gd.state}`);
+      assert.ok(["measured", "inferred", "unavailable"].includes(gd.source));
+      assert.ok([null, "timeout", "overflow", "spawn", "exit", "guard", "cancelled", "parse", "none-listed"].includes(gd.reason));
+      if (gd.source === "unavailable") assert.equal(diag.hardware.gpu_vram_gb, 0, "GPU memory not known is reported as 0, never RAM");
+    } else assert.equal(gd, undefined, "other platforms: no gpuDiscovery (diagnostics unchanged)");
+    // the top-level shapes stay those of the recorded WebUI fixtures on every platform (the render job's live-backend
+    // check; round 20's first head added a macOS-only top-level key and failed it there)
+    const fixtures = path.join(__dirname, "..", "..", "tests", "e2e", "fixtures", "api");
+    for (const [route, file] of [["/api/diagnostics", "diagnostics.json"], ["/api/hardware-specs", "hardware-specs.json"], ["/api/telemetry", "telemetry.json"]]) {
+      const live = Object.keys((await request(srv.port, "GET", route)).json).sort();
+      const fixture = Object.keys(JSON.parse(fs.readFileSync(path.join(fixtures, file), "utf8"))).sort();
+      assert.deepEqual(live, fixture, `${route}: top-level keys match the fixture`);
+    }
+    assert.equal((await request(srv.port, "GET", "/api/hardware-specs")).json.gpuDiscovery, undefined, "/api/hardware-specs unchanged");
   } finally { await stopServerAndWait(srv); removeTestRoot(root); }
 });
