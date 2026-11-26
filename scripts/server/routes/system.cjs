@@ -17,9 +17,9 @@
  * @param {() => Promise<object>} deps.getHealth
  * @param {() => Promise<object>} deps.getDiagnostics
  * @param {() => object[]} deps.getCleanupCandidates
- * @param {() => object} deps.getHardwareSpecs
+ * @param {() => object | Promise<object>} deps.getHardwareSpecs (may wait for the cached GPU info, #197/#181)
  * @param {() => object} deps.getBackendOptions
- * @param {() => object} deps.getTelemetry
+ * @param {() => object | Promise<object>} deps.getTelemetry (may wait for the cached GPU info, #197/#181)
  */
 function systemRoutes(deps) {
   const required = ["json", "getHealth", "getDiagnostics", "getCleanupCandidates", "getHardwareSpecs", "getBackendOptions", "getTelemetry"];
@@ -31,9 +31,9 @@ function systemRoutes(deps) {
     r.get("/api/health", async (req, res) => json(res, 200, await deps.getHealth()));
     r.get("/api/diagnostics", async (req, res) => json(res, 200, await deps.getDiagnostics()));
     r.get("/api/cleanup-candidates", async (req, res) => json(res, 200, { candidates: deps.getCleanupCandidates() }));
-    r.get("/api/hardware-specs", async (req, res) => json(res, 200, deps.getHardwareSpecs()));
+    r.get("/api/hardware-specs", async (req, res) => json(res, 200, await deps.getHardwareSpecs())); // may be async (#197/#181)
     r.get("/api/backend-options", async (req, res) => json(res, 200, deps.getBackendOptions()));
-    r.get("/api/telemetry", async (req, res) => json(res, 200, deps.getTelemetry()));
+    r.get("/api/telemetry", async (req, res) => json(res, 200, await deps.getTelemetry())); // may be async (#197/#181)
   };
 }
 

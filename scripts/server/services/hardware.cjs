@@ -36,6 +36,10 @@ function createHardwareService(deps) {
   const { os, fs, path, execSync, spawnSync, exec, execFile, osPlatform, LLM_BACKEND_PATHS, getBackendProc, getOpenVinoPython, getCoreMLPythonPath } = deps;
   const setIntervalFn = (deps.timers && deps.timers.setInterval) || setInterval;
   const clearIntervalFn = (deps.timers && deps.timers.clearInterval) || clearInterval;
+  const setTimeoutFn = (deps.timers && deps.timers.setTimeout) || setTimeout;
+  const clearTimeoutFn = (deps.timers && deps.timers.clearTimeout) || clearTimeout;
+  // #197/#181: the macOS GPU probe (system_profiler) runs off the request paths, bounded (see primeGpuInfo below).
+  const GPU_PROBE_TIMEOUT_MS = Number.isFinite(deps.gpuProbeTimeoutMs) ? deps.gpuProbeTimeoutMs : 10000;
 
   let lastCpuSample = null;
   let cachedGpuInfo = null;
@@ -329,8 +333,100 @@ function createHardwareService(deps) {
     return cachedLlamaSyclGpu;
   }
 
+  // macOS: the GPU chosen from `system_profiler SPDisplaysDataType` output, or null when none is listed. Shared by the
+  // synchronous path and the bounded asynchronous probe, so both give the same answer for the same output.
+  function selectMacGpu(output) {
+    const lines = output.split("\n");
+    let currentGpu = null;
+    const gpus = [];
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("Chipset Model:")) {
+        if (currentGpu) {
+          gpus.push(currentGpu);
+        }
+        currentGpu = {
+          name: trimmed.substring("Chipset Model:".length).trim(),
+          vram_gb: 0,
+        };
+      } else if (currentGpu && (trimmed.startsWith("VRAM (Total):") || trimmed.startsWith("VRAM (Dynamic, Max):"))) {
+        const valStr = trimmed.split(":")[1].trim(); // e.g. "2 GB" or "1536 MB"
+        let bytesVal = 0;
+        const numMatch = valStr.match(/^([\d\.]+)\s*(GB|MB)/i);
+        if (numMatch) {
+          const val = parseFloat(numMatch[1]);
+          const unit = numMatch[2].toUpperCase();
+          if (unit === "GB") {
+            bytesVal = val;
+          } else if (unit === "MB") {
+            bytesVal = val / 1024;
+          }
+        }
+        currentGpu.vram_gb = Math.round(bytesVal * 100) / 100;
+      }
+    }
+    if (currentGpu) {
+      gpus.push(currentGpu);
+    }
+
+    if (gpus.length > 0) {
+      const isAppleSilicon = gpus.some(g => {
+        const name = g.name.toLowerCase();
+        return name.includes("apple") || name.includes("m1") || name.includes("m2") || name.includes("m3") || name.includes("m4");
+      }) || (os.arch() === "arm64");
+
+      if (isAppleSilicon) {
+        const totalRamGb = Math.round((os.totalmem() / (1024 ** 3)) * 100) / 100;
+        let selected = gpus.find(g => g.name.toLowerCase().includes("apple")) || gpus[0];
+        return {
+          name: selected.name,
+          vram_gb: totalRamGb
+        };
+      } else {
+        const discreteKeywords = ["nvidia", "amd", "radeon", "geforce"];
+        let selected = gpus.find(gpu => {
+          const name = gpu.name.toLowerCase();
+          return discreteKeywords.some(kw => name.includes(kw));
+        });
+        if (!selected) {
+          selected = gpus[0];
+        }
+        return {
+          name: selected.name,
+          vram_gb: selected.vram_gb
+        };
+      }
+    }
+    return null;
+  }
+  // macOS on Apple Silicon (unified memory): the CPU is arm64, or its model names Apple (x64 Node under Rosetta reports
+  // os.arch() "x64" but an "Apple M..." CPU). The same test getHardwareSpecs uses for the tier.
+  function isAppleSiliconHost() {
+    let model = "";
+    try { model = String((os.cpus()[0] || {}).model || ""); } catch (_) { model = ""; }
+    return os.arch() === "arm64" || model.toLowerCase().includes("apple");
+  }
+  // macOS: the value used when system_profiler fails, times out or lists no GPU (#197/#181 round 20). Every supported
+  // macOS has a Metal GPU, so the generic name stays. Its memory is only known on Apple Silicon, where it is the unified
+  // memory (total RAM, as the successful path reports). On an Intel Mac the machine's RAM is NOT the GPU's memory, so
+  // the GPU memory is 0, "not known" (the convention used for unknown GPUs elsewhere in this file).
+  function macFallbackGpu() {
+    if (isAppleSiliconHost()) return { name: "Apple Metal GPU", vram_gb: Math.round((os.totalmem() / (1024 ** 3)) * 100) / 100 };
+    return { name: "Apple Metal GPU", vram_gb: 0 };
+  }
+  // Where a macOS GPU value comes from: "inferred" (Apple Silicon unified memory), "measured" (an Intel Mac GPU with a
+  // VRAM line in system_profiler's output) or "unavailable" (GPU memory not known).
+  function macGpuSource(gpu) {
+    if (!gpu) return "unavailable";
+    if (isAppleSiliconHost()) return "inferred";
+    return gpu.vram_gb > 0 ? "measured" : "unavailable";
+  }
+
   function getGpuInfo() {
     if (cachedGpuInfo) return cachedGpuInfo;
+    // #197/#181: once the bounded probe has started (pending) or the service has stopped, macOS never probes
+    // synchronously; it answers with the truthful "not known yet" value, which is not cached (the probe's result is).
+    if (osPlatform === "darwin" && (gpuProbe.state === "pending" || gpuProbe.state === "stopped")) return macFallbackGpu();
 
     if (osPlatform === "win32" || osPlatform === "linux") {
       const llamaCudaGpu = detectLlamaCudaGpu();
@@ -401,73 +497,14 @@ function createHardwareService(deps) {
           encoding: "utf8",
           stdio: ["ignore", "pipe", "ignore"],
         });
-        const lines = output.split("\n");
-        let currentGpu = null;
-        const gpus = [];
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith("Chipset Model:")) {
-            if (currentGpu) {
-              gpus.push(currentGpu);
-            }
-            currentGpu = {
-              name: trimmed.substring("Chipset Model:".length).trim(),
-              vram_gb: 0,
-            };
-          } else if (currentGpu && (trimmed.startsWith("VRAM (Total):") || trimmed.startsWith("VRAM (Dynamic, Max):"))) {
-            const valStr = trimmed.split(":")[1].trim(); // e.g. "2 GB" or "1536 MB"
-            let bytesVal = 0;
-            const numMatch = valStr.match(/^([\d\.]+)\s*(GB|MB)/i);
-            if (numMatch) {
-              const val = parseFloat(numMatch[1]);
-              const unit = numMatch[2].toUpperCase();
-              if (unit === "GB") {
-                bytesVal = val;
-              } else if (unit === "MB") {
-                bytesVal = val / 1024;
-              }
-            }
-            currentGpu.vram_gb = Math.round(bytesVal * 100) / 100;
-          }
-        }
-        if (currentGpu) {
-          gpus.push(currentGpu);
-        }
-
-        if (gpus.length > 0) {
-          const isAppleSilicon = gpus.some(g => {
-            const name = g.name.toLowerCase();
-            return name.includes("apple") || name.includes("m1") || name.includes("m2") || name.includes("m3") || name.includes("m4");
-          }) || (os.arch() === "arm64");
-
-          if (isAppleSilicon) {
-            const totalRamGb = Math.round((os.totalmem() / (1024 ** 3)) * 100) / 100;
-            let selected = gpus.find(g => g.name.toLowerCase().includes("apple")) || gpus[0];
-            cachedGpuInfo = {
-              name: selected.name,
-              vram_gb: totalRamGb
-            };
-            return cachedGpuInfo;
-          } else {
-            const discreteKeywords = ["nvidia", "amd", "radeon", "geforce"];
-            let selected = gpus.find(gpu => {
-              const name = gpu.name.toLowerCase();
-              return discreteKeywords.some(kw => name.includes(kw));
-            });
-            if (!selected) {
-              selected = gpus[0];
-            }
-            cachedGpuInfo = {
-              name: selected.name,
-              vram_gb: selected.vram_gb
-            };
-            return cachedGpuInfo;
-          }
+        const gpu = selectMacGpu(output);
+        if (gpu) {
+          cachedGpuInfo = gpu;
+          return cachedGpuInfo;
         }
       } catch (_) {}
-      // Fallback if system_profiler command fails
-      const totalRamGb = Math.round((os.totalmem() / (1024 ** 3)) * 100) / 100;
-      cachedGpuInfo = { name: "Apple Metal GPU", vram_gb: totalRamGb };
+      // Fallback if system_profiler command fails (the same truthful value as the bounded probe's)
+      cachedGpuInfo = macFallbackGpu();
       return cachedGpuInfo;
     }
 
@@ -865,7 +902,9 @@ function createHardwareService(deps) {
         tierReason = `GPU with ${gpuVramGb} GB VRAM.`;
       } else {
         tier = "low";
-        tierReason = `GPU with ${gpuVramGb} GB VRAM and ${ramTotalGb} GB RAM.`;
+        tierReason = osPlatform === "darwin" && !gpuVramGb
+          ? `GPU memory not known; ${ramTotalGb} GB RAM.` // #197/#181: macOS GPU memory unknown, not 0 GB
+          : `GPU with ${gpuVramGb} GB VRAM and ${ramTotalGb} GB RAM.`;
       }
     }
 
@@ -1081,6 +1120,65 @@ function createHardwareService(deps) {
 
   // ── Polling timers (moved from module load in serve.cjs; same order and period) ──
   let timers = [];
+  // #197/#181: bounded asynchronous GPU discovery (macOS). The first /api/diagnostics, /api/hardware-specs,
+  // /api/telemetry, /api/resources, HF search, llmfit or LLM start used to run `system_profiler` synchronously (no
+  // timeout): on macOS Intel CI it blocked the event loop for 342-448 ms, during start-up work with a 500 ms budget.
+  // primeGpuInfo() runs the SAME command with execFile (no shell; timeout; SIGKILL; output limit 1 MiB), parses it with
+  // the SAME selectMacGpu(), and on ANY error (non-zero exit, signal, timeout, output limit, spawn failure, nothing
+  // parsed) uses the SAME fallback as the synchronous path: macFallbackGpu(), which reports the GPU memory as not known
+  // (0) on an Intel Mac and the unified memory on Apple Silicon. The result goes into the same cache, computed once per
+  // run and never invalidated, as before; there is no retry within a run (a restart probes again). Request paths await
+  // gpuReady() and then read the cache through the unchanged synchronous getters. While the probe is pending, and after
+  // stop(), a synchronous caller does NOT probe: it gets the uncached "not known" value. Other platforms are unchanged
+  // ("legacy"). States: idle | pending | ready | fallback | stopped | legacy, with probedAt and reason (timeout,
+  // overflow, spawn, exit, guard, cancelled, parse, none-listed); /api/diagnostics reports them on macOS only.
+  let gpuProbe = { state: "idle", probedAt: null, reason: null };
+  let gpuProbePromise = null, gpuProbeChild = null, gpuProbeGuard = null, gpuProbeResolve = null, gpuProbeCallerKilled = false;
+  // Round 20: why a probe gave the fallback, from Node's execFile error (measured on Node 22): output over the limit
+  // (code ERR_CHILD_PROCESS_STDIO_MAXBUFFER, checked first); killed by this service (stop); killed by the timeout
+  // (killed + SIGKILL; a kill by the caller looks the same, hence the flag); spawn failure (a string code such as
+  // ENOENT); otherwise the command exited unsuccessfully (a numeric code or another signal).
+  function classifyGpuProbeError(err) {
+    if (err && err.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return "overflow";
+    if (gpuProbeCallerKilled) return "cancelled";
+    if (err && err.killed === true && err.signal === "SIGKILL") return "timeout";
+    if (err && typeof err.code === "string") return "spawn";
+    return "exit";
+  }
+  function settleGpuProbe(value, state, reason) {
+    if (gpuProbe.state !== "pending") return;
+    if (gpuProbeGuard) { clearTimeoutFn(gpuProbeGuard); gpuProbeGuard = null; }
+    gpuProbeChild = null;
+    const syncFirst = Boolean(cachedGpuInfo);
+    if (state !== "stopped" && !cachedGpuInfo) cachedGpuInfo = value; // set BEFORE the waiters are released
+    gpuProbe = { state, probedAt: Date.now(), reason: syncFirst && state !== "stopped" ? "sync-first" : reason };
+    const resolve = gpuProbeResolve; gpuProbeResolve = null;
+    if (resolve) resolve();
+  }
+  function primeGpuInfo() {
+    if (gpuProbePromise) return gpuProbePromise;
+    if (osPlatform !== "darwin") { gpuProbe = { state: "legacy", probedAt: null, reason: null }; gpuProbePromise = Promise.resolve(); return gpuProbePromise; }
+    if (cachedGpuInfo) { gpuProbe = { state: "ready", probedAt: Date.now(), reason: "sync-first" }; gpuProbePromise = Promise.resolve(); return gpuProbePromise; }
+    gpuProbe = { state: "pending", probedAt: null, reason: null };
+    gpuProbePromise = new Promise((resolve) => { gpuProbeResolve = resolve; });
+    try {
+      gpuProbeChild = execFile("system_profiler", ["SPDisplaysDataType"], { encoding: "utf8", timeout: GPU_PROBE_TIMEOUT_MS, killSignal: "SIGKILL", windowsHide: true, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+        if (err) { settleGpuProbe(macFallbackGpu(), "fallback", classifyGpuProbeError(err)); return; }
+        let gpu = null, parseFailed = false;
+        try { gpu = selectMacGpu(String(stdout || "")); } catch (_) { gpu = null; parseFailed = true; }
+        if (gpu) settleGpuProbe(gpu, "ready", null); else settleGpuProbe(macFallbackGpu(), "fallback", parseFailed ? "parse" : "none-listed");
+      });
+    } catch (_) { settleGpuProbe(macFallbackGpu(), "fallback", "spawn"); return gpuProbePromise; }
+    // a child whose callback never arrives cannot keep a request waiting: settle with the fallback after the timeout
+    gpuProbeGuard = setTimeoutFn(() => { killGpuProbe(); settleGpuProbe(macFallbackGpu(), "fallback", "guard"); }, GPU_PROBE_TIMEOUT_MS + 1000);
+    if (gpuProbeGuard && typeof gpuProbeGuard.unref === "function") gpuProbeGuard.unref();
+    return gpuProbePromise;
+  }
+  function killGpuProbe() { const c = gpuProbeChild; if (c && typeof c.kill === "function") { gpuProbeCallerKilled = true; try { c.kill("SIGKILL"); } catch (_) { /* already gone */ } } }
+  // Resolves when the GPU info can be read without a synchronous probe: at once when it is cached (even if a
+  // synchronous caller filled it first), otherwise when the probe has settled; starts the probe if nothing has.
+  function gpuReady() { if (cachedGpuInfo) return Promise.resolve(); return primeGpuInfo(); }
+
   function start() {
     if (timers.length) return;
     timers.push(setIntervalFn(() => pollNvidiaVram(false), 5000));
@@ -1095,6 +1193,10 @@ function createHardwareService(deps) {
   function stop() {
     for (const t of timers) clearIntervalFn(t);
     timers = [];
+    // a probe still running is killed; its waiters are released without caching anything. After stop no probe starts:
+    // ready() returns the settled promise and getGpuInfo() answers "not known" without a synchronous probe (round 20).
+    if (gpuProbe.state === "pending") { killGpuProbe(); settleGpuProbe(null, "stopped", "cancelled"); }
+    else if (osPlatform === "darwin" && !cachedGpuInfo && gpuProbe.state === "idle") { gpuProbe = { state: "stopped", probedAt: Date.now(), reason: "cancelled" }; gpuProbePromise = Promise.resolve(); }
   }
 
   // ── Read-only memory budget (for model loading and the future resource scheduler, Step 9.9) ──
@@ -1142,6 +1244,10 @@ function createHardwareService(deps) {
   return {
     start,
     stop,
+    prime: primeGpuInfo, // #197/#181: start the bounded GPU probe (serve.cjs calls it once at start-up)
+    ready: gpuReady,
+    // #197/#181: { state, source, reason } (enums only). /api/diagnostics reports it on macOS as gpuDiscovery (round 20).
+    gpuProbeState: () => ({ ...gpuProbe, source: osPlatform === "darwin" ? macGpuSource(cachedGpuInfo || ((gpuProbe.state === "pending" || gpuProbe.state === "stopped") ? macFallbackGpu() : null)) : null }),
     activeTimers: () => timers.length,
     budget,
     // The functions serve.cjs used before the move, under their existing names.

@@ -429,6 +429,25 @@ function createLlmEngine(deps) {
     }
   }
 
+  // #197/#181 round 20: a text start that needs the GPU information (automatic context size) waits for the bounded GPU
+  // discovery BEFORE it stops the old engine or chooses a port, and a stop ends that wait at once. Resolves when
+  // gpuReady() settles (also when it rejects or throws: fail open, chooseAutoContext then reads the uncached "not
+  // known" value); rejects with ENGINE_START_CANCELLED when the attempt is no longer current (checked on registering
+  // and on every stop). No timer; the listener is removed on every outcome.
+  const gpuWaitListeners = new Set();
+  function waitForGpuUnlessStopped(attemptCurrent) {
+    const current = () => { try { return typeof attemptCurrent !== "function" || attemptCurrent() === true; } catch (_) { return false; } };
+    if (!current()) return Promise.reject(engineStartCancelledError());
+    let ready;
+    try { ready = Promise.resolve(deps.gpuReady()); } catch (_) { ready = Promise.resolve(); }
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const onStop = () => { if (done) return; if (current()) { gpuWaitListeners.add(onStop); return; } done = true; reject(engineStartCancelledError()); };
+      gpuWaitListeners.add(onStop);
+      ready.then(() => {}, () => {}).then(() => { if (done) return; done = true; gpuWaitListeners.delete(onStop); resolve(); });
+    });
+  }
+
   function cancelLlmRestart() {
     if (llmRestartTimer) { clearTimeout(llmRestartTimer); llmRestartTimer = null; }
   }
@@ -436,6 +455,9 @@ function createLlmEngine(deps) {
   // Stop requested by the user: end any start in progress right away instead of waiting for it.
   async function stopLlmNow() {
     llmStartToken += 1;
+    // #197/#181 round 20: AFTER the token changed, release every start waiting for GPU discovery (each one checks its
+    // own token, so a benchmark - which a stop never cancels - keeps waiting). Snapshot first: listeners re-register.
+    if (gpuWaitListeners.size) { const ls = [...gpuWaitListeners]; gpuWaitListeners.clear(); for (const l of ls) { try { l(); } catch (_) { /* listener */ } } }
     cancelLlmRestart();
     llmCrash = null;
     if (llmStarting && llmProc) {
@@ -818,6 +840,16 @@ function createLlmEngine(deps) {
       throw notInstalled("llama.cpp is not installed. Run the platform setup script to install the text backend.");
     }
 
+    // #197/#181 round 20: the bounded GPU discovery is awaited here, before the old engine is stopped and before a port
+    // is chosen (an automatic context size reads the GPU information); a stop ends the wait (ENGINE_START_CANCELLED).
+    const attemptCurrent = () => typeof admissionOpts.attemptCurrent !== "function" || admissionOpts.attemptCurrent() === true;
+    {
+      const lp = settings.__loadProfile || {};
+      const requestedContext = Number(lp.contextSize ?? settings.contextSize);
+      if ((!requestedContext || requestedContext <= 0) && typeof deps.gpuReady === "function") await waitForGpuUnlessStopped(admissionOpts.attemptCurrent);
+      if (!attemptCurrent()) throw engineStartCancelledError();
+    }
+
     assertNoOtherActiveRuntime("text", filename);
     // Step 9.9f-2 (only when memory admission is on): the engine processes that exist now must all be seen to exit
     // before a refusal can rest on the memory reading taken after these stops.
@@ -838,7 +870,10 @@ function createLlmEngine(deps) {
     // A refused attempt must leave no setting behind (llmSettings keeps mlock/mmap from earlier starts), so a
     // refused memory-mapping-off request can't turn the next ordinary load into another refusal.
     const settingsBeforeAttempt = ma ? llmSettings : null;
-    PORT_LLM = await findAvailableLlmPort();
+    const chosenPort = await findAvailableLlmPort();
+    // a stop during the stops, the slot wait or the port checks ends the start here, before any state changes (#197)
+    if (!attemptCurrent()) throw engineStartCancelledError();
+    PORT_LLM = chosenPort;
     llmError = null;
 
     const loadProfile = settings.__loadProfile || {};
@@ -1076,6 +1111,8 @@ function createLlmEngine(deps) {
       spawnEnv.ZES_ENABLE_SYSMAN = "1";
     }
 
+    // nothing awaits between the check after the port choice and here; checked again as a last defence (#197/#181)
+    if (!attemptCurrent()) throw engineStartCancelledError();
     console.log("  [llm] Starting:", backend.path, args.join(" "));
     const proc = supervisor.spawnSupervised(backend.path, args, { stdio: "pipe", env: spawnEnv }, { label: "llm" });
     const procSeq = ++llmProcSeq;
@@ -1266,6 +1303,7 @@ function createLlmEngine(deps) {
   }
 
   const state = Object.freeze({
+      get gpuWaitListeners() { return gpuWaitListeners.size; }, // #197/#181 round 20: starts waiting for GPU discovery (tests)
       get PORT_LLM() { return PORT_LLM; },
       get llmProc() { return llmProc; },
       get llmProcSeq() { return llmProcSeq; },

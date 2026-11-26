@@ -16,6 +16,7 @@ const GB = 1024 ** 3;
 function machine({
   platform, arch = "x64", cpuModel = "Test CPU", logical = 8, totalGb = 16, freeGb = 10,
   files = {}, exec: execMap = {}, spawn: spawnMap = {}, execFile: execFileMap = {}, backendPaths = {},
+  execFileErr = {}, execFileHold = [], extraDeps = {}, // #197/#181 async GPU probe controls (additive)
 }) {
   const calls = [];
   const cpu = (i) => ({ model: cpuModel, speed: 3000, times: { user: 100 + i, nice: 0, sys: 50, idle: 800, irq: 0 } });
@@ -48,25 +49,34 @@ function machine({
     const v = lookup(execMap, cmd);
     pending.push(() => (v === undefined ? cb(new Error(`not found: ${cmd}`), "", "") : cb(null, v, "")));
   };
+  const execFileOpts = [], killed = [], held = [];
   const execFile = (file, args, opts, cb) => {
     calls.push(["execFile", [file, ...args].join(" ")]);
+    execFileOpts.push({ file, opts });
     const v = execFileMap[file];
-    pending.push(() => (v === undefined ? cb(new Error("ENOENT"), "", "") : cb(null, v, "")));
+    const child = { kill: (sig) => { killed.push([file, sig]); } };
+    // on an error the recorded output (if any) is still delivered as stdout, so a probe that parses output despite the
+    // error would be caught
+    const deliver = () => (execFileErr[file] ? cb(execFileErr[file], v === undefined ? "" : v, "") : v === undefined ? cb(Object.assign(new Error("ENOENT"), { code: "ENOENT" }), "", "") : cb(null, v, ""));
+    if (execFileHold.includes(file)) held.push(deliver); else pending.push(deliver); // held: the callback never comes unless released
+    return child;
   };
-  const intervals = [];
+  const intervals = [], timeouts = [];
   const timers = {
     setInterval: (fn, ms) => { const t = { fn, ms, cleared: false }; intervals.push(t); return t; },
     clearInterval: (t) => { t.cleared = true; },
+    setTimeout: (fn, ms) => { const t = { fn, ms, cleared: false, unref() {} }; timeouts.push(t); return t; },
+    clearTimeout: (t) => { if (t) t.cleared = true; },
   };
   let backendProc = null;
   const hw = createHardwareService({
     os, fs, path, execSync, spawnSync, exec, execFile, osPlatform: platform, timers,
     LLM_BACKEND_PATHS: { winVulkan: "W:/vk/llama-server.exe", winSycl: "W:/sycl/llama-server.exe", winHip: "W:/hip/llama-server.exe", winCuda: "W:/cuda/llama-server.exe",
       linuxVulkan: "/s/vk/llama-server", linuxSycl: "/s/sycl/llama-server", linuxRocm: "/s/rocm/llama-server", linuxCuda: "/s/cuda/llama-server", ...backendPaths },
-    getBackendProc: () => backendProc, getOpenVinoPython: () => "", getCoreMLPythonPath: () => "",
+    getBackendProc: () => backendProc, getOpenVinoPython: () => "", getCoreMLPythonPath: () => "", ...extraDeps,
   });
   return {
-    hw, f: hw.fns, calls, intervals,
+    hw, f: hw.fns, calls, intervals, timeouts, execFileOpts, killed, held,
     flush: () => { while (pending.length) pending.shift()(); },
     setBackendProc: (p) => { backendProc = p; },
     tick: () => { cpus = cpus.map((c) => ({ ...c, times: { ...c.times, user: c.times.user + 50, idle: c.times.idle + 50 } })); },
@@ -363,5 +373,161 @@ test("real server: hardware routes keep their response shapes; diagnostics still
   } finally {
     stopServer(srv);
     try { fs.rmSync(root, { recursive: true, force: true }); } catch (_) { /* Windows may hold files briefly */ }
+  }
+});
+
+// ── #197/#181: bounded asynchronous GPU discovery (macOS) ─────────────────────────────────────────────────────────
+// The GPU probe used to run `system_profiler` synchronously inside the first request that needed it (no timeout).
+// primeGpuInfo() runs the same command with execFile, parses it with the same function and caches the same values.
+const settle = async (m) => { m.flush(); await m.hw.ready(); };
+const macSync = (arch, out) => machine({ platform: "darwin", arch, exec: { "system_profiler SPDisplaysDataType": out } });
+const macAsync = (arch, out, extra = {}) => machine({ platform: "darwin", arch, execFile: { system_profiler: out }, ...extra });
+const sysProfilerExecSyncs = (m) => m.calls.filter(([k, c]) => k === "execSync" && /system_profiler/.test(c)).length;
+
+test("#197 async GPU probe: identical results to the synchronous path for recorded macOS outputs, with no synchronous probe", async () => {
+  for (const [arch, out] of [["arm64", MAC_ARM_PROFILER], ["x64", MAC_INTEL_PROFILER]]) {
+    const a = macSync(arch, out), b = macAsync(arch, out);
+    b.hw.prime(); await settle(b);
+    assert.equal(b.hw.gpuProbeState().state, "ready", arch);
+    assert.deepEqual(b.f.getGpuInfo(), a.f.getGpuInfo(), `${arch}: same GPU`);
+    assert.equal(JSON.stringify(b.f.getHardwareSpecs()), JSON.stringify(a.f.getHardwareSpecs()), `${arch}: byte-identical hardware specs`);
+    assert.equal(b.hw.budget.totalVramBytes(), a.hw.budget.totalVramBytes(), `${arch}: same VRAM budget`);
+    assert.equal(sysProfilerExecSyncs(b), 0, `${arch}: no synchronous system_profiler`);
+  }
+});
+
+// Node 22's execFile error shapes, as measured (round 20): a timeout {code null, killed true, signal SIGKILL}; output
+// over maxBuffer {code ERR_CHILD_PROCESS_STDIO_MAXBUFFER} (killed undefined; also checked with killed set, so the
+// overflow test cannot depend on it); a missing command {code "ENOENT"} through the callback; a failed exit {code 1}.
+const NODE_ERR = {
+  timeout: () => Object.assign(new Error("timeout"), { code: null, killed: true, signal: "SIGKILL" }),
+  overflow: () => Object.assign(new RangeError("stdout maxBuffer length exceeded"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }),
+  overflowKilled: () => Object.assign(new RangeError("stdout maxBuffer length exceeded"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", killed: true, signal: "SIGKILL" }),
+  exit: () => Object.assign(new Error("exit 1"), { code: 1, killed: false, signal: null }),
+};
+const INTEL_CPU = "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz";
+
+test("#197 async GPU probe (round 20): an Intel Mac whose probe fails never reports its RAM as GPU memory - GPU memory 0 (not known), each failure classified", async () => {
+  for (const [label, extra, reason] of [
+    ["ENOENT", { execFile: {} }, "spawn"],
+    ["empty", { execFile: { system_profiler: "" } }, "none-listed"],
+    ["garbage", { execFile: { system_profiler: "no gpu here\n" } }, "none-listed"],
+    ["non-zero exit with output", { execFile: { system_profiler: MAC_INTEL_PROFILER }, execFileErr: { system_profiler: NODE_ERR.exit() } }, "exit"],
+    ["output limit", { execFile: { system_profiler: MAC_INTEL_PROFILER }, execFileErr: { system_profiler: NODE_ERR.overflow() } }, "overflow"],
+    ["output limit (killed set)", { execFile: { system_profiler: MAC_INTEL_PROFILER }, execFileErr: { system_profiler: NODE_ERR.overflowKilled() } }, "overflow"],
+    ["timeout", { execFile: { system_profiler: MAC_INTEL_PROFILER }, execFileErr: { system_profiler: NODE_ERR.timeout() } }, "timeout"]]) {
+    const m = machine({ platform: "darwin", arch: "x64", cpuModel: INTEL_CPU, totalGb: 32, ...extra });
+    m.hw.prime(); await settle(m);
+    assert.deepEqual(m.f.getGpuInfo(), { name: "Apple Metal GPU", vram_gb: 0 }, `${label}: GPU memory not known, never the 32 GB of RAM`);
+    assert.deepEqual(m.hw.gpuProbeState().state, "fallback", label);
+    assert.equal(m.hw.gpuProbeState().reason, reason, label);
+    assert.equal(m.hw.gpuProbeState().source, "unavailable", label);
+    assert.equal(m.hw.budget.totalVramBytes(), 0, `${label}: the VRAM budget is 0 (unknown), not RAM`);
+    const specs = m.f.getHardwareSpecs();
+    assert.equal(specs.gpu_vram_gb, 0, label);
+    assert.equal(specs.tier, "low", `${label}: the conservative tier`);
+    assert.ok(specs.recommended_models.length > 0 && specs.recommended_models.every((x) => /^GPU memory not known; 32 GB RAM\.$/.test(x.reason)), `${label}: the reason says unknown, not "0 GB VRAM"`);
+    assert.deepEqual([specs.recommended_text_settings.gpuLayers, specs.recommended_text_settings.contextSize], [0, 2048], `${label}: the low tier's settings (CPU layers, 2048 context)`);
+    assert.equal(sysProfilerExecSyncs(m), 0, label);
+  }
+  // the synchronous path (used only before prime) gives the same truthful value
+  assert.deepEqual(machine({ platform: "darwin", arch: "x64", cpuModel: INTEL_CPU, totalGb: 32 }).f.getGpuInfo(), { name: "Apple Metal GPU", vram_gb: 0 });
+});
+
+test("#197 async GPU probe (round 20): on Apple Silicon (arm64, or x64 Node under Rosetta) a failed probe keeps the unified memory, marked inferred", async () => {
+  for (const [label, arch, cpuModel] of [["arm64", "arm64", "Apple M2"], ["Rosetta", "x64", "Apple M2"], ["Rosetta VirtualApple", "x64", "VirtualApple @ 2.50GHz processor"]]) {
+    const m = machine({ platform: "darwin", arch, cpuModel, totalGb: 16, execFile: {}, });
+    m.hw.prime(); await settle(m);
+    assert.deepEqual(m.f.getGpuInfo(), { name: "Apple Metal GPU", vram_gb: 16 }, label);
+    assert.equal(m.hw.gpuProbeState().source, "inferred", label);
+    assert.deepEqual(machine({ platform: "darwin", arch, cpuModel, totalGb: 16 }).f.getGpuInfo(), { name: "Apple Metal GPU", vram_gb: 16 }, `${label}: sync path`);
+  }
+  // while pending, Apple Silicon's provenance is the unified memory it reports (inferred), an Intel Mac's is unavailable
+  const pa = machine({ platform: "darwin", arch: "arm64", cpuModel: "Apple M2", totalGb: 16, execFile: { system_profiler: MAC_ARM_PROFILER }, execFileHold: ["system_profiler"] });
+  pa.hw.prime(); assert.deepEqual([pa.hw.gpuProbeState().state, pa.hw.gpuProbeState().source], ["pending", "inferred"]); pa.hw.stop();
+  const pi = machine({ platform: "darwin", arch: "x64", cpuModel: INTEL_CPU, execFile: { system_profiler: MAC_INTEL_PROFILER }, execFileHold: ["system_profiler"] });
+  pi.hw.prime(); assert.deepEqual([pi.hw.gpuProbeState().state, pi.hw.gpuProbeState().source], ["pending", "unavailable"]); pi.hw.stop();
+  // a successful probe: Rosetta reports like arm64 (unchanged parsing), the Intel discrete GPU's VRAM is measured
+  const r = machine({ platform: "darwin", arch: "x64", cpuModel: "Apple M2", totalGb: 16, execFile: { system_profiler: MAC_ARM_PROFILER } });
+  r.hw.prime(); await settle(r);
+  assert.equal(r.f.getGpuInfo().vram_gb, 16); assert.equal(r.hw.gpuProbeState().source, "inferred");
+  const i = machine({ platform: "darwin", arch: "x64", cpuModel: INTEL_CPU, totalGb: 32, execFile: { system_profiler: MAC_INTEL_PROFILER } });
+  i.hw.prime(); await settle(i);
+  assert.ok(i.f.getGpuInfo().vram_gb > 0); assert.equal(i.hw.gpuProbeState().source, "measured"); assert.equal(i.hw.gpuProbeState().reason, null);
+});
+
+test("#197 async GPU probe: a timeout (killed) and a callback that never arrives (guard) both give the fallback and kill the child", async () => {
+  const t = macAsync("x64", MAC_INTEL_PROFILER, { execFileErr: { system_profiler: NODE_ERR.timeout() } });
+  t.hw.prime(); await settle(t);
+  assert.equal(t.hw.gpuProbeState().reason, "timeout"); assert.deepEqual(t.f.getGpuInfo(), { name: "Apple Metal GPU", vram_gb: 0 }, "no invented GPU memory");
+  const g = macAsync("x64", MAC_INTEL_PROFILER, { execFileHold: ["system_profiler"] });
+  const p = g.hw.prime();
+  assert.equal(g.hw.gpuProbeState().state, "pending");
+  const guard = g.timeouts.find((x) => !x.cleared); assert.ok(guard && guard.ms === 11000, "guard at timeout + 1 s");
+  guard.fn(); await p;
+  assert.equal(g.hw.gpuProbeState().reason, "guard"); assert.deepEqual(g.killed, [["system_profiler", "SIGKILL"]]);
+  assert.deepEqual(g.f.getGpuInfo(), { name: "Apple Metal GPU", vram_gb: 0 });
+  g.held.shift()(); assert.equal(g.f.getGpuInfo().name, "Apple Metal GPU", "a late real result after the guard changes nothing");
+});
+
+test("#197 async GPU probe: the exact execFile call - no shell, a timeout, SIGKILL, hidden window, 1 MiB output limit", () => {
+  const m = macAsync("x64", MAC_INTEL_PROFILER); m.hw.prime();
+  assert.equal(m.execFileOpts.length, 1);
+  const { file, opts } = m.execFileOpts[0];
+  assert.equal(file, "system_profiler");
+  assert.deepEqual({ timeout: opts.timeout, killSignal: opts.killSignal, windowsHide: opts.windowsHide, maxBuffer: opts.maxBuffer, encoding: opts.encoding, shell: opts.shell }, { timeout: 10000, killSignal: "SIGKILL", windowsHide: true, maxBuffer: 1024 * 1024, encoding: "utf8", shell: undefined });
+  assert.deepEqual(m.calls.filter(([k]) => k === "execFile").map(([, c]) => c), ["system_profiler SPDisplaysDataType"]);
+});
+
+test("#197 async GPU probe: stop() while pending kills the child and releases waiters without caching; after stop nothing probes again (round 20)", async () => {
+  const m = macAsync("x64", MAC_INTEL_PROFILER, { execFileHold: ["system_profiler"], exec: { "system_profiler SPDisplaysDataType": MAC_INTEL_PROFILER } });
+  const p = m.hw.prime();
+  m.hw.stop(); await p;
+  assert.deepEqual(m.killed, [["system_profiler", "SIGKILL"]]);
+  assert.deepEqual({ state: m.hw.gpuProbeState().state, reason: m.hw.gpuProbeState().reason }, { state: "stopped", reason: "cancelled" });
+  m.held.shift()(); // the killed child's late callback (Node reports a caller's kill exactly like a timeout)
+  assert.equal(m.hw.gpuProbeState().state, "stopped", "a late callback after stop changes nothing");
+  assert.equal(m.timeouts.every((x) => x.cleared), true, "the guard timer is cleared");
+  // after stop: getters answer "not known" without any probe, ready() resolves at once, prime() starts nothing
+  assert.deepEqual(m.f.getGpuInfo(), { name: "Apple Metal GPU", vram_gb: 0 });
+  m.f.getHardwareSpecs(); m.hw.budget.totalVramBytes(); await m.hw.ready(); await m.hw.prime();
+  assert.equal(sysProfilerExecSyncs(m), 0, "no synchronous probe after stop");
+  assert.equal(m.calls.filter(([k]) => k === "execFile").length, 1, "no new probe after stop");
+  // stopped before it ever started (idle): the same
+  const n = macSync("x64", MAC_INTEL_PROFILER); n.hw.stop();
+  assert.deepEqual(n.f.getGpuInfo(), { name: "Apple Metal GPU", vram_gb: 0 }); await n.hw.ready(); await n.hw.prime();
+  assert.equal(sysProfilerExecSyncs(n), 0); assert.equal(n.calls.filter(([k]) => k === "execFile").length, 0);
+});
+
+test("#197 async GPU probe: concurrent waiters share one probe; a synchronous caller while pending does NOT probe and gets the uncached 'not known' value (round 20)", async () => {
+  const m = macAsync("x64", MAC_INTEL_PROFILER, { cpuModel: INTEL_CPU, exec: { "system_profiler SPDisplaysDataType": MAC_ARM_PROFILER } }); // the sync path would see different output
+  const waits = [m.hw.ready(), m.hw.ready(), m.hw.prime(), m.hw.prime(), m.hw.ready()];
+  assert.equal(m.calls.filter(([k]) => k === "execFile").length, 1, "one probe");
+  assert.deepEqual(m.f.getGpuInfo(), { name: "Apple Metal GPU", vram_gb: 0 }, "while pending: not known (never invented)");
+  assert.equal(sysProfilerExecSyncs(m), 0, "no synchronous probe while the bounded probe is pending");
+  assert.equal(m.hw.gpuProbeState().state, "pending", "nothing cached by the synchronous caller");
+  m.flush(); await Promise.all(waits);
+  assert.deepEqual(m.f.getGpuInfo(), macSync("x64", MAC_INTEL_PROFILER).f.getGpuInfo(), "the probe's result is cached");
+  assert.deepEqual({ state: m.hw.gpuProbeState().state, reason: m.hw.gpuProbeState().reason, source: m.hw.gpuProbeState().source }, { state: "ready", reason: null, source: "measured" });
+  let quick = false; m.hw.ready().then(() => { quick = true; }); await Promise.resolve(); assert.equal(quick, true, "ready() resolves at once once cached");
+});
+
+test("#197 async GPU probe: ready() starts the probe lazily; the event loop keeps running while it is pending", async () => {
+  const m = macAsync("x64", MAC_INTEL_PROFILER);
+  let order = [];
+  const done = m.hw.ready().then(() => order.push("ready"));
+  assert.equal(m.hw.gpuProbeState().state, "pending", "lazily primed");
+  await new Promise((r) => setImmediate(r)); order.push("loop ran");
+  m.flush(); await done;
+  assert.deepEqual(order, ["loop ran", "ready"]);
+});
+
+test("#197 async GPU probe: other platforms are unchanged (no execFile probe; the existing synchronous path)", async () => {
+  for (const platform of ["linux", "win32"]) {
+    const m = machine({ platform });
+    await m.hw.prime();
+    assert.equal(m.hw.gpuProbeState().state, "legacy", platform);
+    assert.equal(m.hw.gpuProbeState().source, null, `${platform}: no macOS provenance`);
+    assert.equal(m.calls.filter(([k, c]) => k === "execFile" && /system_profiler/.test(c)).length, 0, platform);
   }
 });
