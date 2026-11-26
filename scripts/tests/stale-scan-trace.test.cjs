@@ -5,6 +5,12 @@
 //   negative  without the block, the scan delivers its first entry promptly and no gap >= 300 ms covers that window;
 //   fallback  with the report off (no scan), the trace is still published once, by its fallback timer, with no scan;
 //   inert     without USAP_TEST_SF_TRACE the preload prints nothing.
+// #214 verification (test-only): the trace also records asynchronous child processes, so a CI run can tell #214's
+// startup GPU discovery (execFile system_profiler, off the event loop) from a synchronous child on a request path:
+//   request-path sync   a synchronous child (600 ms) run inside the first /api/diagnostics request is recorded as a
+//                       sync call within that request, AND a gap >= 500 ms covers it (the pre-#214 shape is detected);
+//   async child         an asynchronous child started at listening is recorded (start, still running or its exit);
+//                       its timing against the scan is observed, not judged (other synchronous probes exist).
 "use strict";
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -71,5 +77,33 @@ test("fallback: with no scan the trace is still published once, with no scan ent
   await withStudio({ USAP_STALE_FILE_REPORT: "report" }, async (srv) => {
     assert.ok(await report(srv)); await sleep(600);
     assert.ok(!/\[sf-trace\]/.test(srv.log()), "nothing printed without USAP_TEST_SF_TRACE");
+  });
+});
+
+test("#214 check: a synchronous child on the first /api/diagnostics request is recorded in that request, with a covering gap", { timeout: 60000 }, async (t) => {
+  await withStudio({ USAP_STALE_FILE_REPORT: "report", USAP_TEST_SF_TRACE: "1", USAP_TEST_SF_TRACE_REQ_SYNC: "600" }, async (srv) => {
+    assert.ok(await report(srv), "report"); const tr = await trace(srv);
+    assert.ok(tr, "trace");
+    const rq = tr.req.find((r) => r.path === "/api/diagnostics");
+    const sc = tr.sync.find((x) => x.fn === "execFileSync" && /^node(\.exe)?$/i.test(x.cmd) && x.ms >= 550);
+    t.diagnostic(`request-path sync: request ${JSON.stringify(rq)}; sync ${JSON.stringify(tr.sync)}; scan ${JSON.stringify(tr.scan[0] || null)}; gaps ${JSON.stringify(tr.gaps)}`);
+    assert.ok(rq && sc, "the first /api/diagnostics request and its synchronous child are recorded");
+    assert.ok(sc.at >= rq.at && (rq.done === null || sc.at + sc.ms <= rq.done + 1), "the synchronous child ran inside that request");
+    assert.ok(covering(tr, sc.at, sc.at + sc.ms).some((g) => g.covers >= 500), "a gap covers >= 500 ms of the synchronous child");
+  });
+});
+
+test("#214 check: an asynchronous child started at listening is recorded; its overlap with the scan is observed", { timeout: 60000 }, async (t) => {
+  await withStudio({ USAP_STALE_FILE_REPORT: "report", USAP_TEST_SF_TRACE: "1", USAP_TEST_SF_TRACE_ASYNC_CHILD: "400" }, async (srv) => {
+    assert.ok(await report(srv), "report"); const tr = await trace(srv);
+    assert.ok(tr, "trace");
+    const ch = tr.child.find((x) => x.fn === "execFile" && /^node(\.exe)?$/i.test(x.cmd) && x.timeout === 5400);
+    const sc = tr.scan[0];
+    assert.ok(ch && sc, `the asynchronous child and the scan are recorded: ${JSON.stringify(tr.child)}`);
+    assert.ok(ch.at >= tr.listening, "started when listening");
+    assert.ok(!tr.sync.some((x) => x.fn === "execFileSync" && /^node(\.exe)?$/i.test(x.cmd)), "not recorded as a synchronous call");
+    const end = ch.exit === null ? tr.published : ch.exit;
+    const cov = covering(tr, Math.max(ch.at, sc.opendir), Math.min(end, sc.done)).filter((g) => g.covers >= 100);
+    t.diagnostic(`async child (${process.platform}): ${JSON.stringify(ch)}; scan ${JSON.stringify(sc)}; gaps covering child and scan ${JSON.stringify(cov)}; sync ${JSON.stringify(tr.sync)}`);
   });
 });

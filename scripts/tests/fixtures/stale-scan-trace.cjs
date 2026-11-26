@@ -6,6 +6,8 @@
 //   req / res            the first 20 requests (path only, no query) and when each finished
 //   sync                 synchronous child-process calls (execSync / execFileSync / spawnSync, outermost only):
 //                        command basename, start, duration, timeout set, outcome
+//   child                asynchronous child processes (execFile / exec / spawn, outermost only, first 12): command
+//                        basename, start, exit (null if still running at publish), timeout set, outcome (#214 check)
 //   opendir / first / done  the scan's directory: opendir called / resolved (or error code), the first entry
 //                        requested / delivered, the iterator done, entries delivered
 //   gaps                 event-loop gaps >= 50 ms (10 ms timer), and the loop-delay histogram's max
@@ -22,9 +24,10 @@ if (process.env.USAP_TEST_SF_TRACE === "1" && /[\\/]serve\.cjs$/.test(process.ar
   const fs = require("node:fs"), path = require("node:path"), cp = require("node:child_process"), http = require("node:http");
   const { performance, monitorEventLoopDelay } = require("node:perf_hooks");
   const now = () => Math.round(performance.now() * 10) / 10;
-  const rec = { listening: null, req: [], sync: [], scan: [], gaps: [], loopMax: null, published: null };
+  const rec = { listening: null, req: [], sync: [], child: [], scan: [], gaps: [], loopMax: null, published: null };
   const add = (list, o) => { if (list.length < 40) list.push(o); };
   let published = false, pubTimer = null;
+  const base = (cmd) => path.basename(String(cmd).trim().split(/\s+/)[0]).replace(/[^\w.-]/g, "").slice(0, 32);
   // sync child-process calls
   let depth = 0;
   for (const fn of ["execSync", "execFileSync", "spawnSync"]) {
@@ -35,17 +38,49 @@ if (process.env.USAP_TEST_SF_TRACE === "1" && /[\\/]serve\.cjs$/.test(process.ar
       const t0 = now(); depth += 1; let outcome = "ok";
       try { const r = orig.call(this, cmd, ...rest); if (r && r.error) outcome = String(r.error.code || "error").slice(0, 16); else if (r && r.signal) outcome = String(r.signal); return r; }
       catch (e) { outcome = String((e && (e.code || e.signal)) || "error").slice(0, 16); throw e; }
-      finally { depth -= 1; add(rec.sync, { fn, cmd: path.basename(String(cmd).trim().split(/\s+/)[0]).replace(/[^\w.-]/g, "").slice(0, 32), at: t0, ms: Math.round((now() - t0) * 10) / 10, timeout: opts.timeout || 0, outcome }); }
+      finally { depth -= 1; add(rec.sync, { fn, cmd: base(cmd), at: t0, ms: Math.round((now() - t0) * 10) / 10, timeout: opts.timeout || 0, outcome }); }
     };
   }
+  // #214 verification: asynchronous child processes (execFile / exec / spawn, outermost only): command basename, start,
+  // exit (null while still running at publish), timeout set, outcome. The original function runs with the same
+  // arguments and its child object is returned unchanged; the only addition is one 'exit' listener (no callback wrap).
+  let adepth = 0;
+  for (const fn of ["execFile", "exec", "spawn"]) {
+    const orig = cp[fn];
+    cp[fn] = function tracedAsync(cmd, ...rest) {
+      if (adepth > 0 || depth > 0 || published) return orig.call(this, cmd, ...rest);
+      const opts = rest.find((x) => x && typeof x === "object" && !Array.isArray(x)) || {};
+      adepth += 1; let child;
+      try { child = orig.call(this, cmd, ...rest); } finally { adepth -= 1; }
+      if (rec.child.length < 12) {
+        const o = { fn, cmd: base(cmd), at: now(), exit: null, timeout: opts.timeout || 0, outcome: null }; rec.child.push(o);
+        if (child && typeof child.once === "function") child.once("exit", (code, sig) => { o.exit = now(); o.outcome = sig ? String(sig) : code; });
+      }
+      return child;
+    };
+  }
+  // controls only (stale-scan-trace.test.cjs): USAP_TEST_SF_TRACE_REQ_SYNC=<ms> runs, inside the FIRST /api/diagnostics
+  // request's handling, a synchronous child (node sleeping <ms>) through child_process.execFileSync - the pre-#214
+  // request-path shape (execSync system_profiler on the first /api/diagnostics); USAP_TEST_SF_TRACE_ASYNC_CHILD=<ms>
+  // starts, when the server starts listening, an asynchronous child (node sleeping <ms>) through child_process.execFile
+  // - the #214 shape. Both go through the traced functions, so they prove the recorders and the gap sampler see them.
+  const reqSync = Number(process.env.USAP_TEST_SF_TRACE_REQ_SYNC || 0), asyncChild = Number(process.env.USAP_TEST_SF_TRACE_ASYNC_CHILD || 0);
+  const sleeper = (ms) => ["-e", `setTimeout(() => {}, ${Math.round(ms)})`];
+  let reqSyncDone = false;
   // listening + the first 20 requests (path only)
   const emit = http.Server.prototype.emit;
   http.Server.prototype.emit = function tracedEmit(ev, ...args) {
     if (!published) {
-      if (ev === "listening" && rec.listening === null) rec.listening = now();
+      if (ev === "listening" && rec.listening === null) {
+        rec.listening = now();
+        if (asyncChild > 0) cp.execFile(process.execPath, sleeper(asyncChild), { timeout: asyncChild + 5000, windowsHide: true }, () => {}); // control only
+      }
       if (ev === "request" && rec.req.length < 20) {
         const [req, res] = args; const o = { path: String(req.url || "").split("?")[0].slice(0, 40), at: now(), done: null }; rec.req.push(o);
         res.once("finish", () => { o.done = now(); });
+        if (reqSync > 0 && !reqSyncDone && o.path === "/api/diagnostics") { // control only
+          reqSyncDone = true; try { cp.execFileSync(process.execPath, sleeper(reqSync), { timeout: reqSync + 5000, stdio: "ignore", windowsHide: true }); } catch (_) { /* control */ }
+        }
       }
     }
     return emit.call(this, ev, ...args);
