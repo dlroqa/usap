@@ -18,6 +18,7 @@ const { GRACE_MS } = require("../server/http/refusal-close.cjs");
 const { execFile } = require("node:child_process");
 const { judgeRefusedClient } = require("./fixtures/refusal-judge.cjs");
 const { describeLostClient } = require("./fixtures/stall-diag.cjs");
+const { describeStallCorrelates } = require("./fixtures/stall-correlate.cjs"); // #151 diagnostics only
 const { spawn } = require("node:child_process");
 const GRACE_TOLERANCE_MS = 100; // as fixtures/refusal-judge.cjs: the grace timer starts just before 'finish' is observed
 
@@ -83,7 +84,7 @@ async function withServer(fn, extra = {}) {
   const records = () => { try { return fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch (_) { return []; } };
   // the server's record for a client connection (written when the server's socket closes)
   const recordFor = async (st) => { const until = Date.now() + GRACE_MS + SLACK_MS; for (;;) { const r = records().find((x) => x.remotePort === st.localPort); if (r || Date.now() > until) return r; await sleep(50); } };
-  try { return await fn({ port: srv.port, recordFor, records }); }
+  try { return await fn({ port: srv.port, recordFor, records, serverPid: srv.proc.pid }); } // serverPid: #151 diagnostics only
   finally { await stopServerAndWait(srv); removeTestRoot(root); }
 }
 
@@ -131,11 +132,30 @@ test("a declared body over the 64 MiB limit is refused with today's 413 before i
 // period, and the closing reset discarded an answer it never read). The server is judged from its own records; the
 // client must have read the answer unless fixtures/refusal-judge.cjs shows it did not run (documented reset tradeoff).
 const ANSWER_BODY = /"error":"Request body is too large\. Limit is 64 MB\.","code":"BODY_TOO_LARGE"/;
-function concurrentClients(port, n, opts, cpuDiag = false) {
+// stackSample (#151 diagnostics, opt-in): passed only by the concurrent test on macOS (see fixtures/stack-sampler.cjs).
+// onSpawn (#151 diagnostics, optional): called with the client process's pid once it is spawned.
+function concurrentClients(port, n, opts, cpuDiag = false, stackSample = null, onSpawn = null) {
   return new Promise((resolve, reject) => {
-    execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify(cpuDiag ? { port, n, opts, cpuDiag } : { port, n, opts })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
-      (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
+    const child = execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify(cpuDiag ? { port, n, opts, cpuDiag, ...(stackSample ? { stackSample } : {}) } : { port, n, opts })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
+      (err, stdout) => { if (err) return reject(err); try { resolve(JSON.parse(stdout)); } catch (e) { reject(e); } }); // round 17: unparsable output rejects (was an uncaught throw)
+    if (onSpawn && child && child.pid) { try { onSpawn(child.pid); } catch (_) { /* diagnostics only */ } }
   });
+}
+// #151 diagnostics (opt-in, macOS and Linux): the independent main-thread state observer (fixtures/thread-observer.cjs)
+// for the given pids, every 200 ms. stop() -> its JSON or null; never throws.
+function startThreadObserver(pids) {
+  if (!["darwin", "linux"].includes(process.platform)) return { stop: async () => null };
+  let child = null, out = "";
+  try { child = spawn(process.execPath, [path.join(__dirname, "fixtures", "thread-observer.cjs"), "200", ...pids.map(String)], { stdio: ["pipe", "pipe", "ignore"] }); } catch (_) { return { stop: async () => null }; }
+  child.on("error", () => {}); child.stdin.on("error", () => {});
+  child.stdout.on("data", (d) => { if (out.length < 1 << 20) out += d; });
+  const exited = new Promise((r) => child.once("exit", r));
+  let stopped = null; // stop() is idempotent (round 17: the test's finally also calls it)
+  return { pid: child.pid, stop: () => stopped || (stopped = (async () => {
+    try { child.stdin.end(); } catch (_) {}
+    if (await Promise.race([exited.then(() => "exit"), sleep(5000).then(() => "timeout")]) === "timeout") { try { child.kill("SIGKILL"); } catch (_) {} return null; }
+    try { return JSON.parse(out); } catch (_) { return null; }
+  })()) };
 }
 // Server side of one connection, from the connection-log preload: the 413 with its body, promptly, the whole grace
 // period (unless the client closed first), reads within the bound. Returns the judge's view of the connection.
@@ -147,13 +167,15 @@ function startSampler() {
   child.on("error", () => {}); child.stdin.on("error", () => {});
   child.stdout.on("data", (d) => { if (out.length < 65536) out += d; });
   const exited = new Promise((r) => child.once("exit", r));
+  let stopped = null; // stop() is idempotent (round 17: the test's finally also calls it)
   return {
-    stop: async () => {
+    pid: child.pid,
+    stop: () => stopped || (stopped = (async () => {
       try { child.stdin.end(); } catch (_) {}
       const t = await Promise.race([exited.then(() => "exit"), sleep(5000).then(() => "timeout")]);
-      if (t === "timeout") { try { child.kill(); } catch (_) {} return null; }
+      if (t === "timeout") { try { child.kill("SIGKILL"); } catch (_) {} return null; }
       try { return JSON.parse(out); } catch (_) { return null; }
-    },
+    })()),
   };
 }
 function assertServerRefusal(rec, st, label) {
@@ -169,16 +191,31 @@ function assertServerRefusal(rec, st, label) {
 }
 
 test("concurrent over-limit declarations are each refused early; the server's total read stays bounded", async (t) => {
-  await withServer(async ({ port, records }) => {
+  await withServer(async ({ port, records, serverPid }) => {
+    let observer = null, clientPid = null; // #151 diagnostics only
     const sampler = startSampler(); // #151 diagnostics only
+    // round 17 (S151-J413-HANG-201): the observers are stopped on EVERY path. When the client process is killed at its
+    // exec timeout, concurrentClients rejects and the stops below were skipped; both observer children kept their stdin
+    // pipes open and the file ran into its 600 s timeout. The stops are idempotent; verdicts are unchanged.
+    try {
     // cpuDiag (#151 diagnostics only): the client process also records its CPU time, context switches and bytes sent
     // at each tick, and runs a watchdog thread; `proc` is used only in the description below
-    const { clients, ticks, proc } = await concurrentClients(port, 10, { url: URL, mode: "stream", contentLength: 100 * MiB, ignoreFin: true, capBytes: 96 * MiB, maxMs: GRACE_MS + 10000 }, true);
+    const { clients, ticks, proc } = await concurrentClients(port, 10, { url: URL, mode: "stream", contentLength: 100 * MiB, ignoreFin: true, capBytes: 96 * MiB, maxMs: GRACE_MS + 10000 }, true,
+      process.platform === "darwin" ? { seconds: 10, intervalMs: 10 } : null, // #151: main-thread stacks while the clients run (macOS)
+      (pid) => { clientPid = pid; observer = startThreadObserver([pid, serverPid]); }); // #151: independent state observer
     const until = Date.now() + GRACE_MS + SLACK_MS;
     while (records().length < clients.length && Date.now() < until) await sleep(50);
     const recs = records();
     // #151 diagnostics, printed before (and independent of) the assertions below: every client whose answer was lost.
     const samples = await sampler.stop();
+    if (proc && proc.stack !== undefined) t.diagnostic(`#151 client main-thread stacks: ${String(proc.stack).slice(0, 900)}`);
+    const observed = observer ? await observer.stop() : null;
+    for (const [i, st] of clients.entries()) {
+      if (st.status !== null) continue;
+      let d; try { d = describeStallCorrelates({ st, rec: recs.find((x) => x.remotePort === st.localPort), ticks, proc, observer: observed, clientPid, serverPid }); } catch (_) { d = "description failed"; }
+      t.diagnostic(`#151 stall correlates, client ${i}: ${d}`);
+    }
+    if (proc) t.diagnostic(`#151 client process: GC pauses >= 5 ms ${(proc.gc || []).length} (max ${Math.max(0, ...(proc.gc || []).map((g) => g[1]))} ms); loop delay ${proc.loop ? `max ${proc.loop.maxMs} ms p99 ${proc.loop.p99Ms} ms` : "not recorded"}; observer ${observed ? `${observed.platform} samples client ${(observed.procs[clientPid] || {}).samples || 0} studio ${(observed.procs[serverPid] || {}).samples || 0}` : "not run"}`);
     for (const [i, st] of clients.entries()) {
       if (st.status !== null) continue;
       let d; try { d = describeLostClient(st, recs.find((x) => x.remotePort === st.localPort), ticks, samples, proc || null, i); } catch (_) { d = "description failed"; }
@@ -198,7 +235,24 @@ test("concurrent over-limit declarations are each refused early; the server's to
     if (excused.length) t.diagnostic(`${excused.length}/${clients.length} clients excused (documented reset tradeoff): ${excused.join(" | ")}`);
     assert.ok(stalled < clients.length, `at least one client read its answer (a run where none did proves nothing about delivery); excused: ${excused.join(" | ")}`);
     assert.ok(total <= 10 * EARLY_READ_BOUND, `total read ${total}`);
+    } finally { await sampler.stop(); if (observer) await observer.stop(); } // round 17: every path (see above)
   }, { USAP_TEST_CONN_LOG_LOOP: "1" }); // #151 diagnostics: the server's loop summary in each record
+});
+
+// round 17 (S151-J413-HANG-201) control: both observers end their children when stopped, also when the client run
+// fails, and stop() is idempotent (the concurrent test's finally calls it again). The concurrent test itself keeps its
+// verdicts; this only checks the cleanup it now relies on.
+test("observer cleanup: the sampler and the thread observer end their child processes when stopped, also after a failed client run; stop() is idempotent", { timeout: 30000 }, async () => {
+  const sampler = startSampler(); const observer = startThreadObserver([process.pid]);
+  const alive = (pid) => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+  try { assert.ok(alive(sampler.pid), "the sampler child runs"); await assert.rejects(Promise.reject(new Error("client run failed (injected)"))); }
+  finally {
+    const a = sampler.stop(), b = sampler.stop(); assert.equal(a, b, "sampler stop() is idempotent (same promise)");
+    await a; await observer.stop(); await observer.stop();
+  }
+  await sleep(200);
+  assert.equal(alive(sampler.pid), false, "the sampler child is gone");
+  if (observer.pid) assert.equal(alive(observer.pid), false, "the thread observer child is gone");
 });
 
 test("judge rules for this test: an answer is required unless the client provably did not run while the server held the connection", () => {
