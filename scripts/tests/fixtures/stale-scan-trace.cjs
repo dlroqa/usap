@@ -58,6 +58,8 @@ if (process.env.USAP_TEST_SF_TRACE === "1" && /[\\/]serve\.cjs$/.test(process.ar
       }
       return child;
     };
+    const custom = require("node:util").promisify.custom; // keep promisify(execFile / exec) unchanged (not recorded)
+    if (orig[custom]) cp[fn][custom] = orig[custom];
   }
   // controls only (stale-scan-trace.test.cjs): USAP_TEST_SF_TRACE_REQ_SYNC=<ms> runs, inside the FIRST /api/diagnostics
   // request's handling, a synchronous child (node sleeping <ms>) through child_process.execFileSync - the pre-#214
