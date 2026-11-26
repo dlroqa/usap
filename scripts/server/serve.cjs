@@ -287,7 +287,8 @@ const {
 // services/llm-engine.cjs (Step 9.8h). Functions bound later in this file are passed as wrappers,
 // resolved when called.
 const llmEngine = createLlmEngine({
-  ApiError, LLM_BACKEND_PATHS, LLM_BENCHMARK_PATH, LLM_MODELS, LLM_MODEL_SETTINGS_PATH, PREFERRED_LLM_PORT, assertNoOtherActiveRuntime, badRequest, checkPort, decideRestart, fs, getGpuInfo: (...args) => getGpuInfo(...args), getStableSyclGpuLayers, http, isVisionModelFilename, killBackend, killOpenVinoWorker, notFound, notInstalled, os, osPlatform, path, pathInside, readJsonFile, readdirVisible: (...args) => readdirVisible(...args), requestJson, spawnSync, supervisor, waitForChildExit, waitForPortAvailable, writeJsonFile,
+  ApiError, LLM_BACKEND_PATHS, LLM_BENCHMARK_PATH, LLM_MODELS, LLM_MODEL_SETTINGS_PATH, PREFERRED_LLM_PORT, assertNoOtherActiveRuntime, badRequest, checkPort, decideRestart, fs, gpuReady: () => hardware.ready(), // optional (#197/#181)
+  getGpuInfo: (...args) => getGpuInfo(...args), getStableSyclGpuLayers, http, isVisionModelFilename, killBackend, killOpenVinoWorker, notFound, notInstalled, os, osPlatform, path, pathInside, readJsonFile, readdirVisible: (...args) => readdirVisible(...args), requestJson, spawnSync, supervisor, waitForChildExit, waitForPortAvailable, writeJsonFile,
   memoryAdvisor, // optional (Step 9.9d)
   engineSlot, // optional (issue #105)
   // Optional (Step 9.9f-2), only when memory admission is not off. Read at each text load decision.
@@ -462,6 +463,8 @@ function getStableSyclGpuLayers(modelFilename, requestedLayers) {
 // Start background VRAM polling (runs every 5 seconds, only active when backend is idle)
 // Start the hardware polling timers at the same point of start-up as before (Step 9.8e).
 hardware.start();
+// #197/#181: start the bounded GPU probe now (macOS; other platforms unchanged), so no request runs it synchronously.
+hardware.prime();
 
 
 function readJsonFile(filePath, fallback) {
@@ -1373,6 +1376,8 @@ async function addHuggingFaceFileSize(model) {
 }
 
 async function searchHuggingFaceModels(query, filters) {
+  // #197/#181: also covers getTextModelFit() below (its default reads getHardwareSpecs()); keep this await first
+  await hardware.ready();
   const specs = getHardwareSpecs();
   const tier = specs.gpu_vram_gb >= 10 || specs.ram_total_gb >= 32
     ? "high"
@@ -1688,6 +1693,7 @@ try {
 
 // One troubleshooting snapshot (GET /api/diagnostics). No secrets.
 async function getDiagnostics() {
+  await hardware.ready(); // #197/#181: the GPU info is read from the cache, never probed synchronously here
   return {
     generatedAt: new Date().toISOString(),
     connections: connectionStats.snapshot({ refusals: refusalStats() }),
@@ -1749,7 +1755,10 @@ const webSearch = createWebSearchService({
 
 const router = createRouter();
 // Status responses carry shortened paths for every client (issue #52); internal callers keep absolute ones.
-router.use(systemRoutes({ json, getHealth: async () => publicPaths(await getHealth()), getDiagnostics: async () => publicPaths(await getDiagnostics()), getCleanupCandidates, getHardwareSpecs, getBackendOptions: () => publicPaths(getBackendOptions()), getTelemetry }));
+router.use(systemRoutes({ json, getHealth: async () => publicPaths(await getHealth()), getDiagnostics: async () => publicPaths(await getDiagnostics()), getCleanupCandidates,
+  getHardwareSpecs: async () => { await hardware.ready(); return getHardwareSpecs(); }, // #197/#181: cached GPU info, no synchronous probe
+  getBackendOptions: () => publicPaths(getBackendOptions()),
+  getTelemetry: async () => { await hardware.ready(); return getTelemetry(); } }));
 // Step 9.9f-3: bounded voice job queue (services/job-queue.cjs). Off by default (USAP_VOICE_QUEUE=on or scheduler.json
 // "voiceQueue": "on"; USAP_SCHEDULER=off forces it off). Off: not created, and /api/tts/speak and /api/tts/stop are the
 // handlers from before. 1 running + 4 waiting; the longest wait is USAP_VOICE_QUEUE_MAX_WAIT_MS / "voiceQueueMaxWaitMs".
@@ -1865,7 +1874,7 @@ if (CHAT_QUEUE.mode === "on") console.log(`  [scheduler] Chat queue on: ${CHAT_Q
 const chatService = createChatService({ chatTimeouts, promptProtections: () => protectionSettings({ configDir: LLM_CONFIG_DIR }), chatQueue: CHAT_QUEUE.mode === "on" ? createChatQueue({ limit: CHAT_QUEUE.limit, maxWaitMs: CHAT_QUEUE.maxWaitMs }) : null, state: llmEngine.state, errorBody, errorStatus, http, json, redactPaths: errors.redactPaths, requestJson, runExclusiveLlmOperation, startLlm, webSearch });
 const conversations = createConversationStore({ CHAT_HISTORY, badRequest, formatBytes, fs, path, pathInside, readdirVisible, safeOutputName });
 router.use(llmRoutes({
-  state: llmEngine.routeState, PREFERRED_LLM_PORT, benchmarkLlmModel, deleteChatConversation: conversations.deleteChatConversation, doLlmChat: chatService.doLlmChat, errorBody, errorStatus, getLlmBackend, getLlmBackendProbe, getLlmRuntimeStats, getLlmfitRecommendations: (...args) => createLlmfitLookup({ ROOT, fs, getGpuInfo, os, osPlatform, path, spawnSync }).getLlmfitRecommendations(...args), getPersistedLlmModelSettings, json, jsonErrorStatus, killLlm, listChatConversations: conversations.listChatConversations, llmEngineState, llmLifecycleSnapshot, path, publicPaths, readJsonBody, runExclusiveLlmOperation, saveChatConversation: conversations.saveChatConversation, startLlm, stopLlmNow, updateLlmModelSettings,
+  state: llmEngine.routeState, PREFERRED_LLM_PORT, benchmarkLlmModel, deleteChatConversation: conversations.deleteChatConversation, doLlmChat: chatService.doLlmChat, errorBody, errorStatus, getLlmBackend, getLlmBackendProbe, getLlmRuntimeStats, getLlmfitRecommendations: async (...args) => { await hardware.ready(); return createLlmfitLookup({ ROOT, fs, getGpuInfo, os, osPlatform, path, spawnSync }).getLlmfitRecommendations(...args); }, /* #197/#181: cached GPU info */ getPersistedLlmModelSettings, json, jsonErrorStatus, killLlm, listChatConversations: conversations.listChatConversations, llmEngineState, llmLifecycleSnapshot, path, publicPaths, readJsonBody, runExclusiveLlmOperation, saveChatConversation: conversations.saveChatConversation, startLlm, stopLlmNow, updateLlmModelSettings,
   memoryCheck: memoryAdvisor ? () => memoryAdvisor.last("text") : null, // optional (Step 9.9d)
   engineSlot, // optional (issue #105): /api/llm/stop reports an engine that did not exit
 }));
@@ -1904,7 +1913,7 @@ if (SCHEDULER_MODE !== "off") {
       heavyModel: () => { const r = getActiveHeavyRuntime(); return r ? { type: r.type } : null; },
     },
   });
-  router.use(resourceRoutes({ scheduler, json }));
+  router.use(resourceRoutes({ scheduler, json, ready: () => hardware.ready() })); // #197/#181: GPU memory from the cache
 }
 
 // Routes not yet moved into modules, then static files. Only reached through the pipeline.
@@ -1994,6 +2003,8 @@ server.listen(PORT_FRONTEND, LISTEN_HOST, () => {
 // Last line of defence for exits that skip the handlers below (uncaught errors, process.exit):
 // ask every engine to stop now. Hard kills of this server are covered by the engine guards.
 process.on("exit", () => supervisor.stopAllSync());
+// #197/#181: a GPU probe still running is killed with the server (SIGINT/SIGTERM end in process.exit and reach this).
+process.on("exit", () => hardware.stop());
 
 // Graceful shutdown
 process.on("SIGINT",  async () => { if (imageQueue) imageQueue.refuseWaiting("shutdown"); await killBackend(); await killOpenVinoWorker(); await killLlm(); await speech.stopSpeech(); await tts.stopTts(); process.exit(0); });

@@ -845,6 +845,7 @@ function createLlmEngine(deps) {
     let contextSize = Number(loadProfile.contextSize ?? settings.contextSize);
     if (!contextSize || contextSize <= 0) {
       const isGpu = backend.mode.includes("GPU") || backend.mode.includes("CUDA") || backend.mode.includes("Vulkan") || backend.mode.includes("Metal") || backend.mode.startsWith("Auto");
+      if (typeof deps.gpuReady === "function") await deps.gpuReady(); // #197/#181: chooseAutoContext reads the cached GPU info
       contextSize = chooseAutoContext(filename, isGpu);
       console.log(`  [llm] Auto-selected context size: ${contextSize} tokens based on memory limits.`);
     } else {
