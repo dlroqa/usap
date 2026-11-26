@@ -71,10 +71,35 @@ async function startPipelineServerIn(dir, auth) {
     s.on("end", () => { c.peerEnded = true; }); s.on("error", (e) => { c.peerError = c.peerError || e.code || e.message; });
     s.on("close", () => { c.bytesRead = s.bytesRead; c.closed = true; c.closedAt = Date.now(); });
   });
+  // #151 (messages only): the monotonic accept time, and when the request head was parsed ('request', before the
+  // pipeline runs) with monotonic times of parse and answer, so a late answer can be split (fixtures/answer-phases.cjs)
+  server.on("connection", (s) => { const c = bySocket.get(s); if (c) c.acceptedHr = hrMs(); });
+  server.prependListener("request", (req, res) => {
+    const c = bySocket.get(req.socket); if (!c) return;
+    c.requestAt = Date.now(); c.requestHr = hrMs(); res.once("finish", () => { c.answeredHr = hrMs(); });
+    if (controlDelay.ms > 0) { const end = Date.now() + controlDelay.ms; while (Date.now() < end) { /* controls only: a blocked server */ } }
+  });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const readTotal = () => [...conns].reduce((a, c) => a + (c.closed ? c.bytesRead : c.s.bytesRead), 0);
   const close = async () => { for (const c of conns) c.s.destroy(); await new Promise((r) => server.close(r)); fs.rmSync(dir, { recursive: true, force: true }); };
   return { port: server.address().port, token, routeHits, readTotal, conns, close, lanAuth };
+}
+
+// #151 late-answer diagnosis (messages only)
+const { describeLateAnswer, tickGapIn } = require("./fixtures/answer-phases.cjs");
+const hrMs = () => Number(process.hrtime.bigint()) / 1e6; // monotonic, this process only
+const controlDelay = { ms: 0 }; // controls only: block the in-process server this long after a request head is parsed
+// The server answered this connection within `bound` ms of accepting it (the condition is the test's own). Only when it
+// did not, the message adds where the time went (#151, fixtures/answer-phases.cjs; a diagnosis that fails is reported,
+// never thrown).
+function assertAnswerPrompt(c, { conns = [], clients = [], ticks = [] } = {}, bound = ANSWER_MS) {
+  const ok = c.answeredAt - c.acceptedAt <= bound;
+  let why = "";
+  if (!ok) {
+    let d; try { d = describeLateAnswer({ c, conns, clients, ticks, bound }); } catch (_) { d = "late-answer diagnosis failed"; }
+    why = `; ${d}`;
+  }
+  assert.ok(ok, `server answered port ${c.remotePort} ${c.answeredAt - c.acceptedAt} ms after accepting it${why}`);
 }
 
 function assertClosedRefusal(st, status, label) {
@@ -442,7 +467,7 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
     assert.equal(conns.length, 20, `server saw ${conns.length} connections`);
     for (const c of conns) {
       assert.equal(c.status, 403, `server answered port ${c.remotePort} with ${c.status}: ${record()}`);
-      assert.ok(c.answeredAt - c.acceptedAt <= ANSWER_MS, `server answered port ${c.remotePort} ${c.answeredAt - c.acceptedAt} ms after accepting it`);
+      assertAnswerPrompt(c, { conns, clients: all, ticks });
       assert.ok(c.closedAt !== null && c.closedAt - c.answeredAt <= GRACE_MS + SLACK_MS, `server closed port ${c.remotePort} ${c.closedAt - c.answeredAt} ms after the answer`);
       // ...and not before the grace period ended, unless the client itself ended or reset the connection first
       if (!c.peerEnded && !c.peerError) assert.ok(c.closedAt - c.answeredAt >= GRACE_MS - GRACE_TOLERANCE_MS, `server closed port ${c.remotePort} only ${c.closedAt - c.answeredAt} ms after the answer (grace ${GRACE_MS} ms) with the client still there`);
@@ -695,4 +720,109 @@ test("server (default configuration): a chunked JSON body over the 64 MiB limit 
     await stopServerAndWait(srv);
     await removeTestRoot(root);
   }
+});
+
+// ── #151 late-answer diagnosis: controls (messages only; real in-process server, one refused connection each) ──────
+// Each control sends one refused request (403, Origin check) with a complete 2-byte body, reads the answer and closes.
+// It checks the stamps and the reading the late-answer message would carry; the verdict of assertAnswerPrompt itself
+// is the test's own condition, checked with a small bound so a genuinely late answer fails.
+const REFUSED = "POST /api/echo HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+function oneRefused(port, { writeAfterMs = 0 } = {}) {
+  return new Promise((resolve, reject) => {
+    const s = net.connect(port, "127.0.0.1"); let text = "", t = null, localPort = null;
+    const done = setTimeout(() => { s.destroy(); reject(new Error("no answer within 10 s")); }, 10000);
+    s.on("error", () => {});
+    s.on("data", (d) => { text += d; if (/^HTTP\/1\.1 \d{3}/.test(text) && text.includes("\r\n\r\n")) { clearTimeout(done); clearTimeout(t); s.destroy(); resolve({ localPort, text }); } });
+    s.on("connect", () => { localPort = s.localPort; if (writeAfterMs > 0) t = setTimeout(() => s.write(REFUSED), writeAfterMs); else s.write(REFUSED); });
+  });
+}
+async function refusedRecord(srv, opts) {
+  const st = await oneRefused(srv.port, opts);
+  assert.match(st.text, /^HTTP\/1\.1 403/);
+  const c = [...srv.conns].find((x) => x.remotePort === st.localPort);
+  for (let i = 0; i < 40 && c && c.answeredAt === null; i += 1) await sleep(25); // 'finish' precedes the client's read
+  assert.ok(c && c.answeredAt !== null, "the server's record for the connection");
+  return { c, st: { localPort: st.localPort, t0: c.acceptedAt, drainsAt: [] } };
+}
+const lateMessage = (fn) => { try { fn(); } catch (e) { assert.ok(e instanceof assert.AssertionError, `an assertion failure, got ${e && e.name}`); return e.message; } assert.fail("a late answer must still fail"); };
+
+test("#151 late-answer diagnosis (real in-process server; client ticks synthetic): on time / head parsed late / server delay after the head / missing evidence / many late; a late answer still fails", async () => {
+  // on time: stamps present and ordered, phases short, the verdict passes
+  const srv = await startPipelineServer();
+  try {
+    const { c, st } = await refusedRecord(srv);
+    assert.ok(c.acceptedHr <= c.requestHr && c.requestHr <= c.answeredHr, `ordered stamps ${JSON.stringify(c, (k, v) => (k === "s" ? undefined : v))}`);
+    assert.ok(c.requestAt >= c.acceptedAt && c.answeredAt >= c.requestAt);
+    assert.doesNotThrow(() => assertAnswerPrompt(c, { conns: [c], clients: [st], ticks: [] }));
+    // delayed request arrival: the client writes its request 700 ms after connecting
+    const d = await refusedRecord(srv, { writeAfterMs: 700 });
+    assert.ok(d.c.requestHr - d.c.acceptedHr >= 600, `accept->request ${d.c.requestHr - d.c.acceptedHr} ms`);
+    const m1 = lateMessage(() => assertAnswerPrompt(d.c, { conns: [c, d.c], clients: [d.st], ticks: [] }, 300));
+    assert.match(m1, /^server answered port \d+ \d+ ms after accepting it; late-answer diagnosis: request head parsed late; client evidence inconclusive/);
+    assert.match(m1, /client's largest tick gap: accept->head parsed none/); // no ticks given: nothing claimed
+    assert.match(m1, /limits: client and server wall clocks within ~2 ms, client ticks 10 ms apart, the server's event loop is not observed/);
+    assert.match(m1, /1 of 2 connections over 300 ms, 0 without a recorded request/);
+    // ...with the client's ticks: a gap covering the window (the client did not run) vs dense ticks (it kept running)
+    const from = d.c.acceptedAt, to = d.c.requestAt;
+    const paused = [from - 20, from - 10, to + 5, to + 15];
+    const pm = lateMessage(() => assertAnswerPrompt(d.c, { conns: [d.c], clients: [d.st], ticks: paused }, 300));
+    assert.match(pm, /request head parsed late; the client's event loop ran no timer for (\d+) ms of that window \(its process not running or blocked, or a host-wide stall; the server's loop is not observed\)/);
+    assert.equal(Number(pm.match(/ran no timer for (\d+) ms/)[1]), Math.round(to - from), "the pause reported is the part inside the window, not the whole gap");
+    // the same pause, ticks given out of order: the same reading
+    assert.match(lateMessage(() => assertAnswerPrompt(d.c, { conns: [d.c], clients: [d.st], ticks: [...paused].reverse() }, 300)), /request head parsed late; the client's event loop ran no timer/);
+    // a 200 ms gap (over the 100 ms "kept running" limit, under the 80% pause share): inconclusive, neither reading
+    const mid = []; for (let x = from - 20; x <= d.c.answeredAt + 20; x += 10) mid.push(x);
+    const midGap = mid.filter((x) => x <= from + 100 || x >= from + 300);
+    assert.match(lateMessage(() => assertAnswerPrompt(d.c, { conns: [d.c], clients: [d.st], ticks: midGap }, 300)), /request head parsed late; client evidence inconclusive/);
+    const dense = []; for (let x = from - 20; x <= d.c.answeredAt + 20; x += 10) dense.push(x);
+    assert.match(lateMessage(() => assertAnswerPrompt(d.c, { conns: [d.c], clients: [d.st], ticks: dense }, 300)), /request head parsed late; the client process kept running \(transport or server reading: not distinguishable here\)/);
+    // ticks that do not span the window: inconclusive, never a pause
+    assert.match(lateMessage(() => assertAnswerPrompt(d.c, { conns: [d.c], clients: [d.st], ticks: [from + 50, from + 60] }, 300)), /request head parsed late; client evidence inconclusive.*accept->head parsed ticks do not cover it/);
+    // the client had sent the head before the server parsed it (a drain before the parse): the rest is after its write
+    const sent = { ...d.st, drainsAt: [from + 40] };
+    assert.match(lateMessage(() => assertAnswerPrompt(d.c, { conns: [d.c], clients: [sent], ticks: dense }, 300)), /request head parsed late; the client had sent the head by 40 ms after accept \(first drain\); the remaining \d+ ms is after the client's write: transport or server reading\./);
+    // ...and a client pause over the same window is not hidden by it
+    assert.match(lateMessage(() => assertAnswerPrompt(d.c, { conns: [d.c], clients: [sent], ticks: paused }, 300)), /the client had sent the head by 40 ms after accept \(first drain\); the remaining \d+ ms is after the client's write: transport or server reading; also, the client loop ran no timer for \d+ ms of it/);
+    // the most likely real shape (all 20 late, head sent, a client pause, large numbers, a 5-digit port): bounded, and
+    // the limits survive the cut
+    const big = { ...d.c, remotePort: 54321, acceptedAt: 1_700_000_000_000, requestAt: 1_700_000_006_088, answeredAt: 1_700_000_006_195, acceptedHr: 10_000, requestHr: 16_088, answeredHr: 16_195 };
+    const worst = lateMessage(() => assertAnswerPrompt(big, { conns: Array.from({ length: 20 }, () => big),
+      clients: [{ localPort: 54321, t0: big.acceptedAt - 3, drainsAt: [big.acceptedAt + 12], io: { firstDataAt: big.answeredAt + 2 } }],
+      ticks: [big.acceptedAt - 20, big.acceptedAt - 8, big.requestAt + 4, big.answeredAt + 9] }));
+    assert.match(worst, /transport or server reading; also, the client loop ran no timer for \d+ ms of it; 20 connections late/);
+    assert.match(worst, /the server's event loop is not observed/, "the limits survive the cut");
+    assert.ok(worst.length <= 1000, `bounded (${worst.length} chars)`);
+    // a drain 4 ms before the parse is within the 5 ms cross-process slack: NOT taken as "sent before the parse"
+    const edge = { ...d.st, drainsAt: [to - 4] };
+    assert.doesNotMatch(lateMessage(() => assertAnswerPrompt(d.c, { conns: [d.c], clients: [edge], ticks: dense }, 300)), /had sent the head/);
+    // no client record for the port
+    assert.match(lateMessage(() => assertAnswerPrompt(d.c, { conns: [d.c], clients: [] }, 300)), /client: no record for this port/);
+    // wall clock and monotonic clock disagree: the wall clock stepped (the failure itself was measured on it)
+    assert.match(lateMessage(() => assertAnswerPrompt({ ...d.c, answeredAt: d.c.answeredAt + 3000 }, { conns: [d.c] }, 300)), /late-answer diagnosis: wall clock stepped by \d+ ms \(Date\.now and hrtime disagree; the bound was measured on the wall clock\)/);
+    // the pause share is measured on the wall clock, like the ticks
+    assert.deepEqual(tickGapIn([10, 20, 30], 40, 50), { covered: false });
+    assert.equal(tickGapIn([0, 10, 900, 910], 100, 800).overlap, 700);
+    // missing evidence: no request time recorded
+    assert.match(lateMessage(() => assertAnswerPrompt({ ...d.c, requestAt: null, requestHr: null }, { conns: [d.c] }, 300)), /late-answer diagnosis: evidence incomplete \(no request time or no monotonic stamps for this connection\)/);
+    // many late at once
+    const many = Array.from({ length: 6 }, () => d.c);
+    assert.match(lateMessage(() => assertAnswerPrompt(d.c, { conns: many }, 300)), /6 connections late \(possibly a shared cause: the client process, the server process or the host\)/);
+    // a diagnosis that breaks never hides the failure
+    const broken = { localPort: d.c.remotePort, get t0() { throw new Error("broken client record"); } };
+    assert.match(lateMessage(() => assertAnswerPrompt(d.c, { conns: [d.c], clients: [broken] }, 300)), /after accepting it; late-answer diagnosis failed$/);
+  } finally { await srv.close(); }
+  // delayed server processing: this control server blocks its event loop 700 ms when the request arrives
+  const slow = await startPipelineServer();
+  controlDelay.ms = 700;
+  try {
+    const p = await refusedRecord(slow);
+    assert.ok(p.c.answeredHr - p.c.requestHr >= 600, `request->finish ${p.c.answeredHr - p.c.requestHr} ms`);
+    assert.ok(p.c.requestHr - p.c.acceptedHr < p.c.answeredHr - p.c.requestHr, `accept->request ${p.c.requestHr - p.c.acceptedHr} ms < request->finish ${p.c.answeredHr - p.c.requestHr} ms`);
+    const m = lateMessage(() => assertAnswerPrompt(p.c, { conns: [p.c], clients: [p.st], ticks: [] }, 300));
+    assert.match(m, /late-answer diagnosis: delay after the request head was parsed \(the server's processing or writing; its own scheduling is not observed here\)/);
+    assert.ok(m.length <= 1000, `bounded message (${m.length} chars)`);
+    assert.ok(!/[\\/](tmp|Users|home)[\\/]/i.test(m), "no paths in the message");
+  } finally { controlDelay.ms = 0; await slow.close(); }
+  assert.equal(controlDelay.ms, 0, "the control delay is off again for every later server");
+  assert.equal(await noneLingering(), 0, "no connection left lingering");
 });
