@@ -25,6 +25,12 @@ Runs `scripts/ci/docs-check.cjs` on every PR (and on pushes to `main` that touch
 
 It's not a required check. Run it locally with `node scripts/ci/docs-check.cjs`.
 
+## `dev-tools.yml` (advisory)
+Runs the self-tests of the local developer helper `scripts/dev/run_owned.py` natively on the same four runners, only
+when `scripts/dev/**` or the workflow itself changes (or by hand). It is **not** a required check and must not become
+one: a path-filtered required job would block every unrelated pull request. The helper is not used by the studio, its
+tests or the other workflows. Its platform guarantees and limits are in [scripts/dev/README.md](../../scripts/dev/README.md).
+
 ## What CI does *not* prove
 Inference with real models, GPU/NPU backends, or the full first-run launcher setup (it downloads multi-GB runtimes). See [RUNNER_REQUIREMENTS.md](RUNNER_REQUIREMENTS.md) and the `native-runtime` workflow.
 

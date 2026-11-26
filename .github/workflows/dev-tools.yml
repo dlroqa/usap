@@ -1,0 +1,44 @@
+# dev-tools: native self-tests of the local developer helper scripts/dev/run_owned.py on all four desktop runners.
+# NOT a required check, and not part of the product or its test suite: it runs only when scripts/dev/** or this file
+# changes (or by hand). Uses each runner's preinstalled Python; no extra actions. See scripts/dev/README.md.
+name: dev-tools
+
+on:
+  pull_request:
+    paths:
+      - "scripts/dev/**"
+      - ".github/workflows/dev-tools.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-tools-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run-owned:
+    name: dev-tools (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: linux-x64,    runner: ubuntu-24.04 }
+          - { label: windows-x64,  runner: windows-2025 }
+          - { label: macos-arm64,  runner: macos-15 }
+          - { label: macos-x86_64, runner: macos-15-intel }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: run_owned self-tests (native)
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then PY="$(command -v python)"; else PY="$(command -v python3)"; fi  # avoid the Windows Store python3 stub
+          "$PY" -c "import sys; print(sys.version); assert sys.version_info >= (3, 8)"
+          "$PY" -B scripts/dev/test_run_owned.py -v
