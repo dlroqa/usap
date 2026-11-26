@@ -22,7 +22,8 @@ const { closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, WATCH_BYTES
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
 const { rawRequest } = require("./fixtures/refusal-clients.cjs");
 const { timeline: timelineOf } = require("./fixtures/refusal-judge.cjs");
-const { execFile } = require("node:child_process");
+const { execFile, spawn } = require("node:child_process");
+const { startGraceTrace, classify, phaseTimers, timerText, LATE_MS } = require("./fixtures/grace-trace.cjs"); // #151 diagnostics only
 
 const MiB = 1024 * 1024;
 const CHUNK = Buffer.alloc(64 * 1024, 0x61);
@@ -34,12 +35,42 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // A refused socket stops reading, so it may not see the client's own close: it ends when its grace period does.
 async function noneLingering() { const end = Date.now() + GRACE_MS + SLACK_MS; while (lingeringCount() > 0 && Date.now() < end) await sleep(50); return lingeringCount(); }
 
-// ── in-process server: real pipeline, request policy and sign-in ─────────────────────────────────────────────────
-async function startPipelineServer({ auth = "" } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "usap-refusal-"));
-  try { return await startPipelineServerIn(dir, auth); } catch (err) { fs.rmSync(dir, { recursive: true, force: true }); throw err; }
+// #151 diagnostics (opt-in, messages only): the independent main-thread state observer for this process (the
+// in-process server), and one summary line per phase plus one line per connection closed late (at most 5),
+// printed before the phase's unchanged assertions (fixtures/grace-trace.cjs).
+function startThreadObserver(pids) {
+  if (!["darwin", "linux"].includes(process.platform)) return { stop: async () => null };
+  let child = null, out = "";
+  try { child = spawn(process.execPath, [path.join(__dirname, "fixtures", "thread-observer.cjs"), "200", ...pids.map(String)], { stdio: ["pipe", "pipe", "ignore"] }); } catch (_) { return { stop: async () => null }; }
+  child.on("error", () => {}); child.stdin.on("error", () => {});
+  child.stdout.on("data", (d) => { if (out.length < 1 << 20) out += d; });
+  const exited = new Promise((r) => child.once("exit", r));
+  return { stop: async () => {
+    try { child.stdin.end(); } catch (_) {}
+    if (await Promise.race([exited.then(() => "exit"), sleep(5000).then(() => "timeout")]) === "timeout") { try { child.kill(); } catch (_) {} return null; }
+    try { return JSON.parse(out); } catch (_) { return null; }
+  } };
 }
-async function startPipelineServerIn(dir, auth) {
+// from: the trace.mark() cursor where this phase's window starts; returns the cursor where the next one starts.
+function graceDiagnostics(t, label, conns, trace, observer, from) {
+  const to = trace.mark();
+  try {
+    const rows = conns.map((c) => ({ c, r: classify({ conn: c, trace, socketTrace: trace.destroyOf(c.s), observer, cpuMs: trace.cpuMs }) }));
+    const kept = rows.map(({ c }) => (c.closedAt && c.answeredAt ? c.closedAt - c.answeredAt : null)).filter((x) => x !== null);
+    const counts = {}; for (const { r } of rows) counts[r.verdict] = (counts[r.verdict] || 0) + 1;
+    t.diagnostic(`#151 grace close (${label}): ${conns.length} connections, kept ${kept.length ? `${Math.min(...kept)}..${Math.max(...kept)}` : "none"} ms after 'finish'; ${timerText(phaseTimers({ trace, conns, from, to }))}; readings ${Object.entries(counts).map(([k, v]) => `${k} x${v}`).join(", ")}; loop delay so far ${(() => { const l = trace.loopNow(); return l ? `max ${l.maxMs} p99 ${l.p99Ms} ms` : "not recorded"; })()}; since trace start: GC pauses >= 5 ms ${trace.gcs.length}, main-thread gaps >= 100 ms ${trace.gaps.length} (max ${Math.round(Math.max(0, ...trace.gaps.map((g) => g[1])))} ms); observer ${observer ? `${observer.platform} ${((observer.procs[process.pid] || {}).samples) || 0} samples` : "not run"}`);
+    for (const { c, r } of rows.filter(({ c }) => !c.closedAt || !c.answeredAt || c.closedAt - c.answeredAt > GRACE_MS + LATE_MS).slice(0, 5)) t.diagnostic(`#151 grace close (${label}), late connection: ${r.line}`);
+  } catch (_) { t.diagnostic(`#151 grace close (${label}): description failed`); }
+  return to;
+}
+
+// ── in-process server: real pipeline, request policy and sign-in ─────────────────────────────────────────────────
+// trace (#151 diagnostics, opt-in): also record, per connection, when res.end was called.
+async function startPipelineServer({ auth = "", trace = null } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "usap-refusal-"));
+  try { return await startPipelineServerIn(dir, auth, trace); } catch (err) { fs.rmSync(dir, { recursive: true, force: true }); throw err; }
+}
+async function startPipelineServerIn(dir, auth, trace = null) {
   const env = { UAIS_AUTH: auth };
   const requestPolicy = createRequestPolicy({ listenHost: "127.0.0.1", env });
   const lanAuth = createLanAuth({ tokenFile: path.join(dir, "token"), listenHost: "127.0.0.1", env });
@@ -62,6 +93,7 @@ async function startPipelineServerIn(dir, auth) {
   const server = http.createServer((req, res) => {
     const c = bySocket.get(req.socket);
     if (c) res.once("finish", () => { c.status = res.statusCode; c.answeredAt = Date.now(); });
+    if (c && trace) { const end = res.end; res.end = function tracedEnd(...a) { if (c.endCalledAt === undefined) c.endCalledAt = Date.now(); return end.apply(this, a); }; } // #151 diagnostics only
     return pipeline(req, res);
   });
   server.on("connection", (s) => {
@@ -445,7 +477,9 @@ test("refusal: request text inside a refused request's unread body is never pars
 });
 
 test("refusal: 20 concurrent refused clients that keep sending get the answer (or were provably not running during the grace period); the server answers each promptly and closes it in the grace period; reads stay bounded", async (t) => {
-  const srv = await startPipelineServer();
+  const trace = startGraceTrace({ graceMs: GRACE_MS }); // #151 diagnostics only
+  let observer = startThreadObserver([process.pid]);  // #151 diagnostics only
+  const srv = await startPipelineServer({ trace });
   const errors = []; const onErr = (e) => errors.push(e);
   process.on("uncaughtException", onErr);
   try {
@@ -459,7 +493,10 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
       execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify({ port: srv.port, n: 20, opts })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
         (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
     });
-    assert.equal(await noneLingering(), 0);
+    const lingeringAfter = await noneLingering();
+    const phase2From = graceDiagnostics(t, "refused clients", [...srv.conns], trace, await observer.stop(), 0); // #151 diagnostics only
+    observer = startThreadObserver([process.pid]);
+    assert.equal(lingeringAfter, 0);
     const conns = [...srv.conns];
     const record = () => JSON.stringify({ server: conns.map(({ s, ...c }) => ({ ...c, answeredMs: c.answeredAt - c.acceptedAt, keptMs: c.closedAt - c.answeredAt })), clients: all });
     assert.equal(all.length, 20);
@@ -493,7 +530,10 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
       execFile(process.execPath, [path.join(__dirname, "fixtures", "refusal-clients.cjs"), JSON.stringify({ port: srv.port, n: 20, opts: { ...opts, ignoreFin: true, capBytes: 4096 * MiB } })], { timeout: GRACE_MS + 30000, maxBuffer: 16 * MiB },
         (err, stdout) => { if (err) reject(err); else resolve(JSON.parse(stdout)); });
     });
-    assert.equal(await noneLingering(), 0);
+    const hLingeringAfter = await noneLingering();
+    graceDiagnostics(t, "clients that ignore the answer", [...srv.conns].filter((c) => !seen.has(c)), trace, await observer.stop(), phase2From); // #151 diagnostics only
+    observer = null;
+    assert.equal(hLingeringAfter, 0);
     const hConns = [...srv.conns].filter((c) => !seen.has(c));
     assert.equal(hConns.length, 20, `server saw ${hConns.length} new connections`);
     for (const c of hConns) {
@@ -511,7 +551,7 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
     });
     if (stalled.length) t.diagnostic(`${stalled.length}/20 answers lost by a client process that was not running (documented reset tradeoff): ${stalled.join("; ")}`);
     assert.deepEqual(errors, [], "no uncaught socket errors");
-  } finally { process.off("uncaughtException", onErr); await srv.close(); }
+  } finally { process.off("uncaughtException", onErr); trace.stop(); if (observer) await observer.stop(); await srv.close(); }
 });
 
 test("refusal judge: a lost answer is excused only when the server kept the grace period and the client was not running", () => {
