@@ -1342,7 +1342,7 @@ function getTextModelFit(sizeBytes, specs = getHardwareSpecs()) {
     recommended: false,
     mode: "too-large",
     label: "",
-    reason: `${formatBytes(sizeBytes)} weights need about ${formatBytes(runtimeNeed)} including runtime headroom; this computer has about ${formatBytes(usableRam)} usable RAM and ${formatBytes(vramBytes)} VRAM.`,
+    reason: `${formatBytes(sizeBytes)} weights need about ${formatBytes(runtimeNeed)} including runtime headroom; this computer has about ${formatBytes(usableRam)} usable RAM and ${osPlatform === "darwin" && !vramBytes && !isAppleSilicon ? "GPU memory not known" : `${formatBytes(vramBytes)} VRAM`}.`, // #197/#181: macOS unknown, not 0 B
   };
 }
 
@@ -1719,7 +1719,15 @@ async function getDiagnostics() {
     telemetry: getTelemetry(),
     engines: { llm: llmLifecycleSnapshot(), processes: supervisor.snapshot() }, // additive (Step 9.6)
     ...(staleFileReport.snapshot() ? { staleFiles: staleFileReport.snapshot() } : {}), // only when the report is on (R1)
+    ...(osPlatform === "darwin" ? { gpuDiscovery: gpuDiscoverySummary() } : {}), // #197/#181: macOS only, additive
   };
+}
+// #197/#181 (round 20): how the macOS GPU information was obtained, as enums only: state (pending, ready, fallback,
+// stopped), source (measured, inferred = Apple Silicon unified memory, unavailable = GPU memory not known) and reason
+// (null, timeout, overflow, spawn, exit, guard, cancelled, parse, none-listed).
+function gpuDiscoverySummary() {
+  const p = hardware.gpuProbeState();
+  return { state: p.state, source: p.source, reason: p.reason };
 }
 
 // Routes moved into modules (Step 9.8). They run after the pipeline's security checks and
@@ -2006,6 +2014,8 @@ process.on("exit", () => supervisor.stopAllSync());
 // #197/#181: a GPU probe still running is killed with the server (SIGINT/SIGTERM end in process.exit and reach this).
 process.on("exit", () => hardware.stop());
 
-// Graceful shutdown
-process.on("SIGINT",  async () => { if (imageQueue) imageQueue.refuseWaiting("shutdown"); await killBackend(); await killOpenVinoWorker(); await killLlm(); await speech.stopSpeech(); await tts.stopTts(); process.exit(0); });
-process.on("SIGTERM", async () => { if (imageQueue) imageQueue.refuseWaiting("shutdown"); await killBackend(); await killOpenVinoWorker(); await killLlm(); await speech.stopSpeech(); await tts.stopTts(); process.exit(0); });
+// Graceful shutdown. stopLlmNow() first (#197/#181 round 20): a text-engine start still in progress (waiting for GPU
+// discovery, the old engine's exit or a port check) is cancelled, so it cannot spawn an engine while the server exits;
+// its stop (which may already be ending a starting engine) is awaited, so the engine's exit is still confirmed.
+process.on("SIGINT",  async () => { const llmStop = stopLlmNow().catch(() => {}); if (imageQueue) imageQueue.refuseWaiting("shutdown"); await killBackend(); await killOpenVinoWorker(); await killLlm(); await llmStop; await speech.stopSpeech(); await tts.stopTts(); process.exit(0); });
+process.on("SIGTERM", async () => { const llmStop = stopLlmNow().catch(() => {}); if (imageQueue) imageQueue.refuseWaiting("shutdown"); await killBackend(); await killOpenVinoWorker(); await killLlm(); await llmStop; await speech.stopSpeech(); await tts.stopTts(); process.exit(0); });

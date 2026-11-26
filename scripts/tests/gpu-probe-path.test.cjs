@@ -29,5 +29,15 @@ test("request routes never run system_profiler synchronously; macOS runs it once
     assert.equal(sync, 0, "no synchronous (or shell) system_profiler in the studio");
     if (process.platform === "darwin") assert.equal(counts.execFile || 0, 1, "macOS: exactly one asynchronous probe for all routes");
     else assert.equal(lines.length, 0, "other platforms: system_profiler is never started");
+    // round 20: /api/diagnostics reports how the macOS GPU information was obtained (enums only); nothing elsewhere
+    const diag = (await request(srv.port, "GET", "/api/diagnostics")).json;
+    t.diagnostic(`#197 gpu discovery (${process.platform}/${process.arch}): ${JSON.stringify(diag.gpuDiscovery === undefined ? "absent" : diag.gpuDiscovery)}; gpu ${JSON.stringify({ name: diag.hardware.gpu_name, vram_gb: diag.hardware.gpu_vram_gb })}`);
+    if (process.platform === "darwin") {
+      assert.deepEqual(Object.keys(diag.gpuDiscovery).sort(), ["reason", "source", "state"]);
+      assert.ok(["ready", "fallback"].includes(diag.gpuDiscovery.state), `settled: ${diag.gpuDiscovery.state}`);
+      assert.ok(["measured", "inferred", "unavailable"].includes(diag.gpuDiscovery.source));
+      assert.ok([null, "timeout", "overflow", "spawn", "exit", "guard", "cancelled", "parse", "none-listed"].includes(diag.gpuDiscovery.reason));
+      if (diag.gpuDiscovery.source === "unavailable") assert.equal(diag.hardware.gpu_vram_gb, 0, "GPU memory not known is reported as 0, never RAM");
+    } else assert.equal(diag.gpuDiscovery, undefined, "other platforms: no gpuDiscovery key (byte-identical diagnostics)");
   } finally { await stopServerAndWait(srv); removeTestRoot(root); }
 });
