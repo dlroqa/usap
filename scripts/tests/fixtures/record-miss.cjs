@@ -186,8 +186,9 @@ function repoIndex() {
 function sourceHas(base, name) { // a function name is printed only if the repository file it is attributed to contains it
   const r = repoIndex(); const f = r.files.get(base); if (!f) return false;
   if (!r.src.has(base)) { try { r.src.set(base, require("node:fs").readFileSync(f, "utf8")); } catch (_) { r.src.set(base, ""); } }
-  const last = name.split(".").pop().replace(/^<|>$/g, "");
-  return last === "anonymous" || r.src.get(base).includes(last);
+  const text = r.src.get(base);
+  // EVERY segment must be a whole identifier of that file (round 27, E): "a.b.get" is not accepted for "get" alone
+  return name.split(".").every((seg) => seg === "<anonymous>" || new RegExp(`(?<![\\w$])${seg.replace(/\$/g, "\\$")}(?![\\w$])`).test(text));
 }
 const ERRNO = new Set(Object.keys(require("node:os").constants.errno || {}));
 const ERROR_CLASSES = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError", "AggregateError", "AbortError", "SystemError", "AssertionError"]);
@@ -210,9 +211,11 @@ function summarizeLine(line) {
   const tag = line.match(/^\s*\[([a-z][a-z0-9-]{0,24})\]/); if (tag && repoIndex().tags.has(tag[1])) out.push(`[${tag[1]}]`);
   for (const m of line.matchAll(/\b([A-Z][A-Za-z]{0,40}Error)\b/g)) if (ERROR_CLASSES.has(m[1])) out.push(m[1]);
   for (const m of line.matchAll(/\b(E[A-Z0-9]{2,24})\b/g)) if (ERRNO.has(m[1])) out.push(m[1]);
-  for (const m of line.matchAll(/\b(ERR_[A-Z0-9_]{2,60})\b/g)) out.push(m[1]); // Node's own code shape (residual: user text shaped like it)
+  for (const m of line.matchAll(/\b(ERR_[A-Z][A-Z0-9_]{1,40})\b/g)) out.push(m[1]); // Node's own code shape (residual: user text shaped like it)
   for (const m of line.matchAll(/\b(SIG(?:HUP|INT|QUIT|ILL|ABRT|BUS|FPE|KILL|SEGV|PIPE|ALRM|TERM|USR1|USR2|CHLD|BREAK))\b/g)) out.push(m[1]);
-  for (const m of line.matchAll(/\b(code|exit(?: code)?|status)[ :=]+(-?\d{1,6})\b/gi)) out.push(`${m[1].toLowerCase()} ${m[2]}`);
+  // numbers only in fixed templates, at most 3 digits: "exit code N" / "exited with code N" and an HTTP "status NNN"
+  for (const m of line.matchAll(/\bexit(?:ed)?(?: with)? code (-?\d{1,3})(?!\d)/g)) out.push(`exit code ${m[1]}`);
+  for (const m of line.matchAll(/\bstatus[ :=]+([1-5]\d\d)(?!\d)/g)) out.push(`status ${m[1]}`);
   for (const m of line.matchAll(WORDS)) out.push(m[1].toLowerCase());
   return out.length ? [...new Set(out)].join(" ") : null;
 }

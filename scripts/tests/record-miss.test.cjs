@@ -343,9 +343,9 @@ const MARK = /zq[a-z0-9]*/i;
 const WORDS27 = "uncaught|unhandled|rejection|exception|fatal|aborted|abort|killed|timed out|timeout|listening|ready|shutting down|stopped|stopping|exited|crashed|crash|heap|out of memory|warning|deprecated|deprecation|refused|reset";
 // grammar: remove every allowed token; nothing may remain
 const residue = (t) => String(t)
-  .replace(/at (?:[A-Za-z_$][\w$.<>]{0,200} |<fn> )?\((?:<file>|node:[a-z_?]+|[A-Za-z0-9._-]+\.(?:cjs|mjs|js)):\d+:\d+\)/g, "")
+  .replace(/at (?:<fn> |(?:[A-Za-z_$][\w$]{0,59})(?:\.(?:[A-Za-z_$][\w$]{0,59}|<anonymous>)){0,3} )?\((?:<file>|node:[a-z_?]+|[A-Za-z0-9._-]+\.(?:cjs|mjs|js)):\d+:\d+\)/g, "")
   .replace(/\(\d+ other lines?\)/g, "").replace(/\[[a-z][a-z0-9-]{0,24}\]/g, "").replace(/\b(?:[A-Za-z]*Error|ERR_[A-Z0-9_]+|E[A-Z0-9]{2,24}|SIG[A-Z]{2,8})\b/g, "")
-  .replace(/\b(?:exit code|exit|code|status) -?\d{1,6}\b/g, "").replace(new RegExp(`\\b(?:${WORDS27})\\b`, "g"), "").replace(/[ |]/g, "");
+  .replace(/\b(?:exit code|status) -?\d{1,3}\b/g, "").replace(new RegExp(`\\b(?:${WORDS27})\\b`, "g"), "").replace(/[ |]/g, "");
 const grammarOk = (t) => residue(t) === "";
 const items = (t) => (t ? t.split(" | ") : []);
 
@@ -369,15 +369,18 @@ test("S: user text, file names, request bodies and secrets are never printed", (
     "  model: 'zqinspect',", "  path: '/srv/zqinspectpath'", "Authorization: Bearer zqbearer.abc.def", "token=hf_zqtoken API_KEY=zqkey",
     "GET https://zqhost.example/p/f.gguf?sig=zqsig 500", "ignored zqname from zqsource (zqreason)", "[zqtag] not a studio tag", "ZQSECRET happened",
     "EZQSECRET is not an errno", "ZqSecretError: custom class", "    at zqfn (/x/zqfile.cjs:1:2)", "    at zqfn2 (/x/scripts/server/serve.cjs:3:4)",
-    "    at zqfn3 (node:zqmod:1:1)"];
+    "    at zqfn3 (node:zqmod:1:1)", "    at zqa.zqpass.readPort (/x/scripts/server/serve.cjs:5:6)", "    at zqb.<anonymous> (/x/scripts/server/serve.cjs:7:8)",
+    "Your verification code: 482913 zqotp", "code 4821 and status 2001 zqnum", "engine exited with code 48291 zqexit", "status 6000 zqstat", "ERROR zqerror"];
   const t = sanitizeTail(lines.join("\n"));
   assert.ok(!MARK.test(t), `no marker survives: ${t}`); assert.ok(grammarOk(t), `only allowed tokens: residue ${residue(t)}`);
+  assert.doesNotMatch(t, /482913|4821|2001|48291|6000/, "user numbers are not kept");
+  assert.match(t, /at <fn> \(serve\.cjs:5:6\)/); assert.match(t, /at <fn> \(serve\.cjs:7:8\)/);
   assert.match(t, /^\[web-search\]/); assert.match(t, /at \(<file>:1:2\)/); assert.match(t, /at <fn> \(serve\.cjs:3:4\)/); assert.match(t, /at \(node:\?:1:1\)/);
 });
 
 test("S: kept tokens - studio tags, standard error classes, errno and ERR_ codes, signals, exit/status, status words, repo and node frames", () => {
   const t = sanitizeTail(["[backend] Startup failed:", "TypeError: Cannot read properties of undefined", "Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers",
-    "connect ECONNREFUSED 127.0.0.1:1 and ECANCELED", "engine exited with exit code 3 signal SIGKILL", "status=500", "Uncaught exception, listening again",
+    "connect ECONNREFUSED 127.0.0.1:1 and ECANCELED", "engine exited with code 3 signal SIGKILL", "status=500", "Uncaught exception, listening again",
     "    at readPort (/w/scripts/server/serve.cjs:1234:17)", "    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)",
     "    at Socket.emit (node:events:519:28)", "    at Object.<anonymous> (/w/scripts/tests/record-miss.test.cjs:9:1)"].join("\n"));
   for (const want of [/\[backend\]/, /TypeError/, /ERR_HTTP_HEADERS_SENT/, /ECONNREFUSED/, /ECANCELED/, /SIGKILL/, /exit code 3/, /status 500/, /uncaught/, /exception/, /listening/,
