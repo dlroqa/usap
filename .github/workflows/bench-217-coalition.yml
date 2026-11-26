@@ -42,9 +42,9 @@ jobs:
         if: always()
         run: |
           sleep 2
-          ps -axo pid,ppid,pgid,user,lstart,command | grep -E 'coalition_poc|com\.usap\.coalpoc' | grep -v grep || echo "no PoC processes left"
+          ps -axo pid,ppid,pgid,user,lstart,command | grep -E 'coalition_poc|com\.usap\.coalpoc|(^|/| )sleep 90$' | grep -v grep || echo "no PoC processes left (incl. fixture sleep 90)"
           launchctl list | grep com.usap.coalpoc || echo "no PoC launchd job left"
       - name: remove own launchd job if the PoC crashed (own label prefix only)
         if: always()
         run: |
-          for l in $(launchctl list | awk '{print $3}' | grep '^com\.usap\.coalpoc\.' || true); do echo "removing own $l"; launchctl remove "$l" || true; done
+          for l in $(launchctl list | awk '{print $3}' | grep -E '^com\.usap\.coalpoc\.[0-9]+$' || true); do echo "removing own $l"; launchctl remove "$l" || true; done

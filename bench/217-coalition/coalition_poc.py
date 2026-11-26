@@ -327,6 +327,7 @@ def fixture(role, label):
         spawn_fixture("pspawner", "pspawn")
         spawn_fixture("sleeper", "token_target")
         spawn_fixture("sleeper", "stale_target")
+        spawn_fixture("sleeper", "survivor")  # deliberately left out of the first cleanup -> explicit SURVIVORS
         spawn_fixture("churner", "churn")
         if DARWIN:  # launchd-mediated work started on our behalf (expected: a different coalition; out of scope)
             lab = f"com.usap.coalpoc.{os.getpid()}"
@@ -390,16 +391,46 @@ def census():
 
 
 class Tracker:
-    """Certifier knowledge built ONLY from scans (never from fixture reports): processes seen with a known parent."""
+    """Certifier knowledge built ONLY from scans (never from fixture reports): processes seen with a known parent.
+    Keyed by p_uniqueid (kept across exec, never reused). Keeps provenance (which known parent admitted each process)
+    and every idversion observed for a known process (exec bumps idversion; Agent A round 30)."""
 
     def __init__(self, root):
         self.root = root
         self.known_uniq = {root["uniqueid"]}
-        self.known_idv = {root["idversion"]}
+        self.prov = {root["uniqueid"]: None}
+        self.idvs = {root["uniqueid"]: {root["idversion"]}}
         self.scans = 0
+
+    @property
+    def known_idv(self):
+        """idversion -> uniqueid, only for provenance-backed known processes."""
+        return {v: u for u, vs in self.idvs.items() if self.explained(u) for v in vs}
+
+    def explained(self, u):
+        """True only if u's provenance chains back to the root (corrupted/injected entries are unexplained)."""
+        seen = set()
+        while u is not None and u not in seen:
+            if u == self.root["uniqueid"]:
+                return True
+            seen.add(u)
+            if u not in self.prov:
+                return False
+            u = self.prov[u]
+        return False
+
+    def link_ok(self, child, par):
+        """Darwin: ppid is only the original parent or launchd, so a ppid link must agree with the immutable
+        p_orig_ppidversion (guards against parent-pid reuse between reads)."""
+        if not DARWIN:
+            return True
+        return child["orig_ppidversion"] in (self.idvs.get(par["uniqueid"], set()) | {par["idversion"]})
 
     def update(self, procs):
         self.scans += 1
+        for p in procs.values():
+            if p["uniqueid"] in self.idvs:
+                self.idvs[p["uniqueid"]].add(p["idversion"])
         changed = True
         while changed:
             changed = False
@@ -407,15 +438,18 @@ class Tracker:
                 if p["uniqueid"] in self.known_uniq:
                     continue
                 par = procs.get(p["ppid"])
-                if par is not None and par["uniqueid"] in self.known_uniq and p["idversion"] > self.root["idversion"]:
+                if (par is not None and par["uniqueid"] in self.known_uniq and post_root(p, self.root) and
+                        self.link_ok(p, par)):
                     self.known_uniq.add(p["uniqueid"])
-                    self.known_idv.add(p["idversion"])
+                    self.prov[p["uniqueid"]] = par["uniqueid"]
+                    self.idvs.setdefault(p["uniqueid"], set()).add(p["idversion"])
                     changed = True
 
 
 def post_root(p, root):
-    """Started after the root: XNU idversion is a monotonic counter (Agent A); Linux sim uses start ticks."""
-    return p["idversion"] >= root["idversion"] if DARWIN else p["start"] >= root["start"]
+    """Started at or after the root. Darwin: p_uniqueid comes from a monotonic u64 counter at fork and is kept
+    across exec; idversion is NOT start order (exec bumps it). Linux sim: start ticks."""
+    return p["uniqueid"] >= root["uniqueid"] if DARWIN else p["start"] >= root["start"]
 
 
 def classify(p, procs, root, tracker, mode, me, inject_fail=()):
@@ -424,8 +458,10 @@ def classify(p, procs, root, tracker, mode, me, inject_fail=()):
         return "excluded"
     if p["pid"] in inject_fail:
         return "error"
-    if p["uniqueid"] in tracker.known_uniq:  # known first: the root and seen descendants are owned (Agent E #2)
-        return "owned"
+    if any(p.get(k) is None for k in ("uniqueid", "idversion", "uid", "ruid", "ppid")):
+        return "error"  # incomplete identity never proves anything
+    if p["uniqueid"] in tracker.known_uniq:  # known first: the root and seen descendants (Agent E #2)
+        return "owned" if tracker.explained(p["uniqueid"]) else "error"  # no provenance -> corrupted evidence
     if p["uid"] != root["uid"] and p["ruid"] != root["uid"]:
         return "excluded"
     if not post_root(p, root):
@@ -437,8 +473,10 @@ def classify(p, procs, root, tracker, mode, me, inject_fail=()):
             return "error"
         if p["coal"][0] != root["coal"][0]:
             return "excluded"
-        if DARWIN and p["orig_ppidversion"] in tracker.known_idv:
-            return "owned"  # provably ours across reparenting (original parent was seen as ours)
+        if DARWIN:  # original parent was a provenance-backed known process (immutable kernel link) -> ours
+            u = tracker.known_idv.get(p["orig_ppidversion"])
+            if u is not None and p["idversion"] > p["orig_ppidversion"]:
+                return "owned"
     # chain to pid 1 only through post-root processes?  A pre-existing live ancestor => someone else's descendant.
     q, hops = p, 0
     while q["ppid"] not in (0, 1) and hops < 64:
@@ -446,7 +484,7 @@ def classify(p, procs, root, tracker, mode, me, inject_fail=()):
         if par is None:
             return "error"
         if par["uniqueid"] in tracker.known_uniq:
-            return "owned"
+            return "owned" if (tracker.explained(par["uniqueid"]) and tracker.link_ok(q, par)) else "error"
         if not post_root(par, root):
             return "excluded"
         q, hops = par, hops + 1
@@ -466,8 +504,29 @@ def certify(procs, errs, root, tracker, mode, me, inject_fail=()):
         state = "UNCERTAIN"
     else:
         state = "CONFIRMED"
+    counts = {k: sum(1 for c in cls.values() if c == k) for k in ("owned", "candidate", "excluded", "error")}
+    counts["considered"] = len(cls)
+    assert counts["considered"] == sum(counts[k] for k in ("owned", "candidate", "excluded", "error"))
     return {"state": state, "owned": owned, "candidates": cand, "errors": bad, "scan_errors": hard_errs[:10],
-            "classes": cls}
+            "counts": counts, "classes": cls}
+
+
+def wait_gone(rec, timeout):
+    """ONE lookup per iteration (round-29 crash: two lookups raced the target's exit). Explicit outcomes:
+    'vanished' (lookup fails: exited, zombie or reaped), 'replaced' (the pid now holds another process),
+    'still-alive' (same identity after the timeout)."""
+    t_end = time.monotonic() + timeout
+    while True:
+        d, _ = safe(B.info, rec["pid"])
+        if d is None:
+            return "vanished"
+        if d["uniqueid"] != rec["uniqueid"]:
+            return "replaced"
+        if d["status"] == SZOMB:
+            return "vanished"
+        if time.monotonic() >= t_end:
+            return "still-alive"
+        time.sleep(0.05)
 
 
 def verify_and_signal(gt, sig, log):
@@ -507,6 +566,14 @@ def main():
     state = {}
     rc = 2
     try:
+        import hashlib
+        with open(ME, "rb") as fh:
+            sha = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        sha = None
+    out["run"] = {"script_sha256": sha, "git_sha": os.environ.get("GITHUB_SHA"),
+                  "run_id": os.environ.get("GITHUB_RUN_ID"), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT")}
+    try:
         rc = run(out, control, state)
     except BaseException as ex:  # never lose the first-attempt evidence
         import traceback
@@ -514,13 +581,39 @@ def main():
         control("poc_completed_without_crash", True, False, repr(ex)[:300])
         rc = 2
     finally:
-        emergency_cleanup(out, state)
+        try:
+            emergency_cleanup(out, state)
+        except BaseException as ex:  # never skip the evidence output
+            out["emergency_cleanup_error"] = repr(ex)[:300]
+        if "safety_ok" not in out:
+            try:
+                audit_after_crash(out, state)
+            except BaseException as ex:
+                out["crash_audit_error"] = repr(ex)[:300]
+        try:  # emergency signals are sent after run()'s own audit: audit them here, on every path
+            recs = state["reps"].snapshot() if state.get("reps") else []
+            allowed = {r["pid"] for r in recs if "uniqueid" in r and "pid" in r} | \
+                {g["pid"] for g in state.get("gt", {}).values()}
+            em_out = sorted({x["pid"] for x in out.get("emergency_signals", []) if x.get("result") == "sent" and
+                             x["pid"] not in allowed})
+            out["emergency_signals_outside_ground_truth"] = em_out
+            if em_out:
+                out["safety_ok"] = False
+                rc = 3
+        except BaseException as ex:
+            out["emergency_audit_error"] = repr(ex)[:300]
         try:
             os.makedirs("coalpoc-out", exist_ok=True)
             with open("coalpoc-out/result.json", "w") as fh:
                 json.dump(out, fh, indent=1, default=str)
         except OSError:
             pass
+        reached = {c["name"] for c in controls}
+        out["controls_not_reached"] = [n for n in EXPECTED_CONTROLS if n not in reached and
+                                       (DARWIN or n not in DARWIN_ONLY_CONTROLS)]
+        out["controls_undeclared"] = sorted(reached - set(EXPECTED_CONTROLS) - {"poc_completed_without_crash"})
+        print("NOT_REACHED", json.dumps(out["controls_not_reached"]), "UNDECLARED", json.dumps(out["controls_undeclared"]),
+              flush=True)
         print("RESULT_JSON_BEGIN")
         print(json.dumps(out, default=str))
         print("RESULT_JSON_END")
@@ -530,13 +623,51 @@ def main():
     return rc
 
 
+DARWIN_ONLY_CONTROLS = [
+    "orig_ppidversion_survives_reparent", "root_coalition_nonzero", "launchd_job_in_other_coalition",
+    "coalition_create_refused_unprivileged", "launchd_job_lineage_candidate_coalition_excluded",
+    "exec_pre_exec_token_esrch_and_target_alive", "exec_pre_exec_tuple_refused", "audit_token_stale_refused", "corrupted_orig_parent_evidence_not_adopted"]
+EXPECTED_CONTROLS = [
+    "missing_identity_query_fails", "all_fixtures_reported", "exec_rebound_by_uniqueid_and_checked_parent",
+    "owned_tree_shares_root_coalition", "coalition_unchanged_by_reparent", "churn_no_coalition_change",
+    "pre_cleanup_lineage_sees_survivors", "pre_cleanup_lineage_root_counted_owned",
+    "pre_cleanup_lineage_no_attribution_loss", "pre_cleanup_lineage_sibling_not_owned",
+    "pre_cleanup_coalition_sees_survivors", "pre_cleanup_coalition_root_counted_owned",
+    "pre_cleanup_coalition_no_attribution_loss", "pre_cleanup_coalition_sibling_not_owned",
+    "coalition_rule_excludes_all_foreign_non_sibling", "required_fixtures_in_ground_truth",
+    "injected_query_failure_not_confirmed", "wrong_identity_refused",
+    "stale_target_vanished_after_kill", "stale_identity_not_signalled", "explicit_survivors_owned_survivor_only",
+    "pre_cleanup_lineage_own_tree_all_owned", "pre_cleanup_coalition_own_tree_all_owned",
+    "survivor_admitted_by_tracker_lineage",
+    "same_coalition_foreign_orphan_is_uncertain", "corrupted_known_uniqueid_without_provenance_is_error",
+    "certifier_never_signals_even_with_corrupted_evidence", "synthetic_uniqueid_missing", "synthetic_coal_zero",
+    "synthetic_coal_missing", "synthetic_coalition_only_no_lineage", "synthetic_orig_ppid_link_foreign_coalition",
+    "injected_query_failure_after_cleanup_uncertain", "final_state_confirmed"] + DARWIN_ONLY_CONTROLS
+
+
+def audit_after_crash(out, state):
+    """Crash path: leaked self-reported fixtures and signals outside self-reports, computed from the reports."""
+    recs = state["reps"].snapshot() if state.get("reps") else []
+    selfrep = {r["pid"]: r for r in recs if "uniqueid" in r and "pid" in r}
+    alive = []
+    for r in list(selfrep.values()) + list(state.get("gt", {}).values()):
+        if wait_gone(r, 3.0) == "still-alive":
+            alive.append(r.get("label"))
+    sent = [x for x in out.get("signals", []) + out.get("emergency_signals", []) if x.get("result") == "sent"]
+    out["leaked_fixtures"] = alive
+    allowed = set(selfrep) | {g["pid"] for g in state.get("gt", {}).values()}
+    out["signals_outside_ground_truth"] = sorted({x["pid"] for x in sent if x["pid"] not in allowed})
+    out["safety_ok"] = not alive and not out["signals_outside_ground_truth"]
+    out["safety_ok_note"] = "computed on the crash path"
+
+
 def emergency_cleanup(out, state):
     """After a crash (or as a final net): signal ONLY self-reported fixtures whose identity still matches, and
     remove ONLY our own launchd label. A no-op on the normal path (everything is already gone)."""
     reps = state.get("reps")
     recs = reps.snapshot() if reps else []
     log = out.setdefault("emergency_signals", [])
-    for r in recs:
+    for r in list(recs) + [g for g in state.get("gt", {}).values() if g.get("label") in ("exec", "pspawn.child")]:
         if "uniqueid" in r and "pid" in r and r.get("pid") != os.getpid():
             d, _ = safe(B.info, r["pid"])
             if d and d["uniqueid"] == r["uniqueid"] and d["status"] != SZOMB:
@@ -609,7 +740,7 @@ def run(out, control, state):
     th = threading.Thread(target=scanner, daemon=True)
     th.start()
     need = {"direct", "gparent.gc", "same_session_newpgrp", "setsid_seen", "orphan_same_session", "orphan_setsid",
-            "exec", "pspawn.child", "token_target", "stale_target", "sibling", "sibling_orphan_setsid"}
+            "exec", "pspawn.child", "token_target", "stale_target", "survivor", "sibling", "sibling_orphan_setsid"}
     got_all = reps.wait_for(lambda rs: need <= {r.get("label") for r in rs} and
                             any(r.get("role") == "churner" and r.get("phase") == "done" for r in rs) and
                             sum(1 for r in rs if r.get("role") == "orphan" and r.get("phase") == "after_reparent") >= 3,
@@ -665,6 +796,30 @@ def run(out, control, state):
                       "sid_now": d and d["sid"], "orig_ppidversion": r.get("orig_ppidversion"),
                       "puniqueid": r.get("puniqueid"), "comm_now": d and d["comm"]}
     out["facts"] = facts
+    # exec transition: record every identity field before/after; re-bind ONLY via the identity-checked live parent
+    ex = gt.get("exec")
+    exec_probe = {"pre": None, "post": None, "changed": None, "rebound": False}
+    if ex:
+        post, perr = safe(B.info, ex["pid"])
+        pc, _ = safe(B.coal, ex["pid"])
+        rd, _ = safe(B.info, root["pid"])
+        fields = ("uniqueid", "idversion", "orig_ppidversion", "puniqueid", "ppid", "pgid", "uid", "ruid", "comm")
+        exec_probe["pre"] = {k: ex.get(k) for k in fields + ("coal",)}
+        if post:
+            exec_probe["post"] = dict({k: post.get(k) for k in fields}, coal=pc)
+            exec_probe["changed"] = sorted(k for k in fields if ex.get(k) != post.get(k))
+            # positive attribution: same never-reused uniqueid, same pid and uid, still a child of the
+            # identity-checked live root, same coalition. The stale pre-exec tuple is kept for the stale control.
+            if (post["uniqueid"] == ex["uniqueid"] and post["uid"] == ex["uid"] and post["ppid"] == root["pid"] and
+                    rd and rd["uniqueid"] == root["uniqueid"] and pc == root["coal"]):
+                gt["exec.pre"] = dict(ex, label="exec.pre")
+                gt["exec"] = dict(post, label="exec")
+                exec_probe["rebound"] = True
+        else:
+            exec_probe["post_err"] = perr
+    out["exec_identity"] = exec_probe
+    state["gt"] = gt
+    print("EXEC_IDENTITY", json.dumps(exec_probe, default=str), flush=True)
     orph = [r for r in recs if r.get("role") == "orphan" and r.get("phase") == "after_reparent"]
     mids = {r["label"]: r for r in recs if r.get("role") == "orphaner"}
     starts = {r["label"]: r for r in recs if r.get("role") == "orphan" and r.get("phase") == "start"}
@@ -675,6 +830,8 @@ def run(out, control, state):
             puniqueid_before=s and s.get("puniqueid"), puniqueid_after=r.get("puniqueid"),
             mid_uniqueid=m and m.get("uniqueid"), mid_idversion=m and m.get("idversion"),
             orig_ppidversion_after=r.get("orig_ppidversion"))
+    control("exec_rebound_by_uniqueid_and_checked_parent", True, exec_probe["rebound"],
+            f"fields changed by exec: {exec_probe['changed']}")
     ours = ["direct", "gparent.gc", "same_session_newpgrp", "setsid_seen", "orphan_same_session", "orphan_setsid",
             "exec", "pspawn.child"]
     control("owned_tree_shares_root_coalition", True,
@@ -728,6 +885,16 @@ def run(out, control, state):
         control(f"pre_cleanup_{mode}_root_counted_owned", True, root["pid"] in cert["owned"])
         control(f"pre_cleanup_{mode}_no_attribution_loss", [], lost)
         control(f"pre_cleanup_{mode}_sibling_not_owned", [], wrong, "deliberately unrelated same-coalition process")
+        # B1 (Agent E r30): every live non-sibling fixture of OUR tree must be "owned"; "candidate" is tolerated
+        # only for orphan_* (intermediate possibly never scanned); "error"/"excluded" is attribution loss.
+        own_cls = {lab: cls.get(r["pid"]) for lab, r in gt.items()
+                   if r["uniqueid"] not in sib_uniq and not lab.endswith((".pre", ".mid")) and r["pid"] in procs and
+                   procs[r["pid"]]["uniqueid"] == r["uniqueid"] and procs[r["pid"]]["status"] != SZOMB}
+        bad_own = {lab: c for lab, c in own_cls.items()
+                   if c != "owned" and not (c == "candidate" and lab.startswith("orphan_"))}
+        out[f"pre_cleanup_{mode}"]["own_tree_classes"] = own_cls
+        control(f"pre_cleanup_{mode}_own_tree_all_owned", ({}, True), (bad_own, len(own_cls) >= 10),
+                f"classes={own_cls}")
     lpid = launchd.get("pid")
     if DARWIN and lpid and lpid in procs:  # catches a certifier that drops the coalition check (mutant M5)
         control("launchd_job_lineage_candidate_coalition_excluded", ("candidate", "excluded"),
@@ -750,13 +917,20 @@ def run(out, control, state):
     control("wrong_identity_refused", "refused", verify_and_signal(wrong_tuple, 0, out["signals"]))
     st = gt["stale_target"]
     verify_and_signal(st, signal.SIGKILL, out["signals"])
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < 5 and safe(B.info, st["pid"])[0] and \
-            safe(B.info, st["pid"])[0]["status"] != SZOMB:
-        time.sleep(0.05)
-    time.sleep(0.3)
+    control("stale_target_vanished_after_kill", "vanished", wait_gone(st, 5.0))
     control("stale_identity_not_signalled", lambda v: v in ("gone", "zombie", "refused"),
             verify_and_signal(st, signal.SIGTERM, out["signals"]))
+    xp = gt.get("exec.pre")
+    if xp and DARWIN:  # a REAL stale identity on a live pid (XNU bumps idversion on exec; Linux sim cannot)
+        control("exec_pre_exec_tuple_refused", "refused", verify_and_signal(xp, signal.SIGTERM, out["signals"]))
+        if True:
+            r = B.signal_by_token(xp["pid"], xp["idversion"], signal.SIGTERM)
+            out["signals"].append({"pid": xp["pid"], "label": "exec.pre", "sig": "SIGTERM(token,pre-exec idv)",
+                                   "result": f"ret={r}"})
+            time.sleep(0.3)
+            dd = safe(B.info, xp["pid"])[0]
+            control("exec_pre_exec_token_esrch_and_target_alive", lambda v: v[0] == "absent" or
+                    (v[0] == E.ESRCH and v[1]), (r, bool(dd and dd["uniqueid"] == xp["uniqueid"])))
     if DARWIN:
         stale = B.signal_by_token(tt["pid"], tt["idversion"] + 1, signal.SIGTERM)
         alive_after_stale = safe(B.info, tt["pid"])[0] is not None
@@ -779,7 +953,8 @@ def run(out, control, state):
                 if lab in gt:
                     verify_and_signal(gt[lab], sig, out["signals"])
             time.sleep(1.0)
-    own_labels = [k for k in gt if gt[k]["uniqueid"] not in sib_uniq]
+    own_labels = [k for k in gt if gt[k]["uniqueid"] not in sib_uniq and k != "survivor" and
+                  not k.endswith((".pre", ".mid"))]
     kill_set(["root"] + [k for k in own_labels if k != "root"])
     root_p.wait(timeout=10)
     if lj and lj.get("rc") == 0:  # always remove our own submitted job, whether or not its pid was found
@@ -788,14 +963,46 @@ def run(out, control, state):
     time.sleep(1.0)
     procs, errs = census()
     tracker.update(procs)
+    surv = certify(procs, errs, root, tracker, "coalition", me)
+    surv.pop("classes")
+    out["post_own_cleanup_survivor_alive"] = surv
+    sv = gt.get("survivor")
+    so = gt.get("sibling_orphan_setsid")
+    control("survivor_admitted_by_tracker_lineage", True, bool(sv) and sv["uniqueid"] in tracker.known_uniq and
+            tracker.explained(sv["uniqueid"]), "the survivor must be owned via scanned lineage, not adoption")
+    control("explicit_survivors_owned_survivor_only", ("SURVIVORS", [sv and sv["pid"]], True),
+            (surv["state"], surv["owned"], bool(so) and so["pid"] in surv["candidates"]),
+            "deliberately unsignalled owned fixture; the foreign orphan stays a candidate")
+    kill_set(["survivor"])
+    procs, errs = census()
+    tracker.update(procs)
     mid = certify(procs, errs, root, tracker, "coalition", me)
-    mid.pop("classes")
+    mid_classes = mid.pop("classes")
     out["post_own_cleanup_coalition"] = mid
     print("POST-OWN", json.dumps(mid)[:2000], flush=True)
-    so = gt.get("sibling_orphan_setsid")
     control("same_coalition_foreign_orphan_is_uncertain", ("UNCERTAIN", True),
             (mid["state"], bool(so) and so["pid"] in mid["candidates"]),
             f"sibling orphan pid={so and so['pid']} must be a candidate, never signalled by the certifier")
+
+    # deliberately corrupted lineage evidence: a tracker copy that wrongly "knows" the sibling's intermediate.
+    # (a) injected known uniqueid without provenance -> the provenance audit turns it into an error (UNCERTAIN)
+    # (b) injected idversion entry for an unknown (unexplained) parent -> orig_ppidversion adoption refuses it
+    so_mid = gt.get("sibling_orphan_setsid.mid")
+    if so and so["pid"] in procs:
+        import copy
+        n_sig = len(out["signals"])
+        bad_a = copy.deepcopy(tracker)
+        bad_a.known_uniq.add(so["uniqueid"])
+        ra = certify(procs, errs, root, bad_a, "coalition", me)
+        control("corrupted_known_uniqueid_without_provenance_is_error", ("error", "UNCERTAIN"),
+                (ra["classes"].get(so["pid"]), ra["state"]))
+        if DARWIN and so_mid:
+            bad_b = copy.deepcopy(tracker)
+            bad_b.idvs[so_mid["uniqueid"]] = {so_mid["idversion"]}  # no provenance entry for so_mid
+            rb = certify(procs, errs, root, bad_b, "coalition", me)
+            control("corrupted_orig_parent_evidence_not_adopted", ("candidate", "UNCERTAIN"),
+                    (rb["classes"].get(so["pid"]), rb["state"]))
+        control("certifier_never_signals_even_with_corrupted_evidence", n_sig, len(out["signals"]))
 
     # ---- remove the driver's own siblings, then final certification
     kill_set([k for k in gt if gt[k]["uniqueid"] in sib_uniq])
@@ -821,12 +1028,40 @@ def run(out, control, state):
                                  for p in final["candidates"] if p in procs]
     out["final_coalition"] = final
     print("FINAL", json.dumps(final)[:2000], flush=True)
+    # synthetic misleading records (never real processes, never signalled): each must stop a CONFIRMED result
+    # or be excluded, by the rule's own logic.
+    base_rec = {"ppid": 1, "pgid": 0, "sid": 0, "uid": root["uid"], "ruid": root["uid"], "status": 2, "comm": "synthetic",
+                "start": 10 ** 15, "puniqueid": 0, "coal_err": None}
+    hi = max(p["idversion"] for p in procs.values()) + 1000
+    syn = {
+        "coal_zero": dict(base_rec, pid=10 ** 7 + 1, uniqueid=2 ** 62 + 1, idversion=hi + 1, orig_ppidversion=0,
+                          coal=[0, 0]),
+        "coal_missing": dict(base_rec, pid=10 ** 7 + 2, uniqueid=2 ** 62 + 2, idversion=hi + 2, orig_ppidversion=0,
+                             coal=None, coal_err={"what": "synthetic", "errno": "EPERM"}),
+        "coalition_only_no_lineage": dict(base_rec, pid=10 ** 7 + 3, uniqueid=2 ** 62 + 3, idversion=hi + 3,
+                                          orig_ppidversion=0, coal=list(root["coal"])),
+        "orig_ppid_link_foreign_coalition": dict(base_rec, pid=10 ** 7 + 4, uniqueid=2 ** 62 + 4, idversion=hi + 4,
+                                                 orig_ppidversion=root["idversion"],
+                                                 coal=[root["coal"][0] + 10 ** 6, 0]),
+    }
+    syn["uniqueid_missing"] = dict(base_rec, pid=10 ** 7 + 5, uniqueid=None, idversion=hi + 5, orig_ppidversion=0,
+                                   coal=list(root["coal"]))
+    expect = {"uniqueid_missing": ("error", "UNCERTAIN"), "coal_zero": ("error", "UNCERTAIN"), "coal_missing": ("error", "UNCERTAIN"),
+              "coalition_only_no_lineage": ("candidate", "UNCERTAIN"),
+              "orig_ppid_link_foreign_coalition": ("excluded", None)}
+    for name, rec in syn.items():
+        pp = dict(procs)
+        pp[rec["pid"]] = rec
+        c = certify(pp, errs, root, tracker, "coalition", me)
+        obs = (c["classes"].get(rec["pid"]), c["state"] if expect[name][1] else None)
+        control(f"synthetic_{name}", expect[name], obs, "positive attribution required; never signalled")
+
     # injected query failure on a live process after cleanup: must turn the result into UNCERTAIN, never CONFIRMED
     inj2 = certify(procs, errs, root, tracker, "coalition", me, inject_fail=(os.getppid(),))
     control("injected_query_failure_after_cleanup_uncertain", ("UNCERTAIN", True),
             (inj2["state"], os.getppid() in inj2["errors"]))
-    control("final_state_reported", lambda s: s in ("CONFIRMED", "UNCERTAIN"), final["state"],
-            "CONFIRMED expected unless unrelated same-coalition orphans exist (then UNCERTAIN, fail closed)")
+    control("final_state_confirmed", "CONFIRMED", final["state"],
+            f"two consecutive clean scans required; counts={final.get('counts')} candidates={final['candidate_detail']}")
 
     # ---- overhead
     t_w, t_c = time.perf_counter(), time.process_time()
@@ -839,7 +1074,12 @@ def run(out, control, state):
         for p in B.pids():
             safe(B.coal, p)
     c2 = (time.process_time() - t_c2) / n_scan
-    out["overhead"] = {"pids": len(procs), "full_scan_wall_ms": round(w * 1000, 2),
+    t_c3 = time.process_time()
+    for _ in range(n_scan):
+        for p in B.pids():
+            safe(B.info, p)
+    c3 = (time.process_time() - t_c3) / n_scan
+    out["overhead"] = {"pids": len(procs), "identity_only_scan_cpu_ms": round(c3 * 1000, 2), "scans_per_measure": n_scan, "full_scan_wall_ms": round(w * 1000, 2),
                        "full_scan_cpu_ms": round(c * 1000, 2), "coal_only_scan_cpu_ms": round(c2 * 1000, 2),
                        "cpu_at_1hz_pct": round(c * 100, 3), "nproc": os.cpu_count(), "loadavg": os.getloadavg()}
     print("OVERHEAD", json.dumps(out["overhead"]), flush=True)
@@ -851,7 +1091,7 @@ def run(out, control, state):
         if d and d["uniqueid"] == r["uniqueid"] and d["status"] != SZOMB:
             alive.append(lab)
     out["leaked_fixtures"] = alive
-    signalled_pids = {s["pid"] for s in out["signals"] if s["result"] == "sent"}
+    signalled_pids = {s["pid"] for s in out["signals"] + out.get("emergency_signals", []) if s["result"] == "sent"}
     outside = sorted(signalled_pids - {r["pid"] for r in gt.values()})
     out["signals_outside_ground_truth"] = outside
     safety_ok = not alive and not outside and not (final["state"] == "CONFIRMED" and
