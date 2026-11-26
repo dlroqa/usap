@@ -70,6 +70,25 @@ def wait_lines(n, limit=15):  # the root leaves only once its child has written 
         time.sleep(0.02)
 
 
+if "fastexit" in flags:  # the root forks and exits at once; the child forks its own child 200 ms later
+    if level == 0:
+        spawn(1); os._exit(0)
+    if level == 1:
+        time.sleep(0.2); spawn(2)
+    while True: time.sleep(1)
+if "doublefork" in flags:  # an unseen setsid escaper: the middle process starts a new-session grandchild and exits
+    if level == 0:
+        spawn(1); os._exit(0)
+    if level == 1:
+        spawn(2, escape=True); os._exit(0)
+    while True: time.sleep(1)
+if "newgroup" in flags and level == 2 and not WINDOWS:
+    os.setpgid(0, 0)  # leaves the root's group (stays in its session)
+if "forkloop" in flags and level == 1:  # ignores TERM and keeps starting short-lived children through the cleanup
+    if not WINDOWS: signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    while True:
+        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.05)
 if level == 0:
     spawn(1)
     if "exit7" in flags:

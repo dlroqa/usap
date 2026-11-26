@@ -21,20 +21,25 @@ Guarantees per platform (reported as "containment" in the JSON report)
           this tool and reaped continuously) + pidfd signalling. Not covered: a descendant that makes itself a
           subreaper or moves into another cgroup/container, and SIGKILL of this tool itself (for that, run this tool
           inside `systemd-run --user --wait --collect -p KillMode=control-group -p RuntimeMaxSec=...`).
-  macOS   reduced: process group + parent-chain tracking with libproc start times. A descendant that leaves the group
-          (setsid) is still tracked if it is seen while its parent lives (one poll = 20 ms); one that double-forks
-          faster is re-parented to launchd and can escape. Identity is checked right before each signal (a small
-          check-then-signal race remains; macOS has no pidfd).
+  macOS   reduced: the root is kept as an unreaped zombie until verification ends, so its pid, group and session id
+          stay reserved; every descendant that keeps the root's session is owned (os.getsid), even after it is
+          re-parented to launchd or changes group; a setsid escaper is tracked if seen while its parent lives. An
+          escaper not seen in time cannot be proven ours: a lineage check then reports "uncertain" (exit 121) and
+          signals nothing it cannot prove is ours. Identity is checked right before each signal (no pidfd on macOS).
   Windows full while this tool runs, pending native validation (the dev-tools workflow): the Job Object, created with
           KILL_ON_JOB_CLOSE and without breakaway, contains every descendant; the command starts suspended until it
           is in the job. If this tool is killed, closing the job handle still kills the tree. Not covered: an OUTER job
           (a terminal or CI runner) that allows silent breakaway could let a descendant leave unseen.
   With --require-full-containment the tool refuses to start (exit 125) where containment would be reduced.
 
-Exit codes: the command's own code when the tree ended cleanly; 128+N if it died from signal N (POSIX); 124 timeout
-(tree cleaned); 130/143 this tool was interrupted (tree cleaned); 120 survivors remained after the forced kill
-(overrides the others); 125 tool error or unsupported containment; 127 the command could not be started. A command
-that itself exits with 120, 124, 125 or 127 cannot be told apart from these by the code alone: read the --report.
+Certification (report "certification"): "confirmed" every owned process is gone, verified by a clean final rescan
+(Windows: the job is empty); "survivors" known owned processes are still alive; "uncertain" ownership could not be
+completed (a discovery error during the stop, processes still appearing when the kill rounds ran out, a possible unseen
+escaper on macOS). Success is reported only with "confirmed".
+Exit codes: the command's own code when certified; 128+N if it died from signal N (POSIX); 124 timeout; 130/143 this
+tool was interrupted; 120 survivors (overrides all others); 125 tool error or unsupported containment; 127 the command
+could not be started; 121 not certified ("uncertain"). A command
+that itself exits with 120, 121, 124, 125 or 127 cannot be told apart from these by the code alone: read the --report.
 """
 import argparse, ctypes, ctypes.util, json, os, signal, subprocess, sys, threading, time
 
@@ -43,7 +48,7 @@ LINUX = sys.platform.startswith("linux")
 MACOS = sys.platform == "darwin"
 WINDOWS = os.name == "nt"
 POLL = 0.02
-EXIT_TIMEOUT, EXIT_SURVIVORS, EXIT_TOOL, EXIT_NOEXEC = 124, 120, 125, 127
+EXIT_TIMEOUT, EXIT_SURVIVORS, EXIT_UNCERTAIN, EXIT_TOOL, EXIT_NOEXEC = 124, 120, 121, 125, 127
 
 
 class ToolError(Exception):
@@ -81,6 +86,8 @@ class LinuxOwner:
             if not self.children_file:
                 self.warnings.append("/proc/<pid>/task/<tid>/children unavailable: descendants found by group and parent scan only")
         self.known = {}  # pid -> {"start", "fd", "ppid", "pgid"}
+        self.uncertain_reasons = []
+        self.certification_basis = "linux: subreaper + pidfd + clean final rescan"
         self.lock = threading.Lock()
         self.root = None
         self.root_status = None
@@ -164,6 +171,11 @@ class LinuxOwner:
             if self.children_file:
                 for c in self._children_of(pid):
                     self._adopt(c, expect_ppid=pid)
+        now = time.monotonic()
+        if self.children_file and not getattr(self, "stopping", False) and now - getattr(self, "_full_at", 0.0) < 1.0:
+            return  # children files of every known process + this tool (subreaper) find every descendant; the full
+                    # /proc walk below is a once-a-second cross-check and runs on every scan during the stop
+        self._full_at = now
         with os.scandir("/proc") as it:  # group members and parent links (also the fallback without children files)
             for e in it:
                 if not e.name.isdigit(): continue
@@ -250,6 +262,12 @@ class _BsdInfo(ctypes.Structure):
 
 
 class MacOwner:
+    """macOS: the root is kept as an UNREAPED zombie until verification ends (its exit is seen with waitid WNOWAIT), so
+    its pid, group id and session id cannot be reused. Ownership: os.getsid(pid) == root (every descendant that did not
+    call setsid, even after it was re-parented to launchd or moved to another group), or a parent that is a known,
+    identity-checked process (setsid escapers seen while their parent lives). An escaper that is not seen in time cannot
+    be proven ours; a lineage check at verification then reports the run "uncertain" (never "confirmed") and signals
+    nothing it cannot prove is ours."""
     containment = "reduced"
     identity_mode = "libproc-start-check"
 
@@ -259,31 +277,32 @@ class MacOwner:
         self.lib.proc_pidinfo.restype = ctypes.c_int
         self.lib.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
         self.lib.proc_listallpids.restype = ctypes.c_int
-        self.warnings = ["macOS: a descendant that leaves the process group and is re-parented to launchd before it is seen can escape"]
+        if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
+            raise ToolError("os.waitid with WNOWAIT is required on macOS")
+        self.warnings = ["macOS: a descendant that calls setsid and is re-parented to launchd before it is seen cannot be "
+                         "proven ours; such a run is reported 'uncertain'"]
+        self.uncertain_reasons = []
+        self.certification_basis = "macos: session of the pinned root + known parents + lineage check"
         self.proc = None
         self.known = {}
         self.lock = threading.Lock()
         self.root = None
+        self.root_start = None
         self.root_status = None
+        self.root_exited_flag = False
+        self.pinned = False  # True while the root exists unreaped (alive or zombie) and no one else could reap it
         self.escaped_seen = []
+        self.pre = set()
+        self.uid = os.getuid()
 
     def info(self, pid):
+        """(ppid, pgid, start, uid) of a live, non-zombie process, or None."""
         b = _BsdInfo()
         n = self.lib.proc_pidinfo(pid, 3, 0, ctypes.byref(b), ctypes.sizeof(b))  # PROC_PIDTBSDINFO
         if n != ctypes.sizeof(b) or b.pbi_status == 5:  # SZOMB
             return None
-        return int(b.pbi_ppid), int(b.pbi_pgid), (int(b.pbi_start_tvsec), int(b.pbi_start_tvusec))
-
-    def spawn(self, cmd, cwd, env):
-        try:
-            p = subprocess.Popen(cmd, cwd=cwd, env=env, start_new_session=True)
-        except OSError as e:
-            raise ToolError(f"could not start the command: {e}") from e
-        self.proc = p
-        self.root = p.pid
-        st = self.info(p.pid)
-        if st: self.known[p.pid] = {"start": st[2], "ppid": st[0], "pgid": st[1]}
-        return p.pid
+        return int(b.pbi_ppid), int(b.pbi_pgid), (int(b.pbi_start_tvsec), int(b.pbi_start_tvusec)), (int(b.pbi_uid), int(b.pbi_ruid)), \
+            b.pbi_comm.decode("ascii", "replace")[:16]
 
     def _all(self):
         n = self.lib.proc_listallpids(None, 0)
@@ -291,20 +310,40 @@ class MacOwner:
         n = self.lib.proc_listallpids(buf, ctypes.sizeof(buf))
         return [buf[i] for i in range(max(0, n)) if buf[i] > 0]
 
+    def spawn(self, cmd, cwd, env):
+        for q in self._all():  # pre-spawn snapshot: nothing that already existed can be a candidate later
+            st = self.info(q)
+            if st: self.pre.add((q, st[2]))
+        try:
+            p = subprocess.Popen(cmd, cwd=cwd, env=env, start_new_session=True)
+        except OSError as e:
+            raise ToolError(f"could not start the command: {e}") from e
+        self.proc = p
+        self.root = p.pid
+        st = self.info(p.pid)
+        self.pinned = True
+        if st:
+            self.root_start = st[2]
+            self.known[p.pid] = {"start": st[2], "ppid": st[0], "pgid": st[1]}
+        return p.pid
+
+    def _sid(self, pid):
+        try: return os.getsid(pid)
+        except OSError: return None
+
     def scan(self):
         me = os.getpid()
         for pid in self._all():
             if pid in self.known or pid == me: continue
             st = self.info(pid)
             if st is None: continue
-            # same rules as Linux (no pidfd here): a parent that is still the recorded process, or a group a verified
-            # live member still holds; the candidate's identity is re-read afterwards and must be unchanged
-            ok = (st[0] in self.known and self._still_ours(st[0])) or \
-                 (st[1] == self.root and any(k["pgid"] == self.root and self._still_ours(q, pgid=self.root) for q, k in list(self.known.items())))
-            if not ok or self.info(pid) != st: continue
+            in_session = self.pinned and self._sid(pid) == self.root  # sound only while the root is pinned
+            via_parent = st[0] in self.known and self._still_ours(st[0])
+            if not (in_session or via_parent): continue
+            if self.info(pid) != st: continue  # identity unchanged across the checks
             with self.lock:
                 self.known[pid] = {"start": st[2], "ppid": st[0], "pgid": st[1]}
-            if st[1] != self.root:
+            if not in_session:
                 self.escaped_seen.append(pid)
 
     def _still_ours(self, pid, pgid=None):
@@ -312,9 +351,14 @@ class MacOwner:
         return st is not None and st[2] == k["start"] and (pgid is None or st[1] == pgid)
 
     def reap(self):
-        if self.root_status is None and self.proc is not None:
-            rc = self.proc.poll()
-            if rc is not None: self.root_status = rc
+        """Never reaps the root before cleanup ends: its exit is only observed (WNOWAIT), so it stays pinned."""
+        if self.proc is None or self.root_exited_flag: return
+        try:
+            r = os.waitid(os.P_PID, self.root, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            self.uncertain_reasons.append("the root was reaped elsewhere: its ids are no longer pinned"); self.root_exited_flag = True; self.pinned = False; return
+        if r is not None and r.si_pid == self.root:
+            self.root_exited_flag = True
 
     def alive(self):
         out = []
@@ -333,12 +377,44 @@ class MacOwner:
         if not k or st is None or st[2] != k["start"]:
             return False
         try:
-            os.kill(pid, sig); return True
+            os.kill(pid, sig)
         except ProcessLookupError:
             return False
+        if self.root_exited_flag and self.pinned and sig in (signal.SIGTERM, signal.SIGKILL):
+            try: os.killpg(self.root, sig)  # safe: the pinned zombie keeps this group id ours
+            except (ProcessLookupError, PermissionError): pass
+        return True
+
+    def verify(self):
+        """Lineage check (fail-closed): a live same-user process started after the root, not ours and not pre-existing,
+        whose parent chain reaches launchd (pid 1) only through processes also started after the root, may be an unseen
+        setsid escaper. It is reported, never signalled."""
+        cands = []
+        if self.root_start is None:
+            self.uncertain_reasons.append("the root's start time was never read"); return cands
+        infos = {}
+        for q in self._all():
+            st = self.info(q)
+            if st: infos[q] = st
+        for q, st in infos.items():
+            if q in self.known or q == os.getpid() or (q, st[2]) in self.pre or self.uid not in st[3] or st[2] < self.root_start:
+                continue
+            chain, cur, ok = 0, q, False
+            while chain < 64:
+                c = infos.get(cur)
+                if c is None: break
+                if c[0] == 1: ok = True; break
+                par = infos.get(c[0])
+                if par is None or par[2] < self.root_start or (c[0], par[2]) in self.pre: break  # reaches an older process: not ours
+                cur = c[0]; chain += 1
+            if ok: cands.append(q)
+        if cands:
+            det = [{"pid": q, "comm": infos[q][4], "ppid": infos[q][0], "start": list(infos[q][2]), "uid": infos[q][3][0], "ruid": infos[q][3][1]} for q in sorted(cands)[:10]]
+            self.uncertain_reasons.append("possible unseen setsid escapers (not signalled): " + json.dumps(det))
+        return cands
 
     def root_exited(self):
-        return self.root_status is not None
+        return self.root_exited_flag
 
     def root_result(self):
         rc = self.root_status
@@ -350,7 +426,12 @@ class MacOwner:
         return {"pid": pid, "start": list(k["start"]) if k.get("start") else None, "ppid": k.get("ppid"), "pgid": k.get("pgid")}
 
     def close(self):
-        pass
+        """Reap the root last (after verification)."""
+        if self.proc is not None and self.root_status is None:
+            self.pinned = False
+            try: self.root_status = self.proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                self.uncertain_reasons.append("the root could not be reaped")
 
 
 # ── Windows ──────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -476,7 +557,8 @@ def run(cmd, timeout=None, grace=5.0, cwd=None, env=None, require_full=False):
     """Returns (exit_code, report). CLI use only: in-process use would make the caller a subreaper (Linux) whose own
     children this tool would reap. The tree is stopped on EVERY exit path, including an unexpected error in the tool."""
     report = {"version": VERSION, "platform": sys.platform, "containment": None, "identity_mode": None, "root": None,
-              "timed_out": False, "interrupted": None, "signalled": [], "survivors": [], "escaped_seen": [], "warnings": []}
+              "timed_out": False, "interrupted": None, "signalled": [], "survivors": [], "escaped_seen": [], "warnings": [],
+              "certification": None, "certification_basis": "", "uncertain_reasons": []}
     try:
         owner = make_owner()
     except (ToolError, OSError) as e:
@@ -492,7 +574,7 @@ def run(cmd, timeout=None, grace=5.0, cwd=None, env=None, require_full=False):
         for s in [x for x in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK") if hasattr(signal, x)]:
             try: old[s] = signal.signal(getattr(signal, s), h)
             except (OSError, ValueError): pass
-    code, survivors, noexec, failure = None, False, False, None
+    cert, noexec, failure = "uncertain", False, None
     try:
         try:
             owner.spawn(cmd, cwd, env if env is not None else os.environ.copy())
@@ -513,26 +595,33 @@ def run(cmd, timeout=None, grace=5.0, cwd=None, env=None, require_full=False):
                 try: left_after_exit = owner.root_exited() and not report["timed_out"] and len(owner.alive()) > 0
                 except Exception:  # noqa: BLE001 - only a warning depends on it; never skip the stop
                     left_after_exit = False
-                survivors = _stop_tree(owner, grace, report)
+                cert = _stop_tree(owner, grace, report)
                 if left_after_exit:
                     report["warnings"].append("the command exited and left descendants running; they were stopped")
             except BaseException as e:  # noqa: BLE001
                 report["warnings"].append(f"stopping the tree failed: {type(e).__name__}: {e}")
-                survivors = True
+                report["uncertain_reasons"].append(f"stopping the tree failed: {type(e).__name__}")
+                cert = "uncertain"
     finally:
         for s, prev in old.items():
             try: signal.signal(getattr(signal, s), prev)
             except (OSError, ValueError): pass
+    try: owner.close()  # macOS reaps the pinned root here, after verification
+    except Exception:  # noqa: BLE001
+        pass
+    for r in getattr(owner, "uncertain_reasons", []):
+        if r not in report["uncertain_reasons"]: report["uncertain_reasons"].append(r)
+    if report["uncertain_reasons"] and cert == "confirmed": cert = "uncertain"
     rc, sig = owner.root_result()
     report["root"] = {"pid": owner.root, "rc": rc, "signal": sig}
     report["warnings"] += owner.warnings
     report["escaped_seen"] = list(getattr(owner, "escaped_seen", []))
     if failure: report["warnings"].append(failure)
-    try: owner.close()
-    except Exception:  # noqa: BLE001
-        pass
-    if survivors: return EXIT_SURVIVORS, report
+    report["certification"] = cert
+    if failure and cert == "confirmed": cert = report["certification"] = "uncertain" if not noexec else "confirmed"
+    if cert == "survivors": return EXIT_SURVIVORS, report
     if failure: return (EXIT_NOEXEC if noexec else EXIT_TOOL), report
+    if cert != "confirmed": return EXIT_UNCERTAIN, report
     if report["interrupted"]: return 128 + report["interrupted"], report
     if report["timed_out"]: return EXIT_TIMEOUT, report
     if sig: return 128 + sig, report
@@ -540,31 +629,45 @@ def run(cmd, timeout=None, grace=5.0, cwd=None, env=None, require_full=False):
 
 
 def _stop_tree(owner, grace, report):
-    """Graceful stop, bounded grace, forced stop, verification. Signals are blocked meanwhile (POSIX). Discovery and
-    reaping are best-effort here: an error in them is recorded once and never stops the known processes being signalled."""
-    errs = set()
+    """Graceful stop, bounded grace, forced stop, verification. Returns the certification:
+      "confirmed"  every owned process is gone, verified by a clean final rescan (Windows: the job is empty);
+      "survivors"  known owned processes are still alive after the forced stop;
+      "uncertain"  ownership could not be completed (a discovery error during the stop, processes still appearing when
+                   the kill rounds ran out, a platform-specific doubt such as a lineage candidate on macOS).
+    Signals are blocked meanwhile (POSIX). Discovery and reaping are best-effort: an error is recorded once, never
+    stops the known processes being signalled, and makes the result "uncertain"."""
+    reasons = report.setdefault("uncertain_reasons", [])
+    def note(m):
+        if m not in reasons: reasons.append(m)
     def safe(fn):
-        try: fn()
+        try: fn(); return True
         except Exception as e:  # noqa: BLE001
             m = f"during stop: {fn.__name__}: {type(e).__name__}: {e}"
-            if m not in errs: errs.add(m); report["warnings"].append(m)
+            if m not in report["warnings"]: report["warnings"].append(m)
+            note(m); return False
     blocked = set()
     if hasattr(signal, "pthread_sigmask"):
         blocked = {getattr(signal, s) for s in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, s)}
         signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
     try:
         if WINDOWS:
-            if owner.active():
-                owner.graceful()
-                end = time.monotonic() + grace
+            try:
+                if owner.active():
+                    owner.graceful()
+                    end = time.monotonic() + grace
+                    while owner.active() and time.monotonic() < end: time.sleep(POLL)
+                    if owner.active(): owner.force(); report["signalled"].append("TerminateJobObject")
+                end = time.monotonic() + 10
                 while owner.active() and time.monotonic() < end: time.sleep(POLL)
-                if owner.active(): owner.force(); report["signalled"].append("TerminateJobObject")
-            end = time.monotonic() + 10
-            while owner.active() and time.monotonic() < end: time.sleep(POLL)
-            safe(owner.reap)
-            n = owner.active()
+                safe(owner.reap)
+                n = owner.active()
+            except Exception as e:  # noqa: BLE001 - the job API failed: cannot certify (closing the job still kills it)
+                note(f"job query/terminate failed: {type(e).__name__}: {e}")
+                return "uncertain"
             report["survivors"] = [{"job_process": i} for i in range(n)]
-            return n > 0
+            report["certification_basis"] = "windows: job ActiveProcesses == 0"
+            return "survivors" if n else ("uncertain" if reasons else "confirmed")
+        owner.stopping = True  # every scan from here is a full scan
         safe(owner.reap); safe(owner.scan)
         for pid in owner.alive():
             if owner.signal(pid, signal.SIGTERM): report["signalled"].append({"pid": pid, "sig": "TERM"})
@@ -573,10 +676,15 @@ def _stop_tree(owner, grace, report):
             safe(owner.reap); safe(owner.scan)
             if not owner.alive(): break
             time.sleep(POLL)
-        for _ in range(3):  # anything started during the grace period is killed too
-            safe(owner.reap); safe(owner.scan)
+        clean = False
+        for _ in range(6):  # kill rounds; each ends with a rescan, so a process started meanwhile is found and killed
+            safe(owner.reap); ok = safe(owner.scan)
             left = owner.alive()
-            if not left: break
+            if not left:
+                time.sleep(POLL * 2)  # settle, then one more full rescan must also find nothing
+                safe(owner.reap); ok2 = safe(owner.scan)
+                if ok and ok2 and not owner.alive(): clean = True; break
+                continue
             for pid in left:
                 if owner.signal(pid, signal.SIGKILL): report["signalled"].append({"pid": pid, "sig": "KILL"})
             end = time.monotonic() + 5
@@ -585,7 +693,12 @@ def _stop_tree(owner, grace, report):
         safe(owner.reap)
         left = owner.alive()
         report["survivors"] = [owner.describe(p) for p in left]
-        return bool(left)
+        if hasattr(owner, "verify"): safe(owner.verify)
+        for r in getattr(owner, "uncertain_reasons", []): note(r)
+        report["certification_basis"] = getattr(owner, "certification_basis", "")
+        if left: return "survivors"
+        if not clean: note("the kill rounds ended without a clean final rescan")
+        return "uncertain" if reasons else "confirmed"
     finally:
         if blocked: signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
 
@@ -604,8 +717,8 @@ def main(argv=None):
     code, report = run(cmd, timeout=a.timeout, grace=a.grace, require_full=a.require_full_containment)
     if a.report:
         with open(a.report, "w", encoding="utf8") as f: json.dump(report, f, indent=1)
-    if code in (EXIT_SURVIVORS, EXIT_TOOL) or report["warnings"]:
-        sys.stderr.write("run_owned: " + json.dumps({k: report[k] for k in ("containment", "survivors", "warnings")}) + "\n")
+    if code in (EXIT_SURVIVORS, EXIT_UNCERTAIN, EXIT_TOOL) or report["warnings"]:
+        sys.stderr.write("run_owned: " + json.dumps({k: report[k] for k in ("certification", "containment", "survivors", "uncertain_reasons", "warnings")}) + "\n")
     return code
 
 

@@ -128,10 +128,11 @@ class Case(unittest.TestCase):
         self.assertEqual(code, 0, err); self.assertEqual(rep["survivors"], [])
         self.assertGreaterEqual(len(pids), 2); self.assertEqual(self.ident.alive_all(), [])
         self.assertTrue(any("left descendants" in w for w in rep["warnings"]), rep["warnings"])
+        self.assertEqual(rep["certification"], "confirmed", rep)
 
     def test_root_exit_code_is_preserved(self):
         code, rep, err = self.tool("--grace", "2", "--", *self.fixture("exit7"))
-        self.assertEqual(code, 7, err); self.assertEqual(rep["root"]["rc"], 7)
+        self.assertEqual(code, 7, err); self.assertEqual(rep["root"]["rc"], 7); self.assertEqual(rep["certification"], "confirmed", rep)
         self.read_pids(2, wait=1); self.assertEqual(self.ident.alive_all(), [])
 
     def test_timeout_stops_a_three_level_tree(self):
@@ -139,7 +140,7 @@ class Case(unittest.TestCase):
         pids, _ = self.read_pids(3)
         code = p.wait(timeout=60)
         r = load(rep)
-        self.assertEqual(code, ro.EXIT_TIMEOUT, p.stderr.read().decode()); self.assertTrue(r["timed_out"]); self.assertEqual(r["survivors"], [])
+        self.assertEqual(code, ro.EXIT_TIMEOUT, p.stderr.read().decode()); self.assertTrue(r["timed_out"]); self.assertEqual(r["survivors"], []); self.assertEqual(r["certification"], "confirmed", r)
         self.assertEqual(len(pids), 3); self.assertEqual(self.ident.alive_all(), [])
 
     @unittest.skipIf(WINDOWS, "POSIX signals")
@@ -293,12 +294,126 @@ def boom(self):
             if sum(1 for x in f if x.strip()) >= 3: raise RuntimeError("injected")
 ro.{cls}.scan = boom
 code, rep = ro.run([sys.executable, "-B", {FIX!r}, "tree", {self.pids!r}], timeout=30, grace=1, env=dict(os.environ))
-print(json.dumps(dict(code=code, survivors=rep["survivors"], warnings=rep["warnings"])))
+print(json.dumps(dict(code=code, survivors=rep["survivors"], warnings=rep["warnings"], certification=rep["certification"])))
 """)
         self.read_pids(3, wait=1)
-        self.assertEqual(r["code"], ro.EXIT_TOOL, r); self.assertEqual(r["survivors"], [])
+        self.assertEqual(r["code"], ro.EXIT_TOOL, r); self.assertEqual(r["survivors"], []); self.assertEqual(r["certification"], "uncertain", r)
         self.assertTrue(any("injected" in w for w in r["warnings"]), r)
         self.assertEqual(self.ident.alive_all(), [])
+
+    def test_no_descendants_is_confirmed(self):
+        code, rep, err = self.tool("--", sys.executable, "-c", "pass")
+        self.assertEqual(code, 0, err); self.assertEqual(rep["certification"], "confirmed", rep)
+
+    def test_root_exits_before_its_child_is_observed(self):
+        """The macOS arm64 failure: the root forks and exits at once; its child forks later. All must be found."""
+        for i in range(5):  # repeated: the race is timing-dependent
+            code, rep, err = self.tool("--timeout", "20", "--grace", "1", "--", *self.fixture("fastexit"))
+            self.read_pids(3, wait=3)
+            self.assertEqual(self.ident.alive_all(), [], f"run {i}: {rep}")
+            self.assertIn(code, (0, ro.EXIT_UNCERTAIN), err)
+            if code == 0: self.assertEqual(rep["certification"], "confirmed")
+            if os.path.exists(self.pids): os.unlink(self.pids)
+
+    @unittest.skipIf(WINDOWS, "POSIX process groups")
+    def test_descendant_in_a_new_group_is_stopped(self):
+        p, rep = self.tool("--timeout", "3", "--grace", "1", "--", *self.fixture("tree,newgroup"), background=True)
+        self.read_pids(3); code = p.wait(timeout=60); r = load(rep)
+        self.assertEqual(code, ro.EXIT_TIMEOUT, r); self.assertEqual(r["certification"], "confirmed", r); self.assertEqual(self.ident.alive_all(), [])
+
+    def test_unseen_session_escaper_is_never_confirmed(self):
+        """A grandchild that starts a new session after its parent and the root have exited. Linux (subreaper) and
+        Windows (job) must stop it; macOS may not be able to prove it ours, but must then say "uncertain"."""
+        code, rep, err = self.tool("--timeout", "20", "--grace", "1", "--", *self.fixture("doublefork"))
+        self.read_pids(3, wait=3)
+        left = self.ident.alive_all()
+        if MACOS and left:
+            self.assertEqual(code, ro.EXIT_UNCERTAIN, rep); self.assertEqual(rep["certification"], "uncertain", rep)
+        else:
+            self.assertEqual(left, [], rep); self.assertIn(code, (0, ro.EXIT_UNCERTAIN)); self.assertNotEqual(rep["certification"], "survivors")
+        self.assertFalse(code == 0 and left, "never success while a descendant lives")
+
+    def test_forking_during_cleanup_is_never_a_silent_success(self):
+        p, rep = self.tool("--timeout", "2", "--grace", "1", "--", *self.fixture("tree,forkloop"), background=True)
+        self.read_pids(2); code = p.wait(timeout=90); r = load(rep)
+        time.sleep(0.5)  # the short-lived children end on their own
+        self.assertIn(r["certification"], ("confirmed", "survivors", "uncertain"))
+        if r["certification"] == "confirmed":
+            self.assertEqual(code, ro.EXIT_TIMEOUT); self.assertEqual(self.ident.alive_all(), [])
+        else:
+            self.assertIn(code, (ro.EXIT_SURVIVORS, ro.EXIT_UNCERTAIN))
+
+    @unittest.skipIf(WINDOWS, "POSIX discovery")
+    def test_discovery_error_during_the_stop_is_uncertain(self):
+        cls = "LinuxOwner" if LINUX else "MacOwner"
+        r = self.snippet(f"""
+orig = ro.{cls}.scan
+def flaky(self):
+    if getattr(self, "stopping", False): raise OSError("injected stop-phase discovery failure")
+    orig(self)
+ro.{cls}.scan = flaky
+code, rep = ro.run([sys.executable, "-B", {FIX!r}, "tree", {self.pids!r}], timeout=2, grace=1, env=dict(os.environ))
+print(json.dumps(dict(code=code, certification=rep["certification"], reasons=rep["uncertain_reasons"])))
+""")
+        self.assertEqual(r["code"], ro.EXIT_UNCERTAIN, r); self.assertEqual(r["certification"], "uncertain")
+        self.assertEqual(self.ident.alive_all(), [], "known processes were still stopped")
+
+    # ── certification layers, each on its own (a fake owner: no processes are started or signalled) ──
+    class Fake:
+        containment, identity_mode = "full", "fake"
+        def __init__(self, reasons=(), scan_fails=False, alive_fails=False, clean=True):
+            self.uncertain_reasons, self.warnings, self.root, self.root_status = list(reasons), [], -1, 0
+            self.scan_fails, self.alive_fails, self.clean = scan_fails, alive_fails, clean
+            self.certification_basis = "fake"
+        def spawn(self, cmd, cwd, env): return -1
+        def reap(self): pass
+        def scan(self):
+            if self.scan_fails and getattr(self, "stopping", False): raise OSError("fake discovery failure")
+        def alive(self):
+            if self.alive_fails and getattr(self, "stopping", False): raise RuntimeError("fake alive failure")
+            return []
+        def signal(self, pid, sig): return False
+        def describe(self, pid): return {"pid": pid}
+        def root_exited(self): return True
+        def root_result(self): return 0, None
+        def close(self): pass
+
+    def stop_with(self, owner):
+        report = {"warnings": [], "signalled": [], "survivors": []}
+        return ro._stop_tree(owner, 0.05, report), report
+
+    @unittest.skipIf(WINDOWS, "POSIX stop path")
+    def test_layer_stop_clean_fake_is_confirmed(self):
+        self.assertEqual(self.stop_with(self.Fake())[0], "confirmed")
+
+    @unittest.skipIf(WINDOWS, "POSIX stop path")
+    def test_layer_stop_owner_reason_is_uncertain(self):
+        cert, rep = self.stop_with(self.Fake(reasons=["owner doubt"]))
+        self.assertEqual(cert, "uncertain"); self.assertIn("owner doubt", rep["uncertain_reasons"])
+
+    @unittest.skipIf(WINDOWS, "POSIX stop path")
+    def test_layer_stop_discovery_error_is_recorded_as_reason(self):
+        cert, rep = self.stop_with(self.Fake(scan_fails=True))
+        self.assertEqual(cert, "uncertain"); self.assertTrue(any("fake discovery failure" in r for r in rep["uncertain_reasons"]), rep)
+
+    def test_layer_run_owner_reason_is_121(self):
+        orig = ro.make_owner
+        try:
+            ro.make_owner = lambda: self.Fake(reasons=["owner doubt"])
+            code, rep = ro.run(["unused"], timeout=1, grace=0.05)
+        finally:
+            ro.make_owner = orig
+        self.assertEqual((code, rep["certification"]), (ro.EXIT_UNCERTAIN, "uncertain"))
+
+    @unittest.skipIf(WINDOWS, "POSIX stop path")
+    def test_layer_run_stop_failure_is_uncertain_121(self):
+        orig = ro.make_owner
+        try:
+            ro.make_owner = lambda: self.Fake(alive_fails=True)
+            code, rep = ro.run(["unused"], timeout=1, grace=0.05)
+        finally:
+            ro.make_owner = orig
+        self.assertEqual((code, rep["certification"]), (ro.EXIT_UNCERTAIN, "uncertain"), rep)
 
     def test_negative_control_plain_timeout_leaves_descendants(self):
         """The incident: a plain subprocess timeout kills only the direct child."""

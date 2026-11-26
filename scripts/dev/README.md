@@ -20,16 +20,22 @@ python3 scripts/dev/run_owned.py --timeout 600 --grace 5 --report run.json -- no
 | `--report FILE` | write a JSON report: containment, identity mode, root exit, signals sent, survivors, warnings |
 | `--require-full-containment` | refuse to start (exit 125) where containment would be reduced (macOS) |
 
-Exit codes (a command that itself exits 120, 124, 125 or 127 is told apart only by the report): the command's own code when the tree ended cleanly; 128+N if it died from signal N; 124 timeout; 130/143
-this tool was interrupted; **120 processes survived the forced stop** (overrides the others); 125 tool error or
-containment refused; 127 the command could not be started.
+Every run ends with a certification in the report: **confirmed** (every owned process is gone, checked by a clean final
+rescan; Windows: the job is empty), **survivors** (known processes are still alive) or **uncertain** (ownership could not
+be completed: a discovery error during the stop, processes still appearing when the kill rounds ran out, or a possible
+unseen escaper on macOS). The tool reports success only when the run is confirmed.
+
+Exit codes (a command that itself exits 120, 121, 124, 125 or 127 is told apart only by the report): the command's own
+code when confirmed; 128+N if it died from signal N; 124 timeout; 130/143 this tool was interrupted; **120 processes
+survived the forced stop** (overrides the others); **121 not certified (uncertain)**; 125 tool error or containment
+refused; 127 the command could not be started.
 
 ### What is guaranteed where
 
 | Platform | Containment | How | Not covered |
 |---|---|---|---|
-| Linux | full (reduced, and reported so, if `os.pidfd_open` or `/proc/<pid>/task/<tid>/children` is missing) | own session/process group, child subreaper (escaped descendants are re-parented to the tool and reaped continuously), pidfd: a process is pinned before it is recorded and signalled only through its pidfd | a descendant that makes itself a subreaper or joins another cgroup/container; SIGKILL of the tool itself (run the tool inside `systemd-run --user --wait --collect -p KillMode=control-group -p RuntimeMaxSec=…` for that) |
-| macOS | **reduced** | own session/process group, parent-chain tracking with libproc start times, identity checked right before each signal | a descendant that leaves the group and is re-parented to launchd before the tool sees it (one poll = 20 ms); a small check-then-signal race (no pidfd on macOS); SIGKILL of the tool |
+| Linux | full (reduced, and reported so, if `os.pidfd_open` or `/proc/<pid>/task/<tid>/children` is missing) | own session/process group, child subreaper (escaped descendants are re-parented to the tool and reaped continuously; a full `/proc` cross-check once a second and on every stop round), pidfd: a process is pinned before it is recorded and signalled only through its pidfd | a descendant that makes itself a subreaper or joins another cgroup/container; SIGKILL of the tool itself (run the tool inside `systemd-run --user --wait --collect -p KillMode=control-group -p RuntimeMaxSec=…` for that) |
+| macOS | **reduced** | own session; the root is kept as an unreaped zombie until verification, so its pid, group and session id stay reserved; every descendant still in the root's session is owned (even after re-parenting or `setpgid`); setsid escapers seen while their parent lives are tracked; identity checked right before each signal | a descendant that calls `setsid` and loses its parent before the tool sees it cannot be proven ours: the run is then reported **uncertain** (exit 121) and that process is not signalled; a small check-then-signal race (no pidfd on macOS); a backward wall-clock step during the run (start times are wall-clock); SIGKILL of the tool. Same-user jobs that launchd starts during the run can make a run "uncertain" (fail-closed false positive) |
 | Windows | full while the tool runs, **pending native validation** by the `dev-tools` workflow | a Job Object with kill-on-close and without breakaway; the command starts suspended and runs only once it is in the job; graceful Ctrl+Break, then the job is terminated and verified empty; if the tool is killed, closing its job handle still kills the tree | an outer job (terminal, CI runner) that allows silent breakaway could let a descendant leave unseen |
 
 Processes are identified by pid and kernel start time (Linux, macOS) or contained by the job (Windows). Nothing is
