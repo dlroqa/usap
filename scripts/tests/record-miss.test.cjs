@@ -190,19 +190,28 @@ test("without USAP_TEST_CONN_LOG_TRACE the preload writes no trail and the recor
 });
 
 // ── C3 (round 15): dead server, trail cap, read-failure counts, sanitized tail ──────────────────────────────────────
-test("C3 real: the studio dies after its answer; the miss reads 'server dead' with the exit seen before any test stop", { timeout: 30000 }, async () => {
+test("C3 real: the studio dies after its answer; the miss reads 'server dead' with the exit seen before any test stop", { timeout: 30000 }, async (t) => {
+  const ph = { begin: Date.now() }; // round 26: unjudged phase times (the Windows run of this control took 5151 ms)
   await withTraced(async ({ port, collector, srv, root }) => {
+    ph.started = Date.now();
     const st = await overLimit(port);
+    ph.answered = Date.now();
     const killAt = Date.now();
+    srv.proc.once("exit", () => { ph.exitEvent = Date.now(); });
     srv.proc.kill("SIGKILL"); // Windows: TerminateProcess (exit code 1); POSIX: SIGKILL
     await closed(st);
+    ph.clientClosed = Date.now();
     assert.equal(await collector(300, 200, true).recordFor(st), undefined, "a miss (the required-record lookup is unchanged)");
-    assert.match(st.recordMiss, /^server dead: the studio had exited \(code (1|null), signal (SIGKILL|none)\) at -?\d+ \(before the test stopped it\), with no record write traced for this connection/, st.recordMiss);
+    ph.collected = Date.now();
+    assert.match(st.recordMiss, /^server dead: the studio had exited \(code (1|null), signal (SIGKILL|none)\) at -?\d+ \(before the test stopped it\), \d+ ms (before|after) the last read, with no record write traced for this connection/, st.recordMiss);
     assert.match(st.recordMiss, /studio at the miss exited \(pid \d+/);
     const exitRel = Number(/had exited \([^)]*\) at (-?\d+)/.exec(st.recordMiss)[1]);
     assert.ok(exitRel >= killAt - st.t0 - 1, `the exit time (${exitRel}) is the kill's (${killAt - st.t0}), not a constant`);
     assert.ok(!st.recordMiss.includes(root) && !st.recordMiss.includes(require("node:os").tmpdir()), "no paths in the reading");
   });
+  ph.stoppedAndRemoved = Date.now(); // withTraced's finally: stopServerAndWait + removeTestRoot
+  const r = (a, b) => (ph[a] && ph[b] ? ph[b] - ph[a] : "none");
+  t.diagnostic(`phases ms: start ${r("begin", "started")}, answer ${r("started", "answered")}, kill->exit event ${r("answered", "exitEvent")}, kill->client close ${r("answered", "clientClosed")}, collection ${r("clientClosed", "collected")}, stop+remove ${r("collected", "stoppedAndRemoved")}, total ${r("begin", "stoppedAndRemoved")}`);
 });
 
 test("C3 real: a healthy studio's record is found; the server snapshot adds nothing to a hit", { timeout: 30000 }, async () => {
@@ -254,4 +263,92 @@ test("C3 sanitizer: forward-slash drive paths, file URLs, UNC, paths after = or 
     "cwd:/srv/app/x ok", "{ error: 'body text' }", "[{ id: 1 }]", "kept line"].join("\n"));
   for (const bad of ["someone", "C:/x", "fileserver", "/mnt/data", "/srv/app", "body text", "id: 1"]) assert.ok(!t.includes(bad), `${bad} removed: ${t}`);
   assert.match(t, /kept line/);
+});
+
+// ── round 26 corrections (A–E): each control fails under the named mutation ────────────────────────────────────────
+const R26 = { t0: 1000, answeredAt: 2, error: "ECANCELED", errorAt: 1774, closedAt: 1775 };
+const deadAt = (at, before = true) => ({ pid: 7, running: false, exit: { code: 1, signal: null, at, before }, tail: "" });
+const runningSnap = { pid: 7, running: true, tail: "" };
+const arrive5 = (list) => [{ ev: "arrive", id: 1, rp: 5, at: 1001, cl: 100 }, ...list.map(([e, at, extra]) => ({ ev: e, id: 1, at, ...(extra || {}) }))];
+
+test("A: a capped or unparsable trail with a dead studio reads 'server dead; trail incomplete' (mutation: old rule order)", () => {
+  const cap = Array.from({ length: 400 }, (_, i) => ({ ev: "arrive", id: i + 10, rp: 9000 + i, at: 1001 })); // the write for port 5 is not visible
+  const dead = { atMiss: deadAt(2770), afterLook: deadAt(2770) };
+  const r = describeRecordMiss({ st: R26, port: 5, events: cap, polls: { last: 2700 }, server: dead });
+  assert.match(r.verdict, /^server dead; trail incomplete \(400 lines, the preload's cap, 0 unparsable\), record write undecidable: the studio had exited \(code 1, signal none\) at 1770 \(before the test stopped it\), 70 ms after the last read$/, r.verdict);
+  const r2 = describeRecordMiss({ st: R26, port: 5, events: [], polls: {}, server: dead, trailBad: 1 });
+  assert.match(r2.verdict, /^server dead; trail incomplete \(0 lines, 1 unparsable\), record write undecidable/);
+  // a complete trail with no write keeps the plain reading; a complete trail with a successful write is not "dead"
+  assert.match(describeRecordMiss({ st: R26, port: 5, events: arrive5([["end", 1002]]), polls: {}, server: dead }).verdict, /^server dead: the studio had exited/);
+  assert.doesNotMatch(describeRecordMiss({ st: R26, port: 5, events: arrive5([["sockclose", 1500], ["flush", 1501, { result: "ok" }]]), polls: { last: 1400 }, server: dead }).verdict, /^server dead/);
+  // without a server snapshot the trail reading is unchanged
+  assert.match(describeRecordMiss({ st: R26, port: 5, events: cap, polls: {} }).verdict, /^trail incomplete \(400 lines, the preload's cap, 0 unparsable\): undecidable from the trail$/);
+});
+
+test("B: a studio running at the miss and exited by the late look is reported before the trail reading (mutation: afterLook ignored)", () => {
+  const late = { atMiss: runningSnap, afterLook: deadAt(8200, true) };
+  const r = describeRecordMiss({ st: R26, port: 5, events: arrive5([["end", 1002], ["finish", 1003, { status: 413 }]]), polls: { last: 7300, deadline: 7275 }, server: late });
+  assert.match(r.verdict, /^studio exited after the miss \(code 1, signal none\) at 7200 \(before the test stopped it\), 900 ms after the last read \(deadline 6275\); never generated: the server socket was not closed by the end of collection/, r.verdict);
+  // dead at the miss: the dead reading, not the late prefix; running throughout: no prefix
+  assert.match(describeRecordMiss({ st: R26, port: 5, events: arrive5([]), polls: {}, server: { atMiss: deadAt(1900), afterLook: deadAt(1900) } }).verdict, /^server dead:/);
+  assert.doesNotMatch(describeRecordMiss({ st: R26, port: 5, events: arrive5([]), polls: {}, server: { atMiss: runningSnap, afterLook: runningSnap } }).verdict, /exited after the miss/);
+});
+
+test("C: read failures are this lookup's own, split before/during the late look; the log read error is printed (mutation: cumulative counts)", async () => {
+  const root = makeRoot();
+  try {
+    const log = path.join(root, "conn-log.jsonl"); // absent at first: ENOENT
+    const c = makeRecordCollector({ log, trail: null, trace: true, deadlineMs: 120, lateLookMs: 0 });
+    const a = { t0: Date.now(), localPort: 4 };
+    assert.equal(await c.recordFor(a), undefined);
+    assert.match(a.recordMiss, /last read failed ENOENT/, a.recordMiss);
+    assert.match(a.recordMiss, /collector read failures ENOENTx\d+/);
+    assert.doesNotMatch(a.recordMiss, /parse/);
+    fs.writeFileSync(log, "{\"remotePort\": 1, partial\n"); // now readable but unparsable
+    const b = { t0: Date.now(), localPort: 4 };
+    assert.equal(await c.recordFor(b), undefined);
+    assert.match(b.recordMiss, /collector read failures parsex\d+/, b.recordMiss);
+    assert.doesNotMatch(b.recordMiss, /ENOENT/, "the first lookup's ENOENT counts are not carried over");
+    assert.match(b.recordMiss, /last read 1 lines, 1 unparsable/);
+    // late look counted separately
+    const d = { t0: Date.now(), localPort: 4 };
+    await makeRecordCollector({ log, trail: null, trace: true, deadlineMs: 60, lateLookMs: 250 }).recordFor(d);
+    assert.match(d.recordMiss, /collector read failures parsex\d+, during the late look parsex\d+/, d.recordMiss);
+  } finally { removeTestRoot(root); }
+});
+
+test("D: an unreadable trail file reads 'trail unreadable', never 'never seen' (mutation: trail read error swallowed)", async () => {
+  const root = makeRoot();
+  try {
+    const log = path.join(root, "conn-log.jsonl"); fs.writeFileSync(log, "");
+    const st = { t0: Date.now(), localPort: 4 };
+    await makeRecordCollector({ log, trail: path.join(root, "missing-trail.jsonl"), trace: true, deadlineMs: 60, lateLookMs: 0 }).recordFor(st);
+    assert.match(st.recordMiss, /^trail unreadable \(ENOENT\): undecidable from the trail/, st.recordMiss);
+    assert.doesNotMatch(st.recordMiss, /never seen/);
+    const st2 = { t0: Date.now(), localPort: 4 }; const asDir = path.join(root, "trail-is-a-dir"); fs.mkdirSync(asDir);
+    await makeRecordCollector({ log, trail: asDir, trace: true, deadlineMs: 60, lateLookMs: 0 }).recordFor(st2);
+    assert.match(st2.recordMiss, /^trail unreadable \((EISDIR|EPERM|EACCES)\)/, st2.recordMiss);
+    // an empty but readable trail keeps the old reading
+    const empty = path.join(root, "empty-trail.jsonl"); fs.writeFileSync(empty, "");
+    const st3 = { t0: Date.now(), localPort: 4 };
+    await makeRecordCollector({ log, trail: empty, trace: true, deadlineMs: 60, lateLookMs: 0 }).recordFor(st3);
+    assert.match(st3.recordMiss, /^never seen by the record listener \(0 traced arrivals, none for port 4\)/, st3.recordMiss);
+  } finally { removeTestRoot(root); }
+});
+
+test("E: the tail keeps :line:col and error codes, leaks no path or body, reads at most 64 KiB, and shows the tail at the miss (mutation: old patterns)", () => {
+  const os = require("node:os");
+  const t = sanitizeTail([
+    "    at f (C:\\x\\app\\serve.cjs:12:5)", "    at g (/srv/app/scripts/server/serve.cjs:345:17)", "    at h (file:///C:/a/b.cjs:9)",
+    "{ code: 'ECONNRESET', path: '/a/secret' }", "{\"code\":\"EPERM\",\"body\":\"user text\"}", "[{ id: 1 }]", `at k (${path.join(os.tmpdir(), "q", "z.cjs")}:3:4)`].join("\n"));
+  assert.match(t, /<path>:12:5\)/, t); assert.match(t, /<path>:345:17\)/); assert.match(t, /<path>:9\)/);
+  assert.match(t, /\[obj code=ECONNRESET\]/); assert.match(t, /\[obj code=EPERM\]/);
+  for (const bad of ["C:\\x", "/srv/app", "C:/a", "/a/secret", "user text", "id: 1", os.tmpdir()]) assert.ok(!t.includes(bad), `${bad} removed: ${t}`);
+  const big = "x".repeat(200 * 1024) + "\nlast line kept";
+  assert.match(sanitizeTail(big), /last line kept$/);
+  const srvSnap = { atMiss: { pid: 7, running: false, exit: { code: 1, signal: null, at: 2000, before: true }, tail: "Error A" }, afterLook: { pid: 7, running: false, exit: { code: 1, signal: null, at: 2000, before: true }, tail: "Error A | Error B" } };
+  const line = describeRecordMiss({ st: R26, port: 5, events: arrive5([]), polls: {}, server: srvSnap }).line;
+  assert.match(line, /log tail \[Error A \| Error B\], log tail at the miss \[Error A\]/, line);
+  const same = { ...srvSnap, afterLook: { ...srvSnap.afterLook, tail: "Error A" } };
+  assert.doesNotMatch(describeRecordMiss({ st: R26, port: 5, events: arrive5([]), polls: {}, server: same }).line, /tail at the miss/);
 });
