@@ -25,8 +25,9 @@
 //   C  read failures are counted per lookup (not per collector), split into before the deadline and during the late
 //      look; the log read error at the deadline is printed (missing log vs unreadable log vs unparsable line).
 //   D  a trail file that cannot be read reads "trail unreadable (<code>): undecidable", not "never seen".
-//   E  the sanitized tail keeps :line:col after a removed path and error codes of dropped object lines, reads at most
-//      the last 64 KiB, and the tail at the miss is printed when it differs from the one after the late look.
+//   E  the log tail is summarized from an allowlist (round 27, sanitizeTail below): no raw log text is printed; reads at
+//      most the last 64 KiB; the tail at the miss is printed when it differs from the one after the late look. Trail
+//      fields are printed only through allowlists too (codes, identifiers, integers).
 // Only numbers, codes and function names are printed: no paths, no bodies.
 "use strict";
 
@@ -48,6 +49,7 @@ function describeTails(server) {
   const t0 = server.atMiss && server.atMiss.tail;
   const parts = [];
   if (after) parts.push(`log tail [${cut(after)}]`);
+  else if (server.afterLook && after === "") parts.push("log tail [empty]");
   if (t0 && (!server.afterLook || t0 !== after)) parts.push(`log tail at the miss [${cut(t0)}]`); // E
   return parts.join("; ");
 }
@@ -57,22 +59,23 @@ function describeRecordMiss({ st, port, events = [], polls = {}, server = null, 
   const arrives = events.filter((e) => e.ev === "arrive");
   const mine = arrives.filter((e) => e.rp === port);
   const of = (id, ev) => events.filter((e) => e.id === id && e.ev === ev);
-  const client = `client answer ${st.answeredAt ?? "none"}, error ${st.error || "none"} ${st.errorAt ?? ""}, close ${st.closedAt ?? "none"}`.replace(/ +,/g, ",");
-  const coll = `collection ${polls.count || 0} reads ${rel(polls.first)}..${rel(polls.last)} (deadline ${rel(polls.deadline)})${polls.log ? `, last read ${polls.log.error ? `failed ${polls.log.error}` : `${polls.log.lines} lines, ${polls.log.bad} unparsable, ports ${(polls.log.ports || []).slice(0, 8).join("/") || "none"}`}` : ""}${polls.shrank ? ", log shrank" : ""}`; // C: the log read error is printed
+  const client = `client answer ${st.answeredAt ?? "none"}, error ${st.error ? safeCode(st.error) : "none"} ${st.errorAt ?? ""}, close ${st.closedAt ?? "none"}`.replace(/ +,/g, ",");
+  const coll = `collection ${polls.count || 0} reads ${rel(polls.first)}..${rel(polls.last)} (deadline ${rel(polls.deadline)})${polls.log ? `, last read ${polls.log.error ? `failed ${safeCode(polls.log.error)}` : `${polls.log.lines} lines, ${polls.log.bad} unparsable, ports ${(polls.log.ports || []).filter(Number.isInteger).slice(0, 8).join("/") || "none"}`}` : ""}${polls.shrank ? ", log shrank" : ""}`; // C: the log read error is printed
   let verdict, trail = "";
-  const flushedOk = mine.some((a) => of(a.id, "flush").some((f) => f.result === "ok"));
+  const lastMine = mine.length ? mine[mine.length - 1] : null; // the same arrival the trail reading uses (port reuse)
+  const flushedOk = !!lastMine && of(lastMine.id, "flush").some((f) => f.result === "ok");
   const dead = server && server.atMiss && !server.atMiss.running;
   // B: running at the miss, exited by the late look (an exit reported late, e.g. on Windows)
   const deadLate = server && server.atMiss && server.atMiss.running && server.afterLook && !server.afterLook.running;
-  const fmt = (o) => Object.entries(o || {}).map(([k, v]) => `${k}x${v}`).join(",");
+  const fmt = (o) => Object.entries(o || {}).map(([k, v]) => `${safeCode(k)}x${Number.isInteger(v) ? v : "?"}`).join(",");
   const rs = polls.readStats || {}, rsLate = polls.readStatsLate || {}; // C: this lookup's own counts
   const reads = Object.keys(rs).length || Object.keys(rsLate).length ? `; collector read failures ${fmt(rs) || "none"}${Object.keys(rsLate).length ? `, during the late look ${fmt(rsLate)}` : ""}` : "";
-  const capped = events.length >= TRAIL_CAP;
+  const capped = events.length + trailBad >= TRAIL_CAP; // the preload's cap counts lines, parsable or not
   const incomplete = capped || trailBad > 0; // A: decided first; a capped trail cannot show the record write
   const exitPart = (x) => `(code ${x.code !== undefined ? x.code : "?"}, signal ${x.signal || "none"}) at ${rel(x.at)}${x.before ? " (before the test stopped it)" : " (after the test began stopping it)"}${Number.isFinite(x.at) && Number.isFinite(polls.last) ? (x.at >= polls.last ? `, ${Math.round(x.at - polls.last)} ms after the last read` : `, ${Math.round(polls.last - x.at)} ms before the last read`) : ""}`;
   const incompleteText = `trail incomplete (${events.length} lines${capped ? ", the preload's cap" : ""}, ${trailBad} unparsable)`;
   if (trailErr) {
-    verdict = `trail unreadable (${trailErr}): undecidable from the trail${dead ? `; the studio had exited ${exitPart(server.atMiss.exit || {})}` : ""}`; // D
+    verdict = `${trailErr === "ENOENT" ? "trail absent (ENOENT: the preload wrote no trace line)" : `trail unreadable (${safeCode(trailErr)})`}: undecidable from the trail${dead ? `; the studio had exited ${exitPart(server.atMiss.exit || {})}` : ""}`; // D
   } else if (dead && incomplete) {
     verdict = `server dead; ${incompleteText}, record write undecidable: the studio had exited ${exitPart(server.atMiss.exit || {})}`; // A
   } else if (dead && !flushedOk) {
@@ -81,16 +84,16 @@ function describeRecordMiss({ st, port, events = [], polls = {}, server = null, 
     verdict = `${incompleteText}: undecidable from the trail`;
   } else if (!mine.length) {
     const near = arrives.filter((e) => e.at >= t0 - ARRIVE_SLACK_MS && e.at <= t0 + (st.closedAt ?? 0) + ARRIVE_SLACK_MS);
-    verdict = near.length ? `identity mismatch: a request arrived near this client with remotePort ${near.map((e) => e.rp ?? "none").slice(0, 3).join("/")} (client local port ${port})`
+    verdict = near.length ? `identity mismatch: a request arrived near this client with remotePort ${near.map((e) => (Number.isInteger(e.rp) ? e.rp : "none")).slice(0, 3).join("/")} (client local port ${port})`
       : `never seen by the record listener (${arrives.length} traced arrivals, none for port ${port})`;
   } else {
     const a = mine[mine.length - 1], id = a.id;
     const t = (ev) => { const x = of(id, ev); return x.length ? x[0] : null; };
     const end = t("end"), fin = t("finish"), des = t("destroy"), err = t("sockerr"), sc = t("sockclose"), fl = t("flush");
-    trail = `server: arrive ${rel(a.at)} (declared ${a.cl ?? "none"}${a.over ? ", over the limit" : ""}), res.end ${rel(end && end.at)}, finish ${rel(fin && fin.at)}${fin ? ` (${fin.status})` : ""}, destroy ${rel(des && des.at)}${des ? ` by ${(des.by || []).join(" < ") || "unknown"}` : ""}, socket error ${err ? `${err.code} ${rel(err.at)}` : "none"}, socket close ${rel(sc && sc.at)}, record write ${fl ? `${fl.result} ${rel(fl.at)}` : "none"}`;
+    trail = `server: arrive ${rel(a.at)} (declared ${Number.isFinite(a.cl) ? a.cl : "none"}${a.over ? ", over the limit" : ""}), res.end ${rel(end && end.at)}, finish ${rel(fin && fin.at)}${fin ? ` (${Number.isInteger(fin.status) ? fin.status : "?"})` : ""}, destroy ${rel(des && des.at)}${des ? ` by ${(Array.isArray(des.by) ? des.by.slice(0, 4).map(safeName) : []).join(" < ") || "unknown"}` : ""}, socket error ${err ? `${safeCode(err.code)} ${rel(err.at)}` : "none"}, socket close ${rel(sc && sc.at)}, record write ${fl ? `${safeCode(fl.result)} ${rel(fl.at)}` : "none"}`;
     if (mine.length > 1) trail += ` (${mine.length} arrivals for this port)`;
     if (!sc) verdict = `never generated: the server socket was not closed by the end of collection${des ? "" : " (no destroy seen)"}`;
-    else if (!fl || fl.result !== "ok") verdict = `never generated: the record write failed (${fl ? fl.result : "no write attempt"})`;
+    else if (!fl || fl.result !== "ok") verdict = `never generated: the record write failed (${fl ? safeCode(fl.result) : "no write attempt"})`;
     else if (polls.log && polls.log.bad > 0) verdict = `published, but the log had ${polls.log.bad} unparsable line(s): collected as none`;
     else if (polls.shrank) verdict = "published, then the log shrank (overwritten)";
     else if (Number.isFinite(polls.last) && fl.at > polls.last) verdict = `published after the last read (delayed, ${Math.round(fl.at - polls.last)} ms after it)`;
@@ -158,25 +161,72 @@ function makeRecordCollector({ fs = require("node:fs"), log, trail = null, trace
   return { records, recordFor };
 }
 
-// C3: a bounded, sanitized log tail: root/temp/home paths and drive paths replaced, lines with JSON bodies dropped.
-const TAIL_INPUT_MAX = 64 * 1024; // E: only the last 64 KiB of the log are scanned
-function sanitizeTail(text, { root = "", maxLines = 20, maxChars = 1024 } = {}) {
-  const os = require("node:os");
-  const esc = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  let t = String(text || "");
-  if (t.length > TAIL_INPUT_MAX) t = t.slice(-TAIL_INPUT_MAX).replace(/^[^\n]*\n?/, ""); // the cut first line may hold half a path
-  for (const p of [root, os.tmpdir(), os.homedir()].filter(Boolean)) t = t.replace(new RegExp(esc(p).replace(/\\\\/g, "[\\\\/]"), "gi"), "<path>");
-  // E: a path ends before ":line" or ":line:col", which is kept (stack frames stay readable)
-  const LC = String.raw`((?::\d+){1,2})?(?=[\s"']|\)(?:[\s"'),;\]]|$)|$)`; // ")" ends a path only at the end of its token
-  t = t.replace(new RegExp(String.raw`file:\/\/\/?[^\s"')]*?` + LC, "gim"), "<path>$1") // file URLs
-    .replace(new RegExp(String.raw`\\\\[^\s"'\\]+\\[^\s"']*?` + LC, "gm"), "<path>$1") // UNC \\host\share\...
-    .replace(new RegExp(String.raw`[A-Za-z]:[\\/][^\s"']*?` + LC, "gm"), "<path>$1") // drive paths, either slash
-    .replace(new RegExp(String.raw`(^|[\s"'(=:\[,;])\/(?:[^\s"'/]+\/)+[^\s"']*?` + LC, "gm"), "$1<path>$2") // absolute POSIX paths, also after = : [ , ;
-    .replace(/<path>(?:[^\s"')]*?<path>)+/g, "<path>"); // a path whose pieces were replaced twice
-  // drop lines carrying bodies: JSON ({"), util.inspect objects/arrays ({ key: / [{); E: their error code is kept
-  const codeOf = (l) => (l.match(/\bcode:\s*'([A-Z][A-Z0-9_]{1,39})'/) || l.match(/"code"\s*:\s*"([A-Z][A-Z0-9_]{1,39})"/) || [])[1];
-  const lines = t.split(/\r?\n/).filter((l) => l.trim()).map((l) => (!/\{"|\{\s*[\w$]+:|\[\{/.test(l) ? l : codeOf(l) ? `[obj code=${codeOf(l)}]` : null)).filter(Boolean).slice(-maxLines);
-  return lines.join(" | ").slice(-maxChars);
+// Round 27: the studio log tail is no longer scrubbed by matching paths (raw lines could still carry an unusual path,
+// a query, a prompt or a file name); it is SUMMARIZED from an allowlist. Each kept line becomes only these tokens, in
+// order: a leading "[tag]" (lowercase), error class names (…Error), error codes (EXXX, ERR_XXX), signals (SIGXXX),
+// "code N" / "exit N" numbers, a small set of lowercase status words, and stack frames as "at fn (file:line:col)" where
+// fn is an identifier and file is a basename from the repository's own script files (else "<file>"; "node:" modules are
+// kept by name). Everything else — paths, URLs, quoted text, bodies, numbers without a known label — is dropped, and the
+// lines without any allowed token are only counted. Bounded: the last 64 KiB, at most maxLines lines, maxChars chars.
+const TAIL_INPUT_MAX = 64 * 1024;
+const WORDS = /\b(uncaught|unhandled|rejection|exception|fatal|abort(?:ed)?|killed|timeout|timed out|listening|ready|shutting down|stopp(?:ed|ing)|exited|crash(?:ed)?|heap|out of memory|warning|deprecat(?:ed|ion)|refused|reset)\b/gi;
+let repo = null; // the repository's own scripts: basename -> path, and the [tags] its server source prints (read once, after a miss)
+function repoIndex() {
+  if (repo) return repo;
+  const fs = require("node:fs"), path = require("node:path");
+  repo = { files: new Map(), tags: new Set(), src: new Map() };
+  const walk = (d, depth) => { if (depth > 6) return; let es = []; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch (_) { return; }
+    for (const e of es) { if (e.name === "node_modules" || e.name.startsWith(".")) continue; const f = path.join(d, e.name);
+      if (e.isDirectory()) walk(f, depth + 1); else if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.(?:cjs|mjs|js)$/.test(e.name) && !repo.files.has(e.name)) repo.files.set(e.name, f); } };
+  const scripts = path.resolve(__dirname, "..", "..");
+  walk(scripts, 0);
+  for (const [, f] of repo.files) if (f.startsWith(path.join(scripts, "server"))) { try { for (const m of fs.readFileSync(f, "utf8").matchAll(/["'`]\s*\[([a-z][a-z0-9-]{0,24})\]/g)) repo.tags.add(m[1]); } catch (_) { /* none */ } }
+  return repo;
 }
+function sourceHas(base, name) { // a function name is printed only if the repository file it is attributed to contains it
+  const r = repoIndex(); const f = r.files.get(base); if (!f) return false;
+  if (!r.src.has(base)) { try { r.src.set(base, require("node:fs").readFileSync(f, "utf8")); } catch (_) { r.src.set(base, ""); } }
+  const last = name.split(".").pop().replace(/^<|>$/g, "");
+  return last === "anonymous" || r.src.get(base).includes(last);
+}
+const ERRNO = new Set(Object.keys(require("node:os").constants.errno || {}));
+const ERROR_CLASSES = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError", "AggregateError", "AbortError", "SystemError", "AssertionError"]);
+const BUILTINS = new Set(require("node:module").builtinModules.filter((m) => !m.startsWith("_")));
+const IDENT = /^[A-Za-z_$][\w$]{0,59}(?:\.(?:[A-Za-z_$][\w$]{0,59}|<anonymous>)){0,3}$/;
+function frameOf(line) {
+  const m = line.match(/^\s*at (?:async )?(?:(\S{1,120}) \()?(.*?):(\d{1,7}):(\d{1,7})\)?\s*$/);
+  if (!m) return null;
+  const loc = m[2], base = loc.split(/[\\/]/).pop();
+  const lc = `${m[3]}:${m[4]}`;
+  if (/^node:/.test(loc)) { const mod = loc.slice(5); return `at (node:${mod.startsWith("internal/") ? "internal" : BUILTINS.has(mod) ? mod : "?"}:${lc})`; }
+  if (!repoIndex().files.has(base)) return `at (<file>:${lc})`; // not one of the repository's own files: no name, no function
+  const fn = m[1] && IDENT.test(m[1]) && sourceHas(base, m[1]) ? `${m[1]} ` : m[1] ? "<fn> " : "";
+  return `at ${fn}(${base}:${lc})`;
+}
+function summarizeLine(line) {
+  const fr = frameOf(line);
+  if (fr) return fr;
+  const out = [];
+  const tag = line.match(/^\s*\[([a-z][a-z0-9-]{0,24})\]/); if (tag && repoIndex().tags.has(tag[1])) out.push(`[${tag[1]}]`);
+  for (const m of line.matchAll(/\b([A-Z][A-Za-z]{0,40}Error)\b/g)) if (ERROR_CLASSES.has(m[1])) out.push(m[1]);
+  for (const m of line.matchAll(/\b(E[A-Z0-9]{2,24})\b/g)) if (ERRNO.has(m[1])) out.push(m[1]);
+  for (const m of line.matchAll(/\b(ERR_[A-Z0-9_]{2,60})\b/g)) out.push(m[1]); // Node's own code shape (residual: user text shaped like it)
+  for (const m of line.matchAll(/\b(SIG(?:HUP|INT|QUIT|ILL|ABRT|BUS|FPE|KILL|SEGV|PIPE|ALRM|TERM|USR1|USR2|CHLD|BREAK))\b/g)) out.push(m[1]);
+  for (const m of line.matchAll(/\b(code|exit(?: code)?|status)[ :=]+(-?\d{1,6})\b/gi)) out.push(`${m[1].toLowerCase()} ${m[2]}`);
+  for (const m of line.matchAll(WORDS)) out.push(m[1].toLowerCase());
+  return out.length ? [...new Set(out)].join(" ") : null;
+}
+function sanitizeTail(text, { maxLines = 20, maxChars = 1024 } = {}) {
+  let t = String(text || "");
+  if (t.length > TAIL_INPUT_MAX) t = t.slice(-TAIL_INPUT_MAX).replace(/^[^\n]*\n?/, ""); // the cut first line is dropped
+  const kept = []; let other = 0;
+  for (const l of t.split(/\r?\n/)) { if (!l.trim()) continue; const x = summarizeLine(l); if (x) kept.push(x); else other += 1; }
+  const lines = kept.slice(-maxLines);
+  const dropped = other + (kept.length - lines.length);
+  return `${lines.join(" | ")}${dropped ? `${lines.length ? " | " : ""}(${dropped} other line${dropped === 1 ? "" : "s"})` : ""}`.slice(-maxChars);
+}
+// Trail fields are written by the test preload, but they are still only printed through these allowlists.
+const safeCode = (x) => (typeof x === "string" && /^[A-Za-z0-9_]{1,40}$/.test(x) ? x : x === undefined || x === null ? "none" : "?");
+const safeName = (x) => (typeof x === "string" && (IDENT.test(x) || /^<anonymous>$/.test(x)) ? x : "<fn>");
 
 module.exports = { describeRecordMiss, parseTrail, makeRecordCollector, sanitizeTail };

@@ -239,15 +239,6 @@ test("C3 synthetic: rule order - dead without a write, dead WITH a write (not 'd
   assert.match(describeRecordMiss({ st, port: 5, events: ev(1, 5, [["end", 1002]]), polls: { readStats: { parse: 3 } }, server: running }).line, /^never generated: .*studio at the miss running \(pid 7\).*collector read failures parsex3/);
 });
 
-test("C3 sanitizer: no root, temp or home path and no JSON body survive; bounded", () => {
-  const os = require("node:os");
-  const root = path.join(os.tmpdir(), "usap-contract-abc");
-  const text = [`[backend] start ${path.join(root, "app", "m.gguf")}`, `{"error":"a body"}`, "C:\\Users\\someone\\x.exe failed", `at f (${path.join(os.homedir(), "repo", "serve.cjs")}:1:2)`, ...Array.from({ length: 50 }, (_, i) => `line ${i}`)].join("\n");
-  const t = sanitizeTail(text, { root });
-  for (const bad of [root, os.tmpdir(), os.homedir(), "a body", "Users\\someone"]) assert.ok(!t.includes(bad), `${bad} removed: ${t}`);
-  assert.ok(t.length <= 1024 && t.split(" | ").length <= 20, "bounded");
-});
-
 test("C3 real: a studio stopped by the test itself before the reading does not read 'before the test stopped it'", { timeout: 30000 }, async () => {
   await withTraced(async ({ port, collector, stopNow }) => {
     const st = await overLimit(port);
@@ -256,13 +247,6 @@ test("C3 real: a studio stopped by the test itself before the reading does not r
     assert.equal(await collector(300, 200, true).recordFor(st), undefined);
     assert.doesNotMatch(st.recordMiss, /before the test stopped it/, st.recordMiss);
   });
-});
-
-test("C3 sanitizer: forward-slash drive paths, file URLs, UNC, paths after = or :, inspect bodies", () => {
-  const t = sanitizeTail(["opening C:/Users/someone/models/m.gguf", "url file:///C:/x/y.json done", "share \\\\fileserver\\share\\dir\\f.txt", "--model=/mnt/data/models/m.gguf",
-    "cwd:/srv/app/x ok", "{ error: 'body text' }", "[{ id: 1 }]", "kept line"].join("\n"));
-  for (const bad of ["someone", "C:/x", "fileserver", "/mnt/data", "/srv/app", "body text", "id: 1"]) assert.ok(!t.includes(bad), `${bad} removed: ${t}`);
-  assert.match(t, /kept line/);
 });
 
 // ── round 26 corrections (A–E): each control fails under the named mutation ────────────────────────────────────────
@@ -319,13 +303,13 @@ test("C: read failures are this lookup's own, split before/during the late look;
   } finally { removeTestRoot(root); }
 });
 
-test("D: an unreadable trail file reads 'trail unreadable', never 'never seen' (mutation: trail read error swallowed)", async () => {
+test("D: an absent or unreadable trail file reads 'trail absent' / 'trail unreadable', never 'never seen' (mutation: trail read error swallowed)", async () => {
   const root = makeRoot();
   try {
     const log = path.join(root, "conn-log.jsonl"); fs.writeFileSync(log, "");
     const st = { t0: Date.now(), localPort: 4 };
     await makeRecordCollector({ log, trail: path.join(root, "missing-trail.jsonl"), trace: true, deadlineMs: 60, lateLookMs: 0 }).recordFor(st);
-    assert.match(st.recordMiss, /^trail unreadable \(ENOENT\): undecidable from the trail/, st.recordMiss);
+    assert.match(st.recordMiss, /^trail absent \(ENOENT: the preload wrote no trace line\): undecidable from the trail/, st.recordMiss);
     assert.doesNotMatch(st.recordMiss, /never seen/);
     const st2 = { t0: Date.now(), localPort: 4 }; const asDir = path.join(root, "trail-is-a-dir"); fs.mkdirSync(asDir);
     await makeRecordCollector({ log, trail: asDir, trace: true, deadlineMs: 60, lateLookMs: 0 }).recordFor(st2);
@@ -338,22 +322,7 @@ test("D: an unreadable trail file reads 'trail unreadable', never 'never seen' (
   } finally { removeTestRoot(root); }
 });
 
-test("E: the tail keeps :line:col and error codes, leaks no path or body, reads at most 64 KiB, and shows the tail at the miss (mutation: old patterns)", () => {
-  const os = require("node:os");
-  const t = sanitizeTail([
-    "    at f (C:\\x\\app\\serve.cjs:12:5)", "    at g (/srv/app/scripts/server/serve.cjs:345:17)", "    at h (file:///C:/a/b.cjs:9)",
-    "{ code: 'ECONNRESET', path: '/a/secret' }", "{\"code\":\"EPERM\",\"body\":\"user text\"}", "[{ id: 1 }]", `at k (${path.join(os.tmpdir(), "q", "z.cjs")}:3:4)`].join("\n"));
-  assert.match(t, /<path>:12:5\)/, t); assert.match(t, /<path>:345:17\)/); assert.match(t, /<path>:9\)/);
-  assert.match(t, /\[obj code=ECONNRESET\]/); assert.match(t, /\[obj code=EPERM\]/);
-  for (const bad of ["C:\\x", "/srv/app", "C:/a", "/a/secret", "user text", "id: 1", os.tmpdir()]) assert.ok(!t.includes(bad), `${bad} removed: ${t}`);
-  const edge = sanitizeTail(["list [/srv/app/a.cjs] end", "p=/srv/app/b.cjs;q", "x,/srv/app/c.cjs", "open /srv/app/secret/x.cjs, then"].join("\n")); // paths after [ , ; =
-  assert.ok(!/srv|secret/.test(edge), `no path after [ , ; =: ${edge}`);
-  const paren = sanitizeTail(["C:\\w\\proj(1)\\app\\x.cjs failed", "at f (C:\\w\\proj(1)\\app\\y.cjs:4:2)"].join("\n")); // ")" inside a path
-  assert.ok(!/app|x\.cjs|y\.cjs|proj/.test(paren), `no path piece after an inner ")": ${paren}`); assert.match(paren, /<path>:4:2\)/);
-  const halfPath = "/srv/secret-dir/" + "z".repeat(70 * 1024) + "\nkept after the cut"; // the 64 KiB cut lands inside the first line
-  assert.equal(sanitizeTail(halfPath), "kept after the cut");
-  const big = "x".repeat(200 * 1024) + "\nlast line kept";
-  assert.match(sanitizeTail(big), /last line kept$/);
+test("E: the tail at the miss is shown when it differs, and the bound keeps the key parts (mutation: tail at the miss / tails before the client)", () => {
   const srvSnap = { atMiss: { pid: 7, running: false, exit: { code: 1, signal: null, at: 2000, before: true }, tail: "Error A" }, afterLook: { pid: 7, running: false, exit: { code: 1, signal: null, at: 2000, before: true }, tail: "Error A | Error B" } };
   const line = describeRecordMiss({ st: R26, port: 5, events: arrive5([]), polls: {}, server: srvSnap }).line;
   assert.match(line, /log tail \[Error A \| Error B\]; log tail at the miss \[Error A\]$/, line);
@@ -365,4 +334,89 @@ test("E: the tail keeps :line:col and error codes, leaks no path or body, reads 
   for (const part of [/^studio exited after the miss/, /client answer 2, error ECANCELED 1774/, /server: arrive 1/, /collection 9 reads/, /collector read failures .*parsex2, during the late look parsex1/, /record not seen after the deadline either/, /log tail \[…/]) assert.match(bound, part, `${part} survives the cut: ${bound}`);
   const same = { ...srvSnap, afterLook: { ...srvSnap.afterLook, tail: "Error A" } };
   assert.doesNotMatch(describeRecordMiss({ st: R26, port: 5, events: arrive5([]), polls: {}, server: same }).line, /tail at the miss/);
+});
+
+// ── round 27: the log tail is an allowlisted summary; trail fields are printed through allowlists ─────────────────────
+// Every hostile line carries a unique marker (zq…); none may survive. The grammar check: every kept item is built only
+// from allowed tokens.
+const MARK = /zq[a-z0-9]*/i;
+const WORDS27 = "uncaught|unhandled|rejection|exception|fatal|aborted|abort|killed|timed out|timeout|listening|ready|shutting down|stopped|stopping|exited|crashed|crash|heap|out of memory|warning|deprecated|deprecation|refused|reset";
+// grammar: remove every allowed token; nothing may remain
+const residue = (t) => String(t)
+  .replace(/at (?:[A-Za-z_$][\w$.<>]{0,200} |<fn> )?\((?:<file>|node:[a-z_?]+|[A-Za-z0-9._-]+\.(?:cjs|mjs|js)):\d+:\d+\)/g, "")
+  .replace(/\(\d+ other lines?\)/g, "").replace(/\[[a-z][a-z0-9-]{0,24}\]/g, "").replace(/\b(?:[A-Za-z]*Error|ERR_[A-Z0-9_]+|E[A-Z0-9]{2,24}|SIG[A-Z]{2,8})\b/g, "")
+  .replace(/\b(?:exit code|exit|code|status) -?\d{1,6}\b/g, "").replace(new RegExp(`\\b(?:${WORDS27})\\b`, "g"), "").replace(/[ |]/g, "");
+const grammarOk = (t) => residue(t) === "";
+const items = (t) => (t ? t.split(" | ") : []);
+
+test("S: POSIX and Windows paths, spaces, quotes, unusual names and every delimiter leave no path piece", () => {
+  const lines = [
+    "[backend] start /home/zqbob/models/m.gguf", "opening /Volumes/My zqDrive/x.bin", "cwd ~/zqhome/x", "rel ../zqrel/y and app/zqapp/f.gguf",
+    "C:\\Program Files\\zqprog\\x.cjs:1:2 failed", "C:/zqa/b c/d", "\\\\?\\C:\\zqlong\\x", "\\\\zqhost\\share\\x", "json \"C:\\\\Users\\\\zqjson\\\\f\"",
+    "C:\\PROGRA~1\\zqshort\\x", "%USERPROFILE%\\zqenv\\f.gguf", "file:///C:/zqurl/x", "enc %2Fhome%2Fzqenc C%3A%5Czqenc2",
+    "tick `/opt/zqtick/y`", "pipe|/srv/zqpipe/b", "lt </srv/zqlt/b>", "at file@/opt/zqat/b", "paren (/srv/zqparen/x)", "bracket [/srv/zqbr/x]",
+    "eq=/srv/zqeq/x", "q '/srv/zqq/x'", "end /srv/zqend/x),", "semi /srv/zqsemi/x;", "quote /srv/bob's zqquote/x", "uni /srv/zqünï/x",
+  ];
+  const t = sanitizeTail(lines.join("\n"));
+  assert.ok(!MARK.test(t), `no marker survives: ${t}`); assert.ok(grammarOk(t), `only allowed tokens: residue ${residue(t)}`);
+  assert.ok(!/[\\/]/.test(t.replace(/\((?:node:[a-z_?]+|<file>|[\w.-]+):\d+:\d+\)/g, "")), `no slash left outside frames: ${t}`);
+  assert.match(t, /^\[backend\]/, "the leading tag of the studio's own source is kept");
+  assert.match(t, /\(\d+ other lines\)$/, "dropped lines are counted");
+});
+
+test("S: user text, file names, request bodies and secrets are never printed", () => {
+  const lines = ["[web-search] Query: zqprompt what is my zqsecret plan", "Deleted model file: zqfile.gguf", "Restart backend request: { model: 'zqbody' }",
+    "  model: 'zqinspect',", "  path: '/srv/zqinspectpath'", "Authorization: Bearer zqbearer.abc.def", "token=hf_zqtoken API_KEY=zqkey",
+    "GET https://zqhost.example/p/f.gguf?sig=zqsig 500", "ignored zqname from zqsource (zqreason)", "[zqtag] not a studio tag", "ZQSECRET happened",
+    "EZQSECRET is not an errno", "ZqSecretError: custom class", "    at zqfn (/x/zqfile.cjs:1:2)", "    at zqfn2 (/x/scripts/server/serve.cjs:3:4)",
+    "    at zqfn3 (node:zqmod:1:1)"];
+  const t = sanitizeTail(lines.join("\n"));
+  assert.ok(!MARK.test(t), `no marker survives: ${t}`); assert.ok(grammarOk(t), `only allowed tokens: residue ${residue(t)}`);
+  assert.match(t, /^\[web-search\]/); assert.match(t, /at \(<file>:1:2\)/); assert.match(t, /at <fn> \(serve\.cjs:3:4\)/); assert.match(t, /at \(node:\?:1:1\)/);
+});
+
+test("S: kept tokens - studio tags, standard error classes, errno and ERR_ codes, signals, exit/status, status words, repo and node frames", () => {
+  const t = sanitizeTail(["[backend] Startup failed:", "TypeError: Cannot read properties of undefined", "Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers",
+    "connect ECONNREFUSED 127.0.0.1:1 and ECANCELED", "engine exited with exit code 3 signal SIGKILL", "status=500", "Uncaught exception, listening again",
+    "    at readPort (/w/scripts/server/serve.cjs:1234:17)", "    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)",
+    "    at Socket.emit (node:events:519:28)", "    at Object.<anonymous> (/w/scripts/tests/record-miss.test.cjs:9:1)"].join("\n"));
+  for (const want of [/\[backend\]/, /TypeError/, /ERR_HTTP_HEADERS_SENT/, /ECONNREFUSED/, /ECANCELED/, /SIGKILL/, /exit code 3/, /status 500/, /uncaught/, /exception/, /listening/,
+    /at readPort \(serve\.cjs:1234:17\)/, /at \(node:internal:95:5\)/, /at \(node:events:519:28\)/, /at Object\.<anonymous> \(record-miss\.test\.cjs:9:1\)/]) assert.match(t, want, `${want} kept: ${t}`);
+  assert.doesNotMatch(t, /127\.0\.0\.1/, "an address is not a kept token"); assert.ok(grammarOk(t), `only allowed tokens: residue ${residue(t)}`);
+  assert.ok(!grammarOk("TypeError | free text here"), "the grammar check itself rejects free text");
+});
+
+test("S: bounds - 64 KiB window with the cut first line dropped, at most 20 lines, 1024 chars, empty and missing logs", () => {
+  assert.equal(sanitizeTail(""), ""); assert.equal(sanitizeTail(undefined), ""); assert.equal(sanitizeTail("\n\n"), "");
+  assert.equal(sanitizeTail("just text\nmore text"), "(2 other lines)");
+  const half = "ECONNRESET zqhalf " + "z".repeat(70 * 1024) + "\nEPIPE"; // the window starts inside the first line: that line is dropped
+  assert.equal(sanitizeTail(half), "EPIPE");
+  const many = Array.from({ length: 50 }, (_, i) => `[backend] step ${i} ETIMEDOUT`).join("\n");
+  const m = sanitizeTail(many); assert.equal(items(m).length, 21, m); assert.match(m, /\(30 other lines\)$/);
+  const wide = sanitizeTail(Array.from({ length: 30 }, () => "    at handleRequest (/w/scripts/server/serve.cjs:1234567:1234567)").join("\n"));
+  assert.ok(wide.length <= 1024, `bounded (${wide.length})`);
+});
+
+test("S: trail fields print only through allowlists (callers, codes, statuses, ports)", () => {
+  const ev = [{ ev: "arrive", id: 1, rp: 5, at: 1001, cl: "zqcl" }, { ev: "finish", id: 1, status: "zqstatus", at: 1002 },
+    { ev: "destroy", id: 1, by: ["watchAll", "zq path/x", "<anonymous>", { zq: 1 }], at: 1500 }, { ev: "sockerr", id: 1, code: "zq code with spaces", at: 1500 },
+    { ev: "sockclose", id: 1, at: 1501 }, { ev: "flush", id: 1, rp: 5, result: "/srv/zqresult", at: 1502 }];
+  const st = { t0: 1000, answeredAt: 2, error: "connect zqmessage /srv/zqerr", errorAt: 3, closedAt: 4 };
+  const r = describeRecordMiss({ st, port: 5, events: ev, polls: { log: { lines: 1, bad: 0, ports: ["zqport", 5], error: undefined }, readStats: { "zq/k": 1 } } });
+  assert.ok(!MARK.test(r.line), `no marker: ${r.line}`);
+  assert.match(r.line, /destroy 500 by watchAll < <fn> < <anonymous> < <fn>/); assert.match(r.line, /record write \? /); assert.match(r.verdict, /record write failed \(\?\)/);
+  const notArray = describeRecordMiss({ st, port: 5, events: [{ ev: "arrive", id: 1, rp: 5, at: 1001 }, { ev: "destroy", id: 1, by: "zqstring", at: 1500 }], polls: {} });
+  assert.ok(!MARK.test(notArray.line) && !/description failed/.test(notArray.line), notArray.line);
+  const bad = describeRecordMiss({ st, port: 5, events: [], polls: { log: { error: "zq/err" } }, trailErr: "zq trail" });
+  assert.ok(!MARK.test(bad.line), bad.line); assert.match(bad.verdict, /^trail unreadable \(\?\)/);
+});
+
+test("R: refinements - cap counts unparsable lines, the write is judged on the last arrival, an empty tail is shown", () => {
+  const cap399 = Array.from({ length: 399 }, (_, i) => ({ ev: "arrive", id: i + 10, rp: 9000 + i, at: 1001 }));
+  assert.match(describeRecordMiss({ st: R26, port: 5, events: cap399, polls: {}, trailBad: 1 }).verdict, /^trail incomplete \(399 lines, the preload's cap, 1 unparsable\)/);
+  const reuse = [{ ev: "arrive", id: 1, rp: 5, at: 1001 }, { ev: "sockclose", id: 1, at: 1100 }, { ev: "flush", id: 1, rp: 5, result: "ok", at: 1101 },
+    { ev: "arrive", id: 2, rp: 5, at: 1200 }, { ev: "end", id: 2, at: 1201 }]; // the port was reused; only the earlier connection was written
+  assert.match(describeRecordMiss({ st: R26, port: 5, events: reuse, polls: {}, server: { atMiss: deadAt(1900), afterLook: deadAt(1900) } }).verdict, /^server dead:/);
+  const empty = { atMiss: { pid: 7, running: true, tail: "" }, afterLook: { pid: 7, running: true, tail: "" } };
+  assert.match(describeRecordMiss({ st: R26, port: 5, events: arrive5([]), polls: {}, server: empty }).line, /log tail \[empty\]$/);
 });
