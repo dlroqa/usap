@@ -82,6 +82,7 @@ if (process.env.USAP_TEST_SF_TRACE === "1" && /[\\/]serve\.cjs$/.test(process.ar
         res.once("finish", () => { o.done = now(); });
         if (reqSync > 0 && !reqSyncDone && o.path === "/api/diagnostics") { // control only
           reqSyncDone = true; try { cp.execFileSync(process.execPath, sleeper(reqSync), { timeout: reqSync + 5000, stdio: "ignore", windowsHide: true }); } catch (_) { /* control */ }
+          if (publishWanted) schedulePublish(); // the scan may have finished first (control only)
         }
       }
     }
@@ -123,6 +124,9 @@ if (process.env.USAP_TEST_SF_TRACE === "1" && /[\\/]serve\.cjs$/.test(process.ar
     rec.loopMax = Math.round(h.max / 1e6); h.disable(); rec.published = now();
     try { process.stderr.write(`[sf-trace] ${JSON.stringify(rec)}\n`); } catch (_) { /* diagnostics only */ }
   }
-  function schedulePublish() { if (!published && !pubTimer) pubTimer = setTimeout(publish, 50); }
+  // with the request-path control armed, publish waits until that request's synchronous child has run (a fast scan
+  // can finish before the first /api/diagnostics arrives); the 10 s fallback still bounds it. Unchanged otherwise.
+  let publishWanted = false;
+  function schedulePublish() { publishWanted = true; if (reqSync > 0 && !reqSyncDone) return; if (!published && !pubTimer) pubTimer = setTimeout(publish, 50); }
   const fallback = setTimeout(publish, Number(process.env.USAP_TEST_SF_TRACE_FALLBACK || 10000)); fallback.unref(); lag.unref();
 }
