@@ -287,6 +287,8 @@ test("A: a capped or unparsable trail with a dead studio reads 'server dead; tra
 
 test("B: a studio running at the miss and exited by the late look is reported before the trail reading (mutation: afterLook ignored)", () => {
   const late = { atMiss: runningSnap, afterLook: deadAt(8200, true) };
+  // an unreadable trail keeps the late-exit prefix too
+  assert.match(describeRecordMiss({ st: R26, port: 5, events: [], polls: { last: 7300, deadline: 7275 }, server: late, trailErr: "EPERM" }).verdict, /^studio exited after the miss .*; trail unreadable \(EPERM\)/);
   const r = describeRecordMiss({ st: R26, port: 5, events: arrive5([["end", 1002], ["finish", 1003, { status: 413 }]]), polls: { last: 7300, deadline: 7275 }, server: late });
   assert.match(r.verdict, /^studio exited after the miss \(code 1, signal none\) at 7200 \(before the test stopped it\), 900 ms after the last read \(deadline 6275\); never generated: the server socket was not closed by the end of collection/, r.verdict);
   // dead at the miss: the dead reading, not the late prefix; running throughout: no prefix
@@ -346,11 +348,21 @@ test("E: the tail keeps :line:col and error codes, leaks no path or body, reads 
   for (const bad of ["C:\\x", "/srv/app", "C:/a", "/a/secret", "user text", "id: 1", os.tmpdir()]) assert.ok(!t.includes(bad), `${bad} removed: ${t}`);
   const edge = sanitizeTail(["list [/srv/app/a.cjs] end", "p=/srv/app/b.cjs;q", "x,/srv/app/c.cjs", "open /srv/app/secret/x.cjs, then"].join("\n")); // paths after [ , ; =
   assert.ok(!/srv|secret/.test(edge), `no path after [ , ; =: ${edge}`);
+  const paren = sanitizeTail(["C:\\w\\proj(1)\\app\\x.cjs failed", "at f (C:\\w\\proj(1)\\app\\y.cjs:4:2)"].join("\n")); // ")" inside a path
+  assert.ok(!/app|x\.cjs|y\.cjs|proj/.test(paren), `no path piece after an inner ")": ${paren}`); assert.match(paren, /<path>:4:2\)/);
+  const halfPath = "/srv/secret-dir/" + "z".repeat(70 * 1024) + "\nkept after the cut"; // the 64 KiB cut lands inside the first line
+  assert.equal(sanitizeTail(halfPath), "kept after the cut");
   const big = "x".repeat(200 * 1024) + "\nlast line kept";
   assert.match(sanitizeTail(big), /last line kept$/);
   const srvSnap = { atMiss: { pid: 7, running: false, exit: { code: 1, signal: null, at: 2000, before: true }, tail: "Error A" }, afterLook: { pid: 7, running: false, exit: { code: 1, signal: null, at: 2000, before: true }, tail: "Error A | Error B" } };
   const line = describeRecordMiss({ st: R26, port: 5, events: arrive5([]), polls: {}, server: srvSnap }).line;
-  assert.match(line, /log tail \[Error A \| Error B\], log tail at the miss \[Error A\]/, line);
+  assert.match(line, /log tail \[Error A \| Error B\]; log tail at the miss \[Error A\]$/, line);
+  // the bound: two full tails and the late prefix never push out the client, trail, collection or read-failure parts
+  const full = (c) => Array.from({ length: 30 }, (_, i) => `${c}${i} ${"y".repeat(40)}`).join(" | ").slice(-1024);
+  const two = { atMiss: { pid: 7, running: true, tail: full("A") }, afterLook: { pid: 7, running: false, exit: { code: 1, signal: null, at: 7200, before: true }, tail: full("B") } };
+  const bound = describeRecordMiss({ st: R26, port: 5, events: arrive5([["end", 1002], ["finish", 1003, { status: 413 }]]), polls: { count: 9, first: 1800, last: 7300, deadline: 7275, log: { lines: 3, bad: 0, ports: [1, 2, 3] }, readStats: { ENOENTx: 1, parse: 2 }, readStatsLate: { parse: 1 } }, server: two }).line;
+  assert.ok(bound.length <= 1600, `bounded (${bound.length})`);
+  for (const part of [/^studio exited after the miss/, /client answer 2, error ECANCELED 1774/, /server: arrive 1/, /collection 9 reads/, /collector read failures .*parsex2, during the late look parsex1/, /record not seen after the deadline either/, /log tail \[…/]) assert.match(bound, part, `${part} survives the cut: ${bound}`);
   const same = { ...srvSnap, afterLook: { ...srvSnap.afterLook, tail: "Error A" } };
   assert.doesNotMatch(describeRecordMiss({ st: R26, port: 5, events: arrive5([]), polls: {}, server: same }).line, /tail at the miss/);
 });

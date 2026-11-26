@@ -36,10 +36,20 @@ const TRAIL_CAP = 400; // lines; the preload stops tracing silently there (api-c
 function describeServer(server, rel) {
   if (!server) return "";
   const one = (x) => (!x ? "?" : x.running ? `running (pid ${x.pid})` : `exited (pid ${x.pid}, code ${x.exit && x.exit.code !== undefined ? x.exit.code : "?"}, signal ${(x.exit && x.exit.signal) || "none"}, at ${rel(x.exit && x.exit.at)}${x.exit && x.exit.before ? ", before the test's stop" : ""})`);
-  const tail = server.afterLook && server.afterLook.tail ? `, log tail [${server.afterLook.tail}]` : "";
+  return `studio at the miss ${one(server.atMiss)}, after the late look ${one(server.afterLook)}`;
+}
+// The log tails go LAST, each within its own budget, so the cut of the whole line can only shorten tails and never
+// drops the client, trail, collection or read-failure parts (round 26, E).
+const TAIL_BUDGET = 400;
+function describeTails(server) {
+  if (!server) return "";
+  const cut = (x) => (x.length > TAIL_BUDGET ? `…${x.slice(-(TAIL_BUDGET - 1))}` : x); // the end of a log is the useful part
+  const after = server.afterLook && server.afterLook.tail;
   const t0 = server.atMiss && server.atMiss.tail;
-  const tailAtMiss = t0 && (!server.afterLook || t0 !== server.afterLook.tail) ? `, log tail at the miss [${t0}]` : ""; // E
-  return `studio at the miss ${one(server.atMiss)}, after the late look ${one(server.afterLook)}${tail}${tailAtMiss}`;
+  const parts = [];
+  if (after) parts.push(`log tail [${cut(after)}]`);
+  if (t0 && (!server.afterLook || t0 !== after)) parts.push(`log tail at the miss [${cut(t0)}]`); // E
+  return parts.join("; ");
 }
 function describeRecordMiss({ st, port, events = [], polls = {}, server = null, trailBad = 0, trailErr = null }) {
   const t0 = st.t0;
@@ -87,13 +97,13 @@ function describeRecordMiss({ st, port, events = [], polls = {}, server = null, 
     else if (polls.log && (polls.log.ports || []).includes(port)) verdict = "published and present at the last read, but not matched";
     else verdict = "published before the last read but not seen (unexplained)";
   }
-  if (deadLate && !/^server dead|^trail unreadable/.test(verdict)) { // B: prefixed, so the trail reading stays visible
+  if (deadLate && !/^server dead/.test(verdict)) { // B: prefixed, so the trail reading stays visible
     const x = server.afterLook.exit || {};
     verdict = `studio exited after the miss ${exitPart(x)} (deadline ${rel(polls.deadline)}); ${verdict}`;
   }
   const late = polls.late ? `; record appeared after the deadline at ${rel(polls.late.at)}` : "; record not seen after the deadline either";
-  const srv = describeServer(server, rel);
-  return { verdict, line: `${verdict}: ${[srv, client, trail, coll + reads].filter(Boolean).join("; ")}${late}`.slice(0, server ? 1600 : 900) }; // 900 as before; room for the studio part only when it is given
+  const srv = describeServer(server, rel), tails = describeTails(server);
+  return { verdict, line: `${verdict}: ${[srv, client, trail, coll + reads].filter(Boolean).join("; ")}${late}${tails ? `; ${tails}` : ""}`.slice(0, server ? 1600 : 900) }; // 900 as before; room for the studio part only when it is given
 }
 
 // Parse a trail file's text (bounded; bad lines skipped and counted) -> { events, bad }
@@ -153,10 +163,11 @@ const TAIL_INPUT_MAX = 64 * 1024; // E: only the last 64 KiB of the log are scan
 function sanitizeTail(text, { root = "", maxLines = 20, maxChars = 1024 } = {}) {
   const os = require("node:os");
   const esc = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  let t = String(text || "").slice(-TAIL_INPUT_MAX);
+  let t = String(text || "");
+  if (t.length > TAIL_INPUT_MAX) t = t.slice(-TAIL_INPUT_MAX).replace(/^[^\n]*\n?/, ""); // the cut first line may hold half a path
   for (const p of [root, os.tmpdir(), os.homedir()].filter(Boolean)) t = t.replace(new RegExp(esc(p).replace(/\\\\/g, "[\\\\/]"), "gi"), "<path>");
   // E: a path ends before ":line" or ":line:col", which is kept (stack frames stay readable)
-  const LC = String.raw`((?::\d+){1,2})?(?=[\s"')]|$)`;
+  const LC = String.raw`((?::\d+){1,2})?(?=[\s"']|\)(?:[\s"'),;\]]|$)|$)`; // ")" ends a path only at the end of its token
   t = t.replace(new RegExp(String.raw`file:\/\/\/?[^\s"')]*?` + LC, "gim"), "<path>$1") // file URLs
     .replace(new RegExp(String.raw`\\\\[^\s"'\\]+\\[^\s"']*?` + LC, "gm"), "<path>$1") // UNC \\host\share\...
     .replace(new RegExp(String.raw`[A-Za-z]:[\\/][^\s"']*?` + LC, "gm"), "<path>$1") // drive paths, either slash
