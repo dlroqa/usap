@@ -12,7 +12,8 @@ Every process appends an authenticated record of its own pid and kernel identity
   breakaway   (Windows) the child tries CREATE_BREAKAWAY_FROM_JOB and writes "breakaway-ok" or "breakaway-refused"
   orphancheck the root starts a "guard" that starts an "engine"; the root pins the engine with a pidfd while the guard
               still holds it unreaped, lets the guard exit, kills the engine through the pidfd and exits 0 when it is
-              reaped within 1.5 s (pidfd signal 0 -> ESRCH), else 3; 4 without pidfd (Linux)
+              reaped within 1.5 s (pidfd signal 0 -> ESRCH), else 3; 4 without pidfd; 5 if the guard died before the
+              pidfd was proven pinned (Linux). The engine records itself and ends after 120 s
   execlate    the child is seen first, then (after 1 s) replaces itself with /bin/sleep (exec; POSIX)
   slowdoublefork the root stays; the child waits 0.6 s, starts a new-session grandchild and exits, so the grandchild
               is re-parented to launchd/init while the run goes on (POSIX)
@@ -65,6 +66,8 @@ if "orphancheck" in flags:
             fd = os.pidfd_open(engine)  # the guard is alive and blocked on its stdin: the engine is still its child
         except OSError:
             fd = None
+        if fd is not None and guard.poll() is not None:  # round 41: the pin is proven only if the guard outlived the open
+            os.close(fd); note("unpinned"); sys.exit(5)  # (an outside actor killed it): never signal, fail loudly
         guard.stdin.close()  # only now may the guard exit (the engine is then adopted by the tool's subreaper)
         guard.wait()
         if fd is None:
@@ -80,15 +83,21 @@ if "orphancheck" in flags:
             time.sleep(0.02)
         sys.exit(3)
     if level == 1:  # the guard: start the engine, print its pid, hold it unreaped until the root has pinned it
-        e = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(1)"],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        # Round 41: the engine (level 2) writes its own authenticated record, so the case can verify and stop it on every
+        # path (exit 3/4/5, a traceback); it also ends by itself after 120 s (each check of it takes ~2 s).
+        e = subprocess.Popen([sys.executable, __file__, mode, pidfile, "2"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+        e.stdout.readline()  # the engine has written its record: the root learns the pid only after that
         print(e.pid, flush=True)
         sys.stdin.read()  # EOF when the root has the pidfd (or when the root has died)
         os._exit(0)
+    # level 2 (the engine) falls through: it writes its record with the shared call below, then waits there
 
 if "marker" in flags and level == 0:
     open(pidfile + ".ran", "w").close()
 oi.write_own_record(pidfile)
+if "orphancheck" in flags:  # level 2, the engine: recorded; tell the guard, then live at most 120 s
+    print("recorded", flush=True)
+    time.sleep(120); os._exit(0)
 if "solo" in flags:
     time.sleep(40); sys.exit(0)
 if "ignoreterm" in flags and level > 0 and not WINDOWS:
