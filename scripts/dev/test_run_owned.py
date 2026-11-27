@@ -358,21 +358,151 @@ print(json.dumps(dict(code=code, certification=rep["certification"], reasons=rep
         self.assertEqual(r["code"], ro.EXIT_UNCERTAIN, r); self.assertEqual(r["certification"], "uncertain")
         self.assertEqual(self.ident.alive_all(), [], "known processes were still stopped")
 
+    # ── D1: a failed signal is never taken as termination; one failure never stops the others (fault injection) ──
+    DENY = """
+import errno
+cls = ro.LinuxOwner if ro.LINUX else ro.MacOwner
+orig_deliver = cls._deliver
+calls = dict(denied=0, kill_target=0)
+def target():
+    try:
+        with open({pids!r}) as f: lines = [x.strip() for x in f if x.strip()]
+        return int(lines[2]) if len(lines) >= 3 else None
+    except FileNotFoundError: return None
+def deliver(self, pid, k, sig):
+    if pid == target() and calls["denied"] < {limit}:
+        calls["denied"] += 1
+        raise PermissionError(errno.EPERM, "injected EPERM")
+    return orig_deliver(self, pid, k, sig)
+cls._deliver = deliver
+orig_kill, orig_killpg = ro.os.kill, ro.os.killpg
+def kill(pid, sig):
+    if pid == target(): calls["kill_target"] += 1
+    return orig_kill(pid, sig)
+ro.os.kill = kill
+code, rep = ro.run([sys.executable, "-B", {fix!r}, "tree,escape", {pids!r}], timeout=3, grace=1, env=dict(os.environ))
+print(json.dumps(dict(code=code, cert=rep["certification"], survivors=[s["pid"] for s in rep["survivors"]],
+                      codes=rep["reason_codes"], calls=calls, target=target(), signalled=rep["signalled"])))
+"""
+
+    @unittest.skipIf(WINDOWS, "POSIX signals")
+    def test_d1_persistent_eperm_is_a_survivor_and_others_are_stopped(self):
+        r = self.snippet(self.DENY.format(pids=self.pids, fix=FIX, limit=10 ** 6), timeout=90)
+        t = r["target"]
+        self.assertEqual((r["code"], r["cert"]), (ro.EXIT_SURVIVORS, "survivors"), r)
+        self.assertEqual(r["survivors"], [t], r)
+        self.assertTrue(any(c["code"] == "signal_denied" and c["pid"] == t for c in r["codes"]), r)
+        self.assertGreaterEqual(r["calls"]["denied"], 2, "TERM and the KILL rounds were all attempted")
+        self.assertEqual(r["calls"]["kill_target"], 0, "no plain kill() fallback after a denied signal")
+        self.assertEqual([p for p in self.ident.alive_all() if p != t], [], "every other process was stopped")
+        self.assertTrue(self.ident.alive(t), "the denied process really survived (the tearDown stops it by identity)")
+
+    @unittest.skipIf(WINDOWS, "POSIX signals")
+    def test_d1_denied_then_gone_is_uncertain_not_confirmed(self):
+        r = self.snippet(self.DENY.format(pids=self.pids, fix=FIX, limit=1), timeout=90)
+        self.assertEqual((r["code"], r["cert"]), (ro.EXIT_UNCERTAIN, "uncertain"), r)
+        self.assertEqual(r["survivors"], [], r)
+        self.assertTrue(any(c["code"] == "signal_denied" for c in r["codes"]), "the code is sticky")
+        self.assertEqual(self.ident.alive_all(), [])
+
+    @unittest.skipIf(WINDOWS, "POSIX signals")
+    def test_d1_negative_control_empty_deny_set_is_confirmed(self):
+        r = self.snippet(self.DENY.format(pids=self.pids, fix=FIX, limit=0), timeout=90)
+        self.assertEqual((r["code"], r["cert"], r["codes"]), (ro.EXIT_TIMEOUT, "confirmed", []), r)
+        self.assertEqual(self.ident.alive_all(), [])
+
+    @unittest.skipUnless(LINUX, "Linux /proc")
+    def test_d1_unreadable_proc_entry_is_never_assumed_gone(self):
+        r = self.snippet(f"""
+import builtins
+state = dict(on=False)
+real_open = builtins.open
+def fake_open(path, *a, **kw):  # injected at the open() inside _linux_stat itself (module-level name)
+    if state["on"] and isinstance(path, str) and path.endswith("/stat") and path.startswith("/proc/"):
+        with real_open({self.pids!r}) as f: lines = [x.strip() for x in f if x.strip()]
+        if len(lines) >= 3 and path == "/proc/%s/stat" % lines[2]:
+            raise PermissionError(13, "injected EACCES")
+    return real_open(path, *a, **kw)
+ro.open = fake_open
+orig_stop = ro._stop_tree
+def stop(owner, grace, report):
+    state["on"] = True
+    return orig_stop(owner, grace, report)
+ro._stop_tree = stop
+code, rep = ro.run([sys.executable, "-B", {FIX!r}, "tree", {self.pids!r}], timeout=3, grace=1, env=dict(os.environ))
+print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_codes"])))
+""", timeout=90)
+        self.assertNotEqual(r["cert"], "confirmed", r)
+        self.assertTrue(any(c["code"] == "query_error" for c in r["codes"]), r)
+        self.assertEqual(self.ident.alive_all(), [], "the unreadable process was still stopped through its pidfd")
+
+    @unittest.skipUnless(LINUX and hasattr(os, "pidfd_open"), "Linux pidfd")
+    def test_d1_unpinnable_candidate_is_never_silently_dropped(self):
+        """pidfd_open failing (EMFILE) for a grandchild: it can be neither pinned nor signalled, so never "confirmed"."""
+        r = self.snippet(f"""
+import errno
+orig = ro.os.pidfd_open
+seen = dict(root=None, allow=set(), deny=set())
+def pidfd_open(pid, *a):  # decided at first sight by lineage (race-free): root and its child allowed, deeper denied
+    if pid != os.getpid() and pid not in seen["allow"] and pid not in seen["deny"]:
+        if seen["root"] is None:
+            seen["root"] = pid; seen["allow"].add(pid)
+        else:
+            st = ro._linux_stat(pid)
+            (seen["allow"] if st and st[0] == seen["root"] else seen["deny"]).add(pid)
+    if pid in seen["deny"]: raise OSError(errno.EMFILE, "injected EMFILE")
+    return orig(pid, *a)
+ro.os.pidfd_open = pidfd_open
+code, rep = ro.run([sys.executable, "-B", {FIX!r}, "tree", {self.pids!r}], timeout=3, grace=1, env=dict(os.environ))
+print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_codes"], denied=sorted(seen["deny"]))))
+""", timeout=90)
+        self.assertTrue(r["denied"], r)
+        self.assertEqual((r["code"], r["cert"]), (ro.EXIT_UNCERTAIN, "uncertain"), r)
+        self.assertTrue(any(c["code"] == "query_error" and c.get("errno") == 24 for c in r["codes"]), r)
+
+    @unittest.skipUnless(LINUX, "Linux reduced mode")
+    def test_reduced_mode_never_kills_a_grandchild_by_pid(self):
+        """Without pidfd, kill(pid) may only reach the tool's OWN child at the moment of the call (it is that child's
+        only reaper, same thread): a grandchild is reported (signal_unsafe) until it is re-parented to the tool."""
+        r = self.snippet(f"""
+ro._pidfd_works = lambda: False
+orig_kill = ro.os.kill
+seen = []
+def kill(pid, sig):
+    st = ro._linux_stat(pid)
+    seen.append([pid, bool(st) and st[0] == os.getpid()])
+    return orig_kill(pid, sig)
+ro.os.kill = kill
+code, rep = ro.run([sys.executable, "-B", {FIX!r}, "tree", {self.pids!r}], timeout=3, grace=1, env=dict(os.environ))
+with open({self.pids!r}) as f: pids = [int(x) for x in f if x.strip().isdigit()]
+print(json.dumps(dict(code=code, cert=rep["certification"], mode=rep["identity_mode"], codes=rep["reason_codes"], killed=seen, pids=pids)))
+""", timeout=90)
+        self.assertEqual(r["mode"], "starttime-race")
+        self.assertNotEqual(r["cert"], "confirmed", r)
+        self.assertTrue(r["killed"], r)
+        self.assertTrue(all(own for _, own in r["killed"]), f"every kill(pid) target was the tool's own child: {r['killed']}")
+        self.assertTrue(any(c["code"] == "signal_unsafe" for c in r["codes"]), r)
+
     # ── certification layers, each on its own (a fake owner: no processes are started or signalled) ──
     class Fake:
         containment, identity_mode = "full", "fake"
-        def __init__(self, reasons=(), scan_fails=False, alive_fails=False, clean=True):
+        def __init__(self, reasons=(), scan_fails=False, alive_fails=False, clean=True, live=(), raise_for=(), immortal=()):
             self.uncertain_reasons, self.warnings, self.root, self.root_status = list(reasons), [], -1, 0
             self.scan_fails, self.alive_fails, self.clean = scan_fails, alive_fails, clean
             self.certification_basis = "fake"
+            self.live, self.raise_for, self.immortal, self.calls = set(live), set(raise_for), set(immortal), []
         def spawn(self, cmd, cwd, env): return -1
         def reap(self): pass
         def scan(self):
             if self.scan_fails and getattr(self, "stopping", False): raise OSError("fake discovery failure")
         def alive(self):
             if self.alive_fails and getattr(self, "stopping", False): raise RuntimeError("fake alive failure")
-            return []
-        def signal(self, pid, sig): return False
+            return sorted(self.live)
+        def signal(self, pid, sig):
+            self.calls.append((pid, sig))
+            if pid in self.raise_for: raise RuntimeError("fake signal failure")
+            if pid not in self.immortal: self.live.discard(pid)
+            return True
         def describe(self, pid): return {"pid": pid}
         def root_exited(self): return True
         def root_result(self): return 0, None
@@ -395,6 +525,48 @@ print(json.dumps(dict(code=code, certification=rep["certification"], reasons=rep
     def test_layer_stop_discovery_error_is_recorded_as_reason(self):
         cert, rep = self.stop_with(self.Fake(scan_fails=True))
         self.assertEqual(cert, "uncertain"); self.assertTrue(any("fake discovery failure" in r for r in rep["uncertain_reasons"]), rep)
+
+    @unittest.skipIf(WINDOWS, "POSIX stop path")
+    def test_layer_d1_one_failing_signal_does_not_stop_the_others(self):
+        f = self.Fake(live=(1, 2, 3), raise_for=(1,), immortal=(1,))
+        cert, rep = self.stop_with(f)
+        self.assertEqual(cert, "survivors", rep)
+        self.assertTrue({2, 3} <= {p for p, _ in f.calls}, f.calls)
+        self.assertEqual([s["pid"] for s in rep["survivors"]], [1])
+        self.assertTrue(any(c["code"] == "signal_error" and c["pid"] == 1 for c in rep["reason_codes"]), rep)
+
+    @unittest.skipIf(WINDOWS, "POSIX stop path")
+    def test_layer_d1_stop_failure_sweeps_known_processes(self):
+        orig_mk, orig_stop = ro.make_owner, ro._stop_tree
+        f = self.Fake(live=(5,))
+        try:
+            ro.make_owner = lambda: f
+            def boom(owner, grace, report): raise RuntimeError("injected stop failure")
+            ro._stop_tree = boom
+            code, rep = ro.run(["unused"], timeout=1, grace=0.05)
+        finally:
+            ro.make_owner, ro._stop_tree = orig_mk, orig_stop
+        self.assertEqual((code, rep["certification"]), (ro.EXIT_UNCERTAIN, "uncertain"), rep)
+        self.assertIn((5, signal.SIGKILL), f.calls, "the sweep sent SIGKILL to the known process")
+        self.assertTrue(any(c["code"] == "stop_failed" for c in rep["reason_codes"]), rep)
+
+    @unittest.skipIf(WINDOWS, "POSIX stop path")
+    def test_layer_d1_survivors_outrank_reasons(self):
+        cert, rep = self.stop_with(self.Fake(reasons=["owner doubt"], live=(7,), immortal=(7,)))
+        self.assertEqual(cert, "survivors")
+
+    def test_layer_no_option_waives_a_reason(self):
+        """There is no waiver: the CLI has exactly these options, and any reason code forbids "confirmed"."""
+        with open(TOOL, encoding="utf8") as fh: src = fh.read()
+        self.assertNotIn("waive", src.lower().replace("never waive", "").replace("waives one", "").replace("waivable", ""))
+        orig = ro.make_owner
+        try:
+            f = self.Fake(); f.reason_codes = [{"code": "signal_denied", "pid": 1}]
+            ro.make_owner = lambda: f
+            code, rep = ro.run(["unused"], timeout=1, grace=0.05)
+        finally:
+            ro.make_owner = orig
+        self.assertEqual((code, rep["certification"]), (ro.EXIT_UNCERTAIN, "uncertain"), rep)
 
     def test_layer_run_owner_reason_is_121(self):
         orig = ro.make_owner

@@ -36,12 +36,16 @@ Certification (report "certification"): "confirmed" every owned process is gone,
 (Windows: the job is empty); "survivors" known owned processes are still alive; "uncertain" ownership could not be
 completed (a discovery error during the stop, processes still appearing when the kill rounds ran out, a possible unseen
 escaper on macOS). Success is reported only with "confirmed".
+Every doubt is also a typed entry in report "reason_codes" (signal_denied, signal_error, signal_unsafe, query_error,
+group_signal_denied, stop_failed, kill_rounds_unclean, ...). Any code forbids "confirmed"; no option waives one. A
+signal that fails is never taken as termination: one process's failure never stops the others being signalled, and a
+process that still runs after a denied signal is a survivor (120).
 Exit codes: the command's own code when certified; 128+N if it died from signal N (POSIX); 124 timeout; 130/143 this
 tool was interrupted; 120 survivors (overrides all others); 125 tool error or unsupported containment; 127 the command
 could not be started; 121 not certified ("uncertain"). A command
 that itself exits with 120, 121, 124, 125 or 127 cannot be told apart from these by the code alone: read the --report.
 """
-import argparse, ctypes, ctypes.util, json, os, signal, subprocess, sys, threading, time
+import argparse, ctypes, ctypes.util, errno, json, os, select, signal, subprocess, sys, threading, time
 
 VERSION = 1
 LINUX = sys.platform.startswith("linux")
@@ -55,13 +59,52 @@ class ToolError(Exception):
     pass
 
 
+class _UnsafeTarget(Exception):
+    """No race-free way to signal this process on this system (it is reported, never signalled)."""
+
+
+class _ReadFailed(Exception):
+    """A process could not be read right before a signal (not a signal failure)."""
+
+    def __init__(self, err):
+        super().__init__(str(err))
+        self.err = err
+
+
+class ReasonsMixin:
+    """Typed, machine-readable reasons (report "reason_codes"). Every code also adds a human sentence to
+    uncertain_reasons, and ANY code forbids "confirmed": there is no option, default or timeout that waives one.
+      signal_denied  a signal to a known, identity-checked process failed with EPERM (it may still run)
+      signal_error   a signal failed with another OS error
+      query_error    a process could not be read (not "gone": EACCES, EMFILE, ...), so it is never assumed gone
+      signal_unsafe  no race-free signalling primitive for that process here (it was NOT signalled)
+      stop_failed    the stop path itself raised; a best-effort identity-checked sweep followed
+      kill_rounds_unclean  the kill rounds ended without two consecutive clean scans"""
+
+    def _reason(self, code, msg, **kw):
+        codes = self.__dict__.setdefault("reason_codes", [])
+        rec = dict(code=code, **kw)
+        if rec not in codes:
+            codes.append(rec)
+        if msg not in self.uncertain_reasons:
+            self.uncertain_reasons.append(msg)
+
+
+def _signame(sig):
+    try:
+        return signal.Signals(sig).name
+    except (ValueError, AttributeError):
+        return str(sig)
+
+
 # ── Linux ────────────────────────────────────────────────────────────────────────────────────────────────────────────
 def _linux_stat(pid):
-    """(ppid, pgid, starttime) from /proc, or None if gone."""
+    """(ppid, pgid, starttime) from /proc, or None if gone. Any other read failure (EACCES, EMFILE, ...) RAISES: a
+    process that cannot be read is never assumed gone (D4/D1: a false "gone" could certify a live process)."""
     try:
         with open(f"/proc/{pid}/stat", "rb") as f:
             s = f.read().decode("latin1")
-    except OSError:  # gone, unreadable, or a transient error: never treated as ours
+    except (FileNotFoundError, ProcessLookupError):  # the process is gone
         return None
     r = s[s.rindex(")") + 2:].split()
     if r[0] == "Z":
@@ -69,11 +112,36 @@ def _linux_stat(pid):
     return int(r[1]), int(r[2]), int(r[19])
 
 
-class LinuxOwner:
+def _pidfd_works():
+    """os.pidfd_open can exist while the kernel lacks it (ENOSYS before Linux 5.3): probe it on our own pid."""
+    if not hasattr(os, "pidfd_open"):
+        return False
+    try:
+        os.close(os.pidfd_open(os.getpid()))
+        return True
+    except OSError:
+        return False
+
+
+def _ensure_sigchld_default():
+    """An inherited SIG_IGN for SIGCHLD makes the kernel reap children automatically: the root's status (and, on
+    macOS, its pinned pid/group/session) would be lost. This CLI tool restores the default before spawning."""
+    if hasattr(signal, "SIGCHLD") and signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
+
+def _pidfd_exited(fd):
+    """A pidfd becomes readable when its process has exited (Linux 5.3+)."""
+    p = select.poll()
+    p.register(fd, select.POLLIN)
+    return bool(p.poll(0))
+
+
+class LinuxOwner(ReasonsMixin):
     containment = "full"
 
     def __init__(self):
-        self.identity_mode = "pidfd" if hasattr(os, "pidfd_open") else "starttime-race"
+        self.identity_mode = "pidfd" if _pidfd_works() else "starttime-race"
         self.children_file = os.path.exists(f"/proc/{os.getpid()}/task/{os.getpid()}/children")
         self.warnings = []
         libc = ctypes.CDLL(None, use_errno=True)
@@ -93,6 +161,7 @@ class LinuxOwner:
         self.root_status = None
 
     def spawn(self, cmd, cwd, env):
+        _ensure_sigchld_default()
         r, w = os.pipe()  # exec failure is reported through the pipe (exit 127)
         pid = os.fork()
         if pid == 0:
@@ -128,9 +197,17 @@ class LinuxOwner:
         if self.identity_mode == "pidfd":
             try:
                 fd = os.pidfd_open(pid)
-            except (ProcessLookupError, OSError):
+            except ProcessLookupError:  # gone
                 return
-        st = _linux_stat(pid)
+            except OSError as e:  # EMFILE, ENOMEM, a policy denial: it may be ours and cannot be pinned -> never silent
+                self._reason("query_error", f"a candidate process could not be pinned (pidfd_open): {type(e).__name__}", pid=pid, errno=e.errno)
+                return
+        try:
+            st = _linux_stat(pid)
+        except OSError as e:  # unreadable candidate: cannot tell whether it is ours -> never "confirmed"
+            if fd is not None: os.close(fd)
+            self._reason("query_error", f"a candidate process could not be read: {type(e).__name__}", pid=pid, errno=e.errno)
+            return
         ok = st is not None and ((expect_ppid is not None and st[0] == expect_ppid) or (expect_pgid is not None and st[1] == expect_pgid))
         # The candidate is pinned now. Its parent / group must STILL be ours: a parent that is still the recorded process
         # (start time unchanged) was its parent when we read it (a live pid cannot be reused); a group that a verified
@@ -148,7 +225,11 @@ class LinuxOwner:
     def _still_ours(self, pid, pgid=None):
         k = self.known.get(pid)
         if not k: return False
-        st = _linux_stat(pid)
+        try:
+            st = _linux_stat(pid)
+        except OSError as e:
+            self._reason("query_error", f"a known process could not be read: {type(e).__name__}", pid=pid, errno=e.errno)
+            return False
         return st is not None and st[2] == k["start"] and (pgid is None or st[1] == pgid)
 
     def _children_of(self, pid):
@@ -162,6 +243,8 @@ class LinuxOwner:
                     pass
         except (FileNotFoundError, ProcessLookupError):
             pass
+        except OSError as e:  # unreadable: its children may be ours -> recorded (the /proc walk still runs)
+            self._reason("query_error", f"the children of a process could not be read: {type(e).__name__}", pid=pid, errno=e.errno)
         return out
 
     def scan(self):
@@ -181,7 +264,11 @@ class LinuxOwner:
                 if not e.name.isdigit(): continue
                 pid = int(e.name)
                 if pid in self.known or pid == me: continue
-                st = _linux_stat(pid)
+                try:
+                    st = _linux_stat(pid)
+                except OSError as err:  # unreadable: it might be one of ours -> recorded, never silently skipped
+                    self._reason("query_error", f"a process could not be read during discovery: {type(err).__name__}", pid=pid, errno=err.errno)
+                    continue
                 if st is None: continue
                 if st[1] == self.root:
                     self._adopt(pid, expect_pgid=self.root)
@@ -210,7 +297,15 @@ class LinuxOwner:
     def alive(self):
         out = []
         for pid, k in list(self.known.items()):
-            st = _linux_stat(pid)
+            try:
+                st = _linux_stat(pid)
+            except OSError as e:  # unreadable: never assumed gone. The pinned pidfd is authoritative when present.
+                self._reason("query_error", f"a known process could not be read: {type(e).__name__}", pid=pid, errno=e.errno)
+                if k["fd"] is not None and _pidfd_exited(k["fd"]):
+                    self._forget(pid)  # verified exited through its own pidfd (the read failure stays recorded)
+                else:
+                    out.append(pid)  # still running (pidfd) or unverifiable (reduced mode): stays a known survivor
+                continue
             if st is None or st[2] != k["start"]:
                 self._forget(pid)  # pruned every loop: a dead entry never vouches for a parent or a group
             else:
@@ -218,18 +313,46 @@ class LinuxOwner:
                 out.append(pid)
         return out
 
+    def _deliver(self, pid, k, sig):
+        """The only place a signal is sent (fault injection point for the tests)."""
+        if k["fd"] is not None:
+            signal.pidfd_send_signal(k["fd"], sig)  # pinned: cannot reach another process
+        else:
+            # Reduced mode (no pidfd). kill(pid) is safe ONLY for our own child: as a subreaper we are its only reaper
+            # and reap() runs in this same thread, so its pid cannot be reused before this call. Any other process
+            # could be reaped by its own parent and its pid reused between a check and kill(): never signalled
+            # (owner rule: no plain kill fallback; fail closed instead).
+            try:
+                st = _linux_stat(pid)
+            except OSError as e:
+                raise _ReadFailed(e) from e
+            if st is None or st[2] != k["start"]: raise ProcessLookupError(errno.ESRCH, "identity changed")
+            if st[0] != os.getpid():
+                raise _UnsafeTarget(pid)
+            os.kill(pid, sig)
+
     def signal(self, pid, sig):
+        """True only if the signal was delivered. A failed signal is never taken as termination: EPERM/other errors
+        are recorded as typed reasons, and the process stays known (a survivor if it still runs)."""
         k = self.known.get(pid)
         if not k: return False
         try:
-            if k["fd"] is not None:
-                signal.pidfd_send_signal(k["fd"], sig)  # pinned: cannot reach another process
-            else:
-                st = _linux_stat(pid)
-                if st is None or st[2] != k["start"]: return False
-                os.kill(pid, sig)
+            self._deliver(pid, k, sig)
             return True
+        except _ReadFailed as e:
+            self._reason("query_error", f"a known process could not be read before a signal: {type(e.err).__name__}", pid=pid, errno=e.err.errno)
+            return False
+        except _UnsafeTarget:
+            self._reason("signal_unsafe", "reduced mode: a known process that is not our own child cannot be signalled "
+                         "without a PID-reuse race; it was not signalled", pid=pid, sig=_signame(sig))
+            return False
         except ProcessLookupError:
+            return False
+        except PermissionError as e:
+            self._reason("signal_denied", f"a signal to a known process was denied (EPERM): {_signame(sig)}", pid=pid, sig=_signame(sig), errno=e.errno)
+            return False
+        except OSError as e:
+            self._reason("signal_error", f"a signal to a known process failed: {type(e).__name__}", pid=pid, sig=_signame(sig), errno=e.errno)
             return False
 
     def root_exited(self):
@@ -261,7 +384,7 @@ class _BsdInfo(ctypes.Structure):
                 ("pbi_start_tvusec", ctypes.c_uint64)]
 
 
-class MacOwner:
+class MacOwner(ReasonsMixin):
     """macOS: the root is kept as an UNREAPED zombie until verification ends (its exit is seen with waitid WNOWAIT), so
     its pid, group id and session id cannot be reused. Ownership: os.getsid(pid) == root (every descendant that did not
     call setsid, even after it was re-parented to launchd or moved to another group), or a parent that is a known,
@@ -380,9 +503,17 @@ class MacOwner:
             os.kill(pid, sig)
         except ProcessLookupError:
             return False
+        except PermissionError as e:
+            self._reason("signal_denied", f"a signal to a known process was denied (EPERM): {_signame(sig)}", pid=pid, sig=_signame(sig), errno=e.errno)
+            return False
+        except OSError as e:
+            self._reason("signal_error", f"a signal to a known process failed: {type(e).__name__}", pid=pid, sig=_signame(sig), errno=e.errno)
+            return False
         if self.root_exited_flag and self.pinned and sig in (signal.SIGTERM, signal.SIGKILL):
             try: os.killpg(self.root, sig)  # safe: the pinned zombie keeps this group id ours
-            except (ProcessLookupError, PermissionError): pass
+            except ProcessLookupError: pass
+            except OSError as e:  # never silent: a member of our group may not have been signalled
+                self._reason("group_signal_denied", f"a signal to the root's process group failed: {type(e).__name__}", pgid=self.root, sig=_signame(sig), errno=e.errno)
         return True
 
     def verify(self):
@@ -555,10 +686,12 @@ def make_owner():
 
 def run(cmd, timeout=None, grace=5.0, cwd=None, env=None, require_full=False):
     """Returns (exit_code, report). CLI use only: in-process use would make the caller a subreaper (Linux) whose own
-    children this tool would reap. The tree is stopped on EVERY exit path, including an unexpected error in the tool."""
+    children this tool would reap. This tool must be the only reaper of its children (no other waitpid(-1), SIGCHLD
+    handler or SA_NOCLDWAIT in the process): the own-child signalling argument (Linux reduced mode, the pinned macOS
+    root) depends on it. The tree is stopped on EVERY exit path, including an unexpected error in the tool."""
     report = {"version": VERSION, "platform": sys.platform, "containment": None, "identity_mode": None, "root": None,
               "timed_out": False, "interrupted": None, "signalled": [], "survivors": [], "escaped_seen": [], "warnings": [],
-              "certification": None, "certification_basis": "", "uncertain_reasons": []}
+              "certification": None, "certification_basis": "", "uncertain_reasons": [], "reason_codes": []}
     try:
         owner = make_owner()
     except (ToolError, OSError) as e:
@@ -601,7 +734,8 @@ def run(cmd, timeout=None, grace=5.0, cwd=None, env=None, require_full=False):
             except BaseException as e:  # noqa: BLE001
                 report["warnings"].append(f"stopping the tree failed: {type(e).__name__}: {e}")
                 report["uncertain_reasons"].append(f"stopping the tree failed: {type(e).__name__}")
-                cert = "uncertain"
+                report["reason_codes"].append({"code": "stop_failed", "error": type(e).__name__})
+                cert = _sweep_after_stop_failure(owner, report)
     finally:
         for s, prev in old.items():
             try: signal.signal(getattr(signal, s), prev)
@@ -611,7 +745,9 @@ def run(cmd, timeout=None, grace=5.0, cwd=None, env=None, require_full=False):
         pass
     for r in getattr(owner, "uncertain_reasons", []):
         if r not in report["uncertain_reasons"]: report["uncertain_reasons"].append(r)
-    if report["uncertain_reasons"] and cert == "confirmed": cert = "uncertain"
+    for c in getattr(owner, "reason_codes", []):
+        if c not in report["reason_codes"]: report["reason_codes"].append(c)
+    if (report["uncertain_reasons"] or report["reason_codes"]) and cert == "confirmed": cert = "uncertain"
     rc, sig = owner.root_result()
     report["root"] = {"pid": owner.root, "rc": rc, "signal": sig}
     report["warnings"] += owner.warnings
@@ -628,6 +764,32 @@ def run(cmd, timeout=None, grace=5.0, cwd=None, env=None, require_full=False):
     return (rc if rc is not None else EXIT_TOOL), report
 
 
+def _sweep_after_stop_failure(owner, report):
+    """The stop path raised: one more identity-checked SIGKILL round over the known processes (never anything else).
+    Returns "survivors" if a known process still runs, else "uncertain" (never "confirmed")."""
+    if WINDOWS:
+        return "uncertain"
+    try:
+        for pid in owner.alive():
+            try:
+                if owner.signal(pid, signal.SIGKILL): report["signalled"].append({"pid": pid, "sig": "KILL"})
+            except Exception:  # noqa: BLE001 - keep going for the others
+                pass
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            try: owner.reap()
+            except Exception: pass  # noqa: BLE001
+            if not owner.alive(): break
+            time.sleep(POLL)
+        left = owner.alive()
+        if left:
+            report["survivors"] = [owner.describe(p) for p in left]
+            return "survivors"
+    except Exception:  # noqa: BLE001
+        pass
+    return "uncertain"
+
+
 def _stop_tree(owner, grace, report):
     """Graceful stop, bounded grace, forced stop, verification. Returns the certification:
       "confirmed"  every owned process is gone, verified by a clean final rescan (Windows: the job is empty);
@@ -637,8 +799,15 @@ def _stop_tree(owner, grace, report):
     Signals are blocked meanwhile (POSIX). Discovery and reaping are best-effort: an error is recorded once, never
     stops the known processes being signalled, and makes the result "uncertain"."""
     reasons = report.setdefault("uncertain_reasons", [])
+    codes = report.setdefault("reason_codes", [])
     def note(m):
         if m not in reasons: reasons.append(m)
+    def send(pid, sig, name):  # one process's failure never stops the others being signalled (D1)
+        try:
+            if owner.signal(pid, sig): report["signalled"].append({"pid": pid, "sig": name})
+        except Exception as e:  # noqa: BLE001
+            note(f"during stop: signal {name}: {type(e).__name__}: {e}")
+            codes.append({"code": "signal_error", "pid": pid, "sig": name, "error": type(e).__name__})
     def safe(fn):
         try: fn(); return True
         except Exception as e:  # noqa: BLE001
@@ -670,7 +839,7 @@ def _stop_tree(owner, grace, report):
         owner.stopping = True  # every scan from here is a full scan
         safe(owner.reap); safe(owner.scan)
         for pid in owner.alive():
-            if owner.signal(pid, signal.SIGTERM): report["signalled"].append({"pid": pid, "sig": "TERM"})
+            send(pid, signal.SIGTERM, "TERM")
         end = time.monotonic() + grace
         while time.monotonic() < end:
             safe(owner.reap); safe(owner.scan)
@@ -686,7 +855,7 @@ def _stop_tree(owner, grace, report):
                 if ok and ok2 and not owner.alive(): clean = True; break
                 continue
             for pid in left:
-                if owner.signal(pid, signal.SIGKILL): report["signalled"].append({"pid": pid, "sig": "KILL"})
+                send(pid, signal.SIGKILL, "KILL")
             end = time.monotonic() + 5
             while owner.alive() and time.monotonic() < end:
                 safe(owner.reap); time.sleep(POLL)
@@ -695,10 +864,14 @@ def _stop_tree(owner, grace, report):
         report["survivors"] = [owner.describe(p) for p in left]
         if hasattr(owner, "verify"): safe(owner.verify)
         for r in getattr(owner, "uncertain_reasons", []): note(r)
+        for c in getattr(owner, "reason_codes", []):
+            if c not in codes: codes.append(c)
         report["certification_basis"] = getattr(owner, "certification_basis", "")
         if left: return "survivors"
-        if not clean: note("the kill rounds ended without a clean final rescan")
-        return "uncertain" if reasons else "confirmed"
+        if not clean:
+            note("the kill rounds ended without a clean final rescan")
+            codes.append({"code": "kill_rounds_unclean"})
+        return "uncertain" if (reasons or codes) else "confirmed"
     finally:
         if blocked: signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
 
