@@ -7,7 +7,7 @@ guards against is real (a plain timeout kill leaves the tree behind). Cases that
 not give are skipped with the reason, never passed. Every process a case creates is stopped at the end of the case,
 by identity only; nothing is matched by name.
 """
-import contextlib, errno, json, os, shutil, signal, subprocess, sys, tempfile, time, unittest
+import ast, contextlib, errno, json, os, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "run_owned.py")
@@ -21,6 +21,237 @@ LINUX, MACOS, WINDOWS = ro.LINUX, ro.MACOS, ro.WINDOWS
 def load(path):
     with open(path, encoding="utf8") as f:
         return json.load(f)
+
+
+# ── Real-signal guard for tests that start no processes (round 36) ──────────────────────────────────────────────────
+# Rounds 33 and 32 each shipped a test that sent a REAL signal to a made-up target (killpg(4000), killpg(99998)). Every
+# test is classified once below (by full name, never by prefix). For every test that is not OWNED, setUp replaces each
+# real signalling primitive with a blocker that records the attempt and raises BEFORE any OS call; the attempt also fails
+# the test at cleanup even if the code under test swallowed the exception. OWNED tests signal only processes they started
+# and recorded by identity (Ident), and are not guarded (their cleanup must work). The guard never signals anything.
+_SIG_NAMES = frozenset({"kill", "killpg", "pidfd_send_signal", "pthread_kill"})
+_GUARDED = ((os, "kill"), (os, "killpg"), (signal, "pidfd_send_signal"), (signal, "pthread_kill"),
+            (ro.MacOwner, "token_signal"), (ro.WinOwner, "force"))
+_ABSENT = object()
+
+
+class RealSignalBlocked(AssertionError):
+    """A guarded test tried to send a real signal: raised before any OS call."""
+
+
+class SignalGuard:
+    """allow: optional {name: set of first arguments} that may pass to the real function (a test's OWN targets only)."""
+
+    def __init__(self, allow=None):
+        self.allow = {k: frozenset(v) for k, v in (allow or {}).items()}
+        self.attempts, self.saved, self.blockers, self.tampered = [], {}, {}, []
+
+    def _blocker(self, name, orig):
+        allowed = self.allow.get(name, frozenset())
+        def blocked(*a, **kw):
+            if a and type(a[0]) is int and a[0] in allowed and a[0] > 0:
+                return orig(*a, **kw)  # an explicitly allowed own target (never pid <= 0, never a made-up id)
+            self.attempts.append((name,) + tuple(x if isinstance(x, int) else type(x).__name__ for x in a))
+            raise RealSignalBlocked(f"real {name}{tuple(self.attempts[-1][1:])} blocked before any OS call")
+        blocked.__name__, blocked._signal_guard = "blocked_" + name, self
+        return blocked
+
+    def install(self):
+        for owner, name in _GUARDED:
+            orig = owner.__dict__.get(name, _ABSENT) if isinstance(owner, type) else getattr(owner, name, _ABSENT)
+            self.saved[(owner, name)] = orig
+            if orig is not _ABSENT:
+                call = orig if not isinstance(owner, type) else getattr(owner, name)
+                self.blockers[name] = b = self._blocker(name, call)
+                setattr(owner, name, b)
+        return self
+
+    def active(self):
+        return bool(self.blockers) and all(getattr(o, n, _ABSENT) is self.blockers[n] for o, n in _GUARDED if n in self.blockers)
+
+    def restore(self):  # never raises, never signals
+        for (owner, name), orig in reversed(list(self.saved.items())):
+            cur = getattr(owner, name, _ABSENT) if not isinstance(owner, type) else owner.__dict__.get(name, _ABSENT)
+            if name in self.blockers and cur is not self.blockers[name]: self.tampered.append(name)
+            if orig is _ABSENT:
+                if cur is not _ABSENT: delattr(owner, name)
+            else:
+                setattr(owner, name, orig)
+
+    def take(self):
+        """Hand over (and clear) the recorded attempts: for controls that provoke an attempt on purpose."""
+        a, self.attempts = self.attempts, []
+        return a
+
+    def verify_and_restore(self):
+        self.restore()
+        if self.attempts or self.tampered:
+            raise RealSignalBlocked(f"blocked real-signal attempts {self.attempts}; patches left in place {self.tampered}")
+
+
+@contextlib.contextmanager
+def signal_floor():
+    """A minimal last layer for tests that probe a SignalGuard on purpose: installed UNDER the guard being tested, it
+    catches any call the guard lets through, so even a broken guard can never reach the OS. Deliberately independent of
+    SignalGuard (own list, own code). Yields the list of calls that reached the floor (expected: none)."""
+    hits, saved = [], []
+    for owner, name in ((os, "kill"), (os, "killpg"), (signal, "pidfd_send_signal"), (signal, "pthread_kill"),
+                        (ro.MacOwner, "token_signal"), (ro.WinOwner, "force")):
+        if (name in owner.__dict__) if isinstance(owner, type) else hasattr(owner, name):
+            saved.append((owner, name, owner.__dict__[name] if isinstance(owner, type) else getattr(owner, name)))
+            def floor(*a, _n=name, **kw):
+                hits.append((_n,) + tuple(x if type(x) is int else type(x).__name__ for x in a))
+                raise RuntimeError(f"signal floor reached: {_n} (the guard under test let it through)")
+            setattr(owner, name, floor)
+    try:
+        yield hits
+    finally:
+        for owner, name, orig in saved: setattr(owner, name, orig)
+
+
+def signal_cache_violations(src):
+    """Ways to keep a reference that patching the module attribute would not catch: from-imports of signal functions or
+    the raw posix/nt/_signal modules (anywhere), and getattr(os, "kill")-style lookups at import time (module or class
+    level: inside a function the lookup happens at call time, so under a guard it finds the blocker)."""
+    tree, bad = ast.parse(src), []
+    in_function = set()  # nodes whose code runs only when a function is called
+    for f in ast.walk(tree):  # a function's body runs at call time; its defaults and decorators run at definition time
+        if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for st in f.body: in_function.update(id(x) for x in ast.walk(st))
+        elif isinstance(f, ast.Lambda):
+            in_function.update(id(x) for x in ast.walk(f.body))
+    called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module in ("os", "posix", "nt", "signal", "_signal") \
+                and {a.name for a in n.names} & (_SIG_NAMES | {"*"}): bad.append(("from-import", n.lineno))
+        if isinstance(n, ast.Import) and {a.name for a in n.names} & {"posix", "nt", "_signal"}: bad.append(("raw-module", n.lineno))
+        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "getattr" and len(n.args) > 1 and id(n) not in in_function \
+                and isinstance(n.args[1], ast.Constant) and n.args[1].value in _SIG_NAMES: bad.append(("getattr", n.lineno))
+        if isinstance(n, ast.Attribute) and n.attr in _SIG_NAMES and id(n) not in in_function and id(n) not in called \
+                and isinstance(n.value, ast.Name) and n.value.id in ("os", "signal"): bad.append(("alias", n.lineno))
+    return bad
+
+
+def _const_int(v):
+    if isinstance(v, ast.UnaryOp) and isinstance(v.op, ast.USub): v = v.operand
+    return isinstance(v, ast.Constant) and type(v.value) is int
+
+
+def constant_signal_targets(src, names):
+    """In the named test methods: a constant assigned to an owner's .root, or a constant first argument to kill/killpg/
+    _signal_group targets (a made-up id, as in the round-32 killpg(99998))."""
+    cls = [c for c in ast.parse(src).body if isinstance(c, ast.ClassDef) and c.name == "Case"][0]
+    bad = []
+    for fn in (f for f in cls.body if isinstance(f, ast.FunctionDef) and f.name in names):
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign):
+                tg = [e for t in n.targets for e in (t.elts if isinstance(t, ast.Tuple) else [t])]
+                vs = n.value.elts if isinstance(n.value, ast.Tuple) else [n.value] * len(tg)
+                bad += [(fn.name, n.lineno) for t, v in zip(tg, vs) if getattr(t, "attr", None) == "root"
+                        and _const_int(v)]
+            if isinstance(n, ast.Call) and getattr(n.func, "attr", None) in ("kill", "killpg") and n.args \
+                    and _const_int(n.args[0]):
+                bad.append((fn.name, n.lineno))
+    return bad
+
+
+# Start no process; use made-up pids/groups, synthetic owners or fake owners. Guarded.
+SYNTHETIC_TESTS = frozenset({
+    "test_dg_matching_versions_admit_and_record_the_exec_history",
+    "test_dg_missing_orphan_original_parent_version",
+    "test_dg_missing_parent_admission_record",
+    "test_dg_missing_root_version_history",
+    "test_dg_original_parent_version_mismatch",
+    "test_dg_output_size_bounds_and_truncation",
+    "test_dg_portable_scenario_runs_without_posix_signals",
+    "test_dg_query_failure_or_inconsistent_identity",
+    "test_dg_query_returning_no_information",
+    "test_dg_report_key_never_changes_the_exit_code",
+    "test_dg_sensitive_text_is_never_reported",
+    "test_dg_stale_admission_record_and_link_seen_while_root_alive",
+    "test_dg_unobserved_root_exec_version_is_reported_with_its_signature",
+    "test_dg_verdict_and_cleanup_unchanged",
+    "test_dg_verdict_cleanup_and_signals_unchanged",
+    "test_group_eperm_when_not_pinned_is_never_classified",
+    "test_group_eperm_with_a_live_member_is_never_suppressed",
+    "test_group_eperm_with_an_unreadable_group_is_uncertain",
+    "test_group_eperm_with_one_unreadable_process_is_uncertain",
+    "test_group_eperm_with_only_the_zombie_root_is_a_note_not_a_reason",
+    "test_group_harmless_eperm_never_waives_an_earlier_denial",
+    "test_group_missing_is_harmless_and_other_errors_are_reasons",
+    "test_guard_active_after_a_failed_assertion_and_restored_exactly",
+    "test_guard_blocks_synthetic_pid_group_and_pidfd_before_the_os_call",
+    "test_guard_mutations_are_caught_before_signalling",
+    "test_guard_synthetic_owner_signal_paths_are_blocked",
+    "test_guard_unexpected_attempt_fails_even_if_swallowed",
+    "test_layer_d1_one_failing_signal_does_not_stop_the_others",
+    "test_layer_d1_stop_failure_sweeps_known_processes",
+    "test_layer_d1_survivors_outrank_reasons",
+    "test_layer_no_option_waives_a_reason",
+    "test_layer_run_owner_reason_is_121",
+    "test_layer_run_stop_failure_is_uncertain_121",
+    "test_layer_second_clean_rescan_is_required",
+    "test_layer_stop_clean_fake_is_confirmed",
+    "test_layer_stop_discovery_error_is_recorded_as_reason",
+    "test_layer_stop_owner_reason_is_uncertain",
+    "test_n2_orphan_of_an_exited_original_parent_is_admitted",
+    "test_n2_scan_admits_only_with_positive_lineage_and_the_root_coalition",
+})
+# Start their own fixtures (directly or through the tool / a snippet interpreter) and signal only those, by identity. Not guarded.
+OWNED_TESTS = frozenset({
+    "test_d1_denied_then_gone_is_uncertain_not_confirmed",
+    "test_d1_negative_control_empty_deny_set_is_confirmed",
+    "test_d1_persistent_eperm_is_a_survivor_and_others_are_stopped",
+    "test_d1_unpinnable_candidate_is_never_silently_dropped",
+    "test_d1_unreadable_proc_entry_is_never_assumed_gone",
+    "test_descendant_in_a_new_group_is_stopped",
+    "test_discovery_error_during_the_stop_is_uncertain",
+    "test_escaping_grandchild_is_stopped",
+    "test_exec_after_discovery_is_still_stopped",
+    "test_forking_during_cleanup_is_never_a_silent_success",
+    "test_group_id_without_a_live_member_is_never_adopted",
+    "test_guard_owned_fixture_cleanup_works_without_the_guard",
+    "test_limit_tool_sigkill_leaves_the_tree",
+    "test_linux_adopted_orphans_are_reaped_while_running",
+    "test_linux_identity_mismatch_is_never_signalled",
+    "test_mac_group_eperm_with_live_members_is_uncertain",
+    "test_mac_group_inspection_error_is_uncertain",
+    "test_mac_process_list_failure_is_uncertain",
+    "test_mac_root_whose_identity_cannot_be_read_is_never_released",
+    "test_mac_same_coalition_unrelated_orphan_is_uncertain_and_never_signalled",
+    "test_mac_stale_identity_and_simulated_pid_reuse_are_refused",
+    "test_mac_unrelated_launchd_job_neither_uncertain_nor_signalled",
+    "test_mac_without_the_identity_bound_call_nothing_else_is_signalled",
+    "test_mac_zombie_only_group_really_returns_eperm_and_is_harmless",
+    "test_mac_zombie_only_group_run_is_confirmed",
+    "test_negative_control_plain_timeout_leaves_descendants",
+    "test_no_descendants_is_confirmed",
+    "test_node_test_runner_child_does_not_survive",
+    "test_orphaned_session_escaper_with_a_seen_parent_is_stopped",
+    "test_reduced_mode_never_kills_a_grandchild_by_pid",
+    "test_require_full_containment",
+    "test_root_exit_code_is_preserved",
+    "test_root_exits_before_its_child_is_observed",
+    "test_sigterm_ignoring_descendants_are_killed_after_grace",
+    "test_stale_parent_entry_never_adopts_an_unrelated_child",
+    "test_success_leftover_child_is_stopped",
+    "test_timeout_stops_a_three_level_tree",
+    "test_tool_sigterm_stops_the_tree",
+    "test_unexpected_error_in_the_tool_still_stops_the_tree",
+    "test_unseen_session_escaper_is_never_confirmed",
+    "test_unstartable_command_is_127",
+    "test_windows_breakaway_is_refused",
+    "test_windows_tool_killed_job_close_kills_tree",
+})
+# No processes and no signalling (classifiers, source checks). Guarded.
+PURE_TESTS = frozenset({
+    "test_dg_failed_predicate_matches_the_classifier",
+    "test_dg_static_write_only_and_no_signals",
+    "test_guard_every_test_is_classified_exactly_once",
+    "test_guard_no_cached_signal_references",
+    "test_n2_classifier_requires_positive_lineage",
+    "test_static_guard_plain_kill_only_where_proven_safe",
+})
 
 
 class Ident:
@@ -88,11 +319,20 @@ class Ident:
 
 class Case(unittest.TestCase):
     def setUp(self):
+        n = self._testMethodName
+        if sum(n in c for c in (SYNTHETIC_TESTS, OWNED_TESTS, PURE_TESTS)) != 1:
+            self.fail(f"{n} is not classified exactly once (SYNTHETIC_TESTS / OWNED_TESTS / PURE_TESTS)")
+        self.signal_guard = None
+        if n not in OWNED_TESTS:  # active through the test, its failures and tearDown; checked and restored last
+            self.signal_guard = SignalGuard().install()
+            self.addCleanup(self.signal_guard.verify_and_restore)
         self.dir = tempfile.mkdtemp(prefix="run-owned-")
         self.pids = os.path.join(self.dir, "pids")
         self.ident = Ident()
 
     def tearDown(self):
+        if self.signal_guard is not None:  # a guarded test starts nothing, so its cleanup must have nothing to stop
+            self.assertEqual(self.ident.seen, {}, "a guarded (non-OWNED) test recorded processes")
         self.ident.cleanup()
         left = self.ident.alive_all()
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -763,15 +1003,19 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
             end = time.time() + 10
             while time.time() < end and os.waitid(os.P_PID, z.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
                 time.sleep(0.02)
-            with self.assertRaises(PermissionError, msg="XNU: killpg on a zombie-only group returns EPERM"):
-                os.killpg(z.pid, 0 or signal.SIGTERM)
+            self.assertNotEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_IGN, "z must stay unreaped (its group id reserved)")
             o = ro.MacOwner(); o.root, o.pinned, o.root_exited_flag = z.pid, True, True
-            o._signal_group(signal.SIGTERM)
+            g = SignalGuard(allow={"killpg": {z.pid}}).install()  # only the test's own unreaped group may be signalled
+            try:
+                with self.assertRaises(PermissionError, msg="XNU: killpg on a zombie-only group returns EPERM"):
+                    os.killpg(z.pid, 0 or signal.SIGTERM)
+                o._signal_group(signal.SIGTERM)
+            finally:
+                g.verify_and_restore()
             self.assertEqual(o.reason_codes if hasattr(o, "reason_codes") else [], [])
             self.assertEqual([n["event"] for n in o.notes], ["killpg_eperm_no_live_member"])
-            o2 = ro.MacOwner(); o2.root, o2.pinned, o2.root_exited_flag = 99998, True, True  # no such group: ESRCH
-            o2._signal_group(signal.SIGTERM)
-            self.assertEqual((getattr(o2, "reason_codes", []), o2.notes), ([], []))
+            # (round 36) the former check of a made-up group id with a REAL killpg is gone: a missing group (ESRCH)
+            # is covered with a recorder by test_group_missing_is_harmless_and_other_errors_are_reasons
         finally:
             z.wait()
 
@@ -1226,22 +1470,188 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
                 self.dg_scenario("normal", with_signal=True)
         self.assertEqual(hasattr(signal, "SIGKILL"), not WINDOWS, "names restored")
 
-    def test_dg_synthetic_tests_never_signal_a_real_process(self):
-        """Regression control for the round-33 stray killpg(4000): every synthetic-owner test (diagnostics and N2')
-        runs with os.kill / os.killpg replaced by recorders; none may reach them (they target no real process)."""
-        names = sorted(n for n in dir(type(self)) if n.startswith(("test_dg_", "test_n2_"))
-                       and n != "test_dg_synthetic_tests_never_signal_a_real_process")
-        self.assertIn("test_dg_verdict_cleanup_and_signals_unchanged", names)
-        hits, real = [], {n: getattr(os, n) for n in ("kill", "killpg") if hasattr(os, n)}
-        for n in real: setattr(os, n, lambda *a, _n=n: hits.append((_n,) + a))
+    # ── real-signal guard controls (round 36) ──
+    def test_guard_every_test_is_classified_exactly_once(self):
+        """Replaces the round-34 name-prefix sweep: every test is in exactly one reviewed set, and no test method may give
+        an owner a constant .root or kill/killpg a constant id (made-up targets, as in the round-32 killpg(99998))."""
+        names = {n for n in dir(type(self)) if n.startswith(unittest.TestLoader.testMethodPrefix)}
+        sets = (SYNTHETIC_TESTS, OWNED_TESTS, PURE_TESTS)
+        self.assertEqual(set().union(*sets) ^ names, set(), "unclassified or stale names")
+        self.assertEqual(sum(map(len, sets)), len(names), "a name is in two sets")
+        self.assertGreater(len(SYNTHETIC_TESTS), 30)
+        with open(__file__, encoding="utf8") as fh: src = fh.read()
+        self.assertEqual(constant_signal_targets(src, OWNED_TESTS), [])  # unguarded tests: no made-up targets at all
+        readd = src.replace("            o = ro.MacOwner(); o.root, o.pinned, o.root_exited_flag = z.pid, True, True\n",
+                            "            o = ro.MacOwner(); o.root, o.pinned, o.root_exited_flag = z.pid, True, True\n"
+                            "            o2 = ro.MacOwner(); o2.root, o2.pinned, o2.root_exited_flag = 99998, True, True\n", 1)
+        self.assertNotEqual(readd, src)
+        self.assertEqual(constant_signal_targets(readd, OWNED_TESTS), [("test_mac_zombie_only_group_really_returns_eperm_and_is_harmless",
+                                                                 readd.split("\n").index("            o2 = ro.MacOwner(); o2.root, o2.pinned, o2.root_exited_flag = 99998, True, True") + 1)],
+                         "the round-32 block, if re-added, is caught by parsing alone (never run)")
+
+    def test_guard_no_cached_signal_references(self):
+        """Patching os.kill / os.killpg / signal.* intercepts run_owned.py and these tests only because neither file keeps
+        its own reference: no from-imports of signal functions, no raw posix/nt/_signal module, no getattr lookups."""
+        for path in (TOOL, __file__):
+            with open(path, encoding="utf8") as fh: self.assertEqual(signal_cache_violations(fh.read()), [], path)
+        self.assertEqual(sorted(k for k, _ in signal_cache_violations(
+            "from os import kill\nimport posix\nk = getattr(os, 'killpg')\nclass C:\n    j = getattr(os, 'kill')\n"
+            "def f():\n    return getattr(os, 'kill')\n")), ["from-import", "getattr", "getattr", "raw-module"],
+            "import-time lookups are flagged; a call-time lookup inside a function is not")
+        self.assertEqual(sorted(k for k, _ in signal_cache_violations(
+            "k2 = os.kill\ndef g(k=os.killpg):\n    return k\ndef h():\n    return os.kill(1, 0) or signal.pthread_kill\n")),
+            ["alias", "alias"], "import-time aliases and default-argument captures are flagged; call-time uses are not")
+        neg = "class Case:\n    def test_x(self):\n        os.kill(-1, 0)\n        o.root = -5\n        os.killpg(n, 0)\n"
+        self.assertEqual(sorted(constant_signal_targets(neg, {"test_x"})), [("test_x", 3), ("test_x", 4)])
+        self.assertIs(ro.os, os); self.assertIs(ro.signal, signal)
+
+    def test_guard_blocks_synthetic_pid_group_and_pidfd_before_the_os_call(self):
+        """Controls 1-3, 6: every guarded primitive raises before the OS call, through every module alias; the real
+        functions are kept only as the saved originals (never called here)."""
+        import os as os_alias
+        calls = [("kill", lambda: os.kill(4000, 0)), ("kill", lambda: ro.os.kill(4000, 0)),
+                 ("kill", lambda: os_alias.kill(4000, 0)), ("killpg", lambda: getattr(os, "killpg")(4000, 0)),
+                 ("pidfd_send_signal", lambda: signal.pidfd_send_signal(-1, 0)),
+                 ("pthread_kill", lambda: signal.pthread_kill(threading.get_ident(), 0)),
+                 ("token_signal", lambda: ro.MacOwner.token_signal(self.synthetic_mac({}), 4000, 1, 0)),
+                 ("force", lambda: ro.WinOwner.force(object()))]
+        expected = []
+        with signal_floor() as floor_hits:  # under the guard being tested: a broken guard reaches the floor, not the OS
+            g = SignalGuard().install()
+            try:
+                for name, call in calls:
+                    if name not in g.blockers: continue  # absent here (killpg/pthread_kill on Windows, pidfd off Linux)
+                    self.assertTrue(g.active())
+                    with self.assertRaises(RealSignalBlocked): call()
+                    expected.append(name)
+                self.assertEqual([a[0] for a in g.take()], expected)
+                for (owner, name), orig in g.saved.items():
+                    if orig is not _ABSENT: self.assertIsNot(orig, g.blockers[name])
+            finally:
+                g.restore()
+        self.assertEqual(floor_hits, [], "the guard let a call through to the floor")
+        for name in ("kill", "token_signal", "force"): self.assertIn(name, expected)
+        self.assertTrue(self.signal_guard.active())
+
+    def test_guard_synthetic_owner_signal_paths_are_blocked(self):
+        """A synthetic MacOwner's real signal paths (pinned live root → os.kill; exited root → os.killpg) are blocked and
+        recorded; a recorder installed by the test still counts (control 5)."""
+        o = self.synthetic_mac({})
+        o._q = lambda pid, floor=None: {"pid": pid, "uniqueid": 100, "idversion": 1000, "ppid": 1, "pgid": pid}
+        rec = []
+        with signal_floor() as floor_hits:
+            g = SignalGuard().install()
+            try:
+                with self.assertRaises(RealSignalBlocked): o.signal(4000, 0)  # live pinned root: plain kill
+                if "killpg" in g.blockers:
+                    o.notes, o.root_exited_flag = [], True
+                    with self.assertRaises(RealSignalBlocked): o._signal_group(0)  # not an OSError: never "harmless"
+                self.assertEqual([a[:2] for a in g.take()], [("kill", 4000)] + ([("killpg", 4000)] if "killpg" in g.blockers else []))
+                saved, os.kill = os.kill, lambda pid, sig: rec.append((pid, int(sig)))
+                try:
+                    o.root_exited_flag = False; o.signal(4000, 0)
+                finally:
+                    os.kill = saved
+                self.assertTrue(g.active())
+            finally:
+                g.restore()
+        self.assertEqual(floor_hits, []); self.assertEqual(rec, [(4000, 0)]); self.assertTrue(self.signal_guard.active())
+
+    def _inner(self, body, teardown=lambda i: None):
+        class Inner(unittest.TestCase):
+            def setUp(i): i.g = SignalGuard().install(); i.addCleanup(i.g.verify_and_restore)
+            def runTest(i): body(i)
+            def tearDown(i): teardown(i)
+        r = unittest.TestResult()
+        with signal_floor() as floor_hits: Inner().run(r)  # a broken guard in Inner reaches the floor, never the OS
+        self.assertEqual(floor_hits, [], "the inner guard let a call through to the floor")
+        return r
+
+    def test_guard_unexpected_attempt_fails_even_if_swallowed(self):
+        """Control 4: an attempt the code under test swallows (run_owned's stop path catches Exception) still fails."""
+        def body(i):
+            i.assertTrue(i.g.active())
+            try: ro.os.kill(4000, 0)
+            except Exception: pass  # noqa: BLE001 - as a broad handler in the code under test would
+        r = self._inner(body)
+        bad = r.errors + r.failures
+        self.assertEqual(len(bad), 1, bad); self.assertIn("('kill', 4000, ", bad[0][1])  # reported at cleanup
+        self.assertTrue(self.signal_guard.active())
+
+    def test_guard_active_after_a_failed_assertion_and_restored_exactly(self):
+        """Controls 7-8: the guard stays active through an assertion failure and tearDown, and restores the exact objects."""
+        g = self.signal_guard
+        current = {(o, n): (o.__dict__.get(n, _ABSENT) if isinstance(o, type) else getattr(o, n, _ABSENT)) for o, n in _GUARDED}
+        seen = []
+        r = self._inner(lambda i: i.fail("inner failure"), lambda i: seen.append(i.g.active()))
+        self.assertEqual((len(r.failures), len(r.errors), seen), (1, 0, [True]))
+        for (o, n), v in current.items():
+            now = o.__dict__.get(n, _ABSENT) if isinstance(o, type) else getattr(o, n, _ABSENT)
+            self.assertIs(now, v, n)  # the outer (this test's) blockers are back exactly
+        self.assertTrue(g.active())
+        h = SignalGuard().install(); h.restore()
+        self.assertTrue(g.active(), "an inner guard's restore puts the outer blockers back")
+        for (o, n), orig in g.saved.items():  # this test's own saved originals are the real functions, untouched
+            if orig is not _ABSENT: self.assertFalse(hasattr(orig, "_signal_guard"), n)
+
+    def test_guard_owned_fixture_cleanup_works_without_the_guard(self):
+        """Control 9 (OWNED): owned tests are not guarded, and Ident's identity-checked cleanup still stops a fixture."""
+        self.assertIsNone(self.signal_guard)
+        for o, n in _GUARDED:
+            self.assertFalse(hasattr(getattr(o, n, None), "_signal_guard"), n)
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         try:
-            result = unittest.TestResult()
-            for n in names: type(self)(n).run(result)
+            self.ident.record(p.pid)
+            self.assertEqual(self.ident.alive_all(), [p.pid])
+            self.ident.cleanup()
+            self.assertEqual(self.ident.alive_all(), [])
+            self.ident.seen = {}  # cleaned up (and on Windows its handle closed): tearDown must not use it again
         finally:
-            for n, f in real.items(): setattr(os, n, f)
-        self.assertEqual((result.errors, result.failures), ([], []), "the synthetic tests themselves must pass")
-        self.assertGreater(result.testsRun - len(result.skipped), 10)
-        self.assertEqual(hits, [], "a synthetic test reached a real kill/killpg")
+            if p.poll() is None: p.kill()
+            p.wait(10)
+
+    def run_mutant(self, edits, test):
+        """Exec a mutated copy of this module in memory (no files written) and run one of its tests. Every primitive is
+        already blocked by THIS test's guard, installed before the mutant exists, so a mutant cannot reach the OS even
+        if it removes its own guard."""
+        with open(__file__, encoding="utf8") as fh: src = fh.read()
+        for old, new in edits:
+            self.assertEqual(src.count(old), 1, f"mutation anchor drifted: {old[:60]!r}"); src = src.replace(old, new)
+        self.assertEqual(signal_cache_violations(src), [], "a mutant that caches a primitive could bypass the guard")
+        self.assertTrue(self.signal_guard.active())
+        path = list(sys.path)
+        with signal_floor() as floor_hits:  # whatever the mutant does, nothing below the floor is reachable
+            try:
+                ns = {"__name__": "run_owned_mutant", "__file__": __file__}
+                exec(compile(src, "<mutant>", "exec"), ns)  # noqa: S102 - this module's own source, mutated in memory
+                r = unittest.TestResult(); ns["Case"](test).run(r)
+            finally:
+                sys.path[:] = path
+        self.assertTrue(self.signal_guard.active()); self.assertEqual(self.signal_guard.take(), [])
+        return r, floor_hits
+
+    def test_guard_mutations_are_caught_before_signalling(self):
+        """Control 10: deliberately unsafe mutants fail before any OS call: a synthetic test that signals a pinned live
+        made-up root, with and without the mutant's own guard (then THIS test's guard records it); the dg_scenario
+        recorder removed (POSIX). The round-32 block re-added is caught by parsing (test_guard_every_test_...)."""
+        anchor = "        o.scan(); o.scan()\n        self.assertEqual(sorted(o.known), [4000, 4100, 4200, 4600], o.known)\n"
+        unsafe = (anchor + "        o9 = self.synthetic_mac({}); o9._q = lambda pid, floor=None: {'uniqueid': 100, 'idversion': 1000, "
+                  "'ppid': 1, 'pgid': pid}\n        o9.signal(4000, 0)\n")
+        test = "test_n2_scan_admits_only_with_positive_lineage_and_the_root_coalition"
+        r, outer = self.run_mutant([(anchor, unsafe)], test)
+        bad = r.errors + r.failures
+        self.assertTrue(bad); self.assertEqual(outer, [], "the mutant's own guard caught it before the floor")
+        self.assertTrue(all("kill(4000, " in t or "('kill', 4000, " in t for _, t in bad), bad)  # in the body and at cleanup
+        unguard = ("        if n not in OWNED_TESTS:  # active through the test, its failures and tearDown; checked and restored last\n",
+                   "        if False:\n")
+        r, outer = self.run_mutant([(anchor, unsafe), unguard], test)
+        self.assertEqual(len(r.errors + r.failures), 1, r.errors + r.failures)
+        self.assertEqual([a[:2] for a in outer], [("kill", 4000)], "with its guard removed, the attempt reached only the floor")
+        if hasattr(os, "killpg") and hasattr(signal, "SIGKILL"):
+            rec = "        if real_killpg is not None: ro.os.killpg = fake_killpg  # also without the signal step: proves none happens\n"
+            r, outer = self.run_mutant([(rec, "")], "test_dg_verdict_cleanup_and_signals_unchanged")
+            self.assertTrue(r.errors + r.failures); self.assertEqual(outer, [])
+            self.assertIn("('killpg', 4000, ", "".join(x[1] for x in r.errors + r.failures))
 
     def test_dg_report_key_never_changes_the_exit_code(self):
         """Control 14 (driver): an owner without diagnostics reports null; one whose diag_record raises still gives the
