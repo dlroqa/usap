@@ -26,7 +26,11 @@ be completed: a discovery error during the stop, processes still appearing when 
 unseen escaper on macOS). The tool reports success only when the run is confirmed. Every doubt is also a typed entry in
 the report's `reason_codes` (for example `signal_denied`, `signal_unsafe`, `query_error`, `lineage_candidate`); any code
 rules out "confirmed" and no option waives one. A signal that fails is never taken as termination: the other processes
-are still stopped, and a process still running after a denied signal is a survivor (exit 120).
+are still stopped, and a process still running after a denied signal is a survivor (exit 120). On macOS, a signal to
+the root's process group after the root has exited returns EPERM when only the zombie root is left (XNU skips zombie
+members); that is treated as harmless only when a complete census right after it finds no live member, and is kept in
+the report's `notes`. A live member, or a census that cannot be completed, still rules out "confirmed". Every owned
+process, in the group or not, is verified on its own either way.
 
 Exit codes (a command that itself exits 120, 121, 124, 125 or 127 is told apart only by the report): the command's own
 code when confirmed; 128+N if it died from signal N; 124 timeout; 130/143 this tool was interrupted; **120 processes

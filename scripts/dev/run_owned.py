@@ -43,9 +43,11 @@ Certification (report "certification"): "confirmed" every owned process is gone,
 completed (a discovery error during the stop, processes still appearing when the kill rounds ran out, a possible unseen
 escaper on macOS). Success is reported only with "confirmed".
 Every doubt is also a typed entry in report "reason_codes" (signal_denied, signal_error, signal_unsafe, query_error,
-group_signal_denied, stop_failed, kill_rounds_unclean, ...). Any code forbids "confirmed"; no option waives one. A
-signal that fails is never taken as termination: one process's failure never stops the others being signalled, and a
-process that still runs after a denied signal is a survivor (120).
+group_signal_denied, group_membership_unknown, stop_failed, kill_rounds_unclean, ...). Any code forbids "confirmed";
+no option waives one. A signal that fails is never taken as termination: one process's failure never stops the others
+being signalled, and a process that still runs after a denied signal is a survivor (120). Non-blocking evidence, such
+as a macOS group signal that found only the zombie root (EPERM with no live member, checked by a census), is in
+report "notes"; it never replaces the per-process verification.
 Exit codes: the command's own code when certified; 128+N if it died from signal N (POSIX); 124 timeout; 130/143 this
 tool was interrupted; 120 survivors (overrides all others); 125 tool error or unsupported containment; 127 the command
 could not be started; 121 not certified ("uncertain"). A command
@@ -523,6 +525,7 @@ class MacOwner(ReasonsMixin):
         self.root_exited_flag = False
         self.pinned = False   # True while the root exists unreaped (alive or zombie) and only this tool can reap it
         self.escaped_seen = []
+        self.notes = []       # non-blocking evidence (report "notes"), e.g. a harmless killpg EPERM
         self.uid = os.getuid()
 
     # identity ------------------------------------------------------------------------------------------------------
@@ -576,6 +579,8 @@ class MacOwner(ReasonsMixin):
         n = self.lib.proc_listallpids(buf, ctypes.sizeof(buf))
         if n <= 0:
             raise _QueryError(ctypes.get_errno() or errno.EIO, "proc_listallpids failed")
+        if n >= len(buf):  # the list may have been cut off: never a complete census
+            raise _QueryError(errno.EOVERFLOW, "proc_listallpids filled the whole buffer")
         return [buf[i] for i in range(n) if buf[i] > 0]
 
     # spawn ---------------------------------------------------------------------------------------------------------
@@ -776,11 +781,52 @@ class MacOwner(ReasonsMixin):
                 self._reason("signal_error", f"a signal to a known process failed: {type(e).__name__}", pid=pid, sig=_signame(sig), errno=e.errno)
                 break
         if self.root_exited_flag and self.pinned and sig in (signal.SIGTERM, signal.SIGKILL):
-            try: os.killpg(self.root, sig)  # the root's group: reserved while the root is our unreaped zombie
-            except ProcessLookupError: pass
-            except OSError as e:  # never silent: a member of our group may not have been signalled
-                self._reason("group_signal_denied", f"a signal to the root's process group failed: {type(e).__name__}", pgid=self.root, sig=_signame(sig), errno=e.errno)
+            self._signal_group(sig)
         return delivered
+
+    def _group_members(self):
+        """LIVE (non-zombie) processes in the root's process group right now, from a complete libproc census: every
+        process, no user/coalition/age filter (a foreign-uid member is exactly what a real EPERM means). Zombies and
+        vanished processes read as gone. ANY process that cannot be read, or a process list that may be truncated,
+        raises: the membership is then unknown, never assumed empty."""
+        live = []
+        for pid in self._all():
+            q = self._q(pid)  # raises _QueryError on any read failure other than "gone"
+            if q is not None and q["pgid"] == self.root:
+                live.append(pid)
+        return sorted(live)
+
+    def _signal_group(self, sig):
+        """killpg on the pinned root's group (reserved while the root is our unreaped zombie; only members of the
+        root's session can be in it). XNU's killpg skips zombie members and returns EPERM when it found nothing to
+        signal, which is exactly the case once only the zombie root is left. So EPERM is harmless ONLY if a census
+        right after it finds no live member; a live member (a real denial, or one that joined since) or a census that
+        fails keeps the run from "confirmed". This classifies the group signal only: every owned process, inside or
+        outside the group, is still verified on its own (alive(), the final rescans and verify())."""
+        if not (self.pinned and self.root_exited_flag):
+            return  # the group id is ours only while the exited root is still our unreaped zombie
+        try:
+            os.killpg(self.root, sig)
+            return
+        except ProcessLookupError:
+            return  # no such group: nothing to signal
+        except PermissionError as e:
+            try:
+                live = self._group_members()
+            except OSError as qe:
+                self._reason("group_membership_unknown", f"killpg returned EPERM and the root's group could not be "
+                             f"inspected: {type(qe).__name__}", pgid=self.root, sig=_signame(sig), errno=qe.errno)
+                return
+            if live:
+                self._reason("group_signal_denied", "a signal to the root's process group was denied (EPERM) while "
+                             "live members remain", pgid=self.root, sig=_signame(sig), errno=e.errno, members=live[:20])
+            else:
+                note = {"event": "killpg_eperm_no_live_member", "pgid": self.root, "sig": _signame(sig)}
+                if note not in self.notes:
+                    self.notes.append(note)  # evidence only: the group held no live process (zombie root only)
+        except OSError as e:
+            self._reason("group_signal_error", f"a signal to the root's process group failed: {type(e).__name__}",
+                         pgid=self.root, sig=_signame(sig), errno=e.errno)
 
     # verification --------------------------------------------------------------------------------------------------
     def verify(self):
@@ -972,7 +1018,7 @@ def run(cmd, timeout=None, grace=5.0, cwd=None, env=None, require_full=False):
     root) depends on it. The tree is stopped on EVERY exit path, including an unexpected error in the tool."""
     report = {"version": VERSION, "platform": sys.platform, "containment": None, "identity_mode": None, "root": None,
               "timed_out": False, "interrupted": None, "signalled": [], "survivors": [], "escaped_seen": [], "warnings": [],
-              "certification": None, "certification_basis": "", "uncertain_reasons": [], "reason_codes": []}
+              "certification": None, "certification_basis": "", "uncertain_reasons": [], "reason_codes": [], "notes": []}
     try:
         owner = make_owner()
     except (ToolError, OSError) as e:
@@ -1028,6 +1074,7 @@ def run(cmd, timeout=None, grace=5.0, cwd=None, env=None, require_full=False):
         if r not in report["uncertain_reasons"]: report["uncertain_reasons"].append(r)
     for c in getattr(owner, "reason_codes", []):
         if c not in report["reason_codes"]: report["reason_codes"].append(c)
+    report["notes"] = list(getattr(owner, "notes", []))
     if (report["uncertain_reasons"] or report["reason_codes"]) and cert == "confirmed": cert = "uncertain"
     rc, sig = owner.root_result()
     report["root"] = {"pid": owner.root, "rc": rc, "signal": sig}

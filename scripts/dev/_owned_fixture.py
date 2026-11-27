@@ -15,6 +15,9 @@ Every process appends its pid to PIDFILE before doing anything else. Modes (comm
   slowdoublefork the root stays; the child waits 0.6 s, starts a new-session grandchild and exits, so the grandchild
               is re-parented to launchd/init while the run goes on (POSIX)
   launchd     (macOS) the child asks launchd to start an unrelated job (`launchctl submit`) and writes "launchd:LABEL"
+  marker      the root creates PIDFILE.ran as soon as it runs (proves whether the command was released at all)
+  soloexit    the root starts a NEW-SESSION child, waits until it wrote its pid, then exits 0: the root's group is
+              left with no live member (only the zombie root)
 """
 import os, signal, subprocess, sys, time
 
@@ -60,6 +63,8 @@ if "orphancheck" in flags:
         print(e.pid, flush=True)
         os._exit(0)
 
+if "marker" in flags and level == 0:
+    open(pidfile + ".ran", "w").close()
 note(str(os.getpid()))
 if "ignoreterm" in flags and level > 0 and not WINDOWS:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -85,6 +90,10 @@ if "doublefork" in flags:  # an unseen setsid escaper: the middle process starts
         spawn(1); os._exit(0)
     if level == 1:
         spawn(2, escape=True); os._exit(0)
+    while True: time.sleep(1)
+if "soloexit" in flags:
+    if level == 0:
+        spawn(1, escape=True); wait_lines(2); sys.exit(0)
     while True: time.sleep(1)
 if "slowdoublefork" in flags:
     if level == 0:

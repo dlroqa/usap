@@ -7,7 +7,7 @@ guards against is real (a plain timeout kill leaves the tree behind). Cases that
 not give are skipped with the reason, never passed. Every process a case creates is stopped at the end of the case,
 by identity only; nothing is matched by name.
 """
-import json, os, shutil, signal, subprocess, sys, tempfile, time, unittest
+import errno, json, os, shutil, signal, subprocess, sys, tempfile, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "run_owned.py")
@@ -637,7 +637,7 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("kill", "killpg") \
                             and isinstance(node.func.value, ast.Name) and node.func.value.id == "os":
                         key = (cls.name, fn.name, node.func.attr); sites[key] = sites.get(key, 0) + 1
-        self.assertEqual(sites, {("LinuxOwner", "_deliver", "kill"): 1, ("MacOwner", "_deliver", "kill"): 1, ("MacOwner", "signal", "killpg"): 1})
+        self.assertEqual(sites, {("LinuxOwner", "_deliver", "kill"): 1, ("MacOwner", "_deliver", "kill"): 1, ("MacOwner", "_signal_group", "killpg"): 1})
 
     @staticmethod
     def synthetic_mac(procs, pinned=True):
@@ -678,6 +678,172 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
         self.assertIn(("lineage_candidate", 4300), codes)
         self.assertIn(("identity_error", 4500), codes)  # broken parent link: an error, never ownership
 
+    # ── macOS group signal after the root exited: EPERM is harmless only without a live member (round 32) ──
+    def group_case(self, procs, killpg_exc, census_exc=None, prior=()):
+        o = self.synthetic_mac(procs)
+        o.notes, o.root_exited_flag = [], True
+        o.reason_codes = [dict(c) for c in prior]
+        table = {4000: None, **procs}  # 4000: the zombie root (reads as gone)
+        o.census_calls = 0
+        def all_():
+            o.census_calls += 1; return sorted(table)
+        o._all = all_
+        def q(pid, floor=None):
+            if census_exc is not None and (pid == 4100 or not procs): raise census_exc
+            return None if table.get(pid) is None else dict(table[pid])
+        o._q = q
+        orig = ro.os.killpg
+        def fake_killpg(pgid, sig):
+            self.assertEqual(pgid, 4000, "only the pinned root's group is ever signalled")
+            raise killpg_exc
+        ro.os.killpg = fake_killpg
+        try:
+            o._signal_group(signal.SIGKILL)
+        finally:
+            ro.os.killpg = orig
+        return o
+
+    @staticmethod
+    def grp_rec(pid, pgid, uniq):
+        return dict(pid=pid, uniqueid=uniq, idversion=uniq * 10, ppid=1, pgid=pgid, sid=4000, uid=501, ruid=501,
+                    comm="x", orig_ppidversion=0, coal=[7, 8])
+
+    @unittest.skipIf(WINDOWS, "POSIX process groups")
+    def test_group_eperm_with_a_live_member_is_never_suppressed(self):
+        o = self.group_case({4100: self.grp_rec(4100, 4000, 110), 4200: self.grp_rec(4200, 4200, 120)},
+                            PermissionError(errno.EPERM, "denied"))
+        codes = [c for c in o.reason_codes if c["code"] == "group_signal_denied"]
+        self.assertTrue(codes, o.reason_codes); self.assertEqual(codes[0]["members"], [4100])
+        self.assertEqual(o.notes, [])
+
+    @unittest.skipIf(WINDOWS, "POSIX process groups")
+    def test_group_eperm_with_only_the_zombie_root_is_a_note_not_a_reason(self):
+        o = self.group_case({4200: self.grp_rec(4200, 4200, 120)}, PermissionError(errno.EPERM, "nothing to signal"))
+        self.assertEqual(o.reason_codes, []); self.assertEqual(o.notes[0]["event"], "killpg_eperm_no_live_member")
+
+    @unittest.skipIf(WINDOWS, "POSIX process groups")
+    def test_group_eperm_with_an_unreadable_group_is_uncertain(self):
+        o = self.group_case({}, PermissionError(errno.EPERM, "x"), census_exc=ro._QueryError(errno.EIO, "list failed"))
+        self.assertTrue(any(c["code"] == "group_membership_unknown" for c in o.reason_codes), o.reason_codes)
+        self.assertEqual(o.notes, [])
+
+    @unittest.skipIf(WINDOWS, "POSIX process groups")
+    def test_group_eperm_with_one_unreadable_process_is_uncertain(self):
+        o = self.group_case({4100: self.grp_rec(4100, 4100, 110)}, PermissionError(errno.EPERM, "x"),
+                            census_exc=ro._QueryError(errno.EAGAIN, "identity changed during the query"))
+        self.assertTrue(any(c["code"] == "group_membership_unknown" for c in o.reason_codes), o.reason_codes)
+
+    @unittest.skipIf(WINDOWS, "POSIX process groups")
+    def test_group_eperm_when_not_pinned_is_never_classified(self):
+        o = self.synthetic_mac({}); o.notes, o.root_exited_flag, o.pinned, o.reason_codes = [], True, False, []
+        calls = []
+        orig = ro.os.killpg; ro.os.killpg = lambda pg, sg: calls.append(pg)
+        try: o._signal_group(signal.SIGKILL)
+        finally: ro.os.killpg = orig
+        self.assertEqual((calls, o.notes, o.reason_codes), ([], [], []), "an unpinned group id is never signalled")
+
+    @unittest.skipIf(WINDOWS, "POSIX process groups")
+    def test_group_missing_is_harmless_and_other_errors_are_reasons(self):
+        o = self.group_case({}, ProcessLookupError(errno.ESRCH, "no group"))
+        self.assertEqual((o.reason_codes, o.notes, o.census_calls), ([], [], 0), "ESRCH: nothing to inspect")
+        o = self.group_case({}, OSError(errno.EINVAL, "bad"))
+        self.assertTrue(any(c["code"] == "group_signal_error" for c in o.reason_codes), o.reason_codes)
+
+    @unittest.skipIf(WINDOWS, "POSIX process groups")
+    def test_group_harmless_eperm_never_waives_an_earlier_denial(self):
+        prior = [{"code": "signal_denied", "pid": 4300, "sig": "SIGKILL", "errno": 1}]
+        o = self.group_case({}, PermissionError(errno.EPERM, "x"), prior=prior)
+        self.assertIn(prior[0], o.reason_codes)
+
+    @unittest.skipUnless(MACOS, "XNU killpg semantics")
+    def test_mac_zombie_only_group_really_returns_eperm_and_is_harmless(self):
+        """The native mechanism of the round-31 false 'uncertain': a group whose only member is an unreaped zombie."""
+        z = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)  # leader of its own group
+        try:
+            end = time.time() + 10
+            while time.time() < end and os.waitid(os.P_PID, z.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                time.sleep(0.02)
+            with self.assertRaises(PermissionError, msg="XNU: killpg on a zombie-only group returns EPERM"):
+                os.killpg(z.pid, 0 or signal.SIGTERM)
+            o = ro.MacOwner(); o.root, o.pinned, o.root_exited_flag = z.pid, True, True
+            o._signal_group(signal.SIGTERM)
+            self.assertEqual(o.reason_codes if hasattr(o, "reason_codes") else [], [])
+            self.assertEqual([n["event"] for n in o.notes], ["killpg_eperm_no_live_member"])
+            o2 = ro.MacOwner(); o2.root, o2.pinned, o2.root_exited_flag = 99998, True, True  # no such group: ESRCH
+            o2._signal_group(signal.SIGTERM)
+            self.assertEqual((getattr(o2, "reason_codes", []), o2.notes), ([], []))
+        finally:
+            z.wait()
+
+    KILLPG_LOG = """
+log = []
+orig_killpg = ro.os.killpg
+def killpg(pgid, sig):
+    try:
+        r = {inject}
+        log.append("ok"); return r
+    except OSError as e:
+        log.append(type(e).__name__); raise
+ro.os.killpg = killpg
+"""
+
+    @unittest.skipUnless(MACOS, "XNU killpg semantics")
+    def test_mac_zombie_only_group_run_is_confirmed(self):
+        """End to end: the root exits leaving only a new-session child, so its group holds just the zombie root."""
+        r = self.snippet(self.KILLPG_LOG.format(inject="orig_killpg(pgid, sig)") + f"""
+code, rep = ro.run([sys.executable, "-B", {FIX!r}, "soloexit", {self.pids!r}], timeout=20, grace=1, env=dict(os.environ))
+print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_codes"], notes=rep["notes"], log=log,
+                      signalled=[x.get("pid") for x in rep["signalled"]])))
+""", timeout=90, expect=2)
+        self.assertEqual((r["code"], r["cert"], r["codes"]), (0, "confirmed", []), r)
+        self.assertIn("PermissionError", r["log"], "XNU returned EPERM for the zombie-only group")
+        self.assertTrue(any(n["event"] == "killpg_eperm_no_live_member" for n in r["notes"]), r)
+        pids, _ = self.read_pids(2, wait=1)
+        self.assertIn(pids[1], r["signalled"], "the owned new-session child was stopped by its own signal")
+        self.assertEqual(self.ident.alive_all(), [])
+
+    @unittest.skipUnless(MACOS, "XNU killpg semantics")
+    def test_mac_group_eperm_with_live_members_is_uncertain(self):
+        r = self.snippet(self.KILLPG_LOG.format(inject="(_ for _ in ()).throw(PermissionError(1, 'injected EPERM'))") + f"""
+code, rep = ro.run([sys.executable, "-B", {FIX!r}, "tree,ignoreterm", {self.pids!r}], timeout=2, grace=1, env=dict(os.environ))
+print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_codes"], survivors=rep["survivors"], log=log)))
+""", timeout=90)
+        self.assertEqual((r["code"], r["cert"]), (ro.EXIT_UNCERTAIN, "uncertain"), r)
+        self.assertTrue(any(c["code"] == "group_signal_denied" and c.get("members") for c in r["codes"]), r)
+        self.assertEqual(r["survivors"], []); self.assertEqual(self.ident.alive_all(), [])
+
+    @unittest.skipUnless(MACOS, "XNU killpg semantics")
+    def test_mac_group_inspection_error_is_uncertain(self):
+        r = self.snippet(f"""
+def boom(self): raise ro._QueryError(5, "injected group inspection failure")
+ro.MacOwner._group_members = boom
+code, rep = ro.run([sys.executable, "-B", {FIX!r}, "soloexit", {self.pids!r}], timeout=20, grace=1, env=dict(os.environ))
+print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_codes"])))
+""", timeout=90, expect=2)
+        self.assertEqual((r["code"], r["cert"]), (ro.EXIT_UNCERTAIN, "uncertain"), r)
+        self.assertTrue(any(c["code"] == "group_membership_unknown" for c in r["codes"]), r)
+        self.assertEqual(self.ident.alive_all(), [])
+
+    @unittest.skipUnless(MACOS, "macOS spawn")
+    def test_mac_root_whose_identity_cannot_be_read_is_never_released(self):
+        r = self.snippet(f"""
+orig = ro.MacOwner.coal
+n = dict(c=0)
+def coal(self, pid):
+    n["c"] += 1
+    if n["c"] == 1: raise ro._QueryError(5, "injected coalition read failure at spawn")
+    return orig(self, pid)
+ro.MacOwner.coal = coal
+code, rep = ro.run([sys.executable, "-B", {FIX!r}, "marker,tree", {self.pids!r}], timeout=5, grace=1, env=dict(os.environ))
+print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_codes"], rc=rep["root"]["rc"],
+                      ran=os.path.exists({self.pids!r} + ".ran"), warnings=rep["warnings"])))
+""", timeout=60, expect=0)
+        self.assertEqual((r["code"], r["cert"]), (ro.EXIT_TOOL, "uncertain"), r)
+        self.assertTrue(any(c["code"] == "root_identity" for c in r["codes"]), r)
+        self.assertFalse(r["ran"], "the command never ran")
+        self.assertEqual(r["rc"], ro.EXIT_NOEXEC, "the unreleased root exited 127 and was reaped")
+        self.assertFalse(os.path.exists(self.pids), "no process of the tree ever started")
+
     def test_n2_orphan_of_an_exited_original_parent_is_admitted(self):
         """Agent E r31 B1: the original parent has exited (and was pruned from the live set) before its setsid orphan
         is first scanned; the persistent admission record must still link the orphan to us."""
@@ -699,15 +865,19 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
     # ── certification layers, each on its own (a fake owner: no processes are started or signalled) ──
     class Fake:
         containment, identity_mode = "full", "fake"
-        def __init__(self, reasons=(), scan_fails=False, alive_fails=False, clean=True, live=(), raise_for=(), immortal=()):
+        def __init__(self, reasons=(), scan_fails=False, alive_fails=False, clean=True, live=(), raise_for=(), immortal=(), appear_at=None):
             self.uncertain_reasons, self.warnings, self.root, self.root_status = list(reasons), [], -1, 0
             self.scan_fails, self.alive_fails, self.clean = scan_fails, alive_fails, clean
             self.certification_basis = "fake"
             self.live, self.raise_for, self.immortal, self.calls = set(live), set(raise_for), set(immortal), []
+            self.appear_at, self.stop_scans = appear_at, 0
         def spawn(self, cmd, cwd, env): return -1
         def reap(self): pass
         def scan(self):
             if self.scan_fails and getattr(self, "stopping", False): raise OSError("fake discovery failure")
+            if getattr(self, "stopping", False):
+                self.stop_scans += 1
+                if self.stop_scans == self.appear_at: self.live.add(9)  # a process found only by a later rescan
         def alive(self):
             if self.alive_fails and getattr(self, "stopping", False): raise RuntimeError("fake alive failure")
             return sorted(self.live)
@@ -762,6 +932,14 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
         self.assertEqual((code, rep["certification"]), (ro.EXIT_UNCERTAIN, "uncertain"), rep)
         self.assertIn((5, signal.SIGKILL), f.calls, "the sweep sent SIGKILL to the known process")
         self.assertTrue(any(c["code"] == "stop_failed" for c in rep["reason_codes"]), rep)
+
+    @unittest.skipIf(WINDOWS, "POSIX stop path")
+    def test_layer_second_clean_rescan_is_required(self):
+        """A process that appears only at the settle rescan after a clean scan must still be found and stopped."""
+        f = self.Fake(appear_at=4)
+        cert, rep = self.stop_with(f)
+        self.assertIn((9, signal.SIGKILL), f.calls, f"the second rescan found it: scans={f.stop_scans}")
+        self.assertEqual(cert, "confirmed", rep)
 
     @unittest.skipIf(WINDOWS, "POSIX stop path")
     def test_layer_d1_survivors_outrank_reasons(self):
