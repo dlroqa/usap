@@ -7,7 +7,7 @@ guards against is real (a plain timeout kill leaves the tree behind). Cases that
 not give are skipped with the reason, never passed. Every process a case creates is stopped at the end of the case,
 by identity only; nothing is matched by name.
 """
-import errno, json, os, shutil, signal, subprocess, sys, tempfile, time, unittest
+import contextlib, errno, json, os, shutil, signal, subprocess, sys, tempfile, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "run_owned.py")
@@ -1085,7 +1085,14 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
         self.assertEqual((len(obs["root_idversion_history"]), obs["root_idversion_history_truncated"]), (ro._DG_HIST_MAX, True))
         self.assertEqual((obs["first_seen_count"], obs["first_seen_drops"] > 0), (ro._DG_SEEN_MAX, True))
         self.assertEqual((len(obs["candidates"]), obs["candidates_dropped"]), (ro._DG_CAND_MAX, 300 - ro._DG_CAND_MAX))
-        self.assertTrue(any(c["first_seen_seq"] == "unknown_truncated" for c in obs["candidates"]) or all(type(c["first_seen_seq"]) is int for c in obs["candidates"]))
+        self.assertEqual({type(c["first_seen_seq"]) for c in obs["candidates"]}, {int})  # the kept ones were seen first
+        o4 = self.synthetic_mac(procs4 := {4000: R(4000, 100, 1000, 1, 4000, 0)})
+        for n in range(ro._DG_SEEN_MAX): procs4[20000 + n] = R(20000 + n, 2000 + n, 9000 + n, 1, 20000 + n, 7, coal=(9, 9))
+        o4.scan()                                          # first-seen map full with unrelated processes
+        for n in range(ro._DG_SEEN_MAX): del procs4[20000 + n]
+        procs4[4500] = R(4500, 5000, 9999, 1, 4500, 4242)  # a candidate that could not be recorded any more
+        o4.scan(); o4.verify(); c4, _ = self.dg_cand(o4.diag_record(), 5000)
+        self.assertEqual((c4["first_seen_seq"], c4["first_seen_parent"]), ("unknown_truncated", "unknown"))
         size = len(ro.json.dumps(d, separators=(",", ":"))); self.assertLessEqual(size, ro._DG_JSON_MAX)
         orig_max = ro._DG_JSON_MAX
         try:
@@ -1126,13 +1133,17 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
         for v in leaves(d): self.assertTrue(v is None or type(v) in (int, bool, str), v)
         self.assertEqual(ro.validate_attribution_diagnostics(d), [])
 
-    def dg_scenario(self, mode):
-        """One H1-shaped run with the diagnostics normal / disabled / raising; returns the decision-relevant state."""
+    def dg_scenario(self, mode, with_signal):
+        """One H1-shaped run with the diagnostics normal / disabled / raising; returns the decision-relevant state.
+        with_signal adds MacOwner.signal() on a known process (POSIX only: it needs signal.SIGKILL and os.killpg). The
+        root has exited and is pinned there, so signal() also signals the root's group. Wherever os.killpg exists it is
+        replaced by a recorder that raises ProcessLookupError, with or without the signal step, so no real process
+        group (pgid 4000 is synthetic) is ever signalled and an unexpected group signal is counted."""
         R = self.dg_rec
         procs = {4000: R(4000, 100, 1000, 1, 4000, 0), 4100: R(4100, 110, 1010, 4000, 4000, 1000)}
         o = self.synthetic_mac(procs)
         o._q = lambda pid, floor=None: dict(procs[pid]) if pid in procs else None
-        calls = {"census": 0, "deliver": 0, "coal": 0}
+        calls = {"census": 0, "deliver": 0, "coal": 0, "killpg": []}
         census = o._census
         def counted(record_errors=True, floor=None):
             calls["census"] += 1; return census(record_errors, floor)
@@ -1140,6 +1151,10 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
         o._deliver = lambda *a: calls.__setitem__("deliver", calls["deliver"] + 1)
         o.coal = lambda pid: (calls.__setitem__("coal", calls["coal"] + 1), [7, 8])[1]
         saved = {}
+        real_killpg = getattr(ro.os, "killpg", None)
+        def fake_killpg(pgid, sig):
+            calls["killpg"].append((pgid, int(sig))); raise ProcessLookupError(errno.ESRCH, "synthetic group")
+        if real_killpg is not None: ro.os.killpg = fake_killpg  # also without the signal step: proves none happens
         if mode != "normal":
             def boom(*a, **kw): raise RuntimeError("injected diagnostics fault")
             for name in ("_dg_step", "_dg_root", "_dg_scan", "_dg_exit", "_dg_reap", "_dg_cand"):
@@ -1151,25 +1166,82 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
             self.dg_exit(o, procs)
             procs[4200] = R(4200, 120, 1030, 1, 4200, 1005, puniq=100)    # H1: unseen root version
             procs[4300] = R(4300, 130, 1040, 1, 4300, 1000)               # admitted via the observed version
-            o.scan(); o.alive(); found = o.verify(); o.signal(4100, signal.SIGTERM)
+            o.scan(); o.alive(); found = o.verify()
+            if with_signal: o.signal(4100, signal.SIGTERM)
             state = dict(known=sorted(o.known), prov=dict(o.prov), ever=sorted(o.ever), idvs={k: sorted(v) for k, v in o.idvs.items()},
                          found=found, codes=list(o.reason_codes), reasons=list(o.uncertain_reasons), escaped=list(o.escaped_seen),
                          notes=list(getattr(o, "notes", [])), calls=dict(calls))
             return state, o.diag_record()
         finally:
             for name, fn in saved.items(): setattr(ro.MacOwner, name, fn)
+            if real_killpg is not None: ro.os.killpg = real_killpg
 
+    def test_dg_verdict_and_cleanup_unchanged(self):
+        """Control 14 (all platforms, Windows included): diagnostics on, off, or failing on every hook give the same
+        ownership state, reasons, candidates, census and coalition reads, and send nothing."""
+        on, d_on = self.dg_scenario("normal", with_signal=False)
+        off, _ = self.dg_scenario("disabled", with_signal=False)
+        bad, d_bad = self.dg_scenario("raising", with_signal=False)
+        self.assertEqual(on, off); self.assertEqual(on, bad)
+        self.assertEqual(on["found"], [4200]); self.assertIn(4300, on["known"])
+        self.assertEqual((on["calls"]["deliver"], on["calls"]["killpg"]), (0, []))
+        self.assertGreater(on["calls"]["census"], 0)
+        self.assertIsNone(d_on["diag_error"]); self.assertEqual(d_bad["diag_error"], "exception")
+        self.assertEqual(ro.validate_attribution_diagnostics(d_bad), [])
+
+    @unittest.skipUnless(hasattr(signal, "SIGKILL") and hasattr(os, "killpg"),
+                         "MacOwner.signal needs POSIX signal.SIGKILL and os.killpg (CPython on Windows has neither)")
     def test_dg_verdict_cleanup_and_signals_unchanged(self):
-        """Controls 14 + 15: diagnostics on, off, or failing on every hook give the same ownership state, reasons,
-        candidates and signals, and add no census, coalition read or signal."""
-        on, d_on = self.dg_scenario("normal")
-        off, _ = self.dg_scenario("disabled")
-        bad, d_bad = self.dg_scenario("raising")
+        """Control 15 (POSIX): with a signal to a known process, diagnostics on, off or failing give the same state and
+        the same signals: exactly one identity-bound delivery and one group signal to the pinned root's group."""
+        on, d_on = self.dg_scenario("normal", with_signal=True)
+        off, _ = self.dg_scenario("disabled", with_signal=True)
+        bad, d_bad = self.dg_scenario("raising", with_signal=True)
         self.assertEqual(on, off); self.assertEqual(on, bad)
         self.assertEqual(on["found"], [4200]); self.assertIn(4300, on["known"])
         self.assertEqual(on["calls"]["deliver"], 1, "only the explicit signal to the known process")
+        self.assertEqual(on["calls"]["killpg"], [(4000, int(signal.SIGTERM))], "one group signal, to the recorder only")
         self.assertIsNone(d_on["diag_error"]); self.assertEqual(d_bad["diag_error"], "exception")
         self.assertEqual(ro.validate_attribution_diagnostics(d_bad), [])
+
+    @staticmethod
+    @contextlib.contextmanager
+    def without_posix_signals():
+        """A Linux/macOS stand-in for CPython on Windows: signal.SIGKILL and os.killpg are absent (restored after)."""
+        saved = {(m, n): getattr(m, n) for m, n in ((signal, "SIGKILL"), (os, "killpg")) if hasattr(m, n)}
+        for m, n in saved: delattr(m, n)
+        try: yield
+        finally:
+            for (m, n), v in saved.items(): setattr(m, n, v)
+
+    def test_dg_portable_scenario_runs_without_posix_signals(self):
+        """Regression control for round 33's Windows failure (signal.SIGKILL missing): the portable scenario must not
+        touch POSIX-only names, checked on every platform; the signal scenario must fail there (the shim is real)."""
+        with self.without_posix_signals():
+            self.assertFalse(hasattr(signal, "SIGKILL") or hasattr(os, "killpg"))
+            on, _ = self.dg_scenario("normal", with_signal=False)
+            bad, _ = self.dg_scenario("raising", with_signal=False)
+            self.assertEqual(on, bad); self.assertEqual(on["found"], [4200])
+            with self.assertRaisesRegex(AttributeError, "SIGKILL|killpg"):  # negative control: round 33 on Windows
+                self.dg_scenario("normal", with_signal=True)
+        self.assertEqual(hasattr(signal, "SIGKILL"), not WINDOWS, "names restored")
+
+    def test_dg_synthetic_tests_never_signal_a_real_process(self):
+        """Regression control for the round-33 stray killpg(4000): every synthetic-owner test (diagnostics and N2')
+        runs with os.kill / os.killpg replaced by recorders; none may reach them (they target no real process)."""
+        names = sorted(n for n in dir(type(self)) if n.startswith(("test_dg_", "test_n2_"))
+                       and n != "test_dg_synthetic_tests_never_signal_a_real_process")
+        self.assertIn("test_dg_verdict_cleanup_and_signals_unchanged", names)
+        hits, real = [], {n: getattr(os, n) for n in ("kill", "killpg") if hasattr(os, n)}
+        for n in real: setattr(os, n, lambda *a, _n=n: hits.append((_n,) + a))
+        try:
+            result = unittest.TestResult()
+            for n in names: type(self)(n).run(result)
+        finally:
+            for n, f in real.items(): setattr(os, n, f)
+        self.assertEqual((result.errors, result.failures), ([], []), "the synthetic tests themselves must pass")
+        self.assertGreater(result.testsRun - len(result.skipped), 10)
+        self.assertEqual(hits, [], "a synthetic test reached a real kill/killpg")
 
     def test_dg_report_key_never_changes_the_exit_code(self):
         """Control 14 (driver): an owner without diagnostics reports null; one whose diag_record raises still gives the
