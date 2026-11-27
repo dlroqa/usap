@@ -11,6 +11,10 @@ Every process appends its pid to PIDFILE before doing anything else. Modes (comm
   breakaway   (Windows) the child tries CREATE_BREAKAWAY_FROM_JOB and writes "breakaway-ok" or "breakaway-refused"
   orphancheck the root starts a "guard" that starts an "engine" and exits; the root kills the engine and exits 0 when
               it is gone within 1.5 s (as seen by kill(pid, 0)), else 3 (POSIX)
+  execlate    the child is seen first, then (after 1 s) replaces itself with /bin/sleep (exec; POSIX)
+  slowdoublefork the root stays; the child waits 0.6 s, starts a new-session grandchild and exits, so the grandchild
+              is re-parented to launchd/init while the run goes on (POSIX)
+  launchd     (macOS) the child asks launchd to start an unrelated job (`launchctl submit`) and writes "launchd:LABEL"
 """
 import os, signal, subprocess, sys, time
 
@@ -82,6 +86,19 @@ if "doublefork" in flags:  # an unseen setsid escaper: the middle process starts
     if level == 1:
         spawn(2, escape=True); os._exit(0)
     while True: time.sleep(1)
+if "slowdoublefork" in flags:
+    if level == 0:
+        spawn(1)
+    elif level == 1:
+        time.sleep(0.6); spawn(2, escape=True); os._exit(0)
+    while True: time.sleep(1)
+if "execlate" in flags and level == 1 and not WINDOWS:
+    time.sleep(1.0)
+    os.execv("/bin/sleep", ["sleep", "60"])
+if "launchd" in flags and level == 1:
+    label = "com.usap.runowned.test.%d" % os.getpid()
+    if subprocess.run(["launchctl", "submit", "-l", label, "--", "/bin/sleep", "60"]).returncode == 0:
+        note("launchd:" + label)
 if "newgroup" in flags and level == 2 and not WINDOWS:
     os.setpgid(0, 0)  # leaves the root's group (stays in its session)
 if "forkloop" in flags and level == 1:  # ignores TERM and keeps starting short-lived children through the cleanup

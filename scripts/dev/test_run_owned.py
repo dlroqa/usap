@@ -41,8 +41,8 @@ class Ident:
     def start(self, pid):
         if LINUX:
             st = ro._linux_stat(pid); return st and st[2]
-        if MACOS:
-            st = self.mac.info(pid); return st and st[2]
+        if MACOS:  # the kernel's p_uniqueid: never reused, kept across exec
+            st = self.mac.info(pid); return st and st["uniqueid"]
         return None
 
     def record(self, pid):
@@ -67,6 +67,9 @@ class Ident:
         for pid in self.alive_all():
             try:
                 if WINDOWS: self.k.TerminateProcess(self.seen[pid], 1)
+                elif MACOS:  # identity-bound (pid + identity version), never a plain kill(pid)
+                    q = self.mac.info(pid)
+                    if q and q["uniqueid"] == self.seen[pid]: self.mac.token_signal(pid, q["idversion"], signal.SIGKILL)
                 elif hasattr(os, "pidfd_open"):
                     fd = os.pidfd_open(pid)
                     try:
@@ -243,7 +246,11 @@ class V: pid = vpid
 v = V()
 o = ro.LinuxOwner() if ro.LINUX else ro.MacOwner()
 o.root = -1
-o.known[v.pid] = dict(start=-1 if ro.LINUX else (0, 0), fd=None, ppid=0, pgid=0)  # the same pid, another identity
+if ro.LINUX:
+    o.known[v.pid] = dict(start=-1, fd=None, ppid=0, pgid=0)  # the same pid, another identity
+else:  # macOS: a stale entry (another uniqueid) and a root identity every process here would pass on age and coalition
+    o.root_id = dict(uniqueid=0, idversion=0, uid=os.getuid(), ruid=os.getuid(), coal=o.coal(os.getpid()))
+    o.known[v.pid] = dict(uniqueid=-1, idversion=-1, ppid=0, pgid=0); o.prov[-1] = None; o.idvs[-1] = {-1}
 end = time.time() + 10
 while time.time() < end:
     if not os.path.exists({self.pids!r}): time.sleep(0.02); continue
@@ -275,6 +282,8 @@ while time.time() < end:
 with open({self.pids!r}) as f: gpid = int(f.readline())
 o = ro.LinuxOwner() if ro.LINUX else ro.MacOwner()
 o.root = gpid  # as if our root had been reaped and its pid/group id reused by this unrelated group
+if ro.MACOS:  # not pinned (never spawned): the session id is no evidence; age and coalition alone never are
+    o.root_id = dict(uniqueid=0, idversion=0, uid=os.getuid(), ruid=os.getuid(), coal=o.coal(os.getpid()))
 for _ in range(10): o.alive(); o.scan(); time.sleep(0.02)
 print(json.dumps(dict(adopted=sorted(o.known))))
 """)
@@ -482,6 +491,210 @@ print(json.dumps(dict(code=code, cert=rep["certification"], mode=rep["identity_m
         self.assertTrue(r["killed"], r)
         self.assertTrue(all(own for _, own in r["killed"]), f"every kill(pid) target was the tool's own child: {r['killed']}")
         self.assertTrue(any(c["code"] == "signal_unsafe" for c in r["codes"]), r)
+
+    # ── N2' (macOS ownership) ──
+    @unittest.skipIf(WINDOWS, "POSIX exec")
+    def test_exec_after_discovery_is_still_stopped(self):
+        """The child is seen, then execs: macOS bumps its identity version (uniqueid stays); it must still be stopped."""
+        p, rep = self.tool("--timeout", "3", "--grace", "1", "--", *self.fixture("tree,execlate"), background=True)
+        self.read_pids(2); code = p.wait(timeout=60); r = load(rep)
+        self.assertEqual((code, r["certification"]), (ro.EXIT_TIMEOUT, "confirmed"), r)
+        self.assertEqual(self.ident.alive_all(), [], r)
+
+    @unittest.skipIf(WINDOWS, "POSIX sessions")
+    def test_orphaned_session_escaper_with_a_seen_parent_is_stopped(self):
+        """A grandchild starts a new session and is re-parented (launchd / subreaper) while the run goes on."""
+        p, rep = self.tool("--timeout", "3", "--grace", "1", "--", *self.fixture("slowdoublefork"), background=True)
+        self.read_pids(3); code = p.wait(timeout=60); r = load(rep)
+        self.assertEqual((code, r["certification"]), (ro.EXIT_TIMEOUT, "confirmed"), r)
+        self.assertEqual(self.ident.alive_all(), [], r)
+
+    @unittest.skipUnless(MACOS, "macOS launchd")
+    def test_mac_unrelated_launchd_job_neither_uncertain_nor_signalled(self):
+        """Round 28: launchd-started same-user processes made every macOS run 'uncertain'. A launchd job (another
+        coalition) started on the tree's behalf must neither be signalled nor block "confirmed"."""
+        label = None
+        try:
+            p, rep = self.tool("--timeout", "4", "--grace", "1", "--", *self.fixture("tree,launchd"), background=True)
+            _, notes = self.read_pids(3)
+            code = p.wait(timeout=60); r = load(rep)
+            label = next((n.split(":", 1)[1] for n in notes if n.startswith("launchd:")), None)
+            self.assertTrue(label, "launchctl submit worked")
+            out = subprocess.run(["launchctl", "list", label], capture_output=True, text=True).stdout
+            jpid = next((int(x.split("=")[1].strip(" ;")) for x in out.splitlines() if '"PID"' in x), None)
+            self.assertEqual((code, r["certification"]), (ro.EXIT_TIMEOUT, "confirmed"), r)
+            self.assertTrue(jpid, out)
+            self.assertNotIn(jpid, [s.get("pid") for s in r["signalled"]], "the launchd job was not signalled")
+            self.assertIsNotNone(self.ident.mac.info(jpid), "the launchd job still runs (not ours)")
+        finally:
+            if label: subprocess.run(["launchctl", "remove", label], capture_output=True)
+
+    @unittest.skipUnless(MACOS, "macOS coalition")
+    def test_mac_same_coalition_unrelated_orphan_is_uncertain_and_never_signalled(self):
+        sib = os.path.join(self.dir, "sibling")
+        p, rep = self.tool("--timeout", "4", "--grace", "1", "--", *self.fixture("tree"), background=True)
+        self.read_pids(3)
+        helper = os.path.join(self.dir, "sibling.py")
+        with open(helper, "w") as f:  # started by the TEST (not the tool's tree); its parent exits -> an orphan
+            f.write("import subprocess, sys\n"
+                    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(40)'], start_new_session=True,"
+                    " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                    "open(sys.argv[1], 'w').write(str(p.pid))\n")
+        subprocess.run([sys.executable, helper, sib], timeout=30)
+        with open(sib) as f: spid = int(f.read().split()[0])
+        self.ident.record(spid)
+        rc = p.wait(timeout=60); r = load(rep)
+        self.assertEqual((rc, r["certification"]), (ro.EXIT_UNCERTAIN, "uncertain"), r)
+        self.assertTrue(any(c["code"] == "lineage_candidate" and c.get("pid") == spid for c in r["reason_codes"]), r)
+        self.assertNotIn(spid, [s.get("pid") for s in r["signalled"]])
+        self.assertTrue(self.ident.alive(spid), "never signalled (the tearDown stops it by identity)")
+
+    @unittest.skipUnless(MACOS, "macOS audit token")
+    def test_mac_stale_identity_and_simulated_pid_reuse_are_refused(self):
+        v = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]); self.ident.record(v.pid)
+        try:
+            o = ro.MacOwner(); q = o._q(v.pid)
+            self.assertIsNotNone(o.sig_tok, "proc_signal_with_audittoken exists on this runner")
+            self.assertEqual(o.token_signal(v.pid, q["idversion"] + 1, signal.SIGTERM), 3, "stale version: ESRCH")
+            o.known[v.pid] = dict(uniqueid=q["uniqueid"] + 1, idversion=q["idversion"], ppid=0, pgid=0)  # reused pid
+            self.assertFalse(o.signal(v.pid, signal.SIGTERM)); time.sleep(0.2)
+            self.assertIsNone(v.poll(), "neither the stale token nor the foreign identity reached it")
+            o.known[v.pid] = dict(uniqueid=q["uniqueid"], idversion=q["idversion"], ppid=0, pgid=0)
+            self.assertTrue(o.signal(v.pid, signal.SIGTERM)); self.assertIsNotNone(v.wait(timeout=10))
+        finally:
+            if v.poll() is None: v.kill()
+            v.wait()
+
+    @unittest.skipUnless(MACOS, "macOS audit token")
+    def test_mac_without_the_identity_bound_call_nothing_else_is_signalled(self):
+        r = self.snippet(f"""
+orig = ro.MacOwner.__init__
+def init(self): orig(self); self.sig_tok = None
+ro.MacOwner.__init__ = init
+seen = []
+ok, okpg = ro.os.kill, ro.os.killpg
+ro.os.kill = lambda pid, sig: (seen.append(pid), ok(pid, sig))[1]
+code, rep = ro.run([sys.executable, "-B", {FIX!r}, "tree,escape", {self.pids!r}], timeout=3, grace=1, env=dict(os.environ))
+print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_codes"], root=rep["root"]["pid"], killed=sorted(set(seen)))))
+""", timeout=90)
+        self.assertIn((r["code"], r["cert"]), ((ro.EXIT_SURVIVORS, "survivors"), (ro.EXIT_UNCERTAIN, "uncertain")), r)
+        self.assertTrue(any(c["code"] == "signal_unsafe" for c in r["codes"]), r)
+        self.assertEqual([p for p in r["killed"] if p != r["root"]], [], "plain kill() only for the pinned root")
+
+    @unittest.skipUnless(MACOS, "macOS libproc")
+    def test_mac_process_list_failure_is_uncertain(self):
+        r = self.snippet(f"""
+orig = ro.MacOwner._all
+def a(self):
+    if getattr(self, "stopping", False): raise ro._QueryError(5, "injected proc_listallpids failure")
+    return orig(self)
+ro.MacOwner._all = a
+code, rep = ro.run([sys.executable, "-B", {FIX!r}, "tree", {self.pids!r}], timeout=2, grace=1, env=dict(os.environ))
+print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_codes"])))
+""", timeout=90)
+        self.assertEqual((r["code"], r["cert"]), (ro.EXIT_UNCERTAIN, "uncertain"), r)
+        self.assertTrue(any(c["code"] == "scan_error" for c in r["codes"]), r)
+        self.assertEqual(self.ident.alive_all(), [])
+
+    def test_n2_classifier_requires_positive_lineage(self):
+        """Pure N2' rules (no system calls; all platforms): coalition, age, user or name never prove ownership."""
+        me, uid = 99999, 501
+        root = dict(uniqueid=100, idversion=1000, uid=uid, ruid=uid, coal=[7, 8])
+        known, prov, idvs = {100, 110}, {100: None, 110: 100}, {100: {1000}, 110: {1010, 1011}}
+        def rec(**kw):
+            d = dict(pid=5000, ppid=1, uid=uid, ruid=uid, uniqueid=200, idversion=2000, orig_ppidversion=0, coal=[7, 8])
+            d.update(kw); return d
+        pre = rec(pid=40, uniqueid=50, idversion=500)  # an older (pre-root) live process
+        procs = {40: pre, 4100: rec(pid=4100, uniqueid=110, idversion=1011)}
+        cls = lambda p: ro.mac_classify(p, procs, root, known, prov, idvs, me, uid)[0]
+        self.assertEqual(cls(rec()), "candidate")                                    # same coalition, no lineage
+        self.assertEqual(cls(rec(coal=[9, 10])), "excluded")                         # another coalition (launchd jobs)
+        self.assertEqual(cls(rec(coal=[0, 0])), "error")                             # coalition 0
+        self.assertEqual(cls(rec(coal=None, coal_err=1)), "error")                   # unreadable coalition
+        self.assertEqual(cls(rec(uniqueid=None)), "error")                           # incomplete identity
+        self.assertEqual(cls(rec(uniqueid=60)), "excluded")                          # older than the root
+        self.assertEqual(cls(rec(uid=0, ruid=0)), "excluded")                        # another user
+        self.assertEqual(cls(rec(ppid=40)), "excluded")                              # descendant of an older process
+        self.assertEqual(cls(rec(orig_ppidversion=1010)), "unadmitted")              # original parent ours (pre-exec idv)
+        self.assertEqual(cls(rec(orig_ppidversion=1010, idversion=900)), "candidate")  # impossible order: not adopted
+        self.assertEqual(cls(rec(orig_ppidversion=1010, coal=[9, 10])), "excluded")  # orig link, foreign coalition
+        self.assertEqual(cls(rec(ppid=4100, orig_ppidversion=1011)), "unadmitted")   # parent link confirmed
+        self.assertEqual(cls(rec(ppid=4100, orig_ppidversion=4242)), "error")        # parent pid reused: link broken
+        self.assertEqual(cls(rec(uniqueid=110)), "owned")
+        corrupt = dict(prov); del corrupt[110]
+        self.assertEqual(ro.mac_classify(rec(uniqueid=110), procs, root, known, corrupt, idvs, me, uid)[0], "error")
+        self.assertEqual(ro.mac_classify(rec(orig_ppidversion=1010), procs, root, known, corrupt, idvs, me, uid)[0], "candidate")
+
+    def test_static_guard_plain_kill_only_where_proven_safe(self):
+        """Every os.kill / os.killpg call site is in a function with a stated safety argument: Linux reduced mode
+        (the tool's own child), the pinned macOS root and its process group."""
+        import ast
+        with open(TOOL, encoding="utf8") as fh: tree = ast.parse(fh.read())
+        sites = {}
+        for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+            for fn in [n for n in cls.body if isinstance(n, ast.FunctionDef)]:
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("kill", "killpg") \
+                            and isinstance(node.func.value, ast.Name) and node.func.value.id == "os":
+                        key = (cls.name, fn.name, node.func.attr); sites[key] = sites.get(key, 0) + 1
+        self.assertEqual(sites, {("LinuxOwner", "_deliver", "kill"): 1, ("MacOwner", "_deliver", "kill"): 1, ("MacOwner", "signal", "killpg"): 1})
+
+    @staticmethod
+    def synthetic_mac(procs, pinned=True):
+        """A MacOwner without libproc (all platforms): scan()/verify() run on a synthetic process table."""
+        o = ro.MacOwner.__new__(ro.MacOwner)
+        o.uncertain_reasons, o.warnings, o.escaped_seen = [], [], []
+        o.lock = __import__("threading").Lock()
+        o.root, o.pinned, o.root_exited_flag, o.uid = 4000, pinned, False, 501
+        o.root_id = dict(uniqueid=100, idversion=1000, uid=501, ruid=501, coal=[7, 8])
+        o.known = {4000: dict(uniqueid=100, idversion=1000, ppid=1, pgid=4000)}
+        o.prov, o.idvs, o.ever, o.sig_tok = {100: None}, {100: {1000}}, {100}, object()
+        o._census = lambda record_errors=True, floor=None: {k: dict(v) for k, v in procs.items()}
+        return o
+
+    def test_n2_scan_admits_only_with_positive_lineage_and_the_root_coalition(self):
+        def rec(pid, uniq, idv, ppid, sid, orig, coal=(7, 8)):
+            return dict(pid=pid, uniqueid=uniq, idversion=idv, ppid=ppid, pgid=pid, sid=sid, uid=501, ruid=501,
+                        comm="x", orig_ppidversion=orig, coal=list(coal))
+        procs = {4000: rec(4000, 100, 1000, 1, 4000, 0),
+                 4100: rec(4100, 110, 1010, 4000, 4000, 1000),             # session of the pinned root
+                 4200: rec(4200, 120, 1020, 1, 4200, 1010),                # setsid orphan, original parent 4100 (admitted first)
+                 4300: rec(4300, 130, 1030, 1, 4300, 4242),                # same coalition, no lineage: never admitted
+                 4400: rec(4400, 140, 1040, 4100, 4400, 1010, (9, 9)),     # lineage but another coalition: not admitted
+                 4500: rec(4500, 150, 1050, 4100, 4500, 7777),             # ppid link that disagrees with orig_ppidversion
+                 4600: rec(4600, 160, 1060, 1, 4000, 9999),                # only the pinned root's session links it
+                 3000: rec(3000, 50, 500, 1, 3000, 0)}                     # older than the root
+        o = self.synthetic_mac(procs)
+        o.scan(); o.scan()
+        self.assertEqual(sorted(o.known), [4000, 4100, 4200, 4600], o.known)
+        self.assertEqual((o.prov[110], o.prov[120]), (100, 110))
+        self.assertTrue(any(c["code"] == "coalition_mismatch" and c["pid"] == 4400 for c in o.reason_codes))
+        o2 = self.synthetic_mac(procs, pinned=False)  # not pinned: the session id is no evidence
+        o2.scan()
+        self.assertEqual(sorted(o2.known), [4000, 4100, 4200], o2.known)
+        found = sorted(o.verify())
+        self.assertIn(4300, found)
+        codes = {(c["code"], c.get("pid")) for c in o.reason_codes}
+        self.assertIn(("lineage_candidate", 4300), codes)
+        self.assertIn(("identity_error", 4500), codes)  # broken parent link: an error, never ownership
+
+    def test_n2_orphan_of_an_exited_original_parent_is_admitted(self):
+        """Agent E r31 B1: the original parent has exited (and was pruned from the live set) before its setsid orphan
+        is first scanned; the persistent admission record must still link the orphan to us."""
+        def rec(pid, uniq, idv, ppid, sid, orig, coal=(7, 8)):
+            return dict(pid=pid, uniqueid=uniq, idversion=idv, ppid=ppid, pgid=pid, sid=sid, uid=501, ruid=501,
+                        comm="x", orig_ppidversion=orig, coal=list(coal))
+        procs = {4000: rec(4000, 100, 1000, 1, 4000, 0), 4100: rec(4100, 110, 1010, 4000, 4000, 1000)}
+        o = self.synthetic_mac(procs)
+        o.scan(); self.assertIn(4100, o.known)
+        del procs[4100]; o.alive = lambda: None  # the intermediate exits ...
+        with o.lock: o.known.pop(4100)          # ... and is pruned from the live set, as alive() does
+        procs[4200] = rec(4200, 120, 1020, 1, 4200, 1010)  # its setsid child, re-parented to launchd, seen only now
+        procs[4300] = rec(4300, 130, 1030, 1, 4300, 1011)  # a stranger with no such link
+        o.scan()
+        self.assertIn(4200, o.known); self.assertNotIn(4300, o.known)
+        self.assertEqual(o.prov[120], 110)
+        self.assertEqual(ro.mac_classify(procs[4200], procs, o.root_id, o.ever, o.prov, o.idvs, 1, 501)[0], "owned")
 
     # ── certification layers, each on its own (a fake owner: no processes are started or signalled) ──
     class Fake:
