@@ -27,6 +27,8 @@ correctness and reliability, not speed; 9.10 may reuse the four-platform evidenc
 
 ## 2. Workstreams
 
+Workstreams g1–g7 below are the Step 9.9g acceptance workstreams.
+
 The thresholds below were accepted by the owner on 2026-11-22. The evidence rules in this section apply to every
 workstream.
 
