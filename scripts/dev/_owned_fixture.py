@@ -2,7 +2,8 @@
 
     python3 _owned_fixture.py MODE PIDFILE [LEVEL]
 
-Every process appends its pid to PIDFILE before doing anything else. Modes (comma-separated flags):
+Every process appends an authenticated record of its own pid and kernel identity to PIDFILE before doing anything else
+(_owned_ident.write_own_record; round 38: the test never admits a bare pid). Modes (comma-separated flags):
   tree        root -> child -> grandchild, all sleep
   ignoreterm  the child and grandchild ignore SIGTERM (POSIX)
   escape      the grandchild leaves the group: setsid (POSIX) / DETACHED_PROCESS + new group (Windows)
@@ -18,10 +19,17 @@ Every process appends its pid to PIDFILE before doing anything else. Modes (comm
   marker      the root creates PIDFILE.ran as soon as it runs (proves whether the command was released at all)
   soloexit    the root starts a NEW-SESSION child, waits until it wrote its pid, then exits 0: the root's group is
               left with no live member (only the zombie root)
+  solo        one process: records itself and sleeps 40 s (an orphan the test starts through a helper)
+  recordparent PIDFILE PPID   not a tree: records the identity of its PARENT, which must be PPID and is blocked waiting
+              for this process (a node test process, which cannot read its own kernel identity)
 """
 import os, signal, subprocess, sys, time
+import _owned_ident as oi  # this script's own directory is sys.path[0]
 
 mode, pidfile = sys.argv[1], sys.argv[2]
+if mode == "recordparent":
+    oi.write_parent_record(pidfile, int(sys.argv[3]))
+    sys.exit(0)
 level = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 flags = set(mode.split(","))
 WINDOWS = os.name == "nt"
@@ -44,7 +52,7 @@ def spawn(next_level, extra=0, escape=False):
 
 if "orphancheck" in flags:
     if level == 0:
-        note(str(os.getpid()))
+        oi.write_own_record(pidfile)
         guard = subprocess.Popen([sys.executable, __file__, mode, pidfile, "1"], stdout=subprocess.PIPE)
         engine = int(guard.stdout.readline())
         guard.wait()
@@ -65,7 +73,9 @@ if "orphancheck" in flags:
 
 if "marker" in flags and level == 0:
     open(pidfile + ".ran", "w").close()
-note(str(os.getpid()))
+oi.write_own_record(pidfile)
+if "solo" in flags:
+    time.sleep(40); sys.exit(0)
 if "ignoreterm" in flags and level > 0 and not WINDOWS:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 def wait_lines(n, limit=15):  # the root leaves only once its child has written its pid (no race on slow runners)

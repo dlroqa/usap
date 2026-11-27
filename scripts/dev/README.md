@@ -68,5 +68,8 @@ controls show the failures are real: a plain timeout leaves the tree; SIGKILL of
 stated limit). Fault injection checks that a denied or failing signal, an unreadable process or a failing process
 list never ends in "confirmed"; macOS cases cover `exec`, re-parented session escapers, an unrelated launchd job (not
 signalled, not blocking), an unrelated same-coalition orphan (uncertain, not signalled), stale identities and simulated
-PID reuse. Cases a platform cannot support are skipped with the reason. The `dev-tools` workflow runs them on Linux,
+PID reuse. The tests own a process only through a record it wrote about itself when it started (pid and kernel
+identity, authenticated with the test case's key, `_owned_ident.py`), checked against the process that holds the pid
+when the record is read; a bare pid, or a pid now held by another identity, is never admitted or signalled. Cases a
+platform cannot support are skipped with the reason. The `dev-tools` workflow runs them on Linux,
 Windows and both macOS runners.

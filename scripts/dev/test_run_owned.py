@@ -1,19 +1,26 @@
-"""Self-tests for run_owned.py (unittest; Python 3.8+). Run: python3 -B scripts/dev/test_run_owned.py -v
+"""Self-tests for run_owned.py (unittest; Python 3.8+; on Linux, stopping a leftover the test did not start itself
+needs a pidfd - Python 3.9+ - and without one the case fails as "unverifiable", never a plain kill by pid).
+Run: python3 -B scripts/dev/test_run_owned.py -v
 
 Every case builds a real process tree (_owned_fixture.py), runs it through the CLI in its own process, and then checks
-by IDENTITY (POSIX: pid + kernel start time, recorded the moment the pid appears; Windows: an open process handle,
-which also pins the pid) that no process of the tree survived. Negative controls show that the failure each case
+by IDENTITY that no process of the tree survived. Each fixture process records its OWN identity (Linux start time,
+macOS uniqueid, Windows creation time) as its first action, authenticated with the case's key (_owned_ident.py); the
+test admits a pid only when that record authenticates, its parent is admitted, and the process now at that pid has
+that identity (round 38: a bare pid read later, possibly after the process ended and its pid was reused, is never
+ownership evidence). Cleanup signals only through a pin (pidfd / identity-version token / handle) after a re-check. Negative controls show that the failure each case
 guards against is real (a plain timeout kill leaves the tree behind). Cases that need a guarantee the platform does
 not give are skipped with the reason, never passed. Every process a case creates is stopped at the end of the case,
 by identity only; nothing is matched by name.
 """
-import ast, contextlib, errno, json, os, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
+import ast, contextlib, errno, json, os, secrets, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "run_owned.py")
 FIX = os.path.join(HERE, "_owned_fixture.py")
+PY = getattr(sys, "_base_executable", None) or sys.executable  # the real interpreter (a venv launcher would sit between)
 sys.path.insert(0, HERE)
 import run_owned as ro  # noqa: E402
+import _owned_ident as oi  # noqa: E402
 
 LINUX, MACOS, WINDOWS = ro.LINUX, ro.MACOS, ro.WINDOWS
 
@@ -196,6 +203,14 @@ SYNTHETIC_TESTS = frozenset({
     "test_layer_stop_owner_reason_is_uncertain",
     "test_n2_orphan_of_an_exited_original_parent_is_admitted",
     "test_n2_scan_admits_only_with_positive_lineage_and_the_root_coalition",
+    "test_ident_admits_only_authentic_records_verified_against_the_current_holder",
+    "test_ident_record_missing_or_ended_first_admits_nothing_alive",
+    "test_ident_lineage_requires_an_admitted_parent",
+    "test_ident_multiple_fixtures_ending_in_any_order",
+    "test_ident_cleanup_after_failure_timeout_and_cancellation",
+    "test_ident_unknown_and_unverifiable_are_never_a_clean_cleanup",
+    "test_ident_mutation_late_admission_is_caught",
+    "test_ident_problems_fail_the_case",
 })
 # Start their own fixtures (directly or through the tool / a snippet interpreter) and signal only those, by identity. Not guarded.
 OWNED_TESTS = frozenset({
@@ -242,6 +257,7 @@ OWNED_TESTS = frozenset({
     "test_unstartable_command_is_127",
     "test_windows_breakaway_is_refused",
     "test_windows_tool_killed_job_close_kills_tree",
+    "test_ident_real_records_admit_the_fixture_and_never_a_reused_pid",
 })
 # No processes and no signalling (classifiers, source checks). Guarded.
 PURE_TESTS = frozenset({
@@ -251,70 +267,223 @@ PURE_TESTS = frozenset({
     "test_guard_no_cached_signal_references",
     "test_n2_classifier_requires_positive_lineage",
     "test_static_guard_plain_kill_only_where_proven_safe",
+    "test_static_ident_admission_and_signal_paths",
+    "test_ident_own_identity_matches_run_owned",
 })
 
 
-class Ident:
-    """Identity of processes seen by a test: survives PID reuse (start time / open handle)."""
+class _Entry:
+    """One admitted process. ident: the identity the process recorded about ITSELF at start (or, for a child the test
+    holds as an unreaped Popen, read while it was certainly that child). pin: Windows handle opened at admission and
+    verified to name that identity. popen: the test's own Popen (stopped through it, never by pid)."""
+    __slots__ = ("ident", "pin", "popen")
+
+    def __init__(self, ident, pin=None, popen=None):
+        self.ident, self.pin, self.popen = ident, pin, popen
+
+
+class _RealBackend:
+    """The only code through which Ident reaches the OS. Admission compares the CURRENT holder of a pid with the
+    identity a record claims; a signal goes only through a pin (pidfd / identity-version audit token / handle) after a
+    re-check; there is no plain kill(pid) anywhere (round 38: a check followed by kill(pid) is not atomic)."""
 
     def __init__(self):
-        self.seen = {}
         self.mac = ro.MacOwner() if MACOS else None
-        if WINDOWS:
-            import ctypes
-            from ctypes import wintypes as w
-            self.k = ctypes.WinDLL("kernel32", use_last_error=True)
-            self.k.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]; self.k.OpenProcess.restype = w.HANDLE
-            self.k.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]; self.k.WaitForSingleObject.restype = w.DWORD
-            self.k.TerminateProcess.argtypes = [w.HANDLE, w.UINT]; self.k.TerminateProcess.restype = w.BOOL
-            self.k.CloseHandle.argtypes = [w.HANDLE]
 
-    def start(self, pid):
+    def verify(self, pid, ident):
+        """("alive", pin) if the process at pid has exactly ident; ("exited", None) if no process holds pid (or it has
+        ended); ("reused", current) if a process with another identity holds it. Raises oi.IdentityError if unreadable."""
+        if WINDOWS:
+            w = oi.win()
+            h = w.open(pid, w.SYNCHRONIZE | w.QUERY_LIMITED)  # query first: a reuser may refuse TERMINATE (never ours)
+            if h is None: return "exited", None
+            try:
+                cur, ended = w.identity(h), w.exited(h)  # through the handle itself: it pins this object, no pid lookup
+                if cur != ident: return "reused", cur
+                if ended: return "exited", None
+                # h keeps this process object (and so its pid) alive: a second open by pid names the same object
+                t = w.open(pid, w.SYNCHRONIZE | w.TERMINATE | w.QUERY_LIMITED)
+                try:
+                    same = t is not None and w.identity(t) == ident
+                except BaseException:
+                    w.close(t); raise
+                if not same:
+                    w.close(t); raise oi.IdentityError(errno.EAGAIN, "pinned process changed identity")
+                return "alive", t
+            finally:
+                w.close(h)
+        cur = oi.identity_of(pid)
+        if cur is None: return "exited", None
+        return ("alive", None) if cur == ident else ("reused", cur)
+
+    def alive(self, pid, e):
+        if e.popen is not None: return e.popen.poll() is None
+        if WINDOWS: return bool(e.pin) and not oi.win().exited(e.pin)
+        try:
+            return oi.identity_of(pid) == e.ident
+        except oi.IdentityError:
+            return True  # unreadable is never "gone" (a survivor check must not pass on it); never signalled either
+
+    def stop(self, pid, e):
+        """SIGKILL / TerminateProcess the admitted process through a pin. None = stopped or already gone (the pid's
+        holder, if any, has another identity and is left alone); otherwise the reason it could not be done safely."""
+        if e.popen is not None:
+            e.popen.kill()  # the test's own Popen, unreaped (only the test reaps it): its pid cannot have been reused
+            return None
+        if WINDOWS:
+            if not e.pin: return None  # never pinned: it had ended before admission
+            w = oi.win()
+            if w.exited(e.pin) or w.k.TerminateProcess(e.pin, 1): return None
+            return "TerminateProcess failed: %d" % w.ctypes.get_last_error()
+        if MACOS:
+            try:
+                q = self.mac._q(pid)
+            except OSError as x:
+                return "identity unreadable: %s" % x
+            if q is None or "M%d" % q["uniqueid"] != e.ident: return None
+            r = self.mac.token_signal(pid, q["idversion"], signal.SIGKILL)  # the kernel matches pid AND idversion
+            if r is None: return "no proc_signal_with_audittoken (macOS < 14.2): not signalled"
+            return None if r in (0, errno.ESRCH) else "token_signal errno %d" % r
         if LINUX:
-            st = ro._linux_stat(pid); return st and st[2]
-        if MACOS:  # the kernel's p_uniqueid: never reused, kept across exec
-            st = self.mac.info(pid); return st and st["uniqueid"]
-        return None
+            if not hasattr(os, "pidfd_open"): return "no pidfd: the process cannot be pinned (never a plain kill by pid)"
+            try:
+                fd = os.pidfd_open(pid)
+            except ProcessLookupError:
+                return None
+            except OSError as x:
+                return "pidfd_open errno %s" % x.errno
+            try:
+                if oi.identity_of(pid) != e.ident: return None  # pinned AFTER our process ended: not ours, untouched
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+                return None
+            except ProcessLookupError:
+                return None
+            except OSError as x:
+                return "%s: %s" % (type(x).__name__, x)
+            finally:
+                os.close(fd)
+        return "no pinned signal on this platform"
 
-    def record(self, pid):
-        if pid in self.seen: return
-        if WINDOWS:
-            h = self.k.OpenProcess(0x00100000 | 0x0001 | 0x1000, False, pid)  # SYNCHRONIZE | TERMINATE | QUERY_LIMITED
-            self.seen[pid] = h or None
-        else:
-            self.seen[pid] = self.start(pid)
+    def release(self, e):
+        if WINDOWS and e.pin:
+            oi.win().close(e.pin); e.pin = None
+
+
+class Ident:
+    """Processes a test case owns, by identity (round 38, DD-R37-LATE-IDENT). A pid is admitted ONLY by
+      * admit_line: a pid-file record the process wrote about itself at start (oi.write_own_record) that authenticates
+        with this case's key, whose parent claim names a record already admitted, and whose identity the process now
+        at that pid has (alive; Windows: pinned by a handle verified to name it) - or no process holds the pid (exited:
+        kept as evidence, never signalled). A different identity there is a reused pid: recorded, never admitted alive,
+        never signalled. A bare pid, a truncated/edited/foreign/stale line or an unverifiable one is never admitted.
+      * record_child: a Popen the test holds and has not reaped (its pid cannot be reused before the test reaps it).
+    Every problem is kept (rejected / unknown / unverifiable) and fails the case: unknown ownership is never a clean
+    cleanup."""
+
+    def __init__(self, key="", backend=None):
+        self.key = key
+        self.b = backend if backend is not None else _RealBackend()
+        self.seen = {}      # pid -> _Entry: every admitted process (alive or ended at admission)
+        self.claims = {}    # pid -> identity of every authentic, lineage-checked record (parent evidence)
+        self.lines = {}     # pid-file line -> admitted pid or None (each line is decided once)
+        self.rejected, self.unknown, self.unverifiable, self.reused = [], [], [], []
+
+    @property
+    def mac(self):
+        return getattr(self.b, "mac", None)
+
+    def _admit(self, pid, entry):  # the ONLY place a pid enters self.seen (static test)
+        old = self.seen.get(pid)
+        if old is not None: self.b.release(old)
+        self.seen[pid] = entry
+
+    def admit_line(self, line):
+        """Decide one complete pid-file line; returns the admitted pid or None."""
+        if line in self.lines: return self.lines[line]
+        self.lines[line] = None
+        try:
+            pid, ident, parent = oi.parse_record(line, self.key)
+        except oi.RecordError as x:
+            self.rejected.append((str(x), line[:100])); return None
+        if parent is not None and self.claims.get(parent[0]) != parent[1]:
+            self.rejected.append(("parent claim names no admitted record (lineage missing or contradictory)", line[:100]))
+            return None
+        old = self.seen.get(pid)
+        if old is not None and old.ident == ident:
+            self.lines[line] = pid; return pid
+        try:
+            state, x = self.b.verify(pid, ident)
+        except oi.IdentityError as err:
+            self.unknown.append((pid, "identity unreadable: %s" % err)); return None
+        if old is not None and self.alive(pid):
+            if state == "alive": self.b.release(_Entry(ident, x))
+            self.rejected.append(("a live admitted process already holds this pid", line[:100])); return None
+        self.claims[pid] = ident
+        if state == "reused":
+            self.reused.append((pid, ident, x))  # our process has ended; the replacement is never ours
+            x = None
+        self._admit(pid, _Entry(ident, x if state == "alive" else None))
+        self.lines[line] = pid
+        return pid
+
+    def record_child(self, popen):
+        """Admit the test's own unreaped child (its identity is read while it certainly is that child)."""
+        if popen.returncode is not None: raise AssertionError("record_child needs a child the test has not reaped")
+        ident = oi.identity_of(popen.pid)
+        state, pin = self.b.verify(popen.pid, ident) if ident is not None else ("exited", None)
+        if popen.returncode is not None or state == "reused": raise AssertionError("the child changed during admission")
+        self.claims[popen.pid] = ident
+        self._admit(popen.pid, _Entry(ident, pin if state == "alive" else None, popen))
+        return popen.pid
 
     def alive(self, pid):
-        v = self.seen.get(pid)
-        if v is None: return False
-        if WINDOWS: return self.k.WaitForSingleObject(v, 0) == 0x102  # WAIT_TIMEOUT: still running
-        return self.start(pid) == v
+        e = self.seen.get(pid)
+        return e is not None and self.b.alive(pid, e)
 
     def alive_all(self):
         return [p for p in self.seen if self.alive(p)]
 
+    def problems(self):
+        return [("rejected",) + r for r in self.rejected] + [("unknown",) + u for u in self.unknown] + \
+               [("unverifiable",) + u for u in self.unverifiable]
+
     def cleanup(self):
-        """Stop what a case left behind (negative controls), by identity only."""
-        for pid in self.alive_all():
+        """Stop what a case left behind, through pins only; one failure never stops the others."""
+        for pid, e in list(self.seen.items()):
             try:
-                if WINDOWS: self.k.TerminateProcess(self.seen[pid], 1)
-                elif MACOS:  # identity-bound (pid + identity version), never a plain kill(pid)
-                    q = self.mac.info(pid)
-                    if q and q["uniqueid"] == self.seen[pid]: self.mac.token_signal(pid, q["idversion"], signal.SIGKILL)
-                elif hasattr(os, "pidfd_open"):
-                    fd = os.pidfd_open(pid)
-                    try:
-                        if self.alive(pid): signal.pidfd_send_signal(fd, signal.SIGKILL)
-                    finally: os.close(fd)
-                elif self.alive(pid):
-                    os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
+                if not self.b.alive(pid, e): continue
+                why = self.b.stop(pid, e)
+            except Exception as x:  # noqa: BLE001 - recorded, and the case fails on it
+                why = "%s: %s" % (type(x).__name__, x)
+            if why: self.unverifiable.append((pid, why))
         end = time.time() + 5
         while self.alive_all() and time.time() < end: time.sleep(0.05)
+        for e in self.seen.values():
+            if e.popen is not None and e.popen.poll() is not None: e.popen.wait()
         if WINDOWS:
-            for h in self.seen.values():
-                if h: self.k.CloseHandle(h)
+            left = set(self.alive_all())
+            for pid, e in self.seen.items():
+                if pid not in left: self.b.release(e)
+
+
+def scan_pidfile(ident, path):
+    """Admit every COMPLETE line of a pid file (an unterminated last line may still be being written: left for a later
+    read, never admitted). Returns (admitted pids in file order, note lines, record-like line count)."""
+    try:
+        with open(path, encoding="ascii", errors="replace") as f:
+            data = f.read()
+    except FileNotFoundError:
+        data = ""
+    pids, notes, n = [], [], 0
+    for x in (s.strip() for s in data.split("\n")[:-1]):
+        if not x: continue
+        if x.startswith(oi.TAG + " ") or x == oi.TAG or x.isdigit():  # a bare pid is refused by admit_line
+            n += 1
+            p = ident.admit_line(x)
+            if p is not None and p not in pids: pids.append(p)
+        else:
+            notes.append(x)
+    return pids, notes, n
 
 
 class Case(unittest.TestCase):
@@ -328,7 +497,10 @@ class Case(unittest.TestCase):
             self.addCleanup(self.signal_guard.verify_and_restore)
         self.dir = tempfile.mkdtemp(prefix="run-owned-")
         self.pids = os.path.join(self.dir, "pids")
-        self.ident = Ident()
+        self.key = secrets.token_hex(16)  # this case's own key: only processes this case starts inherit it
+        self.env = dict(os.environ, **{oi.KEY_ENV: self.key})
+        self.env.pop(oi.PARENT_ENV, None)
+        self.ident = Ident(self.key)
 
     def tearDown(self):
         if self.signal_guard is not None:  # a guarded test starts nothing, so its cleanup must have nothing to stop
@@ -337,27 +509,26 @@ class Case(unittest.TestCase):
         left = self.ident.alive_all()
         shutil.rmtree(self.dir, ignore_errors=True)
         self.assertEqual(left, [], "the case's own cleanup left processes")
+        self.assert_clean_ownership(self.ident)
+
+    def assert_clean_ownership(self, ident):
+        """A rejected record, an unreadable identity or a cleanup that could not be done through a pin fails the case."""
+        self.assertEqual(ident.problems(), [], "ownership unknown or cleanup unverifiable: never a clean cleanup")
 
     def read_pids(self, n, wait=15):
         end = time.time() + wait
         while True:
-            try:
-                with open(self.pids, encoding="utf8") as f:
-                    lines = [x.strip() for x in f if x.strip()]
-            except FileNotFoundError:
-                lines = []
-            for x in lines:
-                if x.isdigit(): self.ident.record(int(x))
-            if sum(x.isdigit() for x in lines) >= n or time.time() > end:
-                return [int(x) for x in lines if x.isdigit()], [x for x in lines if not x.isdigit()]
+            pids, notes, count = scan_pidfile(self.ident, self.pids)
+            if count >= n or time.time() > end:
+                return pids, notes
             time.sleep(0.02)
 
     def tool(self, *args, timeout=60, background=False):
         rep = os.path.join(self.dir, "report.json")
         cmd = [sys.executable, "-B", TOOL, "--report", rep, *args]
         if background:
-            return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE), rep
-        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout)
+            return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=self.env), rep
+        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout, env=self.env)
         report = load(rep) if os.path.exists(rep) else None
         return p.returncode, report, p.stderr.decode(errors="replace")
 
@@ -447,7 +618,7 @@ class Case(unittest.TestCase):
     @unittest.skipUnless(LINUX and hasattr(os, "pidfd_open"), "Linux pidfd")
     def test_linux_identity_mismatch_is_never_signalled(self):
         victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-        self.ident.record(victim.pid)
+        self.ident.record_child(victim)
         snippet = ("import sys, os, signal; sys.path.insert(0, %r); import run_owned as ro\n"
                    "o = ro.LinuxOwner(); pid = %d\n"
                    "o.known[pid] = {'start': -1, 'fd': None, 'ppid': 0, 'pgid': 0}\n"
@@ -465,7 +636,7 @@ class Case(unittest.TestCase):
 
     def _snippet(self, code, timeout):
         out = subprocess.run([sys.executable, "-B", "-c", f"import sys, os, json, signal, subprocess, time; sys.path.insert(0, {HERE!r}); import run_owned as ro\n" + code],
-                             capture_output=True, text=True, timeout=timeout)
+                             capture_output=True, text=True, timeout=timeout, env=self.env)
         self.assertEqual(out.returncode, 0, out.stderr)
         return json.loads(out.stdout.strip().splitlines()[-1])
 
@@ -481,7 +652,7 @@ while time.time() < end:
     with open({self.pids!r}) as f:
         if sum(1 for x in f if x.strip()) >= 1: break
     time.sleep(0.02)
-with open({self.pids!r}) as f: vpid = int(f.readline())
+with open({self.pids!r}) as f: vpid = int(f.readline().split()[1])  # record: R1 <pid> ...
 class V: pid = vpid
 v = V()
 o = ro.LinuxOwner() if ro.LINUX else ro.MacOwner()
@@ -519,7 +690,7 @@ while time.time() < end:
     with open({self.pids!r}) as f:
         if sum(1 for x in f if x.strip()) >= 3: break
     time.sleep(0.02)
-with open({self.pids!r}) as f: gpid = int(f.readline())
+with open({self.pids!r}) as f: gpid = int(f.readline().split()[1])  # record: R1 <pid> ...
 o = ro.LinuxOwner() if ro.LINUX else ro.MacOwner()
 o.root = gpid  # as if our root had been reaped and its pid/group id reused by this unrelated group
 if ro.MACOS:  # not pinned (never spawned): the session id is no evidence; age and coalition alone never are
@@ -616,7 +787,7 @@ calls = dict(denied=0, kill_target=0)
 def target():
     try:
         with open({pids!r}) as f: lines = [x.strip() for x in f if x.strip()]
-        return int(lines[2]) if len(lines) >= 3 else None
+        return int(lines[2].split()[1]) if len(lines) >= 3 else None  # record: R1 <pid> ...
     except FileNotFoundError: return None
 def deliver(self, pid, k, sig):
     if pid == target() and calls["denied"] < {limit}:
@@ -669,7 +840,7 @@ real_open = builtins.open
 def fake_open(path, *a, **kw):  # injected at the open() inside _linux_stat itself (module-level name)
     if state["on"] and isinstance(path, str) and path.endswith("/stat") and path.startswith("/proc/"):
         with real_open({self.pids!r}) as f: lines = [x.strip() for x in f if x.strip()]
-        if len(lines) >= 3 and path == "/proc/%s/stat" % lines[2]:
+        if len(lines) >= 3 and path == "/proc/%s/stat" % lines[2].split()[1]:
             raise PermissionError(13, "injected EACCES")
     return real_open(path, *a, **kw)
 ro.open = fake_open
@@ -723,7 +894,7 @@ def kill(pid, sig):
     return orig_kill(pid, sig)
 ro.os.kill = kill
 code, rep = ro.run([sys.executable, "-B", {FIX!r}, "tree", {self.pids!r}], timeout=3, grace=1, env=dict(os.environ))
-with open({self.pids!r}) as f: pids = [int(x) for x in f if x.strip().isdigit()]
+with open({self.pids!r}) as f: pids = [int(x.split()[1]) for x in f if x.startswith("R1 ")]
 print(json.dumps(dict(code=code, cert=rep["certification"], mode=rep["identity_mode"], codes=rep["reason_codes"], killed=seen, pids=pids)))
 """, timeout=90)
         self.assertEqual(r["mode"], "starttime-race")
@@ -776,13 +947,16 @@ print(json.dumps(dict(code=code, cert=rep["certification"], mode=rep["identity_m
         self.read_pids(3)
         helper = os.path.join(self.dir, "sibling.py")
         with open(helper, "w") as f:  # started by the TEST (not the tool's tree); its parent exits -> an orphan
-            f.write("import subprocess, sys\n"
-                    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(40)'], start_new_session=True,"
-                    " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
-                    "open(sys.argv[1], 'w').write(str(p.pid))\n")
-        subprocess.run([sys.executable, helper, sib], timeout=30)
-        with open(sib) as f: spid = int(f.read().split()[0])
-        self.ident.record(spid)
+            f.write("import subprocess, sys\n"  # the orphan records ITSELF (authenticated identity, round 38)
+                    "subprocess.Popen([sys.executable, sys.argv[2], 'solo', sys.argv[1]], start_new_session=True,"
+                    " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n")
+        subprocess.run([sys.executable, helper, sib, FIX], timeout=30, env=self.env)
+        end = time.time() + 15
+        while True:
+            spids, _, _ = scan_pidfile(self.ident, sib)
+            if spids or time.time() > end: break
+            time.sleep(0.02)
+        self.assertEqual(len(spids), 1, self.ident.problems()); spid = spids[0]
         rc = p.wait(timeout=60); r = load(rep)
         self.assertEqual((rc, r["certification"]), (ro.EXIT_UNCERTAIN, "uncertain"), r)
         self.assertTrue(any(c["code"] == "lineage_candidate" and c.get("pid") == spid for c in r["reason_codes"]), r)
@@ -791,7 +965,7 @@ print(json.dumps(dict(code=code, cert=rep["certification"], mode=rep["identity_m
 
     @unittest.skipUnless(MACOS, "macOS audit token")
     def test_mac_stale_identity_and_simulated_pid_reuse_are_refused(self):
-        v = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]); self.ident.record(v.pid)
+        v = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]); self.ident.record_child(v)
         try:
             o = ro.MacOwner(); q = o._q(v.pid)
             self.assertIsNotNone(o.sig_tok, "proc_signal_with_audittoken exists on this runner")
@@ -1601,7 +1775,7 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
             self.assertFalse(hasattr(getattr(o, n, None), "_signal_guard"), n)
         p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         try:
-            self.ident.record(p.pid)
+            self.ident.record_child(p)
             self.assertEqual(self.ident.alive_all(), [p.pid])
             self.ident.cleanup()
             self.assertEqual(self.ident.alive_all(), [])
@@ -1814,7 +1988,7 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
     def test_negative_control_plain_timeout_leaves_descendants(self):
         """The incident: a plain subprocess timeout kills only the direct child."""
         try:
-            subprocess.run(self.fixture("tree"), timeout=3)
+            subprocess.run(self.fixture("tree"), timeout=3, env=self.env)
         except subprocess.TimeoutExpired:
             pass
         pids, _ = self.read_pids(3, wait=2)
@@ -1825,12 +1999,245 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
         leak = os.path.join(self.dir, "leak.test.cjs")
         with open(leak, "w") as f:
             f.write("const t=require('node:test');const n=require('node:net');const fs=require('node:fs');"
-                    f"t('hang',async()=>{{fs.appendFileSync({json.dumps(self.pids)},process.pid+'\\n');n.createServer().listen(0,'127.0.0.1');await new Promise(()=>{{}});}});")
+                    f"t('hang',async()=>{{require('node:child_process').execFileSync({json.dumps(PY)},[{json.dumps(FIX)},'recordparent',{json.dumps(self.pids)},String(process.pid)],{{stdio:'ignore'}});n.createServer().listen(0,'127.0.0.1');await new Promise(()=>{{}});}});")
         code, rep, err = self.tool("--timeout", "4", "--grace", "2", "--", shutil.which("node"), "--test", leak)
         pids, _ = self.read_pids(1, wait=1)
         self.assertEqual(code, ro.EXIT_TIMEOUT, err); self.assertTrue(pids, "the per-file test process ran")
         self.assertEqual(self.ident.alive_all(), [], rep)
 
+    # ── Round 38 (DD-R37-LATE-IDENT): identity is admitted only from the process's own authenticated record ──────────
+    class FakeTable:
+        """Synthetic process table for Ident (no OS call at all): pid -> current identity. stop() behaves like the real
+        pinned paths: it 'signals' only when the holder still has the admitted identity, and records that in kills."""
+        mac = None
+
+        def __init__(self, table):
+            self.table, self.kills, self.unreadable = dict(table), [], set()
+
+        def verify(self, pid, ident):
+            if pid in self.unreadable: raise oi.IdentityError(errno.EACCES, "synthetic unreadable")
+            cur = self.table.get(pid)
+            if cur is None: return "exited", None
+            return ("alive", None) if cur == ident else ("reused", cur)
+
+        def alive(self, pid, e):
+            return pid in self.unreadable or self.table.get(pid) == e.ident
+
+        def stop(self, pid, e):
+            if pid in self.unreadable: return "synthetic: identity unreadable"
+            if self.table.get(pid) == e.ident:
+                self.kills.append((pid, e.ident)); del self.table[pid]
+            return None
+
+        def release(self, e):
+            pass
+
+    @staticmethod
+    def rec(pid, n, parent=None, key="k" * 32):
+        return oi.make_record(pid, f"{oi.PREFIX}{n}", (parent[0], f"{oi.PREFIX}{parent[1]}") if parent else None, key)
+
+    def fake_ident(self, table, key="k" * 32):
+        t = self.FakeTable({p: f"{oi.PREFIX}{n}" for p, n in table.items()})
+        return Ident(key, backend=t), t
+
+    def test_ident_admits_only_authentic_records_verified_against_the_current_holder(self):
+        ident, t = self.fake_ident({7001: 11, 7003: 99, 7004: 14})  # 7002 ended; 7003 reused by another identity
+        k, other = "k" * 32, "x" * 32
+        ok = self.rec(7001, 11)
+        self.assertEqual(ident.admit_line(ok), 7001)                           # valid, alive: admitted
+        self.assertEqual(ident.admit_line(self.rec(7002, 12)), 7002)           # authentic, ended before reading: evidence
+        self.assertEqual(ident.admit_line(self.rec(7003, 13)), 7003)           # authentic, pid reused: never alive
+        self.assertEqual(ident.reused, [(7003, f"{oi.PREFIX}13", f"{oi.PREFIX}99")])
+        forged = self.rec(7004, 15)                                           # writer claims an identity the pid lacks
+        self.assertEqual(ident.admit_line(forged), 7004); self.assertFalse(ident.alive(7004))
+        bad = [("7005", "not a record"),                                       # bare pid
+               (ok.replace(f"{oi.PREFIX}11", f"{oi.PREFIX}14").replace("7001", "7004"), "does not authenticate"),  # substituted
+               (self.rec(7006, 16, key=other), "does not authenticate"),        # stale: another case's key
+               (ok[:-10], "does not authenticate"),                             # truncated mac
+               (" ".join(ok.split(" ")[:5]), "truncated"),                      # truncated line
+               ("R1", "truncated"),
+               (oi.make_record(7007, f"{oi.PREFIX}17", None, ""), "does not authenticate")]  # unauthenticated
+        for line, why in bad:
+            self.assertIsNone(ident.admit_line(line), line)
+            self.assertIn(why, ident.rejected[-1][0], (line, ident.rejected[-1]))
+        self.assertEqual(sorted(ident.alive_all()), [7001])
+        self.assertNotIn(7005, ident.seen); self.assertNotIn(7006, ident.seen); self.assertNotIn(7007, ident.seen)
+        ident.cleanup()
+        self.assertEqual(t.kills, [(7001, f"{oi.PREFIX}11")], "only the verified live fixture; never the reuser 7003/7004")
+        self.assertEqual(t.table[7003], f"{oi.PREFIX}99"); self.assertEqual(t.table[7004], f"{oi.PREFIX}14")
+        self.assertEqual(ident.unverifiable, [])
+
+    def test_ident_record_missing_or_ended_first_admits_nothing_alive(self):
+        ident, t = self.fake_ident({7101: 21})
+        path = os.path.join(self.dir, "none")
+        self.assertEqual(scan_pidfile(ident, path), ([], [], 0), "no pid file: nothing admitted")
+        with open(path, "w") as f: f.write(self.rec(7101, 21) + "\n" + self.rec(7102, 22))  # last line unterminated
+        pids, notes, n = scan_pidfile(ident, path)
+        self.assertEqual((pids, n), ([7101], 1), "an unterminated (still being written) line is never admitted")
+        del t.table[7101]                                                      # the fixture ends before cleanup
+        ident.cleanup(); self.assertEqual(t.kills, []); self.assertEqual(ident.alive_all(), [])
+
+    def test_ident_lineage_requires_an_admitted_parent(self):
+        ident, t = self.fake_ident({7201: 31, 7202: 32, 7203: 33, 7204: 34, 7205: 35})
+        self.assertEqual(ident.admit_line(self.rec(7201, 31)), 7201)
+        self.assertEqual(ident.admit_line(self.rec(7202, 32, parent=(7201, 31))), 7202)   # verified lineage
+        self.assertIsNone(ident.admit_line(self.rec(7203, 33, parent=(7299, 39))))         # original parent missing
+        self.assertIsNone(ident.admit_line(self.rec(7204, 34, parent=(7201, 30))))         # contradictory parent identity
+        self.assertEqual(ident.admit_line(self.rec(7205, 35, parent=(7202, 32))), 7205)   # grandchild
+        self.assertEqual([r[0][:25] for r in ident.rejected], ["parent claim names no adm"] * 2)
+        ident.cleanup()
+        self.assertEqual(sorted(p for p, _ in t.kills), [7201, 7202, 7205]); self.assertIn(7203, t.table); self.assertIn(7204, t.table)
+
+    def test_ident_multiple_fixtures_ending_in_any_order(self):
+        ident, t = self.fake_ident({7301: 41, 7302: 42, 7303: 43, 7304: 44})
+        lines = [self.rec(7301, 41), self.rec(7302, 42, parent=(7301, 41)), self.rec(7303, 43, parent=(7302, 42)),
+                 self.rec(7304, 44, parent=(7301, 41))]
+        del t.table[7302]; t.table[7303] = f"{oi.PREFIX}90"                    # middle ended; grandchild's pid reused
+        for x in lines: ident.admit_line(x)
+        del t.table[7301]                                                      # root ends after admission
+        t.table[7301] = f"{oi.PREFIX}91"                                       # ... and its pid is reused before cleanup
+        ident.cleanup()
+        self.assertEqual(t.kills, [(7304, f"{oi.PREFIX}44")])
+        self.assertEqual((t.table[7301], t.table[7303]), (f"{oi.PREFIX}91", f"{oi.PREFIX}90"), "reusers untouched")
+        self.assertEqual(ident.rejected, [])
+
+    def test_ident_cleanup_after_failure_timeout_and_cancellation(self):
+        outer = self
+        for exc in (AssertionError("the case's assertion failed"), subprocess.TimeoutExpired("tool", 1), KeyboardInterrupt()):
+            ident, t = self.fake_ident({7401: 51, 7402: 99})
+            class Inner(unittest.TestCase):
+                def runTest(self):
+                    self.addCleanup(ident.cleanup)  # like tearDown: runs after a failure or a timeout
+                    ident.admit_line(outer.rec(7401, 51)); ident.admit_line(outer.rec(7402, 52))
+                    raise exc
+            res = unittest.TestResult()
+            try:
+                Inner().run(res)
+            except KeyboardInterrupt:  # unittest re-raises it: no cleanup ran (Phase 4 leak), and nothing was signalled
+                self.assertEqual(t.kills, []); ident.cleanup()
+            self.assertEqual(t.kills, [(7401, f"{oi.PREFIX}51")], type(exc).__name__)
+            self.assertEqual(t.table[7402], f"{oi.PREFIX}99")
+
+    def test_ident_unknown_and_unverifiable_are_never_a_clean_cleanup(self):
+        ident, t = self.fake_ident({7501: 61, 7502: 62})
+        t.unreadable.add(7502)
+        ident.admit_line(self.rec(7501, 61)); ident.admit_line(self.rec(7502, 62))
+        self.assertEqual([u[0] for u in ident.unknown], [7502]); self.assertNotIn(7502, ident.seen)
+        t.unreadable = {7501}
+        ident.cleanup()
+        self.assertEqual(t.kills, []); self.assertEqual([u[0] for u in ident.unverifiable], [7501])
+        self.assertEqual({p[0] for p in ident.problems()}, {"unknown", "unverifiable"})
+
+    def test_ident_problems_fail_the_case(self):
+        ident, t = self.fake_ident({7701: 81})
+        self.assert_clean_ownership(ident)
+        for add in (lambda: ident.admit_line("7701"), lambda: ident.unknown.append((7701, "x")),
+                    lambda: ident.unverifiable.append((7701, "x"))):
+            ident.rejected, ident.unknown, ident.unverifiable, ident.lines = [], [], [], {}
+            add()
+            with self.assertRaises(AssertionError): self.assert_clean_ownership(ident)
+        td = [f for f in ast.parse(open(__file__, encoding="utf8").read()).body if isinstance(f, ast.ClassDef) and f.name == "Case"][0]
+        tear = [f for f in td.body if isinstance(f, ast.FunctionDef) and f.name == "tearDown"][0]
+        self.assertTrue(any(isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "assert_clean_ownership" for n in ast.walk(tear)),
+                        "tearDown checks ownership problems")
+
+    def test_ident_mutation_late_admission_is_caught(self):
+        """Mutation control: an Ident that looks the identity up when it reads the pid file (the round-37 defect) is
+        caught by the reuse scenario - through the synthetic recorder, never through a real signal."""
+        def scenario(cls):
+            ident, t = None, None
+            t = self.FakeTable({7601: f"{oi.PREFIX}99"})  # the fixture 7601 (identity 71) ended; its pid was reused
+            ident = cls("k" * 32, backend=t)
+            ident.admit_line(self.rec(7601, 71)); ident.admit_line("7601")
+            ident.cleanup()
+            return t.kills
+        class MutantLateIdent(Ident):
+            def admit_line(self, line):  # MUTANT: pid from any line, identity of the CURRENT holder (late admission)
+                try:
+                    pid = oi.parse_record(line, self.key)[0]
+                except oi.RecordError:
+                    pid = int(line) if line.isdigit() else None
+                if pid is None: return None
+                self._admit(pid, _Entry(self.b.table.get(pid)))
+                return pid
+        self.assertEqual(scenario(Ident), [], "the corrected Ident never signals the reuser")
+        self.assertEqual(scenario(MutantLateIdent), [(7601, f"{oi.PREFIX}99")], "the control detects late admission")
+
+    def test_static_ident_admission_and_signal_paths(self):
+        """Source-level: a pid enters Ident.seen only in Ident._admit, called only by admit_line and record_child (and
+        by mutation controls); no bare-pid record() exists; Ident and its backend never call kill/killpg; the fixture
+        writes only its own record (and its blocked parent's in recordparent)."""
+        with open(__file__, encoding="utf8") as fh: tree = ast.parse(fh.read())
+        top = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+        ident = top["Ident"]
+        meths = {f.name: f for f in ident.body if isinstance(f, ast.FunctionDef)}
+        self.assertNotIn("record", meths, "no bare-pid admission method")
+        writers, callers = set(), set()
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef): continue
+            for n in ast.walk(fn):
+                if isinstance(n, (ast.Assign, ast.AugAssign)):
+                    for tg in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                        if isinstance(tg, ast.Subscript) and getattr(tg.value, "attr", None) == "seen": writers.add(fn.name)
+                if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "_admit": callers.add(fn.name)
+                if isinstance(n, ast.Call) and getattr(n.func, "attr", None) in ("record",) and \
+                        getattr(getattr(n.func, "value", None), "attr", None) == "ident": self.fail(f"ident.record() in {fn.name}")
+        self.assertEqual(writers, {"_admit"})
+        self.assertEqual({c for c in callers if c in meths}, {"admit_line", "record_child"})
+        mutation = "test_ident_mutation_late_admission_is_caught"
+        for node in tree.body:  # outside Ident, only the mutation control may call _admit (its own mutant class)
+            scopes = [f for f in node.body if isinstance(f, ast.FunctionDef)] if isinstance(node, ast.ClassDef) and node.name == "Case" else [node]
+            for sc in scopes:
+                if (isinstance(node, ast.ClassDef) and node.name == "Ident") or getattr(sc, "name", None) == mutation: continue
+                self.assertFalse(any(isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "_admit" for n in ast.walk(sc)),
+                                 getattr(sc, "name", type(sc).__name__))
+        for cname in ("Ident", "_RealBackend"):
+            for n in ast.walk(top[cname]):
+                if isinstance(n, ast.Call) and getattr(n.func, "attr", None) in ("kill", "killpg") and \
+                        getattr(n.func.value, "id", None) == "os": self.fail(f"plain {n.func.attr} in {cname}")
+        with open(FIX, encoding="utf8") as fh: fsrc = fh.read()
+        self.assertNotIn("str(os.getpid())", fsrc, "the fixture never writes a bare pid")
+        ft = ast.parse(fsrc)
+        calls = [n for n in ast.walk(ft) if isinstance(n, ast.Call) and getattr(n.func, "attr", None) in
+                 ("write_own_record", "write_parent_record", "make_record")]
+        self.assertEqual(sorted(c.func.attr for c in calls), ["write_own_record", "write_own_record", "write_parent_record"])
+        self.assertTrue(all(len(c.args) == 1 for c in calls if c.func.attr == "write_own_record"), "own record: no pid argument")
+        with open(os.path.join(HERE, "_owned_ident.py"), encoding="utf8") as fh: it = ast.parse(fh.read())
+        own = [f for f in it.body if isinstance(f, ast.FunctionDef) and f.name == "write_own_record"][0]
+        self.assertIn("os.getpid()", ast.unparse(own)) if hasattr(ast, "unparse") else None
+
+    def test_ident_own_identity_matches_run_owned(self):
+        """The identity a process records about itself is the value run_owned reads for that pid (same scale)."""
+        me, mine = os.getpid(), oi.identity_of(os.getpid())
+        self.assertIsNotNone(mine)
+        if LINUX: self.assertEqual(mine, "L%d" % ro._linux_stat(me)[2])
+        elif MACOS: self.assertEqual(mine, "M%d" % ro.MacOwner()._q(me)["uniqueid"])
+        elif WINDOWS: self.assertRegex(mine, r"^W[0-9]+$"); self.assertEqual(oi.identity_of(me), mine)
+        self.assertIsNone(oi.identity_of(2 ** 22 + 12345) if not WINDOWS else None)
+
+    def test_ident_real_records_admit_the_fixture_and_never_a_reused_pid(self):
+        """OWNED: a real fixture records itself and is stopped through the record path; a record naming a live process
+        of the test with ANOTHER identity (a simulated reuse) is never admitted alive and never signalled."""
+        p = subprocess.Popen([sys.executable, "-B", FIX, "solo", self.pids], env=self.env,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            pids, _ = self.read_pids(1, wait=15)
+            self.assertEqual(pids, [p.pid], self.ident.problems())
+            self.assertEqual(self.ident.seen[p.pid].ident, oi.identity_of(p.pid))
+            real = oi.identity_of(holder.pid)
+            wrong = f"{oi.PREFIX}{int(real[1:]) + 1}"
+            with open(self.pids, "a") as f: f.write(oi.make_record(holder.pid, wrong, None, self.key) + "\n")
+            pids, _ = self.read_pids(2, wait=1)
+            self.assertEqual(self.ident.reused, [(holder.pid, wrong, real)]); self.assertFalse(self.ident.alive(holder.pid))
+            self.ident.cleanup()
+            self.assertIsNone(holder.poll(), "the process holding the pid under another identity was never signalled")
+            self.assertIsNotNone(p.wait(timeout=10), "the authenticated fixture was stopped through its pin")
+            self.assertEqual(self.ident.unverifiable, [])
+        finally:
+            for q in (p, holder):
+                if q.poll() is None: q.kill()
+                q.wait(10)
 
 if __name__ == "__main__":
     print(f"run_owned self-tests on {sys.platform}, Python {sys.version.split()[0]}", flush=True)
