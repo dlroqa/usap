@@ -228,6 +228,8 @@ OWNED_TESTS = frozenset({
     "test_guard_owned_fixture_cleanup_works_without_the_guard",
     "test_limit_tool_sigkill_leaves_the_tree",
     "test_linux_adopted_orphans_are_reaped_while_running",
+    "test_f1_orphancheck_reports_an_unreaped_zombie",
+    "test_f1_dead_pidfd_never_reaches_another_process",
     "test_linux_identity_mismatch_is_never_signalled",
     "test_mac_group_eperm_with_live_members_is_uncertain",
     "test_mac_group_inspection_error_is_uncertain",
@@ -267,6 +269,7 @@ PURE_TESTS = frozenset({
     "test_guard_no_cached_signal_references",
     "test_n2_classifier_requires_positive_lineage",
     "test_static_guard_plain_kill_only_where_proven_safe",
+    "test_static_fixture_signals_only_through_pidfd",
     "test_static_ident_admission_and_signal_paths",
     "test_ident_own_identity_matches_run_owned",
 })
@@ -610,10 +613,51 @@ class Case(unittest.TestCase):
         else:
             self.assertEqual(code, 0, err); self.assertEqual(rep["containment"], "full")
 
-    @unittest.skipUnless(LINUX, "Linux subreaper")
+    @unittest.skipUnless(LINUX and ro._pidfd_works(), "Linux subreaper and pidfd (the fixture signals only through a pidfd)")
     def test_linux_adopted_orphans_are_reaped_while_running(self):
         code, rep, err = self.tool("--timeout", "20", "--", *self.fixture("orphancheck"))
+        if code == 4: self.skipTest("the fixture could not pin the engine with a pidfd (it never falls back to kill(pid))")
         self.assertEqual(code, 0, f"a killed orphan must not stay a zombie that looks alive: {err}")
+
+    @unittest.skipUnless(LINUX and ro._pidfd_works(), "Linux subreaper and pidfd")
+    def test_f1_orphancheck_reports_an_unreaped_zombie(self):
+        """F1 negative control: under a subreaper that never reaps the engine, the fixture's pidfd check must see the
+        killed engine as an unreaped zombie and exit 3 (the reap check is not vacuous). The helper is this test's own
+        child; it waits only for the fixture root; the zombie is reaped by init when the helper exits."""
+        helper = ("import ctypes, subprocess, sys\n"
+                  "assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0\n"  # PR_SET_CHILD_SUBREAPER
+                  "print(subprocess.Popen(sys.argv[1:]).wait(), flush=True)\n")  # waitpid(root) only, never -1
+        h = subprocess.run([sys.executable, "-c", helper, *self.fixture("orphancheck")], capture_output=True, text=True,
+                           timeout=60, env=self.env)
+        self.read_pids(1, wait=1)
+        self.assertEqual(h.stdout.strip(), "3", h.stderr)
+
+    @unittest.skipUnless(LINUX and ro._pidfd_works() and hasattr(signal, "pidfd_send_signal"), "Linux pidfd")
+    def test_f1_dead_pidfd_never_reaches_another_process(self):
+        """F1 pid-reuse property: once the pinned process is reaped, its pidfd refuses every signal (ESRCH), whatever
+        process later holds the number. Only this test's own child is involved."""
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        fd = os.pidfd_open(p.pid)
+        try:
+            p.kill(); p.wait(10)  # reaped: the number is free for reuse from here on
+            for sig in (0, signal.SIGKILL):
+                with self.assertRaises(ProcessLookupError): signal.pidfd_send_signal(fd, sig)
+        finally:
+            os.close(fd)
+            if p.poll() is None: p.kill(); p.wait(10)
+
+    def test_static_fixture_signals_only_through_pidfd(self):
+        """F1: the fixture never calls os.kill/os.killpg; in orphancheck the pidfd is opened before the guard is released
+        or reaped, and the engine is signalled (and its reap checked) only through pidfd_send_signal."""
+        with open(FIX, encoding="utf8") as fh: tree = ast.parse(fh.read())
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+        self.assertEqual([c.lineno for c in calls if c.func.attr in ("kill", "killpg") and getattr(c.func.value, "id", None) == "os"], [])
+        line = lambda attr, owner=None: [c.lineno for c in calls if c.func.attr == attr and (owner is None or ast.unparse(c.func.value) == owner)] \
+            if hasattr(ast, "unparse") else [c.lineno for c in calls if c.func.attr == attr]
+        opened, released, reaped = line("pidfd_open"), line("close", "guard.stdin"), line("wait", "guard")
+        self.assertEqual(len(opened), 1); self.assertTrue(released and reaped)
+        self.assertLess(opened[0], min(released)); self.assertLess(opened[0], min(reaped))
+        self.assertGreaterEqual(len(line("pidfd_send_signal")), 2)
 
     @unittest.skipUnless(LINUX and hasattr(os, "pidfd_open"), "Linux pidfd")
     def test_linux_identity_mismatch_is_never_signalled(self):

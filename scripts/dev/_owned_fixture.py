@@ -10,8 +10,9 @@ Every process appends an authenticated record of its own pid and kernel identity
   exit7       the root starts the child, then exits with code 7 at once
   exit0       the root starts the child, then exits with code 0 at once
   breakaway   (Windows) the child tries CREATE_BREAKAWAY_FROM_JOB and writes "breakaway-ok" or "breakaway-refused"
-  orphancheck the root starts a "guard" that starts an "engine" and exits; the root kills the engine and exits 0 when
-              it is gone within 1.5 s (as seen by kill(pid, 0)), else 3 (POSIX)
+  orphancheck the root starts a "guard" that starts an "engine"; the root pins the engine with a pidfd while the guard
+              still holds it unreaped, lets the guard exit, kills the engine through the pidfd and exits 0 when it is
+              reaped within 1.5 s (pidfd signal 0 -> ESRCH), else 3; 4 without pidfd (Linux)
   execlate    the child is seen first, then (after 1 s) replaces itself with /bin/sleep (exec; POSIX)
   slowdoublefork the root stays; the child waits 0.6 s, starts a new-session grandchild and exits, so the grandchild
               is re-parented to launchd/init while the run goes on (POSIX)
@@ -51,24 +52,38 @@ def spawn(next_level, extra=0, escape=False):
 
 
 if "orphancheck" in flags:
+    # Round 40 (F1): the engine is signalled only through a pidfd taken while its pid is provably pinned. The guard keeps
+    # the engine as its own unreaped child (it never waits) and stays alive until the root holds the pidfd, so nothing can
+    # reap the engine and its pid cannot be reused before the pidfd exists. No plain kill(pid) on this path.
     if level == 0:
         oi.write_own_record(pidfile)
-        guard = subprocess.Popen([sys.executable, __file__, mode, pidfile, "1"], stdout=subprocess.PIPE)
+        if not (hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")):
+            note("nopidfd"); sys.exit(4)  # never a plain kill: the test skips (run_owned stops the engine as its own)
+        guard = subprocess.Popen([sys.executable, __file__, mode, pidfile, "1"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         engine = int(guard.stdout.readline())
+        try:
+            fd = os.pidfd_open(engine)  # the guard is alive and blocked on its stdin: the engine is still its child
+        except OSError:
+            fd = None
+        guard.stdin.close()  # only now may the guard exit (the engine is then adopted by the tool's subreaper)
         guard.wait()
+        if fd is None:
+            note("nopidfd"); sys.exit(4)
         time.sleep(0.2)
-        os.kill(engine, signal.SIGKILL)
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
         end = time.time() + 1.5
-        while time.time() < end:
+        while time.time() < end:  # signal 0 through the pidfd: succeeds while the engine is alive or an unreaped zombie
             try:
-                os.kill(engine, 0)
-            except ProcessLookupError:
-                sys.exit(0)
+                signal.pidfd_send_signal(fd, 0)
+            except ProcessLookupError:  # reaped (by the tool's subreaper): what the test checks
+                os.close(fd); sys.exit(0)
             time.sleep(0.02)
         sys.exit(3)
-    if level == 1:  # the guard: start the engine, print its pid, exit
-        e = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(1)"])
+    if level == 1:  # the guard: start the engine, print its pid, hold it unreaped until the root has pinned it
+        e = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(1)"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         print(e.pid, flush=True)
+        sys.stdin.read()  # EOF when the root has the pidfd (or when the root has died)
         os._exit(0)
 
 if "marker" in flags and level == 0:
