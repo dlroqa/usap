@@ -793,8 +793,9 @@ ro.os.killpg = killpg
         r = self.snippet(self.KILLPG_LOG.format(inject="orig_killpg(pgid, sig)") + f"""
 code, rep = ro.run([sys.executable, "-B", {FIX!r}, "soloexit", {self.pids!r}], timeout=20, grace=1, env=dict(os.environ))
 print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_codes"], notes=rep["notes"], log=log,
-                      signalled=[x.get("pid") for x in rep["signalled"]])))
+                      signalled=[x.get("pid") for x in rep["signalled"]], diag=rep.get("attribution_diagnostics"))))
 """, timeout=90, expect=2)
+        sys.stderr.write("attribution_diagnostics: " + json.dumps(r.get("diag"), separators=(",", ":")) + "\n")  # evidence, pass or fail
         self.assertEqual((r["code"], r["cert"], r["codes"]), (0, "confirmed", []), r)
         self.assertIn("PermissionError", r["log"], "XNU returned EPERM for the zombie-only group")
         self.assertTrue(any(n["event"] == "killpg_eperm_no_live_member" for n in r["notes"]), r)
@@ -861,6 +862,356 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
         self.assertIn(4200, o.known); self.assertNotIn(4300, o.known)
         self.assertEqual(o.prov[120], 110)
         self.assertEqual(ro.mac_classify(procs[4200], procs, o.root_id, o.ever, o.prov, o.idvs, 1, 501)[0], "owned")
+
+    # ── macOS attribution diagnostics (round 33): evidence only, never a behaviour change (all platforms) ──
+    class _ZombieLib:
+        """Fake libproc for the one zombie read at root exit: returns (uniqueid, idversion), a size error, or raises."""
+        def __init__(self, uniq=100, idv=None, n=None, err=0, boom=False):
+            self.uniq, self.idv, self.n, self.err, self.boom, self.calls = uniq, idv, n, err, boom, []
+        def proc_pidinfo(self, pid, flavor, arg, ref, size):
+            self.calls.append((pid, flavor, arg))
+            if self.boom: raise RuntimeError("injected")
+            if self.n is not None: ro.ctypes.set_errno(self.err); return self.n
+            ref._obj.p_uniqueid, ref._obj.p_idversion = self.uniq, self.idv
+            return size
+
+    @staticmethod
+    def dg_rec(pid, uniq, idv, ppid, sid, orig, coal=(7, 8), puniq=None, **kw):
+        d = dict(pid=pid, uniqueid=uniq, idversion=idv, ppid=ppid, pgid=pid, sid=sid, uid=501, ruid=501, comm="x",
+                 orig_ppidversion=orig, coal=None if coal is None else list(coal), puniqueid=puniq)
+        d.update(kw); return d
+
+    def dg_exit(self, o, procs, lib=None):
+        """The root exits: reap() would see it (WNOWAIT) and take the one zombie read; the zombie reads as gone."""
+        o.lib = lib or self._ZombieLib(idv=procs[4000]["idversion"])
+        o._dg_step(); o.root_exited_flag = True; o._dg_exit()  # as reap() does: one step, then the exit
+        del procs[4000]
+        with o.lock: o.known.pop(4000, None)
+
+    def dg_unobserved_exec(self, orig=1005, exit_idv=1005, procs_extra=None):
+        """H1 shape: the root is seen at 1000, execs to 1005 unseen, forks a setsid child and exits."""
+        R = self.dg_rec
+        procs = {4000: R(4000, 100, 1000, 1, 4000, 0)}
+        o = self.synthetic_mac(procs)
+        o.scan()                                   # root seen at 1000 only
+        procs[4000]["idversion"] = exit_idv        # exec, never observed
+        self.dg_exit(o, procs, self._ZombieLib(idv=exit_idv))
+        procs[4200] = R(4200, 120, 1030, 1, 4200, orig, puniq=100)
+        procs.update(procs_extra or {})
+        o.scan(); found = o.verify()
+        return o, procs, found, o.diag_record()
+
+    def dg_cand(self, diag, uniq):
+        c = [x for x in diag["observed"]["candidates"] if x["uniqueid"] == uniq]
+        i = [x for x in diag["inferred"]["candidates"] if x["uniqueid"] == uniq]
+        self.assertEqual((len(c), len(i)), (1, 1), diag); return c[0], i[0]
+
+    def test_dg_matching_versions_admit_and_record_the_exec_history(self):
+        """Controls 1 + 7 (positive): every root version seen in order; the orphan of the post-exec root is admitted."""
+        R = self.dg_rec
+        procs = {4000: R(4000, 100, 1000, 1, 4000, 0)}
+        o = self.synthetic_mac(procs)
+        o._dg_root(procs[4000], "spawn"); o.scan()
+        procs[4000]["idversion"] = 1005; o.scan()                    # exec observed by a scan
+        self.dg_exit(o, procs)
+        procs[4200] = R(4200, 120, 1030, 1, 4200, 1005, puniq=100)    # orphan forked at 1005
+        o.scan()
+        self.assertIn(4200, o.known); self.assertEqual(o.verify(), [])
+        d = o.diag_record(); obs = d["observed"]
+        self.assertEqual(ro.validate_attribution_diagnostics(d), [], d)
+        self.assertEqual([(h["value"], h["source"]) for h in obs["root_idversion_history"]], [(1000, "spawn"), (1005, "scan")])
+        seqs = [h["first_seq"] for h in obs["root_idversion_history"]]
+        self.assertEqual(seqs, sorted(seqs)); self.assertLess(seqs[0], seqs[1])
+        self.assertEqual((obs["root_exit_read"], obs["root_exit_idversion"], obs["root_reap_status"]), ("read", 1005, "exit_observed"))
+        self.assertGreater(obs["root_exit_seq"], seqs[1])
+        self.assertEqual((obs["candidates"], obs["root_in_ever"], obs["root_prov_present"], obs["root_idvs_count"]), ([], True, True, 2))
+        self.assertIsNone(d["diag_error"])
+
+    def test_dg_unobserved_root_exec_version_is_reported_with_its_signature(self):
+        """Controls 2, 7, 8, 11: the round-32 Intel shape. The verdict is unchanged (lineage_candidate, never signalled);
+        the record shows which predicate failed and the facts that tell H1 apart."""
+        o, procs, found, d = self.dg_unobserved_exec()
+        self.assertEqual(found, [4200]); self.assertNotIn(4200, o.known)
+        self.assertIn(("lineage_candidate", 4200), {(c["code"], c.get("pid")) for c in o.reason_codes})
+        self.assertEqual(ro.validate_attribution_diagnostics(d), [], d)
+        c, i = self.dg_cand(d, 120)
+        self.assertEqual((c["idversion"], c["orig_ppidversion"], c["puniqueid"], c["puniqueid_eq_root"], c["ppid"]), (1030, 1005, 100, True, 1))
+        self.assertEqual((c["class"], c["reason_code"], c["failed_predicate"]), ("candidate", "lineage_candidate", "no_positive_lineage"))
+        self.assertEqual((c["session"], c["parent_link"], c["original_parent"], c["coalition_match"], c["consistency"]),
+                         ("sid_other", "ppid_launchd", "no_admitted_match", "same", "consistent"))
+        self.assertEqual((c["first_seen_root_alive"], c["first_seen_parent"], c["first_seen_vs_root_exit"], c["first_seen_admitted"]),
+                         (False, "launchd", "after_exit_observed", False))
+        self.assertGreater(c["first_seen_seq"], d["observed"]["root_exit_seq"])
+        self.assertEqual([h["value"] for h in d["observed"]["root_idversion_history"]], [1000])
+        self.assertEqual((i["orig_ppidversion_relation"], i["orig_ppidversion_vs_root_exit_idversion"]), ("above_max_observed", "equal"))
+        self.assertEqual(set(i["readings"]), {"orig_version_not_in_root_history", "orig_version_is_root_exit_version",
+                                              "first_seen_without_live_root", "puniqueid_names_root"})
+
+    def test_dg_original_parent_version_mismatch(self):
+        """Control 2: a version the root was never seen at, and not its exit version either."""
+        _, _, found, d = self.dg_unobserved_exec(orig=1003, exit_idv=1005)
+        self.assertEqual(found, [4200])
+        c, i = self.dg_cand(d, 120)
+        self.assertEqual((c["orig_ppidversion"], c["original_parent"]), (1003, "no_admitted_match"))
+        self.assertEqual((i["orig_ppidversion_relation"], i["orig_ppidversion_vs_root_exit_idversion"]), ("above_max_observed", "different"))
+        self.assertNotIn("orig_version_is_root_exit_version", i["readings"])
+
+    def test_dg_missing_root_version_history(self):
+        """Control 3: the root was never observed alive (already a zombie at the first census): nothing is invented."""
+        R = self.dg_rec
+        procs = {4000: R(4000, 100, 1000, 1, 4000, 0)}
+        o = self.synthetic_mac(procs)
+        self.dg_exit(o, procs, self._ZombieLib(n=0, err=ro.errno.ESRCH))
+        procs[4200] = R(4200, 120, 1030, 1, 4200, 1005, puniq=100)
+        o.scan(); o.verify(); d = o.diag_record()
+        self.assertEqual(ro.validate_attribution_diagnostics(d), [], d)
+        obs = d["observed"]; c, i = self.dg_cand(d, 120)
+        self.assertEqual((obs["root_idversion_history"], obs["root_last_alive_seq"], obs["root_exit_read"], obs["root_exit_idversion"]),
+                         ([], None, "gone", None))
+        self.assertIsNotNone(obs["root_first_unseen_seq"])
+        self.assertEqual((i["orig_ppidversion_relation"], i["orig_ppidversion_vs_root_exit_idversion"]), ("root_history_empty", "unavailable"))
+        self.assertIn("root_history_missing", i["readings"])
+        o2 = self.synthetic_mac({4000: R(4000, 100, 1000, 1, 4000, 0)}); o2.idvs = {}  # admission versions lost
+        self.assertEqual(o2.diag_record()["observed"]["root_idvs_count"], 0)
+
+    def test_dg_missing_orphan_original_parent_version(self):
+        """Control 4: a missing orig_ppidversion stays null (never 0) and is an identity error, as before."""
+        _, _, found, d = self.dg_unobserved_exec(orig=None)
+        self.assertEqual(found, [4200])
+        c, i = self.dg_cand(d, 120)
+        self.assertEqual((c["orig_ppidversion"], c["class"], c["failed_predicate"], c["original_parent"], c["reason_code"]),
+                         (None, "error", "incomplete_identity", "orig_unavailable", "identity_error"))
+        self.assertEqual((i["orig_ppidversion_relation"], i["orig_ppidversion_vs_root_exit_idversion"]), ("unavailable", "unavailable"))
+
+    def test_dg_missing_parent_admission_record(self):
+        """Control 5: the original parent's version is known but its admission record (provenance) is missing."""
+        R = self.dg_rec
+        procs = {4000: R(4000, 100, 1000, 1, 4000, 0), 4100: R(4100, 110, 1010, 4000, 4000, 1000)}
+        o = self.synthetic_mac(procs); o.scan(); self.assertIn(4100, o.known)
+        del procs[4100]; o.known.pop(4100); del o.prov[110]          # corrupted record: 110 no longer explained
+        procs[4200] = R(4200, 120, 1030, 1, 4200, 1010, puniq=110)
+        o.verify(); d = o.diag_record(); c, i = self.dg_cand(d, 120)
+        self.assertEqual((c["class"], c["original_parent"], c["puniqueid_eq_root"]), ("candidate", "version_known_owner_unexplained", False))
+        self.assertEqual(i["orig_ppidversion_relation"], "above_max_observed")
+        o3 = self.synthetic_mac({4000: R(4000, 100, 1000, 1, 4000, 0)}); o3.ever = set(); o3.prov = {}
+        self.assertEqual((o3.diag_record()["observed"]["root_in_ever"], o3.diag_record()["observed"]["root_prov_present"]), (False, False))
+
+    def test_dg_stale_admission_record_and_link_seen_while_root_alive(self):
+        """Controls 6 + 8: a parent link that disagrees with orig_ppidversion while the root is alive (H2 shape): the
+        child is first seen BEFORE the exit, under the live root, and the broken link is named."""
+        R = self.dg_rec
+        procs = {4000: R(4000, 100, 1000, 1, 4000, 0), 4200: R(4200, 120, 1030, 4000, 4200, 999, puniq=100)}
+        o = self.synthetic_mac(procs); o.scan()
+        self.assertNotIn(4200, o.known)
+        o.verify(); d = o.diag_record(); c, i = self.dg_cand(d, 120)
+        self.assertEqual((c["class"], c["failed_predicate"], c["parent_link"], c["consistency"]),
+                         ("error", "broken_lineage_link", "parent_known_link_mismatch", "not_checked"))
+        self.assertEqual((c["first_seen_parent"], c["first_seen_root_alive"], c["first_seen_vs_root_exit"]), ("root", True, "root_exit_not_observed"))
+        first = c["first_seen_seq"]
+        self.dg_exit(o, procs); procs[4200]["ppid"] = 1; o.scan(); o.scan()  # re-seen as an orphan: the FIRST sighting stays
+        d = o.diag_record(); c, _ = self.dg_cand(d, 120)
+        self.assertEqual((c["first_seen_seq"], c["first_seen_parent"], c["first_seen_root_alive"], c["first_seen_vs_root_exit"]),
+                         (first, "root", True, "before_exit_observed"))
+
+    def test_dg_query_returning_no_information(self):
+        """Control 9: an empty census, an unread coalition and a vanished zombie are recorded as such."""
+        R = self.dg_rec
+        procs = {4000: R(4000, 100, 1000, 1, 4000, 0)}
+        o = self.synthetic_mac(procs); o.scan()
+        procs.clear(); o.verify()
+        d = o.diag_record(); self.assertEqual(ro.validate_attribution_diagnostics(d), [], d)
+        self.assertEqual(d["observed"]["candidates"], [])
+        _, _, found, d = self.dg_unobserved_exec(procs_extra={4300: R(4300, 130, 1040, 1, 4300, 4242, coal=None)})
+        c, _ = self.dg_cand(d, 130)
+        self.assertEqual((c["class"], c["failed_predicate"], c["coalition_match"]), ("error", "coalition_unreadable", "not_read"))
+
+    def test_dg_query_failure_or_inconsistent_identity(self):
+        """Control 10: a failing census keeps scan_error; a zombie read that fails or names another process is kept
+        out of the evidence (no idversion invented)."""
+        R = self.dg_rec
+        procs = {4000: R(4000, 100, 1000, 1, 4000, 0)}
+        o = self.synthetic_mac(procs); o.scan()
+        def fail(record_errors=True, floor=None): raise ro._QueryError(ro.errno.EAGAIN, "injected")
+        o._census = fail; o.verify()
+        self.assertIn("scan_error", [c["code"] for c in o.reason_codes])
+        self.assertEqual(ro.validate_attribution_diagnostics(o.diag_record()), [])
+        for lib, want in ((self._ZombieLib(uniq=999, idv=1005), "identity_mismatch"), (self._ZombieLib(n=-1, err=ro.errno.EPERM), "error"),
+                          (self._ZombieLib(boom=True), "error")):
+            o = self.synthetic_mac({4000: R(4000, 100, 1000, 1, 4000, 0)})
+            o.lib = lib; o.root_exited_flag = True; o._dg_exit()
+            obs = o.diag_record()["observed"]
+            self.assertEqual((obs["root_exit_read"], obs["root_exit_idversion"]), (want, None), lib.__dict__)
+            self.assertEqual(lib.calls, [(4000, ro._PROC_PIDUNIQIDENTIFIERINFO, 1)])
+        o._dg_exit(); self.assertEqual(len(lib.calls), 1, "the zombie read happens once per run")
+
+    def test_dg_failed_predicate_matches_the_classifier(self):
+        """Control 11: on every row of the classifier table the diagnostic class/predicate is the classifier's own, and
+        the sub-outcomes never contradict it."""
+        me, uid = 99999, 501
+        root = dict(uniqueid=100, idversion=1000, uid=uid, ruid=uid, coal=[7, 8])
+        known, prov, idvs = {100, 110}, {100: None, 110: 100}, {100: {1000}, 110: {1010, 1011}}
+        def rec(**kw):
+            d = dict(pid=5000, ppid=1, uid=uid, ruid=uid, uniqueid=200, idversion=2000, orig_ppidversion=0, coal=[7, 8], sid=5000)
+            d.update(kw); return d
+        procs = {40: rec(pid=40, uniqueid=50, idversion=500), 4100: rec(pid=4100, uniqueid=110, idversion=1011),
+                 4101: rec(pid=4101, uniqueid=110, idversion=1012)}  # 110 now at an exec version not yet in idvs
+        rows = [rec(ppid=4101, orig_ppidversion=1012), rec(), rec(coal=[9, 10]), rec(coal=[0, 0]), rec(coal=None, coal_err=1), rec(uniqueid=None), rec(uniqueid=60),
+                rec(uid=0, ruid=0), rec(ppid=40), rec(orig_ppidversion=1010), rec(orig_ppidversion=1010, idversion=900),
+                rec(ppid=4100, orig_ppidversion=1011), rec(ppid=4100, orig_ppidversion=4242), rec(uniqueid=110), rec(ppid=777)]
+        seen = set()
+        for p in rows:
+            cls, why = ro.mac_classify(p, procs, root, known, prov, idvs, me, uid)
+            e = ro.mac_attribution_explain(p, procs, root, known, prov, idvs, me, uid, True, 4000)
+            self.assertEqual((e["class"], e["failed_predicate"]), (cls, ro._DG_WHY.get(why, "other")), p)
+            self.assertNotEqual(e["consistency"], "inconsistent", (p, e)); seen.add(e["failed_predicate"])
+            errs = []; ro._dg_check(e, ("obj", ro._DG_CAND_SCHEMA), "e", errs); self.assertEqual(errs, [], e)
+        self.assertTrue({"no_positive_lineage", "coalition_zero", "coalition_unreadable", "incomplete_identity", "unadmitted_original_parent",
+                         "unadmitted_parent", "broken_lineage_link", "lineage_gap"} <= seen, seen)
+        e = ro.mac_attribution_explain(rec(orig_ppidversion=1010), procs, root, known, prov, idvs, me, uid, True, 4000)
+        self.assertEqual((e["original_parent"], e["consistency"]), ("matches_admitted_idv_gt", "consistent"))
+
+    def test_dg_output_size_bounds_and_truncation(self):
+        """Control 12: bounded lists with explicit counts; the worst case stays under the size bound; the validator
+        rejects unknown keys, wrong types, unknown values and oversized lists."""
+        R = self.dg_rec
+        procs = {4000: R(4000, 100, 1000, 1, 4000, 0)}
+        o = self.synthetic_mac(procs)
+        for v in range(1000, 1020): procs[4000]["idversion"] = v; o.scan()
+        self.dg_exit(o, procs)
+        for n in range(300):
+            procs[10000 + n] = R(10000 + n, 1000 + n, 5000 + n, 1, 10000 + n, 3_000_000_000 + n, puniq=2 ** 63 + n)
+        o.scan(); o.verify(); d = o.diag_record(); obs = d["observed"]
+        self.assertEqual(ro.validate_attribution_diagnostics(d), [], d)
+        self.assertEqual((len(obs["root_idversion_history"]), obs["root_idversion_history_truncated"]), (ro._DG_HIST_MAX, True))
+        self.assertEqual((obs["first_seen_count"], obs["first_seen_drops"] > 0), (ro._DG_SEEN_MAX, True))
+        self.assertEqual((len(obs["candidates"]), obs["candidates_dropped"]), (ro._DG_CAND_MAX, 300 - ro._DG_CAND_MAX))
+        self.assertTrue(any(c["first_seen_seq"] == "unknown_truncated" for c in obs["candidates"]) or all(type(c["first_seen_seq"]) is int for c in obs["candidates"]))
+        size = len(ro.json.dumps(d, separators=(",", ":"))); self.assertLessEqual(size, ro._DG_JSON_MAX)
+        orig_max = ro._DG_JSON_MAX
+        try:
+            ro._DG_JSON_MAX = size - 1  # the size bound itself is enforced (not only the list bounds)
+            self.assertIn("diag: larger than the size bound", ro.validate_attribution_diagnostics(d))
+            self.assertEqual(o.diag_record(), {"schema": 1, "diag_error": "validation_failed"})
+        finally:
+            ro._DG_JSON_MAX = orig_max
+        print(f"  worst-case attribution_diagnostics size: {size} bytes (bound {ro._DG_JSON_MAX})", file=sys.stderr)
+        bad = []
+        x = json.loads(json.dumps(d)); x["observed"]["cmdline"] = 1; bad.append(x)
+        x = json.loads(json.dumps(d)); x["observed"]["root_reap_status"] = "free text"; bad.append(x)
+        x = json.loads(json.dumps(d)); x["observed"]["candidates"].append(dict(x["observed"]["candidates"][0])); bad.append(x)
+        x = json.loads(json.dumps(d)); x["observed"]["root_idvs_count"] = True; bad.append(x)
+        x = json.loads(json.dumps(d)); x["observed"]["root_exit_seq"] = "5"; bad.append(x)
+        x = json.loads(json.dumps(d)); x["observed"]["candidates"][0]["comm"] = "Python"; bad.append(x)
+        x = json.loads(json.dumps(d)); x["schema"] = None; bad.append(x)
+        x = {"schema": 1, "diag_error": None, "observed": {"root_idversion_history": [{"value": 2 ** 2000, "first_seq": 1, "source": "scan"}]}}; bad.append(x)
+        for b in bad: self.assertTrue(ro.validate_attribution_diagnostics(b), b if len(str(b)) < 300 else str(b)[:300])
+        o.__dict__["_dg_state"]["hist"].append({"value": 7, "first_seq": 0, "source": "bogus"})  # corrupted state
+        self.assertEqual(o.diag_record(), {"schema": 1, "diag_error": "validation_failed"})
+        o.__dict__["_dg_state"]["hist"].append({"value": "x", "first_seq": 0, "source": "scan"})  # cannot even be built
+        self.assertEqual(o.diag_record(), {"schema": 1, "diag_error": "exception"})
+
+    def test_dg_sensitive_text_is_never_reported(self):
+        """Control 13: names, command lines, environments and paths never reach the diagnostics."""
+        M = "SENSITIVE_MARKER_7f3a"
+        extra = dict(comm=M, cmdline=[M], env={M: M}, cwd="/" + M, path="/" + M, url="https://" + M)
+        _, _, found, d = self.dg_unobserved_exec(procs_extra={4300: self.dg_rec(4300, 130, 1040, 1, 4300, 4242, **extra)})
+        self.assertIn(4300, found)
+        blob = json.dumps(d); self.assertNotIn(M, blob); self.assertNotIn("Python", blob)
+        def leaves(x):
+            if isinstance(x, dict):
+                for v in x.values(): yield from leaves(v)
+            elif isinstance(x, list):
+                for v in x: yield from leaves(v)
+            else: yield x
+        for v in leaves(d): self.assertTrue(v is None or type(v) in (int, bool, str), v)
+        self.assertEqual(ro.validate_attribution_diagnostics(d), [])
+
+    def dg_scenario(self, mode):
+        """One H1-shaped run with the diagnostics normal / disabled / raising; returns the decision-relevant state."""
+        R = self.dg_rec
+        procs = {4000: R(4000, 100, 1000, 1, 4000, 0), 4100: R(4100, 110, 1010, 4000, 4000, 1000)}
+        o = self.synthetic_mac(procs)
+        o._q = lambda pid, floor=None: dict(procs[pid]) if pid in procs else None
+        calls = {"census": 0, "deliver": 0, "coal": 0}
+        census = o._census
+        def counted(record_errors=True, floor=None):
+            calls["census"] += 1; return census(record_errors, floor)
+        o._census = counted
+        o._deliver = lambda *a: calls.__setitem__("deliver", calls["deliver"] + 1)
+        o.coal = lambda pid: (calls.__setitem__("coal", calls["coal"] + 1), [7, 8])[1]
+        saved = {}
+        if mode != "normal":
+            def boom(*a, **kw): raise RuntimeError("injected diagnostics fault")
+            for name in ("_dg_step", "_dg_root", "_dg_scan", "_dg_exit", "_dg_reap", "_dg_cand"):
+                saved[name] = getattr(ro.MacOwner, name)
+                setattr(ro.MacOwner, name, ro._diag_safe(boom) if mode == "raising" else (lambda self, *a, **kw: None))
+        try:
+            o.scan(); o.scan()
+            procs[4000]["idversion"] = 1005
+            self.dg_exit(o, procs)
+            procs[4200] = R(4200, 120, 1030, 1, 4200, 1005, puniq=100)    # H1: unseen root version
+            procs[4300] = R(4300, 130, 1040, 1, 4300, 1000)               # admitted via the observed version
+            o.scan(); o.alive(); found = o.verify(); o.signal(4100, signal.SIGTERM)
+            state = dict(known=sorted(o.known), prov=dict(o.prov), ever=sorted(o.ever), idvs={k: sorted(v) for k, v in o.idvs.items()},
+                         found=found, codes=list(o.reason_codes), reasons=list(o.uncertain_reasons), escaped=list(o.escaped_seen),
+                         notes=list(getattr(o, "notes", [])), calls=dict(calls))
+            return state, o.diag_record()
+        finally:
+            for name, fn in saved.items(): setattr(ro.MacOwner, name, fn)
+
+    def test_dg_verdict_cleanup_and_signals_unchanged(self):
+        """Controls 14 + 15: diagnostics on, off, or failing on every hook give the same ownership state, reasons,
+        candidates and signals, and add no census, coalition read or signal."""
+        on, d_on = self.dg_scenario("normal")
+        off, _ = self.dg_scenario("disabled")
+        bad, d_bad = self.dg_scenario("raising")
+        self.assertEqual(on, off); self.assertEqual(on, bad)
+        self.assertEqual(on["found"], [4200]); self.assertIn(4300, on["known"])
+        self.assertEqual(on["calls"]["deliver"], 1, "only the explicit signal to the known process")
+        self.assertIsNone(d_on["diag_error"]); self.assertEqual(d_bad["diag_error"], "exception")
+        self.assertEqual(ro.validate_attribution_diagnostics(d_bad), [])
+
+    def test_dg_report_key_never_changes_the_exit_code(self):
+        """Control 14 (driver): an owner without diagnostics reports null; one whose diag_record raises still gives the
+        same exit code and certification."""
+        orig = ro.make_owner
+        try:
+            ro.make_owner = lambda: self.Fake()
+            c1, r1 = ro.run(["unused"], timeout=1, grace=0.05)
+            f = self.Fake(); f.diag_record = lambda: (_ for _ in ()).throw(RuntimeError("x")); ro.make_owner = lambda: f
+            c2, r2 = ro.run(["unused"], timeout=1, grace=0.05)
+        finally:
+            ro.make_owner = orig
+        self.assertIsNone(r1["attribution_diagnostics"])
+        self.assertEqual(r2["attribution_diagnostics"], {"schema": 1, "diag_error": "exception"})
+        self.assertEqual((c1, r1["certification"]), (c2, r2["certification"]))
+
+    def test_dg_static_write_only_and_no_signals(self):
+        """Control 15 (static): outside the diagnostics, MacOwner only CALLS self._dg_* as statements (their result is
+        never used, so no decision can read them); the diagnostics never signal, add reasons/notes or query processes,
+        apart from the one zombie read in _dg_exit."""
+        import ast
+        with open(TOOL, encoding="utf8") as fh: tree = ast.parse(fh.read())
+        mac = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MacOwner"][0]
+        forbidden = {"kill", "killpg", "_deliver", "token_signal", "_reason", "_coal_into", "_q", "_census", "_all", "coal",
+                     "signal", "_signal_group", "sig_tok", "waitid", "waitpid"}
+        def attrs(node): return {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+        for fn in [n for n in mac.body if isinstance(n, ast.FunctionDef)]:
+            if fn.name.startswith("_dg") or fn.name == "diag_record":
+                self.assertFalse(attrs(fn) & forbidden, (fn.name, attrs(fn) & forbidden))
+                n_pidinfo = sum(1 for n in ast.walk(fn) if isinstance(n, ast.Attribute) and n.attr == "proc_pidinfo")
+                self.assertEqual(n_pidinfo, 1 if fn.name == "_dg_exit" else 0, fn.name)
+                continue
+            uses = [n for n in ast.walk(fn) if isinstance(n, ast.Attribute) and n.attr.startswith("_dg")]
+            stmt_calls = [n.value.func for n in ast.walk(fn) if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+                          and isinstance(n.value.func, ast.Attribute) and n.value.func.attr.startswith("_dg_")]
+            self.assertEqual(len(uses), len(stmt_calls), f"{fn.name} reads diagnostic state")
+        for name in ("mac_attribution_explain", "_dg_relation"):
+            fn = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name][0]
+            self.assertFalse(attrs(fn) & forbidden, name)
+            calls = {n.func.id for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            self.assertTrue(calls <= {"mac_classify", "_mac_explained", "_mac_link_ok", "_dg_int", "type", "isinstance", "any",
+                                      "max", "min", "dict", "int", "len"}, calls)
 
     # ── certification layers, each on its own (a fake owner: no processes are started or signalled) ──
     class Fake:

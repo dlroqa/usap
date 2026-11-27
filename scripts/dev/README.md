@@ -30,7 +30,10 @@ are still stopped, and a process still running after a denied signal is a surviv
 the root's process group after the root has exited returns EPERM when only the zombie root is left (XNU skips zombie
 members); that is treated as harmless only when a complete census right after it finds no live member, and is kept in
 the report's `notes`. A live member, or a census that cannot be completed, still rules out "confirmed". Every owned
-process, in the group or not, is verified on its own either way.
+process, in the group or not, is verified on its own either way. On macOS, the report's `attribution_diagnostics`
+records why an unexplained process could not be attributed to the run (the root's observed identity versions, when
+each process was first seen, the outcome of each admission check), as integers, booleans and fixed values only, never
+names, command lines, environments or paths. It is evidence only: it never changes the result or what is signalled.
 
 Exit codes (a command that itself exits 120, 121, 124, 125 or 127 is told apart only by the report): the command's own
 code when confirmed; 128+N if it died from signal N; 124 timeout; 130/143 this tool was interrupted; **120 processes

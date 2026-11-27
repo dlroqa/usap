@@ -47,7 +47,9 @@ group_signal_denied, group_membership_unknown, stop_failed, kill_rounds_unclean,
 no option waives one. A signal that fails is never taken as termination: one process's failure never stops the others
 being signalled, and a process that still runs after a denied signal is a survivor (120). Non-blocking evidence, such
 as a macOS group signal that found only the zombie root (EPERM with no live member, checked by a census), is in
-report "notes"; it never replaces the per-process verification.
+report "notes"; it never replaces the per-process verification. On macOS, report "attribution_diagnostics" records,
+with typed and bounded fields only, why an unexplained process could not be attributed (root identity-version history,
+first sightings, the outcome of each admission predicate); it is evidence only and never changes a result.
 Exit codes: the command's own code when certified; 128+N if it died from signal N (POSIX); 124 timeout; 130/143 this
 tool was interrupted; 120 survivors (overrides all others); 125 tool error or unsupported containment; 127 the command
 could not be started; 121 not certified ("uncertain"). A command
@@ -472,6 +474,186 @@ def mac_classify(p, procs, root, known_uniq, prov, idvs, me, my_uid):
     return "candidate", "same coalition, no lineage to the root"
 
 
+# ── macOS attribution diagnostics (evidence only) ────────────────────────────────────────────────────────────────────
+# Why was a process left unexplained? The report key "attribution_diagnostics" records it with typed, bounded fields:
+# integers, booleans and fixed enum strings only (never a name, command line, environment, path or free text). The
+# bookkeeping is WRITE-ONLY: no ownership decision (scan, alive, reap, signal, verify, mac_classify) reads it, it never
+# adds a reason code or note, never signals, and every hook swallows its own errors (diag_error). "observed" holds what
+# the kernel or this tool recorded; "inferred" holds readings derived from it, which are not facts.
+_DG_HIST_MAX, _DG_CAND_MAX, _DG_SEEN_MAX, _DG_READ_MAX, _DG_JSON_MAX = 8, 8, 256, 6, 8192
+_DG_WHY = {"same coalition, no lineage to the root": "no_positive_lineage", "lineage gap": "lineage_gap",
+           "broken lineage link": "broken_lineage_link", "provenance missing": "provenance_missing",
+           "incomplete identity": "incomplete_identity", "coalition unreadable": "coalition_unreadable",
+           "coalition 0": "coalition_zero", "original parent is ours": "unadmitted_original_parent",
+           "parent is ours": "unadmitted_parent"}
+_DG_CLASS_CODE = {"candidate": "lineage_candidate", "error": "identity_error", "unadmitted": "unadmitted_owned"}
+
+
+def _dg_int(v):
+    return v if type(v) is int else None
+
+
+def mac_attribution_explain(p, procs, root, known_uniq, prov, idvs, me, my_uid, pinned, root_pid):
+    """Pure (no system calls, no state changes): the outcome of every N2' admission predicate for one process.
+    The class comes from mac_classify itself; the sub-outcomes mirror its predicates and are cross-checked against
+    that class ("consistency"), so a divergence shows up instead of being reported as evidence."""
+    cls, why = mac_classify(p, procs, root, known_uniq, prov, idvs, me, my_uid)
+    ru = root["uniqueid"]
+    sid = p.get("sid")
+    session = "not_pinned" if not pinned else ("sid_unavailable" if type(sid) is not int else
+                                              ("sid_is_root" if sid == root_pid else "sid_other"))
+    c = p.get("coal")
+    if p.get("coal_err") is not None: coalition = "unreadable"
+    elif not isinstance(c, (list, tuple)) or not c: coalition = "not_read"
+    elif c[0] == 0: coalition = "zero"
+    else: coalition = "same" if c[0] == root["coal"][0] else "other"
+    opv, idv = _dg_int(p.get("orig_ppidversion")), _dg_int(p.get("idversion"))
+    if opv is None:
+        orig = "orig_unavailable"
+    else:
+        owners = [u for u, vs in idvs.items() if opv in vs]
+        if any(u in known_uniq and _mac_explained(u, ru, prov) for u in owners):
+            orig = "matches_admitted_idv_gt" if idv is not None and idv > opv else "matches_admitted_idv_not_gt"
+        else:
+            orig = "version_known_owner_unexplained" if owners else "no_admitted_match"
+    pp = _dg_int(p.get("ppid"))
+    if pp is None: parent = "parent_identity_incomplete"
+    elif pp in (0, 1): parent = "ppid_launchd"
+    else:
+        par = procs.get(pp)
+        if par is None: parent = "parent_not_in_census"
+        elif _dg_int(par.get("uniqueid")) is None: parent = "parent_identity_incomplete"
+        elif par["uniqueid"] in known_uniq:
+            ok = opv is not None and _mac_explained(par["uniqueid"], ru, prov) and \
+                _mac_link_ok(p, par["uniqueid"], par.get("idversion"), idvs)
+            parent = "parent_known_link_ok" if ok else "parent_known_link_mismatch"
+        elif par["uniqueid"] < ru: parent = "parent_older_than_root"
+        else: parent = "parent_unadmitted"
+    expected = None  # what the sub-outcomes imply, where they decide it alone
+    if cls in ("candidate", "unadmitted") and coalition == "same":
+        if orig == "matches_admitted_idv_gt" or parent == "parent_known_link_ok": expected = "unadmitted"
+        elif parent == "ppid_launchd": expected = "candidate"
+    consistency = "not_checked" if expected is None else ("consistent" if expected == cls else "inconsistent")
+    puq = _dg_int(p.get("puniqueid"))
+    return {"pid": _dg_int(p.get("pid")), "uniqueid": _dg_int(p.get("uniqueid")), "idversion": idv,
+            "orig_ppidversion": opv, "ppid": pp, "puniqueid": puq,
+            "puniqueid_eq_root": None if puq is None else puq == ru,
+            "class": cls, "reason_code": _DG_CLASS_CODE.get(cls, "none"), "failed_predicate": _DG_WHY.get(why, "other"),
+            "session": session, "parent_link": parent, "original_parent": orig, "coalition_match": coalition,
+            "consistency": consistency}
+
+
+def _dg_relation(opv, values):
+    """Inferred: where a child's original-parent version lies relative to the root versions this tool observed."""
+    if type(opv) is not int: return "unavailable"
+    if not values: return "root_history_empty"
+    if opv in values: return "equal_observed"
+    if opv > max(values): return "above_max_observed"
+    if opv < min(values): return "below_min_observed"
+    return "between_unobserved"
+
+
+_E = lambda *v: ("enum", frozenset(v))
+_INT, _INTN, _BOOL, _BOOLN = ("int", False), ("int", True), ("bool", False), ("bool", True)
+_DG_SEQ_OR = ("int_or_enum", frozenset({"never", "unknown_truncated"}))
+_DG_CAND_SCHEMA = {
+    "pid": _INTN, "uniqueid": _INTN, "idversion": _INTN, "orig_ppidversion": _INTN, "ppid": _INTN, "puniqueid": _INTN,
+    "puniqueid_eq_root": _BOOLN,
+    "class": _E("owned", "unadmitted", "candidate", "excluded", "error"),
+    "reason_code": _E("lineage_candidate", "identity_error", "unadmitted_owned", "none"),
+    "failed_predicate": _E(*_DG_WHY.values(), "other"),
+    "session": _E("not_pinned", "sid_unavailable", "sid_is_root", "sid_other"),
+    "parent_link": _E("parent_identity_incomplete", "ppid_launchd", "parent_not_in_census", "parent_known_link_ok",
+                      "parent_known_link_mismatch", "parent_older_than_root", "parent_unadmitted"),
+    "original_parent": _E("orig_unavailable", "matches_admitted_idv_gt", "matches_admitted_idv_not_gt",
+                          "version_known_owner_unexplained", "no_admitted_match"),
+    "coalition_match": _E("unreadable", "not_read", "zero", "same", "other"),
+    "consistency": _E("consistent", "inconsistent", "not_checked"),
+    "first_seen_seq": _DG_SEQ_OR,
+    "first_seen_parent": _E("root", "launchd", "admitted", "absent", "other", "unknown"),
+    "first_seen_root_alive": _BOOLN, "first_seen_admitted": _BOOLN,
+    "first_seen_vs_root_exit": _E("before_exit_observed", "after_exit_observed", "root_exit_not_observed", "unknown"),
+}
+_DG_SCHEMA = {
+    "schema": _INT,
+    "diag_error": ("enum", frozenset({"exception", "validation_failed"}), True),
+    "observed": ("obj", {
+        "root_uniqueid": _INTN,
+        "root_idversion_history": ("list", _DG_HIST_MAX, ("obj", {
+            "value": _INT, "first_seq": _INT, "source": _E("spawn", "alive", "scan", "signal")})),
+        "root_idversion_history_truncated": _BOOL,
+        "root_last_alive_seq": _INTN, "root_first_unseen_seq": _INTN, "root_exit_seq": _INTN,
+        "root_exit_read": _E("not_attempted", "read", "gone", "identity_mismatch", "error"),
+        "root_exit_idversion": _INTN,
+        "root_reap_status": _E("not_observed", "exit_observed", "reaped_by_close", "reaped_elsewhere", "unreaped_timeout"),
+        "root_in_ever": _BOOL, "root_prov_present": _BOOL, "root_idvs_count": _INT,
+        "seq_final": _INT, "first_seen_count": _INT, "first_seen_drops": _INT,
+        "candidates": ("list", _DG_CAND_MAX, ("obj", _DG_CAND_SCHEMA)),
+        "candidates_dropped": _INT,
+    }),
+    "inferred": ("obj", {
+        "candidates": ("list", _DG_CAND_MAX, ("obj", {
+            "uniqueid": _INTN,
+            "orig_ppidversion_relation": _E("unavailable", "root_history_empty", "equal_observed", "above_max_observed",
+                                            "below_min_observed", "between_unobserved"),
+            "orig_ppidversion_vs_root_exit_idversion": _E("equal", "different", "unavailable"),
+            "readings": ("list", _DG_READ_MAX, _E(
+                "orig_version_not_in_root_history", "orig_version_is_root_exit_version", "root_history_missing",
+                "first_seen_without_live_root", "never_seen_before_verify", "puniqueid_names_root",
+                "admission_record_inconsistent", "explain_inconsistent")),
+        })),
+    }),
+}
+
+
+def _dg_check(x, spec, path, errs):
+    kind = spec[0]
+    if kind == "obj":
+        if type(x) is not dict: errs.append(f"{path}: not an object"); return
+        for k, v in x.items():
+            if k not in spec[1]: errs.append(f"{path}.{k}: not allowed"); continue
+            _dg_check(v, spec[1][k], f"{path}.{k}", errs)
+        return
+    if kind == "list":
+        if type(x) is not list: errs.append(f"{path}: not a list"); return
+        if len(x) > spec[1]: errs.append(f"{path}: longer than {spec[1]}")
+        for i, v in enumerate(x): _dg_check(v, spec[2], f"{path}[{i}]", errs)
+        return
+    nullable = len(spec) > 2 and spec[2] if kind == "enum" else (kind in ("int", "bool") and spec[1])
+    if x is None:
+        if not nullable: errs.append(f"{path}: null")
+        return
+    if kind == "int" and (type(x) is not int or not -2 ** 63 <= x < 2 ** 64): errs.append(f"{path}: not a 64-bit int")
+    elif kind == "bool" and type(x) is not bool: errs.append(f"{path}: not a bool")
+    elif kind == "enum" and (type(x) is not str or x not in spec[1]): errs.append(f"{path}: not an allowed value")
+    elif kind == "int_or_enum" and not ((type(x) is int and -2 ** 63 <= x < 2 ** 64) or (type(x) is str and x in spec[1])):
+        errs.append(f"{path}: not an int or an allowed value")
+
+
+def validate_attribution_diagnostics(d):
+    """[] if d obeys the allowlist (keys, types, enums, list bounds, total size), else the list of violations."""
+    errs = []
+    _dg_check(d, ("obj", _DG_SCHEMA), "diag", errs)
+    if type(d) is dict and ("schema" not in d or "diag_error" not in d): errs.append("diag: schema/diag_error missing")
+    try:
+        if len(json.dumps(d, separators=(",", ":"))) > _DG_JSON_MAX: errs.append("diag: larger than the size bound")
+    except (TypeError, ValueError):
+        errs.append("diag: not serializable")
+    return errs
+
+
+def _diag_safe(fn):
+    """Diagnostics never affect the run: any error inside a hook is recorded as diag_error and swallowed."""
+    def wrapper(self, *a, **kw):
+        try:
+            fn(self, *a, **kw)
+        except Exception:  # noqa: BLE001
+            try: self.__dict__["_dg_error"] = "exception"
+            except Exception: pass  # noqa: BLE001
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
 class MacOwner(ReasonsMixin):
     """macOS, model N2' (validated natively on hosted macOS 15 arm64 and Intel by the bench PoC, run 45913017857):
       * Identity is the kernel's p_uniqueid (never reused within a boot, kept across exec); p_idversion changes on
@@ -560,7 +742,8 @@ class MacOwner(ReasonsMixin):
         if int(s.pbsi_status) == _SZOMB: return None
         return {"pid": pid, "ppid": int(s.pbsi_ppid), "pgid": int(s.pbsi_pgid), "sid": sid, "uid": int(s.pbsi_uid),
                 "ruid": int(s.pbsi_ruid), "comm": s.pbsi_comm.decode("ascii", "replace")[:16],
-                "uniqueid": int(u2.p_uniqueid), "idversion": int(u2.p_idversion), "orig_ppidversion": int(u2.p_orig_ppidversion)}
+                "uniqueid": int(u2.p_uniqueid), "idversion": int(u2.p_idversion), "orig_ppidversion": int(u2.p_orig_ppidversion),
+                "puniqueid": int(u2.p_puniqueid)}  # diagnostics only (never ownership evidence)
 
     def coal(self, pid):
         c = self._pidinfo(pid, _PROC_PIDCOALITIONINFO, _CoalInfo())
@@ -582,6 +765,129 @@ class MacOwner(ReasonsMixin):
         if n >= len(buf):  # the list may have been cut off: never a complete census
             raise _QueryError(errno.EOVERFLOW, "proc_listallpids filled the whole buffer")
         return [buf[i] for i in range(n) if buf[i] > 0]
+
+    # attribution diagnostics (write-only; see mac_attribution_explain) -------------------------------------------------
+    def _dg(self):
+        d = self.__dict__.get("_dg_state")
+        if d is None:
+            d = self.__dict__["_dg_state"] = {
+                "seq": 0, "hist": [], "hist_trunc": False, "last_alive": None, "first_unseen": None, "exit_seq": None,
+                "exit_read": "not_attempted", "exit_idv": None, "reap": "not_observed", "seen": {}, "seen_drops": 0,
+                "cand": {}, "cand_dropped": set()}
+        return d
+
+    @_diag_safe
+    def _dg_step(self):
+        self._dg()["seq"] += 1
+
+    @_diag_safe
+    def _dg_root(self, q, source):
+        """One observation of the root: q is its live identity, or None (gone, zombie, or the pid changed hands)."""
+        d, ru = self._dg(), (self.root_id or {}).get("uniqueid")
+        if q is None or ru is None or q.get("older") or q.get("uniqueid") != ru:
+            if d["first_unseen"] is None and source != "spawn": d["first_unseen"] = d["seq"]
+            return
+        d["last_alive"] = d["seq"]
+        v = q["idversion"]
+        if any(h["value"] == v for h in d["hist"]): return
+        if len(d["hist"]) >= _DG_HIST_MAX: d["hist_trunc"] = True; return
+        d["hist"].append({"value": int(v), "first_seq": d["seq"], "source": source})
+
+    @_diag_safe
+    def _dg_scan(self, procs):
+        """First sighting of every same-user process newer than the root, from the census scan() already holds."""
+        d, ru, uid = self._dg(), self.root_id["uniqueid"], self.root_id["uid"]
+        rq = procs.get(self.root)
+        self._dg_root(rq, "scan")
+        root_alive = rq is not None and not rq.get("older") and rq.get("uniqueid") == ru
+        seen = d["seen"]
+        for q in procs.values():
+            u = q["uniqueid"]
+            if u in seen or u <= ru or q.get("older") or (q.get("uid") != uid and q.get("ruid") != uid): continue
+            if len(seen) >= _DG_SEEN_MAX: d["seen_drops"] += 1; continue
+            pp = procs.get(q["ppid"])
+            kind = ("launchd" if q["ppid"] in (0, 1) else "absent" if pp is None else
+                    "root" if pp.get("uniqueid") == ru else "admitted" if pp.get("uniqueid") in self.ever else "other")
+            d["seen"][q["uniqueid"]] = (d["seq"], kind, root_alive, q["uniqueid"] in self.ever)
+
+    @_diag_safe
+    def _dg_exit(self):
+        """At the first observed root exit: ONE read of the zombie root's final identity version (libproc flavor 17
+        with arg 1 looks up zombies; the pid is ours and unreaped, and the uniqueid must match)."""
+        d = self._dg()
+        if d["exit_seq"] is not None: return
+        d["exit_seq"], d["reap"] = d["seq"], "exit_observed"
+        try:
+            st = _UniqInfo()
+            ctypes.set_errno(0)
+            n = self.lib.proc_pidinfo(self.root, _PROC_PIDUNIQIDENTIFIERINFO, 1, ctypes.byref(st), ctypes.sizeof(st))
+            if n != ctypes.sizeof(st): d["exit_read"] = "gone" if ctypes.get_errno() in (0, errno.ESRCH) else "error"
+            elif int(st.p_uniqueid) != self.root_id["uniqueid"]: d["exit_read"] = "identity_mismatch"
+            else: d["exit_read"], d["exit_idv"] = "read", int(st.p_idversion)
+        except Exception:  # noqa: BLE001
+            d["exit_read"] = "error"
+
+    @_diag_safe
+    def _dg_reap(self, what):
+        self._dg()["reap"] = what
+
+    @_diag_safe
+    def _dg_cand(self, q, procs, me):
+        d, key = self._dg(), (q.get("pid"), q.get("uniqueid"))
+        if key in d["cand"] or key in d["cand_dropped"]: return
+        if len(d["cand"]) >= _DG_CAND_MAX: d["cand_dropped"].add(key); return
+        d["cand"][key] = mac_attribution_explain(q, procs, self.root_id, self.ever, self.prov, self.idvs, me, self.uid,
+                                                 self.pinned, self.root)
+
+    def diag_record(self):
+        """report["attribution_diagnostics"]: built after the verdict, validated against the allowlist."""
+        try:
+            d = self._dg()
+            hist = [dict(h) for h in d["hist"]]
+            vals = [h["value"] for h in hist]
+            ru = (self.root_id or {}).get("uniqueid")
+            cands, inf = [], []
+            for key in sorted(d["cand"], key=lambda k: (k[0] if type(k[0]) is int else -1, k[1] if type(k[1]) is int else -1)):
+                e = dict(d["cand"][key])
+                fs = d["seen"].get(e["uniqueid"])
+                if fs is None:
+                    e.update(first_seen_seq="unknown_truncated" if d["seen_drops"] else "never", first_seen_parent="unknown",
+                             first_seen_root_alive=None, first_seen_admitted=None, first_seen_vs_root_exit="unknown")
+                else:
+                    e.update(first_seen_seq=fs[0], first_seen_parent=fs[1], first_seen_root_alive=fs[2], first_seen_admitted=fs[3],
+                             first_seen_vs_root_exit="root_exit_not_observed" if d["exit_seq"] is None else
+                             ("before_exit_observed" if fs[0] < d["exit_seq"] else "after_exit_observed"))
+                cands.append(e)
+                rel = _dg_relation(e["orig_ppidversion"], vals)
+                vs_exit = ("unavailable" if e["orig_ppidversion"] is None or d["exit_idv"] is None else
+                           "equal" if e["orig_ppidversion"] == d["exit_idv"] else "different")
+                rd = []
+                if rel in ("above_max_observed", "below_min_observed", "between_unobserved"): rd.append("orig_version_not_in_root_history")
+                if vs_exit == "equal": rd.append("orig_version_is_root_exit_version")
+                if rel == "root_history_empty": rd.append("root_history_missing")
+                if e["first_seen_root_alive"] is False: rd.append("first_seen_without_live_root")
+                if e["first_seen_seq"] == "never": rd.append("never_seen_before_verify")
+                if e["puniqueid_eq_root"] is True: rd.append("puniqueid_names_root")
+                if rel == "equal_observed" and e["original_parent"] not in ("matches_admitted_idv_gt", "matches_admitted_idv_not_gt"):
+                    rd.append("admission_record_inconsistent")
+                if e["consistency"] == "inconsistent": rd.append("explain_inconsistent")
+                inf.append({"uniqueid": e["uniqueid"], "orig_ppidversion_relation": rel,
+                            "orig_ppidversion_vs_root_exit_idversion": vs_exit, "readings": rd[:_DG_READ_MAX]})
+            rec = {"schema": 1, "diag_error": self.__dict__.get("_dg_error"),
+                   "observed": {"root_uniqueid": ru, "root_idversion_history": hist,
+                                "root_idversion_history_truncated": bool(d["hist_trunc"]),
+                                "root_last_alive_seq": d["last_alive"], "root_first_unseen_seq": d["first_unseen"],
+                                "root_exit_seq": d["exit_seq"], "root_exit_read": d["exit_read"],
+                                "root_exit_idversion": d["exit_idv"], "root_reap_status": d["reap"],
+                                "root_in_ever": ru is not None and ru in self.ever,
+                                "root_prov_present": ru is not None and ru in self.prov,
+                                "root_idvs_count": len(self.idvs.get(ru, ())) if ru is not None else 0,
+                                "seq_final": d["seq"], "first_seen_count": len(d["seen"]), "first_seen_drops": d["seen_drops"],
+                                "candidates": cands, "candidates_dropped": len(d["cand_dropped"])},
+                   "inferred": {"candidates": inf}}
+            return rec if not validate_attribution_diagnostics(rec) else {"schema": 1, "diag_error": "validation_failed"}
+        except Exception:  # noqa: BLE001
+            return {"schema": 1, "diag_error": "exception"}
 
     # spawn ---------------------------------------------------------------------------------------------------------
     def spawn(self, cmd, cwd, env):
@@ -618,6 +924,7 @@ class MacOwner(ReasonsMixin):
                 self.ever.add(q["uniqueid"])
                 self.prov[q["uniqueid"]] = None
                 self.idvs[q["uniqueid"]] = {q["idversion"]}
+            self._dg_root(q, "spawn")
         except OSError as e:  # never run the command unowned: the root is not released (it exits 127 at once)
             self._reason("root_identity", f"the root's identity could not be read: {type(e).__name__}", pid=pid, errno=e.errno)
             os.close(w_go); os.close(r_err)
@@ -660,6 +967,7 @@ class MacOwner(ReasonsMixin):
         if self.root_id is None:
             return
         me, ru = os.getpid(), self.root_id["uniqueid"]
+        self._dg_step()
         procs = self._census(floor=ru)
         for q in procs.values():  # every identity version a known process shows (exec bumps it)
             if not q.get("older") and q["uniqueid"] in self.idvs:
@@ -701,20 +1009,24 @@ class MacOwner(ReasonsMixin):
                 if via[0] != "session":
                     self.escaped_seen.append(pid)
                 changed = True
+        self._dg_scan(procs)
 
     def reap(self):
         """Never reaps the root before cleanup ends: its exit is only observed (WNOWAIT), so it stays pinned."""
         if self.root is None or self.root_exited_flag: return
+        self._dg_step()
         try:
             r = os.waitid(os.P_PID, self.root, os.WEXITED | os.WNOHANG | os.WNOWAIT)
         except ChildProcessError:
             self._reason("root_unpinned", "the root was reaped elsewhere: its ids are no longer pinned", pid=self.root)
-            self.root_exited_flag = True; self.pinned = False; return
+            self.root_exited_flag = True; self.pinned = False; self._dg_reap("reaped_elsewhere"); return
         if r is not None and r.si_pid == self.root:
             self.root_exited_flag = True
+            self._dg_exit()
 
     def alive(self):
         out = []
+        self._dg_step()
         for pid, k in list(self.known.items()):
             try:
                 q = self._q(pid)
@@ -722,6 +1034,7 @@ class MacOwner(ReasonsMixin):
                 self._reason("query_error", f"a known process could not be read: {type(e).__name__}", pid=pid, errno=e.errno)
                 out.append(pid)
                 continue
+            if pid == self.root: self._dg_root(q, "alive")
             if q is None or q["uniqueid"] != k["uniqueid"]:
                 with self.lock: self.known.pop(pid, None)  # gone, a zombie, or the pid now belongs to another process
             else:
@@ -764,6 +1077,7 @@ class MacOwner(ReasonsMixin):
             if q is None or q["uniqueid"] != k["uniqueid"]:
                 break
             self.idvs.setdefault(k["uniqueid"], set()).add(q["idversion"])
+            if pid == self.root: self._dg_root(q, "signal")
             try:
                 self._deliver(pid, dict(k, idversion=q["idversion"]), sig)
                 delivered = True
@@ -841,6 +1155,7 @@ class MacOwner(ReasonsMixin):
         me, found = os.getpid(), {}
         for i in range(2):
             if i: time.sleep(0.1)
+            self._dg_step()
             try:
                 procs = self._census()
             except OSError as e:
@@ -855,6 +1170,7 @@ class MacOwner(ReasonsMixin):
                 if cls in ("candidate", "error", "unadmitted"):
                     found[(pid, q["uniqueid"])] = {"pid": pid, "comm": q["comm"], "ppid": q["ppid"], "class": cls, "why": why,
                                                    "coal": q.get("coal")}
+                    self._dg_cand(q, procs, me)
         for d in sorted(found.values(), key=lambda d: d["pid"])[:20]:
             code = {"candidate": "lineage_candidate", "error": "identity_error", "unadmitted": "unadmitted_owned"}[d["class"]]
             self._reason(code, f"not provable either way, reported and never signalled: {d['class']} ({d['why']})", **d)
@@ -883,11 +1199,11 @@ class MacOwner(ReasonsMixin):
             try:
                 pid, status = os.waitpid(self.root, os.WNOHANG)
             except ChildProcessError:
-                self._reason("root_unpinned", "the root was reaped elsewhere", pid=self.root); break
+                self._reason("root_unpinned", "the root was reaped elsewhere", pid=self.root); self._dg_reap("reaped_elsewhere"); break
             if pid == self.root:
-                self.root_status = status; break
+                self.root_status = status; self._dg_reap("reaped_by_close"); break
             if time.monotonic() > end:
-                self._reason("root_unreaped", "the root could not be reaped", pid=self.root); break
+                self._reason("root_unreaped", "the root could not be reaped", pid=self.root); self._dg_reap("unreaped_timeout"); break
             time.sleep(POLL)
         self.pinned = False
 
@@ -1018,7 +1334,8 @@ def run(cmd, timeout=None, grace=5.0, cwd=None, env=None, require_full=False):
     root) depends on it. The tree is stopped on EVERY exit path, including an unexpected error in the tool."""
     report = {"version": VERSION, "platform": sys.platform, "containment": None, "identity_mode": None, "root": None,
               "timed_out": False, "interrupted": None, "signalled": [], "survivors": [], "escaped_seen": [], "warnings": [],
-              "certification": None, "certification_basis": "", "uncertain_reasons": [], "reason_codes": [], "notes": []}
+              "certification": None, "certification_basis": "", "uncertain_reasons": [], "reason_codes": [], "notes": [],
+              "attribution_diagnostics": None}
     try:
         owner = make_owner()
     except (ToolError, OSError) as e:
@@ -1075,6 +1392,8 @@ def run(cmd, timeout=None, grace=5.0, cwd=None, env=None, require_full=False):
     for c in getattr(owner, "reason_codes", []):
         if c not in report["reason_codes"]: report["reason_codes"].append(c)
     report["notes"] = list(getattr(owner, "notes", []))
+    try: report["attribution_diagnostics"] = owner.diag_record() if hasattr(owner, "diag_record") else None
+    except Exception: report["attribution_diagnostics"] = {"schema": 1, "diag_error": "exception"}  # noqa: BLE001
     if (report["uncertain_reasons"] or report["reason_codes"]) and cert == "confirmed": cert = "uncertain"
     rc, sig = owner.root_result()
     report["root"] = {"pid": owner.root, "rc": rc, "signal": sig}
