@@ -74,4 +74,75 @@ function judgeRefusedClientProposed(st, conn, ticks, status, bodyMatch = null, p
   return { ok: true, kind: "stalled", why: `client process did not run past a single activity point while the server held the connection (macOS rule)${timeline(st, conn, ticks)}` };
 }
 
-module.exports = { judgeRefusedClient, judgeRefusedClientProposed, timeline };
+// ── macOS judge v2b (#151 class B; used on darwin only, by the json-413 concurrent and refusal-close 20-client tests) ──
+// Same server-side conditions as today's rule. On macOS, libuv's kqueue backend hands a socket's write and read results
+// to their callback as separate entries, so a write completion ('drain') can run before the read of an answer that has
+// already arrived, and a process that stops right after it loses the answer. A lost answer is excused only if:
+//   E0 the client's own ticks bracket the window (a tick at or before the answer, a tick at or after the close):
+//      missing scheduling evidence is never excused;
+//   D0 the client received no data before the close;
+//   T2 no two consecutive client ticks inside the window (no complete event-loop iteration);
+//   N1 at most one drain inside the window;
+//   C1 a drain whose check phase was recorded: that check phase ran at or after the close, with no margin (the
+//      iteration that handled the drain never finished while the server held the connection);
+//   C0 a drain without a recorded check phase: no tick at all inside the window;
+//   A1 no tick after the drain inside the window (no later iteration began);
+//   U  when a drain is inside the window: the server closed within GRACE_MS + MAC_SLACK_MS of the answer (a server far
+//      outside its close bound is not excused by this rule);
+//   W  (every record except a pinned historical replay record) when the answer finished, the server socket's byte count covered at
+//      least the answer body (conn.bytesWrittenAtFinish >= conn.minAnswerBytes); missing values fail. What this shows,
+//      and what it does not: the record is taken at the response's 'finish' event, which Node documents as emitted once
+//      the response's last segment was handed off to the operating system; that is the only evidence of an OS
+//      hand-off here. socket.bytesWritten itself counts bytes accepted for writing, including bytes still queued in
+//      Node's buffers (verified on Node 22.12.0: a 64 MiB write to a non-reading peer reads 64 MiB at once), so the
+//      count alone proves no hand-off; it shows the answer was at least fully written to the socket. Neither shows
+//      that the bytes reached or were read by the client. The count includes headers, so it is a lower-bound check
+//      (single-request connections only). W and K are required of EVERY record, whether or not a call site sets
+//      conn.requireWriteEvidence (that flag no longer decides anything): a call site that omitted it can never get an
+//      excuse without write and clock evidence. The only exception is a record explicitly marked conn.replayRecord ===
+//      true: the pinned historical replay (refusal-judge-replay.json), recorded before these fields existed; only its
+//      test sets the mark. Historical replay records carry no such fields and no requireWriteEvidence
+//      flag;
+//   K  (live records) the two processes' clocks are consistent with causality: the client started its request no later
+//      than the server first saw it (st.t0 <= conn.seenAt + 5 ms), and the client saw the connection end no earlier
+//      than the server closed it (io.errorAt or io.closeAt >= closedAt - 5 ms). A record that violates either, or
+//      lacks the values, fails: an offset between the records' clocks never produces an excuse it detects. Limit: an
+//      offset smaller than the slack between those causal events is not detectable; both processes read the same
+//      machine's wall clock, so the real offset is the reading latency only;
+//   P  drain and check-phase records pair one to one (io.drainChecksAt has the same length as drainsAt when present):
+//      otherwise neither can be trusted and the loss fails.
+// Without a drain in the window the verdict is today's rule (plus E0). Never used on Linux or Windows.
+const MAC_SLACK_MS = 2500; // the scheduling slack refusal-close.test.cjs already allows on top of the grace period
+function judgeRefusedClientMac(st, conn, ticks, status, bodyMatch = null) {
+  const base = judgeRefusedClientRule({ ...st, drainsAt: [] }, conn, ticks, status, bodyMatch);
+  if (base.kind === "answered") return base;
+  if (!base.ok) return { ...base, why: `${base.why}${timeline(st, conn, ticks)}` };
+  const fail = (why) => ({ ok: false, why: `${why} (macOS rule)${timeline(st, conn, ticks)}` });
+  const sorted = [...(ticks || [])].sort((a, b) => a - b);
+  const inWindow = (t) => t > conn.answeredAt + TICK_MARGIN_MS && t < conn.closedAt - TICK_MARGIN_MS;
+  if (!sorted.some((t) => t <= conn.answeredAt + TICK_MARGIN_MS) || !sorted.some((t) => t >= conn.closedAt - TICK_MARGIN_MS)) return fail("answer lost, and the client's ticks do not cover the window (no scheduling evidence)");
+  const io = st.io || {};
+  if (io.firstDataAt != null && io.firstDataAt <= conn.closedAt - TICK_MARGIN_MS) return fail(`answer lost although the client received data ${io.firstDataAt - conn.answeredAt} ms after the answer`);
+  if (conn.replayRecord !== true) { // W and K: required unless the record is a marked historical replay record
+    const end = io.errorAt != null ? io.errorAt : io.closeAt;
+    if (!Number.isFinite(st.t0) || !Number.isFinite(conn.seenAt) || st.t0 > conn.seenAt + TICK_MARGIN_MS) return fail(`answer lost, and the client's start (${st.t0}) is not before the server saw the request (${conn.seenAt}): clocks inconsistent`);
+    if (!Number.isFinite(end) || end < conn.closedAt - TICK_MARGIN_MS) return fail(`answer lost, and the client saw the end ${Number.isFinite(end) ? `${end - conn.closedAt} ms` : "never"} relative to the server's close: clocks inconsistent or no end seen`);
+    const w = conn.bytesWrittenAtFinish, need = conn.minAnswerBytes;
+    if (!Number.isFinite(w) || !Number.isFinite(need) || need <= 0 || w < need) return fail(`answer lost, and the server's write of the answer is not shown (socket bytes counted at finish ${w}, answer body ${need})`);
+  }
+  const drainsAt = st.drainsAt || [], checks = io.drainChecksAt || [];
+  if (Array.isArray(io.drainChecksAt) && io.drainChecksAt.length !== drainsAt.length) return fail(`answer lost, and the drain and check-phase records do not pair (${drainsAt.length} drains, ${io.drainChecksAt.length} check records)`);
+  const drains = drainsAt.map((t, i) => ({ t, check: checks[i] == null ? null : checks[i] })).filter((d) => inWindow(d.t));
+  if (drains.length === 0) return { ...base, why: `${base.why}${timeline(st, conn, ticks)}` };
+  if (drains.length > 1) return fail(`answer lost although the client handled I/O on this connection ${drains.length} times while the server kept it open`);
+  const [d] = drains;
+  const inTicks = sorted.filter(inWindow);
+  if (d.check != null && d.check < conn.closedAt) return fail(`answer lost although the loop iteration that handled a drain at ${d.t - conn.answeredAt} ms reached its check phase at ${d.check - conn.answeredAt} ms, before the close`);
+  if (d.check == null && inTicks.length > 0) return fail(`answer lost; a drain at ${d.t - conn.answeredAt} ms without a check-phase record and a tick in the window`);
+  if (inTicks.some((t) => t > d.t)) return fail(`answer lost although the client ticked after its drain at ${d.t - conn.answeredAt} ms`);
+  const kept = conn.closedAt - conn.answeredAt;
+  if (kept > GRACE_MS + MAC_SLACK_MS) return fail(`answer lost, and the server closed ${kept} ms after the answer (more than grace ${GRACE_MS} + ${MAC_SLACK_MS} ms)`);
+  return { ok: true, kind: "stalled", why: `the client's loop did not complete an I/O phase after its drain at ${d.t - conn.answeredAt} ms before the close at ${kept} ms (macOS rule)${timeline(st, conn, ticks)}` };
+}
+
+module.exports = { judgeRefusedClient, judgeRefusedClientProposed, judgeRefusedClientMac, MAC_SLACK_MS, timeline };

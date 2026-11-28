@@ -7,7 +7,7 @@ const net = require("node:net");
 const path = require("node:path");
 const { execFile } = require("node:child_process");
 const test = require("node:test");
-const { judgeRefusedClient, judgeRefusedClientProposed } = require("./fixtures/refusal-judge.cjs");
+const { judgeRefusedClient, judgeRefusedClientProposed, judgeRefusedClientMac } = require("./fixtures/refusal-judge.cjs");
 const { GRACE_MS } = require("../server/http/refusal-close.cjs");
 
 const conn = { status: 413, answeredAt: 10000, closedAt: 10000 + GRACE_MS + 3 };
@@ -88,5 +88,7 @@ test("real sockets: an active client that lost its answer is rejected by today's
       const p = judgeRefusedClientProposed(st, rec, ticks, 413, null, platform);
       assert.equal(p.ok, false, `proposed rule (${platform}) must reject an active client: ${p.why}`);
     }
+    const mac = judgeRefusedClientMac(st, rec, ticks, 413); // the v2b macOS rule, checked on every platform's runner
+    assert.equal(mac.ok, false, `macOS rule v2b must reject an active client: ${mac.why}`);
   } finally { server.close(); }
 });

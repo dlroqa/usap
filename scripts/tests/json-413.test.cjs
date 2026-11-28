@@ -16,7 +16,10 @@ const test = require("node:test");
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
 const { GRACE_MS } = require("../server/http/refusal-close.cjs");
 const { execFile } = require("node:child_process");
-const { judgeRefusedClient } = require("./fixtures/refusal-judge.cjs");
+const { judgeRefusedClient, judgeRefusedClientMac } = require("./fixtures/refusal-judge.cjs");
+const { j2Evidence } = require("./fixtures/j2-evidence.cjs"); // #151 J2 evidence line only
+// #151 class B: on macOS the per-client judge is the v2b rule (fixtures/refusal-judge.cjs); elsewhere today's rule.
+const judgeLostClient = process.platform === "darwin" ? judgeRefusedClientMac : judgeRefusedClient;
 const { describeLostClient } = require("./fixtures/stall-diag.cjs");
 const { spawn } = require("node:child_process");
 const GRACE_TOLERANCE_MS = 100; // as fixtures/refusal-judge.cjs: the grace timer starts just before 'finish' is observed
@@ -165,7 +168,8 @@ function assertServerRefusal(rec, st, label) {
   const clientClosedFirst = st.t0 + st.closedAt < rec.sockCloseAt && st.error === null;
   if (!clientClosedFirst) assert.ok(rec.sockCloseAt - rec.finishAt >= GRACE_MS - GRACE_TOLERANCE_MS, `${label}: the server closed ${rec.sockCloseAt - rec.finishAt} ms after the answer (grace ${GRACE_MS} ms) ${ev}`);
   assert.ok(rec.bytesRead <= EARLY_READ_BOUND, `${label}: the server read ${rec.bytesRead} bytes from this connection (bound ${EARLY_READ_BOUND}) ${ev}`);
-  return { conn: { status: rec.status, answeredAt: rec.finishAt, closedAt: rec.sockCloseAt }, ev };
+  // Write evidence for the macOS judge (#151 J2): the socket's byte count at 'finish' vs the answer body's length.
+  return { conn: { status: rec.status, answeredAt: rec.finishAt, closedAt: rec.sockCloseAt, requireWriteEvidence: true, seenAt: rec.arrivedAt, bytesWrittenAtFinish: Number.isFinite(rec.bytesWrittenAtFinish) ? rec.bytesWrittenAtFinish : null, minAnswerBytes: Buffer.byteLength(rec.body || "") }, ev };
 }
 
 test("concurrent over-limit declarations are each refused early; the server's total read stays bounded", async (t) => {
@@ -190,7 +194,10 @@ test("concurrent over-limit declarations are each refused early; the server's to
       const rec = recs.find((x) => x.remotePort === st.localPort);
       const { conn, ev } = assertServerRefusal(rec, st, `client ${i}`);
       total += rec.bytesRead;
-      const v = judgeRefusedClient(st, conn, ticks, 413, ANSWER_BODY);
+      const v = judgeLostClient(st, conn, ticks, 413, ANSWER_BODY);
+      // #151 J2 evidence (messages only, every platform): each lost client's J2 inputs and predicates, evaluated
+      // independently of the judge, next to the J2 judge's own result. The verdict used below is unchanged.
+      if (st.status !== 413) { let e; try { e = j2Evidence(st, conn, ticks, 413, judgeRefusedClientMac(st, conn, ticks, 413, ANSWER_BODY)); } catch (_) { e = "description failed"; } t.diagnostic(`J2 evidence, client ${i}: ${e}`); }
       assert.ok(v.ok, `client ${i}: ${v.why} ${ev}`);
       if (v.kind === "answered") assert.equal(st.connectionHeader, "close", `client ${i}: Connection: close ${ev}`);
       else { stalled += 1; excused.push(`client ${i}: ${v.why}`); }

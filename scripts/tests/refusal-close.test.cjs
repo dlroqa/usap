@@ -21,7 +21,8 @@ const { describeFailClosed } = require("./fixtures/failclosed-diag.cjs");
 const { closeAfterAnswer, bodyMayRemain, GRACE_MS, SMALL_BODY_BYTES, WATCH_BYTES, WATCH_MS, lingeringCount, resumedCount, closedReadingCount } = require("../server/http/refusal-close.cjs");
 const { makeRoot, startServer, stopServerAndWait, removeTestRoot } = require("./api-contract/harness.cjs");
 const { rawRequest } = require("./fixtures/refusal-clients.cjs");
-const { timeline: timelineOf } = require("./fixtures/refusal-judge.cjs");
+const { timeline: timelineOf, judgeRefusedClientMac } = require("./fixtures/refusal-judge.cjs");
+const { j2Evidence } = require("./fixtures/j2-evidence.cjs"); // #151 J2 evidence line only
 const { execFile } = require("node:child_process");
 
 const MiB = 1024 * 1024;
@@ -61,11 +62,21 @@ async function startPipelineServerIn(dir, auth) {
   const bySocket = new WeakMap();
   const server = http.createServer((req, res) => {
     const c = bySocket.get(req.socket);
-    if (c) res.once("finish", () => { c.status = res.statusCode; c.answeredAt = Date.now(); });
+    if (c) {
+      // The answer body's size for the macOS judge's write evidence (#151 J2): counted from what the pipeline writes
+      // (its JSON answers carry no Content-Length header). The wrappers only count, then call the originals.
+      c.bodyBytes = 0;
+      const write = res.write, end = res.end;
+      const count = (chunk) => { if (chunk && typeof chunk !== "function") c.bodyBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk)); };
+      res.write = function (chunk, ...rest) { count(chunk); return write.call(this, chunk, ...rest); };
+      res.end = function (chunk, ...rest) { count(chunk); return end.call(this, chunk, ...rest); };
+      res.once("finish", () => { c.status = res.statusCode; c.answeredAt = Date.now(); c.bytesWrittenAtFinish = req.socket.bytesWritten; c.minAnswerBytes = c.bodyBytes || null; });
+    }
     return pipeline(req, res);
   });
   server.on("connection", (s) => {
-    const c = { s, bytesRead: 0, remotePort: s.remotePort, acceptedAt: Date.now(), status: null, answeredAt: null, closedAt: null, peerEnded: false, peerError: null };
+    const c = { s, bytesRead: 0, remotePort: s.remotePort, acceptedAt: Date.now(), status: null, answeredAt: null, closedAt: null, peerEnded: false, peerError: null, requireWriteEvidence: true, seenAt: null, bytesWrittenAtFinish: null, minAnswerBytes: null };
+    c.seenAt = c.acceptedAt; // macOS judge clock check (#151 J2): when the server first saw this connection
     conns.add(c); bySocket.set(s, c);
     // whether the client ended or reset the connection first (then an early close is the client's, not the server's)
     s.on("end", () => { c.peerEnded = true; }); s.on("error", (e) => { c.peerError = c.peerError || e.code || e.message; });
@@ -479,8 +490,11 @@ test("refusal: 20 concurrent refused clients that keep sending get the answer (o
     const stalled = [];
     all.forEach((st, i) => {
       const c = conns.find((x) => x.remotePort === st.localPort);
-      const v = judgeRefusedClient(st, c, ticks, 403);
+      // #151 class B: on macOS the v2b rule (fixtures/refusal-judge.cjs); elsewhere this file's rule, unchanged.
+      const v = process.platform === "darwin" ? judgeRefusedClientMac(st, c, ticks, 403) : judgeRefusedClient(st, c, ticks, 403);
       const tl = timelineOf(st, c, ticks); // #151 diagnostics: client activity relative to the server's answer (message only)
+      // #151 J2 evidence (messages only, every platform): see json-413.test.cjs. The verdict used here is unchanged.
+      if (st.status !== 403) { let e; try { e = j2Evidence(st, c, ticks, 403, judgeRefusedClientMac(st, c, ticks, 403)); } catch (_) { e = "description failed"; } t.diagnostic(`J2 evidence, client ${i}: ${e}`); }
       assert.ok(v.ok, `client ${i}: ${v.why}${tl}; client error ${st.error}: ${record()}`);
       if (v.kind === "stalled") { stalled.push(`client ${i}: ${v.why}${tl}`); return; }
       assert.doesNotThrow(() => JSON.parse(st.body), `client ${i}: complete JSON answer, got ${JSON.stringify(st.body.slice(0, 80))}`);
