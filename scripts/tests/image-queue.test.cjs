@@ -447,8 +447,23 @@ const txt2img = (port, prompt) => new Promise((resolve) => {
   q.end(d);
 });
 const resources = async (srv) => (await request(srv.port, "GET", "/api/resources")).json;
+// #179 diagnostics (test-only, message only; the same reading as the rollback test below): when any of the concurrent
+// generations did not answer 200, print one bounded, sanitized line — each answer's status or client error code with
+// its time, the studio's error words (why its request to the engine failed), the engine processes' start/listening/exit
+// records, the engine's own request counts and the [backend] log lines — BEFORE, and independent of, the unchanged
+// assertions. Never throws, never changes a verdict.
+async function diagnoseGenerations(t, srv, all, t0, label) {
+  if (!all.some((r) => r.status !== 200)) return;
+  let line;
+  try {
+    let stats = null;
+    try { const port = (await request(srv.port, "GET", "/api/backend-status")).json.port; stats = (await request(port, "GET", "/fake/stats")).json; } catch (_) {}
+    line = describeRollbackFailures(all, { t0, diag: fakeSdDiag(srv.root), stats, log: srv.log() });
+  } catch (_) { line = "description failed"; }
+  t.diagnostic(`${label} generations: ${line}`);
+}
 
-test("server: off by default — no queue, concurrent generations reach the engine at once as before, /api/resources unchanged", async () => {
+test("server: off by default — no queue, concurrent generations reach the engine at once as before, /api/resources unchanged", async (t) => {
   await withServer({ USAP_ENGINE_SLOT: "on" }, async (srv) => {
     await load(srv);
     const rs = await resources(srv);
@@ -456,18 +471,21 @@ test("server: off by default — no queue, concurrent generations reach the engi
     assert.deepEqual(rs.engines.image.queue, { running: null, waiting: null, known: false });
     const t0 = Date.now();
     const all = await Promise.all([0, 1, 2, 3].map((i) => txt2img(srv.port, `p${i}`)));
+    await diagnoseGenerations(t, srv, all, t0, "off-by-default");
     for (const r of all) assert.equal(r.status, 200, "no 429 when off");
     assert.ok(Date.now() - t0 < 9000, "all four were forwarded at once (the fake runs them concurrently)");
   });
 });
 
-test("server: imageQueue on without engineSlot is refused at start with a clear log line, and stays off", async () => {
+test("server: imageQueue on without engineSlot is refused at start with a clear log line, and stays off", async (t) => {
   await withServer({ USAP_IMAGE_QUEUE: "on" }, async (srv) => {
     assert.match(srv.log(), /image queue "on" is not supported without engineSlot and stays off/);
     await load(srv);
     const rs = await resources(srv);
     assert.equal(rs.limits.imageQueue, undefined);
+    const t0 = Date.now();
     const all = await Promise.all([0, 1, 2, 3].map((i) => txt2img(srv.port, `p${i}`)));
+    await diagnoseGenerations(t, srv, all, t0, "noslot");
     for (const r of all) assert.equal(r.status, 200);
   });
 });
