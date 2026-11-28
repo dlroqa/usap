@@ -211,6 +211,15 @@ SYNTHETIC_TESTS = frozenset({
     "test_ident_unknown_and_unverifiable_are_never_a_clean_cleanup",
     "test_ident_mutation_late_admission_is_caught",
     "test_ident_problems_fail_the_case",
+    "test_phase2_exited_tool_is_never_signalled",
+    "test_phase2_term_ignoring_tool_is_killed_after_grace",
+    "test_phase2_tool_that_never_exits_is_unverifiable",
+    "test_phase2_interrupted_cleanup_is_retried",
+    "test_phase2_exception_in_one_stop_never_skips_the_others",
+    "test_phase2_late_records_after_a_timeout_are_identity_checked",
+    "test_phase2_cleanup_is_registered_before_the_test_body",
+    "test_phase2_windows_branch_kills_through_the_handle",
+    "test_phase2_case_dir_removal_is_bounded_and_reported",
 })
 # Start their own fixtures (directly or through the tool / a snippet interpreter) and signal only those, by identity. Not guarded.
 OWNED_TESTS = frozenset({
@@ -263,6 +272,11 @@ OWNED_TESTS = frozenset({
     "test_windows_breakaway_is_refused",
     "test_windows_tool_killed_job_close_kills_tree",
     "test_ident_real_records_admit_the_fixture_and_never_a_reused_pid",
+    "test_phase2_normal_exit_sends_no_signal",
+    "test_phase2_foreground_timeout_stops_the_tool_and_its_tree",
+    "test_phase2_background_wait_timeout_stops_tool_then_fixtures",
+    "test_phase2_real_tool_ignoring_term_is_killed",
+    "test_phase2_tool_stderr_leaves_no_open_pipe",
 })
 # No processes and no signalling (classifiers, source checks). Guarded.
 PURE_TESTS = frozenset({
@@ -275,6 +289,9 @@ PURE_TESTS = frozenset({
     "test_static_fixture_signals_only_through_pidfd",
     "test_static_ident_admission_and_signal_paths",
     "test_ident_own_identity_matches_run_owned",
+    "test_static_tool_processes_only_through_start",
+    "test_static_teardown_stops_tools_before_pinned_cleanup",
+    "test_static_untracked_interpreters_inventory",
 })
 
 
@@ -531,6 +548,25 @@ runpy.run_path(fix, run_name="__main__")
 '''
 
 
+# Round 42 (Phase 2 gap 5): Case methods that start a process directly with subprocess instead of as a tracked tool
+# (_start_cmd). Each is the case's own child with its own timeout; what they start is stopped only through pinned records.
+# test_static_untracked_interpreters_inventory keeps this list exact.
+UNTRACKED_STARTERS = frozenset({
+    "_snippet",  # snippet(): run_owned in-process, capture_output pipes
+    "test_guard_owned_fixture_cleanup_works_without_the_guard",
+    "test_f1_dead_pidfd_never_reaches_another_process",  # F1: its own child, pinned by pidfd; reaped in finally
+    "test_f1_orphancheck_reports_an_unreaped_zombie",  # F1: subreaper helper (subprocess.run, 60 s); reaps adopted children
+    "test_ident_real_records_admit_the_fixture_and_never_a_reused_pid",
+    "test_linux_identity_mismatch_is_never_signalled",
+    "test_mac_same_coalition_unrelated_orphan_is_uncertain_and_never_signalled",
+    "test_mac_stale_identity_and_simulated_pid_reuse_are_refused",
+    "test_mac_unrelated_launchd_job_neither_uncertain_nor_signalled",
+    "test_mac_zombie_only_group_really_returns_eperm_and_is_harmless",
+    "test_negative_control_plain_timeout_leaves_descendants",
+    "test_phase2_tool_stderr_leaves_no_open_pipe",
+})
+
+
 class Case(unittest.TestCase):
     def setUp(self):
         n = self._testMethodName
@@ -546,15 +582,36 @@ class Case(unittest.TestCase):
         self.env = dict(os.environ, **{oi.KEY_ENV: self.key})
         self.env.pop(oi.PARENT_ENV, None)
         self.ident = Ident(self.key)
+        self._tools = []  # Phase 2 (round 40): every tool process this case started, stopped through its own Popen
+        self.addCleanup(self._stop_all_tools)  # idempotent; tearDown calls it first, this covers a failing tearDown
 
     def tearDown(self):
+        self._stop_all_tools()  # tools first (run_owned stops its own tree on SIGTERM), then descendants by pin
         if self.signal_guard is not None:  # a guarded test starts nothing, so its cleanup must have nothing to stop
             self.assertEqual(self.ident.seen, {}, "a guarded (non-OWNED) test recorded processes")
         self.ident.cleanup()
         left = self.ident.alive_all()
-        shutil.rmtree(self.dir, ignore_errors=True)
+        dir_left = self._remove_case_dir()
         self.assertEqual(left, [], "the case's own cleanup left processes")
         self.assert_clean_ownership(self.ident)
+        self.assertIsNone(dir_left, "the case's temporary folder could not be removed (on Windows: a file is still open)")
+
+    def _remove_case_dir(self, rmtree=shutil.rmtree, attempts=10, delay=0.2):
+        """Round 42: the case folder is removed with bounded retries (~2 s: a scanner or a just-exited process may still
+        hold a file on Windows); if it is still there, the path and the last error are returned, and the case fails,
+        instead of the folder being silently abandoned. Never signals anything."""
+        err = None
+        for i in range(attempts):
+            try:
+                rmtree(self.dir)
+            except FileNotFoundError:
+                return None
+            except OSError as x:
+                err = "%s: %s" % (type(x).__name__, x)
+            if not os.path.exists(self.dir):
+                return None
+            if i + 1 < attempts: time.sleep(delay)
+        return "%s left (%s)" % (self.dir, err)
 
     def assert_clean_ownership(self, ident):
         """A rejected record, an unreadable identity or a cleanup that could not be done through a pin fails the case."""
@@ -568,14 +625,86 @@ class Case(unittest.TestCase):
                 return pids, notes
             time.sleep(0.02)
 
-    def tool(self, *args, timeout=60, background=False):
+    # ── Phase 2 (round 40): tool processes are tracked and stopped through their own Popen, never by pid ──
+    # Bounds (round 42). The execution timeout of a test's tool() call is unchanged; cleanup runs only AFTER that timeout
+    # has already failed the call (finish_tool re-raises TimeoutExpired) or in tearDown, so it never extends a successful
+    # test. Per tool on POSIX: SIGTERM, wait TOOL_GRACE + 5 s (10 s), SIGKILL, wait 5 s => at most ~15 s, then the tool is
+    # recorded as unverifiable (the case fails). Tools are stopped one after another, so N live tools take at most ~N x 15 s,
+    # plus at most ~5 s for the case's pinned cleanup (Ident.cleanup). A foreground tool() that times out therefore raises
+    # TimeoutExpired up to ~15 s after its timeout (it used to be an immediate SIGKILL with no tree stop).
+    # Windows: Popen.kill() is TerminateProcess on the tool's own handle: no graceful step, no report from the tool; its
+    # tree ends when the tool's job object closes (run_owned's KILL_ON_JOB_CLOSE), then wait 5 s. Bound ~5 s per tool.
+    # macOS: no pidfd and no subreaper. SIGTERM lets run_owned stop its own tree (its macOS ownership path); descendants that
+    # outlive the tool are stopped only through the case's pinned records (Ident: audit-token identity) in tearDown; an
+    # unrecorded descendant cannot be found by this harness (documented limit, not assumed away).
+    TOOL_GRACE = 5  # seconds run_owned gets to stop its tree after SIGTERM before the tool itself is killed
+
+    def _start_cmd(self, cmd):
+        """Start one tool process. stderr goes to a file, not a pipe: the tool's descendants inherit it, so a pipe would
+        stay open (and a read to EOF would block) while any of them survives; the parent's copy is closed at once."""
+        err = os.path.join(self.dir, "tool-%d.stderr" % len(self._tools))
+        with open(err, "wb") as fh:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=fh, env=self.env)
+        self._tools.append({"p": p, "err": err, "done": False})
+        return p
+
+    def start_tool(self, *args):
         rep = os.path.join(self.dir, "report.json")
-        cmd = [sys.executable, "-B", TOOL, "--report", rep, *args]
+        return self._start_cmd([sys.executable, "-B", TOOL, "--report", rep, *args]), rep
+
+    def tool_stderr(self, p):
+        e = next(t for t in self._tools if t["p"] is p)
+        with open(e["err"], "rb") as fh:
+            return fh.read().decode(errors="replace")
+
+    def finish_tool(self, p, timeout):
+        """Wait for a tool; on a timeout stop it (and what it started) before re-raising, so no failure path leaks it."""
+        try:
+            return p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.stop_tool(p)
+            raise
+
+    def stop_tool(self, p, grace=None):
+        """Bounded stop through the Popen only (never a pid): POSIX SIGTERM (run_owned stops its own tree), wait grace+5 s,
+        then kill and wait 5 s (<= ~15 s with the default grace); Windows kill = TerminateProcess on the handle (closing the
+        job kills the tree), wait 5 s. Then admit late records (identity-checked) so the case's
+        cleanup can stop leftovers by pin. A tool that does not exit is recorded as unverifiable (the case fails)."""
+        grace = self.TOOL_GRACE if grace is None else grace
+        if p.poll() is None:
+            if WINDOWS:
+                p.kill()
+            else:
+                p.send_signal(signal.SIGTERM)
+                try:
+                    p.wait(timeout=grace + 5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.ident.unverifiable.append((p.pid, "tool process did not exit after kill"))
+        scan_pidfile(self.ident, self.pids)
+        for t in self._tools:
+            if t["p"] is p: t["done"] = True
+
+    def _stop_all_tools(self):
+        """Idempotent: each tool is stopped once; one failure is recorded and never stops the others."""
+        for t in list(self._tools):
+            if t["done"]: continue
+            try:
+                self.stop_tool(t["p"])
+            except Exception as x:  # noqa: BLE001 - recorded; the case fails on it
+                t["done"] = True
+                self.ident.unverifiable.append((getattr(t["p"], "pid", None), "tool stop failed: %s: %s" % (type(x).__name__, x)))
+
+    def tool(self, *args, timeout=60, background=False):
+        p, rep = self.start_tool(*args)
         if background:
-            return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=self.env), rep
-        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout, env=self.env)
+            return p, rep
+        code = self.finish_tool(p, timeout)
         report = load(rep) if os.path.exists(rep) else None
-        return p.returncode, report, p.stderr.decode(errors="replace")
+        return code, report, self.tool_stderr(p)
 
     def fixture(self, mode):
         return [sys.executable, "-B", FIX, mode, self.pids]
@@ -597,21 +726,21 @@ class Case(unittest.TestCase):
     def test_timeout_stops_a_three_level_tree(self):
         p, rep = self.tool("--timeout", "3", "--grace", "2", "--", *self.fixture("tree"), background=True)
         pids, _ = self.read_pids(3)
-        code = p.wait(timeout=60)
+        code = self.finish_tool(p, 60)
         r = load(rep)
-        self.assertEqual(code, ro.EXIT_TIMEOUT, p.stderr.read().decode()); self.assertTrue(r["timed_out"]); self.assertEqual(r["survivors"], []); self.assertEqual(r["certification"], "confirmed", r)
+        self.assertEqual(code, ro.EXIT_TIMEOUT, self.tool_stderr(p)); self.assertTrue(r["timed_out"]); self.assertEqual(r["survivors"], []); self.assertEqual(r["certification"], "confirmed", r)
         self.assertEqual(len(pids), 3); self.assertEqual(self.ident.alive_all(), [])
 
     @unittest.skipIf(WINDOWS, "POSIX signals")
     def test_sigterm_ignoring_descendants_are_killed_after_grace(self):
         p, rep = self.tool("--timeout", "2", "--grace", "1", "--", *self.fixture("tree,ignoreterm"), background=True)
-        self.read_pids(3); code = p.wait(timeout=60); r = load(rep)
+        self.read_pids(3); code = self.finish_tool(p, 60); r = load(rep)
         self.assertEqual(code, ro.EXIT_TIMEOUT); self.assertTrue(any(s.get("sig") == "KILL" for s in r["signalled"]), r["signalled"])
         self.assertEqual(self.ident.alive_all(), [])
 
     def test_escaping_grandchild_is_stopped(self):
         p, rep = self.tool("--timeout", "3", "--grace", "1", "--", *self.fixture("tree,escape"), background=True)
-        pids, _ = self.read_pids(3); code = p.wait(timeout=60); r = load(rep)
+        pids, _ = self.read_pids(3); code = self.finish_tool(p, 60); r = load(rep)
         self.assertEqual(len(pids), 3)
         self.assertEqual(self.ident.alive_all(), [], r)
         self.assertEqual(code, ro.EXIT_TIMEOUT)
@@ -620,19 +749,19 @@ class Case(unittest.TestCase):
     @unittest.skipUnless(WINDOWS, "Windows Job Object")
     def test_windows_breakaway_is_refused(self):
         p, rep = self.tool("--timeout", "3", "--grace", "1", "--", *self.fixture("tree,breakaway"), background=True)
-        _, notes = self.read_pids(3); p.wait(timeout=60)
+        _, notes = self.read_pids(3); self.finish_tool(p, 60)
         self.assertIn("breakaway-refused", notes); self.assertEqual(self.ident.alive_all(), [])
 
     @unittest.skipIf(WINDOWS, "POSIX signal to the tool")
     def test_tool_sigterm_stops_the_tree(self):
         p, rep = self.tool("--grace", "1", "--", *self.fixture("tree,ignoreterm"), background=True)
-        self.read_pids(3); time.sleep(0.3); p.send_signal(signal.SIGTERM); code = p.wait(timeout=60)
+        self.read_pids(3); time.sleep(0.3); p.send_signal(signal.SIGTERM); code = self.finish_tool(p, 60)
         self.assertEqual(code, 128 + signal.SIGTERM); self.assertEqual(self.ident.alive_all(), [])
 
     @unittest.skipUnless(WINDOWS, "Windows: closing the job handle kills the tree")
     def test_windows_tool_killed_job_close_kills_tree(self):
         p, rep = self.tool("--", *self.fixture("tree,escape"), background=True)
-        self.read_pids(3); time.sleep(0.5); p.kill(); p.wait(timeout=30)
+        self.read_pids(3); time.sleep(0.5); p.kill(); self.finish_tool(p, 30)
         end = time.time() + 10
         while self.ident.alive_all() and time.time() < end: time.sleep(0.1)
         self.assertEqual(self.ident.alive_all(), [], "KILL_ON_JOB_CLOSE")
@@ -641,7 +770,7 @@ class Case(unittest.TestCase):
     def test_limit_tool_sigkill_leaves_the_tree(self):
         """Documented limit (negative control): SIGKILL of the tool cannot be handled in-process."""
         p, rep = self.tool("--", *self.fixture("tree"), background=True)
-        self.read_pids(3); time.sleep(0.3); p.kill(); p.wait(timeout=30); time.sleep(0.3)
+        self.read_pids(3); time.sleep(0.3); p.kill(); self.finish_tool(p, 30); time.sleep(0.3)
         self.assertTrue(self.ident.alive_all(), "expected survivors: this is the limit the docs state")
 
     def test_unstartable_command_is_127(self):
@@ -774,6 +903,11 @@ class Case(unittest.TestCase):
         victim.kill(); victim.wait()
 
     def snippet(self, code, timeout=60, expect=3):
+        """Round 42 scope note: a snippet interpreter is NOT a tracked tool (it runs run_owned in-process, never TOOL): it
+        is this case's own subprocess.run child with capture_output pipes and its own timeout. Its descendants are stopped
+        only through their pinned records (read here and in tearDown). On Windows, subprocess.run's communicate() after a
+        timeout kill could wait on a pipe a surviving descendant holds; the snippets' fixtures use DEVNULL for their stdio.
+        Every untracked interpreter start is inventoried in UNTRACKED_STARTERS (test_static_untracked_interpreters_inventory)."""
         try:
             return self._snippet(code, timeout)
         finally:
@@ -883,7 +1017,7 @@ print(json.dumps(dict(code=code, survivors=rep["survivors"], warnings=rep["warni
     @unittest.skipIf(WINDOWS, "POSIX process groups")
     def test_descendant_in_a_new_group_is_stopped(self):
         p, rep = self.tool("--timeout", "3", "--grace", "1", "--", *self.fixture("tree,newgroup"), background=True)
-        self.read_pids(3); code = p.wait(timeout=60); r = load(rep)
+        self.read_pids(3); code = self.finish_tool(p, 60); r = load(rep)
         self.assertEqual(code, ro.EXIT_TIMEOUT, r); self.assertEqual(r["certification"], "confirmed", r); self.assertEqual(self.ident.alive_all(), [])
 
     def test_unseen_session_escaper_is_never_confirmed(self):
@@ -900,7 +1034,7 @@ print(json.dumps(dict(code=code, survivors=rep["survivors"], warnings=rep["warni
 
     def test_forking_during_cleanup_is_never_a_silent_success(self):
         p, rep = self.tool("--timeout", "2", "--grace", "1", "--", *self.fixture("tree,forkloop"), background=True)
-        self.read_pids(2); code = p.wait(timeout=90); r = load(rep)
+        self.read_pids(2); code = self.finish_tool(p, 90); r = load(rep)
         time.sleep(0.5)  # the short-lived children end on their own
         self.assertIn(r["certification"], ("confirmed", "survivors", "uncertain"))
         if r["certification"] == "confirmed":
@@ -1053,7 +1187,7 @@ print(json.dumps(dict(code=code, cert=rep["certification"], mode=rep["identity_m
     def test_exec_after_discovery_is_still_stopped(self):
         """The child is seen, then execs: macOS bumps its identity version (uniqueid stays); it must still be stopped."""
         p, rep = self.tool("--timeout", "3", "--grace", "1", "--", *self.fixture("tree,execlate"), background=True)
-        self.read_pids(2); code = p.wait(timeout=60); r = load(rep)
+        self.read_pids(2); code = self.finish_tool(p, 60); r = load(rep)
         self.assertEqual((code, r["certification"]), (ro.EXIT_TIMEOUT, "confirmed"), r)
         self.assertEqual(self.ident.alive_all(), [], r)
 
@@ -1061,7 +1195,7 @@ print(json.dumps(dict(code=code, cert=rep["certification"], mode=rep["identity_m
     def test_orphaned_session_escaper_with_a_seen_parent_is_stopped(self):
         """A grandchild starts a new session and is re-parented (launchd / subreaper) while the run goes on."""
         p, rep = self.tool("--timeout", "3", "--grace", "1", "--", *self.fixture("slowdoublefork"), background=True)
-        self.read_pids(3); code = p.wait(timeout=60); r = load(rep)
+        self.read_pids(3); code = self.finish_tool(p, 60); r = load(rep)
         self.assertEqual((code, r["certification"]), (ro.EXIT_TIMEOUT, "confirmed"), r)
         self.assertEqual(self.ident.alive_all(), [], r)
 
@@ -1073,7 +1207,7 @@ print(json.dumps(dict(code=code, cert=rep["certification"], mode=rep["identity_m
         try:
             p, rep = self.tool("--timeout", "4", "--grace", "1", "--", *self.fixture("tree,launchd"), background=True)
             _, notes = self.read_pids(3)
-            code = p.wait(timeout=60); r = load(rep)
+            code = self.finish_tool(p, 60); r = load(rep)
             label = next((n.split(":", 1)[1] for n in notes if n.startswith("launchd:")), None)
             self.assertTrue(label, "launchctl submit worked")
             out = subprocess.run(["launchctl", "list", label], capture_output=True, text=True).stdout
@@ -1102,7 +1236,7 @@ print(json.dumps(dict(code=code, cert=rep["certification"], mode=rep["identity_m
             if spids or time.time() > end: break
             time.sleep(0.02)
         self.assertEqual(len(spids), 1, self.ident.problems()); spid = spids[0]
-        rc = p.wait(timeout=60); r = load(rep)
+        rc = self.finish_tool(p, 60); r = load(rep)
         self.assertEqual((rc, r["certification"]), (ro.EXIT_UNCERTAIN, "uncertain"), r)
         self.assertTrue(any(c["code"] == "lineage_candidate" and c.get("pid") == spid for c in r["reason_codes"]), r)
         self.assertNotIn(spid, [s.get("pid") for s in r["signalled"]])
@@ -2383,6 +2517,235 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
             for q in (p, holder):
                 if q.poll() is None: q.kill()
                 q.wait(10)
+    # ── Phase 2 (round 40): cleanup after tool timeouts — controls ─────────────────────────────────────────────────────
+    class FakeTool:
+        """Tool stand-in for synthetic Phase 2 controls: records what stop_tool asks; never reaches the OS."""
+        def __init__(self, pid=7900, alive=True, ignore_term=False, unkillable=False, wait_raises=(), stop_raises=None):
+            self.pid, self.alive, self.ignore_term, self.unkillable = pid, alive, ignore_term, unkillable
+            self.wait_raises, self.stop_raises, self.calls = list(wait_raises), stop_raises, []
+            self.returncode = None if alive else 0
+        def poll(self): return None if self.alive else self.returncode
+        def send_signal(self, sig):
+            self.calls.append(("signal", int(sig)))
+            if self.stop_raises: raise self.stop_raises
+            if not self.ignore_term: self.alive, self.returncode = False, -int(sig)
+        def kill(self):
+            self.calls.append(("kill",))
+            if self.stop_raises: raise self.stop_raises
+            if not self.unkillable: self.alive, self.returncode = False, -9
+        def wait(self, timeout=None):
+            self.calls.append(("wait", timeout))
+            if self.wait_raises: raise self.wait_raises.pop(0)
+            if self.alive: raise subprocess.TimeoutExpired("fake-tool", timeout)
+            return self.returncode
+
+    @contextlib.contextmanager
+    def swapped_ident(self, ident):
+        saved = self.ident; self.ident = ident
+        try: yield ident
+        finally: self.ident = saved
+
+    def add_fake_tool(self, **kw):
+        t = self.FakeTool(**kw); self._tools.append({"p": t, "err": None, "done": False}); return t
+
+    def test_phase2_exited_tool_is_never_signalled(self):
+        t = self.add_fake_tool(alive=False)
+        self._stop_all_tools(); self._stop_all_tools()
+        self.assertEqual([c for c in t.calls if c[0] != "wait"], [], "no signal to a tool that already exited")
+        self.assertTrue(self._tools[-1]["done"])
+
+    def test_phase2_term_ignoring_tool_is_killed_after_grace(self):
+        t = self.add_fake_tool(ignore_term=True)
+        self.stop_tool(t, grace=0)
+        expect = [("kill",), ("wait", 5)] if WINDOWS else [("signal", int(signal.SIGTERM)), ("wait", 5), ("kill",), ("wait", 5)]
+        self.assertEqual(t.calls, expect); self.assertEqual(t.returncode, -9); self.assertEqual(self.ident.unverifiable, [])
+
+    def test_phase2_tool_that_never_exits_is_unverifiable(self):
+        with self.swapped_ident(Ident("k" * 32, backend=self.FakeTable({}))) as ident:
+            t = self.add_fake_tool(ignore_term=True, unkillable=True)
+            self.stop_tool(t, grace=0)
+            self.assertEqual([u[0] for u in ident.unverifiable], [7900]); self.assertTrue(ident.problems())
+
+    def test_phase2_interrupted_cleanup_is_retried(self):
+        t = self.add_fake_tool(wait_raises=[KeyboardInterrupt()])
+        if WINDOWS: t.kill = lambda: (t.calls.append(("kill",)), setattr(t, "alive", False), setattr(t, "returncode", -9))[0]
+        with self.assertRaises(KeyboardInterrupt): self._stop_all_tools()
+        self.assertFalse(self._tools[-1]["done"], "an interrupted stop is not marked done")
+        self._stop_all_tools()
+        self.assertTrue(self._tools[-1]["done"]); self.assertIsNotNone(t.returncode)
+
+    def test_phase2_exception_in_one_stop_never_skips_the_others(self):
+        with self.swapped_ident(Ident("k" * 32, backend=self.FakeTable({}))) as ident:
+            bad = self.add_fake_tool(pid=7901, stop_raises=OSError(errno.EPERM, "synthetic"))
+            good = self.add_fake_tool(pid=7902)
+            self._stop_all_tools()
+            self.assertIsNotNone(good.returncode, "the second tool was still stopped")
+            self.assertEqual([u[0] for u in ident.unverifiable], [7901]); self.assertTrue(all(t["done"] for t in self._tools))
+
+    def test_phase2_late_records_after_a_timeout_are_identity_checked(self):
+        """After a tool timeout, records written late are admitted only by identity: a reused pid and a forged
+        identity are never signalled; an unreadable one is reported (missing handle) — synthetic table, no OS calls."""
+        table = self.FakeTable({7911: f"{oi.PREFIX}1", 7912: f"{oi.PREFIX}99", 7913: f"{oi.PREFIX}3", 7914: f"{oi.PREFIX}4"})
+        table.unreadable.add(7914)
+        with self.swapped_ident(Ident("k" * 32, backend=table)) as ident:
+            with open(self.pids, "w") as f:
+                for pid, n in ((7911, 1), (7912, 2), (7913, 30), (7914, 4)): f.write(self.rec(pid, n) + "\n")  # 7912 reused, 7913 forged
+            t = self.add_fake_tool(ignore_term=False)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                t.wait_raises = [subprocess.TimeoutExpired("fake-tool", 1)]
+                self.finish_tool(t, 1)
+            ident.cleanup()
+            self.assertEqual(table.kills, [(7911, f"{oi.PREFIX}1")], "only the verified live record is stopped")
+            self.assertEqual((table.table[7912], table.table[7913]), (f"{oi.PREFIX}99", f"{oi.PREFIX}3"))
+            self.assertEqual([u[0] for u in ident.unknown], [7914]); self.assertTrue(ident.problems())
+
+    def phase2_observer_check(self, n):
+        """An independent observer (same key, fresh Ident) admits the case's records and must find none alive BEFORE
+        tearDown runs (so tearDown cannot mask a leak). Non-vacuous: it must have admitted n records."""
+        obs = Ident(self.key)
+        try:
+            pids, _, _ = scan_pidfile(obs, self.pids)
+            self.assertEqual(len(pids), n, obs.problems())
+            end = time.time() + 10
+            while obs.alive_all() and time.time() < end: time.sleep(0.05)
+            self.assertEqual(obs.alive_all(), [], "the tool's tree outlived the tool's timeout")
+            self.assertEqual(obs.problems(), [])
+        finally:
+            obs.cleanup()  # releases Windows handles; stops nothing unless the assertion above already failed
+
+    def test_phase2_normal_exit_sends_no_signal(self):
+        p, rep = self.start_tool("--", sys.executable, "-c", "pass")
+        self.assertEqual(self.finish_tool(p, 60), 0)
+        sent = []
+        p.send_signal = lambda sig: sent.append(sig); p.kill = lambda: sent.append("kill")
+        self._stop_all_tools()
+        self.assertEqual(sent, []); self.assertIsNone(p.stderr, "stderr is a file, not a pipe")
+        self.assertTrue(os.path.exists(self._tools[-1]["err"]))
+
+    def test_phase2_foreground_timeout_stops_the_tool_and_its_tree(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.tool("--grace", "1", "--", *self.fixture("tree"), timeout=4)  # the tool itself has no --timeout
+        p = self._tools[-1]["p"]
+        self.assertIsNotNone(p.returncode, "the timed-out tool was stopped and reaped")
+        if not WINDOWS: self.assertEqual(p.returncode, 128 + signal.SIGTERM, self.tool_stderr(p))
+        self.phase2_observer_check(3)
+
+    def test_phase2_background_wait_timeout_stops_tool_then_fixtures(self):
+        p, rep = self.tool("--grace", "1", "--", *self.fixture("tree"), background=True)
+        self.read_pids(3)
+        with self.assertRaises(subprocess.TimeoutExpired): self.finish_tool(p, 2)
+        self.assertIsNotNone(p.returncode)
+        self.phase2_observer_check(3)
+
+    @unittest.skipIf(WINDOWS, "POSIX: SIGTERM step")
+    def test_phase2_real_tool_ignoring_term_is_killed(self):
+        ready, script = os.path.join(self.dir, "ready"), os.path.join(self.dir, "ignore_term.py")
+        with open(script, "w") as f:
+            f.write("import signal, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nopen(sys.argv[1], 'w').close()\ntime.sleep(60)\n")
+        p = self._start_cmd([sys.executable, script, ready])
+        end = time.time() + 15
+        while not os.path.exists(ready) and time.time() < end: time.sleep(0.02)
+        self.assertTrue(os.path.exists(ready), "the TERM-ignoring tool is ready (handshake)")
+        self.stop_tool(p, grace=0)
+        self.assertEqual(p.returncode, -signal.SIGKILL); self.assertEqual(self.ident.unverifiable, [])
+
+    def test_phase2_tool_stderr_leaves_no_open_pipe(self):
+        """F2 dependency of Phase 2: tool stderr is a file. Positive: a tool run leaves no ResourceWarning. Negative
+        (harness check): this test's own child with an unread, unclosed stderr pipe does produce one."""
+        import gc, warnings
+        def warns(run):
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always", ResourceWarning)
+                run(); gc.collect()
+            return [x for x in w if issubclass(x.category, ResourceWarning)]
+        def tool_run():
+            p, _ = self.start_tool("--", sys.executable, "-c", "pass"); self.finish_tool(p, 60); self._stop_all_tools()
+        def leaky_run():
+            q = subprocess.Popen([sys.executable, "-c", "pass"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE); q.wait(30)
+        self.assertEqual(warns(tool_run), [])
+        self.assertTrue(warns(leaky_run), "the ResourceWarning harness detects an unclosed pipe")
+
+    def test_static_tool_processes_only_through_start(self):
+        """Every process started with TOOL goes through _start_cmd; the Phase 2 helpers never call os.kill/os.killpg."""
+        with open(__file__, encoding="utf8") as fh: tree = ast.parse(fh.read())
+        case = [c for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "Case"][0]
+        starters = set()
+        for fn in (f for f in case.body if isinstance(f, ast.FunctionDef)):
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Call) and getattr(n.func, "attr", None) in ("Popen", "run", "call", "check_call", "check_output") \
+                        and any(isinstance(a, ast.Name) and a.id == "TOOL" for a in ast.walk(n)):
+                    starters.add(fn.name)
+                if fn.name in ("_start_cmd", "start_tool", "finish_tool", "stop_tool", "_stop_all_tools") and isinstance(n, ast.Call) \
+                        and getattr(n.func, "attr", None) in ("kill", "killpg") and getattr(n.func.value, "id", None) == "os":
+                    self.fail(f"os.{n.func.attr} in {fn.name}")
+        self.assertEqual(starters - {"_start_cmd", "start_tool"}, set(), "a tool process started outside start_tool")
+        start = [f for f in case.body if isinstance(f, ast.FunctionDef) and f.name == "start_tool"][0]
+        self.assertTrue(any(isinstance(n, ast.Name) and n.id == "TOOL" for n in ast.walk(start)))
+
+    # ── Phase 2 round 42 controls ──
+    def test_phase2_cleanup_is_registered_before_the_test_body(self):
+        """The tools' stop is registered with addCleanup in setUp, so it also runs when tearDown itself fails."""
+        self.assertTrue(any(getattr(f, "__func__", None) is Case._stop_all_tools for f, _a, _k in self._cleanups),
+                        "setUp must register _stop_all_tools with addCleanup")
+
+    def test_phase2_windows_branch_kills_through_the_handle(self):
+        """Synthetic, on every platform: with WINDOWS set, stop_tool calls the handle's kill() (TerminateProcess), never
+        send_signal; with it cleared, the POSIX order is SIGTERM, wait, kill, wait. No OS call (FakeTool)."""
+        g = globals(); saved = g["WINDOWS"]
+        try:
+            g["WINDOWS"] = True
+            t = self.add_fake_tool(ignore_term=True); self.stop_tool(t, grace=0)
+            self.assertEqual(t.calls, [("kill",), ("wait", 5)])
+            g["WINDOWS"] = False
+            u = self.add_fake_tool(ignore_term=True); self.stop_tool(u, grace=0)
+            self.assertEqual(u.calls, [("signal", int(signal.SIGTERM)), ("wait", 5), ("kill",), ("wait", 5)])
+        finally:
+            g["WINDOWS"] = saved
+
+    def test_phase2_case_dir_removal_is_bounded_and_reported(self):
+        """A folder that cannot be removed is reported with its path after bounded retries (never silently abandoned);
+        a transient failure is retried. Synthetic remover; only this test's own sub-folder is touched."""
+        saved = self.dir
+        sub = tempfile.mkdtemp(prefix="sub-", dir=saved)
+        try:
+            self.dir = sub
+            calls = []
+            def stuck(path): calls.append(path); raise PermissionError(errno.EACCES, "synthetic: file in use")
+            msg = self._remove_case_dir(rmtree=stuck, attempts=3, delay=0)
+            self.assertEqual(len(calls), 3); self.assertIn(sub, msg or ""); self.assertIn("PermissionError", msg or "")
+            once = []
+            def flaky(path):
+                if not once: once.append(1); raise PermissionError(errno.EACCES, "synthetic: transient")
+                shutil.rmtree(path)
+            self.assertIsNone(self._remove_case_dir(rmtree=flaky, attempts=3, delay=0)); self.assertFalse(os.path.exists(sub))
+        finally:
+            self.dir = saved
+
+    def test_static_teardown_stops_tools_before_pinned_cleanup(self):
+        """tearDown stops the tools first (run_owned stops its own tree on SIGTERM), then the case's pinned cleanup."""
+        with open(__file__, encoding="utf8") as fh: tree = ast.parse(fh.read())
+        case = [c for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "Case"][0]
+        td = [f for f in case.body if isinstance(f, ast.FunctionDef) and f.name == "tearDown"][0]
+        first = td.body[0]
+        self.assertTrue(isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)
+                        and getattr(first.value.func, "attr", None) == "_stop_all_tools", "tearDown's first statement")
+        calls = [n for n in ast.walk(td) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+        stop = min(c.lineno for c in calls if c.func.attr == "_stop_all_tools")
+        pinned = min(c.lineno for c in calls if c.func.attr == "cleanup")
+        self.assertLess(stop, pinned)
+
+    def test_static_untracked_interpreters_inventory(self):
+        """Every Case method that starts a process with subprocess directly (not a tracked tool) is listed in
+        UNTRACKED_STARTERS, so a new untracked start is a reviewed change, not an accident."""
+        with open(__file__, encoding="utf8") as fh: tree = ast.parse(fh.read())
+        case = [c for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "Case"][0]
+        found = set()
+        for fn in (f for f in case.body if isinstance(f, ast.FunctionDef)):
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and getattr(n.func.value, "id", None) == "subprocess" \
+                        and n.func.attr in ("Popen", "run", "call", "check_call", "check_output"):
+                    found.add(fn.name)
+        self.assertEqual(found - {"_start_cmd"}, UNTRACKED_STARTERS)
 
 if __name__ == "__main__":
     print(f"run_owned self-tests on {sys.platform}, Python {sys.version.split()[0]}", flush=True)
