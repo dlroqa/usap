@@ -52,11 +52,70 @@ Goal: a red check means a real problem, and a rerun is never needed to merge.
 
 | Criterion | Measure |
 |---|---|
-| First-attempt pass rate | Each applicable check passes on the first attempt in at least 98% of its last 50 runs on `main` and pull requests, counted separately per check and per runner |
+| First-attempt pass rate | Each applicable check passes on the first attempt in at least 98% of its last 50 runs on `main` and pull requests, counted separately per check and per runner (see "g1 measurement" below) |
 | Known flakes | Every open CI issue is either fixed with negative controls, or reaches its closure-review threshold (as #160 did: at least 16 runs on 16 commits with 3 pushes to `main` and zero failures), or has a documented, owner-accepted limitation |
 | No unexplained reruns | 10 consecutive pushes to `main` green on the first attempt |
 | Diagnostics before changes | No judge, timing limit or assertion is relaxed to make a flake pass; a test change needs evidence that the failure is not a product defect |
 | Runner health tracked | First-attempt failure rate per runner and day is recorded, so a degraded runner pool is seen as such (a hypothesis until shown) |
+
+#### g1 measurement
+
+These rules define how the g1 criteria above are measured. They change no threshold (98%, 50 samples, 10 pushes) and no
+historical first-attempt result.
+
+* **Checks.** Applicable checks are the eight branch-protection required contexts: build-test and render on linux-x64,
+  windows-x64, macos-arm64 and macos-x86_64. Each is measured as its own series. Other workflows are reported separately
+  and are not part of the rate.
+* **Cohort and missing evidence.** The cohort is every push to `main` and every pull request whose base is `main`,
+  including fork pull requests. Eligible events are discovered independently of workflow-run search: base-`main` pull
+  requests and their pushed head SHAs come from the pulls API and the pull-request timeline, and `main` pushes come from
+  the repository's activity record, cross-checked against the first-parent history of `main`. Each event is then matched
+  to its check runs and attempt-1 jobs. A required context with no observable first-attempt result is recorded as
+  UNKNOWN/UNOBSERVED with its reason. It is never fabricated, never counted as a pass and never silently dropped. A job
+  that exists with any conclusion other than success (including skipped, neutral, timed_out, action_required,
+  startup_failure and stale) is an observed unsuccessful sample, not UNOBSERVED. Missing evidence is resolved only by
+  obtaining the original attempt-1 result, never by exclusion, a rerun or a later run. A fork pull request awaiting
+  approval can keep a window INCOMPLETE until its sample leaves the window. If unresolved missing evidence affects a
+  context's 50-sample window, that context's acceptance measurement is INCOMPLETE and no rate is claimed as acceptance;
+  INCOMPLETE takes precedence over treating the missing result as an unsuccessful sample.
+* **Diagnostic pull requests.** Diagnostic pull requests count in the primary rate. The label `ci-diagnostic` is
+  reporting metadata, not an exemption. It places a pull request in the diagnostic reporting cohort only if it was on the
+  pull request before that pull request's first eligible CI execution, which is the creation time of its earliest ci or
+  render-e2e run, compared with the timeline `labeled` timestamp. Labels are never applied retroactively. A label added
+  later does not classify the pull request, removing it later changes nothing, and unlabelled pull requests are reported
+  as unclassified.
+* **Samples and cutoff.** One sample per (context, head SHA, event): the attempt-1 job of the earliest-created run of
+  that context's workflow for that head SHA and event. If that run is deleted, or its attempt 1 has no job for the
+  context, the sample is that missing result under the cohort rule; a job from a later run or a later attempt is never
+  used instead. Samples are ordered by run creation time, then run ID. The window is the latest 50 samples created at or
+  before the report's cutoff. Every sample, including UNKNOWN/UNOBSERVED and cancelled samples, occupies its position in
+  the window, and the window is never extended past it. A sample not yet concluded at the cutoff is in the window and
+  makes the measurement INCOMPLETE. Each report uses one fixed UTC cutoff, never changed within that report, and
+  discloses: the cutoff; the query scope; the contexts; the ordering; the original attempt-1 run and job IDs; the
+  completeness status; and the reason for every inclusion and exclusion. Fewer than 50 samples is NOT
+  COMPUTABLE.
+* **Runner and check changes.** A change to the operating-system image or major runtime behaviour, to test-command
+  semantics, to the required-context definition, or a substantial harness or infrastructure change affecting
+  comparability requires a documented comparability review (date, change, evidence, whether histories remain comparable
+  and why, owner decision). A cosmetic label change alone is insufficient. A series is never reset automatically. Any
+  accepted segmentation is explicit, recorded and prospective, and is never a method of removing failures. A
+  comparability decision takes effect only for samples created after the decision is recorded. It never re-segments,
+  excludes or reweights samples created earlier.
+* **Cancellations.** Every cancelled attempt-1 job that is a sample under the cohort and sample rules is recorded with
+  its run and job IDs and counts as an unsuccessful sample, whatever the reason for cancellation. The cancellation reason
+  and any supersession evidence are recorded separately and do not change the sample's result.
+* **Pushes to `main`.** A push to `main` is green on the first attempt when attempt 1 of all eight protected contexts
+  succeeded. The docs, dev-tools and native-runtime workflows are reported separately and do not affect the count. A
+  workflow that was not triggered is recorded as DID NOT RUN, not as green. A cancelled, missing or failed protected
+  context breaks the series. (A missing protected context makes the rate INCOMPLETE but breaks this series; the asymmetry
+  is intended.)
+* **Recurrences.** Recurrence monitoring is tracked per issue, separately from the rolling 50-sample rate. A recurrence
+  restarts that issue's monitoring and closure counts but never removes, resets or reweights samples in the rate window;
+  the failing sample stays in the window as one unsuccessful sample.
+* **Runner health.** First-attempt results per runner and per UTC day (samples, failures, cancellations, unobserved) are
+  recorded in a private table derived from the same samples, with raw run references, the cutoff, the date, the
+  platform, the context, the attempt and the cancellation handling. The table is a supporting operational report and
+  never substitutes for the last-50 formal rate.
 
 Issues: #151, #127, #108, #109, #110 (see section 3). #160 closed after its closure review on 2026-11-22.
 
