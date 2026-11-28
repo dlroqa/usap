@@ -11,25 +11,67 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
 const { matchGcSample, writeTrigger } = require("../ci/memprobe-gc.cjs");
+const { observer, describeProbeWait } = require("./fixtures/memprobe-diag.cjs"); // diagnostics only
 
 const PROBE = path.join(__dirname, "..", "ci", "image-queue-memprobe.cjs");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const read = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch (_) { return null; } };
 async function until(fn, ms = 5000, every = 20) { const end = Date.now() + ms; for (;;) { const v = fn(); if (v) return v; if (Date.now() > end) return null; await sleep(every); } }
 // The real probe in a stand-in "serve.cjs" process (the probe only activates in a process with that name).
-function startProbe(dir, out, { exposeGc = true } = {}) {
+function startProbe(dir, out, { exposeGc = true, diag = false } = {}) {
   fs.mkdirSync(path.join(dir, "srv"), { recursive: true });
   const serve = path.join(dir, "srv", "serve.cjs");
   fs.writeFileSync(serve, "setInterval(() => {}, 1000);\n");
   const args = [...(exposeGc ? ["--expose-gc"] : []), "--require", PROBE, serve];
-  const child = spawn(process.execPath, args, { env: { ...process.env, USAP_IQ_MEMPROBE: out }, stdio: "ignore" });
+  const child = spawn(process.execPath, args, { env: { ...process.env, USAP_IQ_MEMPROBE: out, ...(diag ? { USAP_IQ_MEMPROBE_DIAG: "1" } : {}) }, stdio: "ignore" });
   return child;
 }
-const stop = (child) => new Promise((r) => { if (child.exitCode !== null) return r(); child.once("exit", r); child.kill(); });
+// A child that has already exited has exitCode set (normal exit) OR signalCode set (killed by a signal, exitCode null).
+// Checking only exitCode waited forever for an 'exit' event already emitted, so a probe killed by a signal turned the
+// test's real failure into "Promise resolution is still pending" (reproduced: SIGKILL and SIGTERM, Node 22.12.0).
+const stop = (child) => new Promise((r) => { if (child.exitCode !== null || child.signalCode !== null) return r(); child.once("exit", r); child.kill(); });
 
 let dir;
 test.before(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "usap-memprobe-")); });
 test.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* best effort */ } });
+
+// Measurement (messages only, every platform): does the probe's own record rename fail while a reader polls the file
+// every 5 ms, as the reproduction test does (#188 10ebb29 Windows: no GC-marked record within 5 s)? For about 3 s,
+// with 5 GC requests, it prints records published, the probe's write/rename errors by stage and code, how many
+// GC-marked records the reader saw, and the reader's own outcomes. It asserts only that the measurement ran.
+test("measurement: probe record write/rename errors while a reader polls every 5 ms (messages only)", async (t) => {
+  const out = path.join(dir, "measure.json");
+  const child = startProbe(dir, out, { diag: true });
+  try {
+    assert.ok(await until(() => { const p = read(out); return p && p.gcAvailable; }), "probe running");
+    const obs = observer(); const seenMarked = new Set(); const end = Date.now() + 3000; let k = 0, next = Date.now();
+    while (Date.now() < end) {
+      if (Date.now() >= next && k < 5) { k += 1; writeTrigger(`${out}.gc`, `gc-measure-${k}`); next = Date.now() + 550; }
+      const p = obs.read(out); if (p && p.gcId) seenMarked.add(p.gcId);
+      await sleep(5);
+    }
+    await sleep(450);
+    const last = read(out) || obs.last || {};
+    const d = last.diag || {};
+    const errs = Object.entries(d.errors || {}).map(([key, n]) => `${key.replace(/[^A-Za-z0-9:_-]/g, "")}x${n}`).join(",") || "none";
+    const rd = Object.entries(obs.errors).map(([c, n]) => `${c}x${n}`).join(",") || "none";
+    t.diagnostic(`D6 probe measurement (${process.platform}): requests ${k}; probe ticks ${d.ticks ?? "?"}, records published ${d.writesOk ?? "?"}, record write errors ${errs}; GC-marked records seen by the reader ${seenMarked.size} of ${k}; last record's lastGc ${last.lastGc && /^gc-measure-\d$/.test(last.lastGc.id) ? last.lastGc.id : "none"}; reader ${obs.reads} reads: ok ${obs.ok}, partial ${obs.parse}, errors ${rd}`);
+    assert.ok(Number.isFinite(d.writesOk) && d.writesOk > 5 && k === 5, "the measurement ran");
+  } finally { await stop(child); }
+});
+
+test("stop(): returns for a child that is running, exited normally, or was already killed by a signal", async () => {
+  const start = (code) => spawn(process.execPath, ["-e", code], { stdio: "ignore" });
+  const exited = (c) => new Promise((r) => (c.exitCode !== null || c.signalCode !== null ? r() : c.once("exit", r)));
+  const running = start("setInterval(() => {}, 1000)");
+  await stop(running); assert.ok(running.exitCode !== null || running.signalCode !== null, "stopped");
+  const normal = start("process.exit(3)"); await exited(normal); await stop(normal); assert.equal(normal.exitCode, 3);
+  for (const sig of ["SIGKILL", "SIGTERM"]) {
+    const killed = start("setInterval(() => {}, 1000)"); killed.kill(sig); await exited(killed);
+    assert.equal(killed.exitCode, null); assert.ok(killed.signalCode, `${sig}: ended by a signal`);
+    await stop(killed); // waited forever before (exitCode null, 'exit' already emitted)
+  }
+});
 
 test("rule: the right request, the right process, taken after the request; anything else is not yet", () => {
   const req = { id: "gc-ab12-3", pid: 100, requestedAt: 5000 };
@@ -47,16 +89,23 @@ test("rule: the right request, the right process, taken after the request; anyth
   assert.equal(matchGcSample({ lastGc: g }, { ...req, id: "" }), null);
 });
 
-test("reproduction: a read after the probe's next plain tick misses the sample with the old rule and finds it with the new one", async () => {
+// Diagnostics (Windows CI, #188 10ebb29: "the probe answered" failed): each cycle prints one line (fixtures/memprobe-diag.cjs)
+// with the request's publication, the test's own reads by outcome, the last record seen and the probe's recorded
+// events (request seen, GC, any swallowed write or rename error), before the unchanged assertions.
+test("reproduction: a read after the probe's next plain tick misses the sample with the old rule and finds it with the new one", async (t) => {
   const out = path.join(dir, "late.json");
-  const child = startProbe(dir, out);
+  const child = startProbe(dir, out, { diag: true });
   try {
     assert.ok(await until(() => { const p = read(out); return p && p.gcAvailable; }), "probe running");
     for (let k = 1; k <= 3; k += 1) {
       const id = `gc-late-${k}`; const requestedAt = Date.now();
-      writeTrigger(`${out}.gc`, id);
+      const attempts = writeTrigger(`${out}.gc`, id);
       // wait until the GC-marked record has been written AND overwritten by a later plain tick (the CI miss)
-      const marked = await until(() => { const p = read(out); return p && p.gcId === id ? p : null; }, 5000, 5);
+      const obs = observer();
+      const marked = await until(() => { const p = obs.read(out); return p && p.gcId === id ? p : null; }, 5000, 5);
+      let line;
+      try { line = describeProbeWait({ req: { id, requestedAt }, attempts, obs, child, triggerFile: `${out}.gc`, recordFile: out }); } catch (_) { line = "description failed"; }
+      t.diagnostic(`D6 probe cycle ${k} (${marked ? "marked record seen" : "marked record NOT seen"}): ${line}`);
       assert.ok(marked, "the probe answered");
       assert.ok(await until(() => { const p = read(out); return p && p.t > marked.t && p.gcId === undefined ? p : null; }), "overwritten by a plain tick");
       const late = read(out);
