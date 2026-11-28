@@ -217,6 +217,9 @@ SYNTHETIC_TESTS = frozenset({
     "test_phase2_interrupted_cleanup_is_retried",
     "test_phase2_exception_in_one_stop_never_skips_the_others",
     "test_phase2_late_records_after_a_timeout_are_identity_checked",
+    "test_phase2_cleanup_is_registered_before_the_test_body",
+    "test_phase2_windows_branch_kills_through_the_handle",
+    "test_phase2_case_dir_removal_is_bounded_and_reported",
 })
 # Start their own fixtures (directly or through the tool / a snippet interpreter) and signal only those, by identity. Not guarded.
 OWNED_TESTS = frozenset({
@@ -287,6 +290,8 @@ PURE_TESTS = frozenset({
     "test_static_ident_admission_and_signal_paths",
     "test_ident_own_identity_matches_run_owned",
     "test_static_tool_processes_only_through_start",
+    "test_static_teardown_stops_tools_before_pinned_cleanup",
+    "test_static_untracked_interpreters_inventory",
 })
 
 
@@ -543,6 +548,25 @@ runpy.run_path(fix, run_name="__main__")
 '''
 
 
+# Round 42 (Phase 2 gap 5): Case methods that start a process directly with subprocess instead of as a tracked tool
+# (_start_cmd). Each is the case's own child with its own timeout; what they start is stopped only through pinned records.
+# test_static_untracked_interpreters_inventory keeps this list exact.
+UNTRACKED_STARTERS = frozenset({
+    "_snippet",  # snippet(): run_owned in-process, capture_output pipes
+    "test_guard_owned_fixture_cleanup_works_without_the_guard",
+    "test_f1_dead_pidfd_never_reaches_another_process",  # F1: its own child, pinned by pidfd; reaped in finally
+    "test_f1_orphancheck_reports_an_unreaped_zombie",  # F1: subreaper helper (subprocess.run, 60 s); reaps adopted children
+    "test_ident_real_records_admit_the_fixture_and_never_a_reused_pid",
+    "test_linux_identity_mismatch_is_never_signalled",
+    "test_mac_same_coalition_unrelated_orphan_is_uncertain_and_never_signalled",
+    "test_mac_stale_identity_and_simulated_pid_reuse_are_refused",
+    "test_mac_unrelated_launchd_job_neither_uncertain_nor_signalled",
+    "test_mac_zombie_only_group_really_returns_eperm_and_is_harmless",
+    "test_negative_control_plain_timeout_leaves_descendants",
+    "test_phase2_tool_stderr_leaves_no_open_pipe",
+})
+
+
 class Case(unittest.TestCase):
     def setUp(self):
         n = self._testMethodName
@@ -567,9 +591,27 @@ class Case(unittest.TestCase):
             self.assertEqual(self.ident.seen, {}, "a guarded (non-OWNED) test recorded processes")
         self.ident.cleanup()
         left = self.ident.alive_all()
-        shutil.rmtree(self.dir, ignore_errors=True)
+        dir_left = self._remove_case_dir()
         self.assertEqual(left, [], "the case's own cleanup left processes")
         self.assert_clean_ownership(self.ident)
+        self.assertIsNone(dir_left, "the case's temporary folder could not be removed (on Windows: a file is still open)")
+
+    def _remove_case_dir(self, rmtree=shutil.rmtree, attempts=10, delay=0.2):
+        """Round 42: the case folder is removed with bounded retries (~2 s: a scanner or a just-exited process may still
+        hold a file on Windows); if it is still there, the path and the last error are returned, and the case fails,
+        instead of the folder being silently abandoned. Never signals anything."""
+        err = None
+        for i in range(attempts):
+            try:
+                rmtree(self.dir)
+            except FileNotFoundError:
+                return None
+            except OSError as x:
+                err = "%s: %s" % (type(x).__name__, x)
+            if not os.path.exists(self.dir):
+                return None
+            if i + 1 < attempts: time.sleep(delay)
+        return "%s left (%s)" % (self.dir, err)
 
     def assert_clean_ownership(self, ident):
         """A rejected record, an unreadable identity or a cleanup that could not be done through a pin fails the case."""
@@ -584,6 +626,17 @@ class Case(unittest.TestCase):
             time.sleep(0.02)
 
     # ── Phase 2 (round 40): tool processes are tracked and stopped through their own Popen, never by pid ──
+    # Bounds (round 42). The execution timeout of a test's tool() call is unchanged; cleanup runs only AFTER that timeout
+    # has already failed the call (finish_tool re-raises TimeoutExpired) or in tearDown, so it never extends a successful
+    # test. Per tool on POSIX: SIGTERM, wait TOOL_GRACE + 5 s (10 s), SIGKILL, wait 5 s => at most ~15 s, then the tool is
+    # recorded as unverifiable (the case fails). Tools are stopped one after another, so N live tools take at most ~N x 15 s,
+    # plus at most ~5 s for the case's pinned cleanup (Ident.cleanup). A foreground tool() that times out therefore raises
+    # TimeoutExpired up to ~15 s after its timeout (it used to be an immediate SIGKILL with no tree stop).
+    # Windows: Popen.kill() is TerminateProcess on the tool's own handle: no graceful step, no report from the tool; its
+    # tree ends when the tool's job object closes (run_owned's KILL_ON_JOB_CLOSE), then wait 5 s. Bound ~5 s per tool.
+    # macOS: no pidfd and no subreaper. SIGTERM lets run_owned stop its own tree (its macOS ownership path); descendants that
+    # outlive the tool are stopped only through the case's pinned records (Ident: audit-token identity) in tearDown; an
+    # unrecorded descendant cannot be found by this harness (documented limit, not assumed away).
     TOOL_GRACE = 5  # seconds run_owned gets to stop its tree after SIGTERM before the tool itself is killed
 
     def _start_cmd(self, cmd):
@@ -613,8 +666,9 @@ class Case(unittest.TestCase):
             raise
 
     def stop_tool(self, p, grace=None):
-        """Bounded stop through the Popen only: POSIX SIGTERM (run_owned stops its own tree), wait grace+5 s, then kill and
-        wait 5 s; Windows kill (closing the job kills the tree). Then admit late records (identity-checked) so the case's
+        """Bounded stop through the Popen only (never a pid): POSIX SIGTERM (run_owned stops its own tree), wait grace+5 s,
+        then kill and wait 5 s (<= ~15 s with the default grace); Windows kill = TerminateProcess on the handle (closing the
+        job kills the tree), wait 5 s. Then admit late records (identity-checked) so the case's
         cleanup can stop leftovers by pin. A tool that does not exit is recorded as unverifiable (the case fails)."""
         grace = self.TOOL_GRACE if grace is None else grace
         if p.poll() is None:
@@ -849,6 +903,11 @@ class Case(unittest.TestCase):
         victim.kill(); victim.wait()
 
     def snippet(self, code, timeout=60, expect=3):
+        """Round 42 scope note: a snippet interpreter is NOT a tracked tool (it runs run_owned in-process, never TOOL): it
+        is this case's own subprocess.run child with capture_output pipes and its own timeout. Its descendants are stopped
+        only through their pinned records (read here and in tearDown). On Windows, subprocess.run's communicate() after a
+        timeout kill could wait on a pipe a surviving descendant holds; the snippets' fixtures use DEVNULL for their stdio.
+        Every untracked interpreter start is inventoried in UNTRACKED_STARTERS (test_static_untracked_interpreters_inventory)."""
         try:
             return self._snippet(code, timeout)
         finally:
@@ -2622,6 +2681,71 @@ print(json.dumps(dict(code=code, cert=rep["certification"], codes=rep["reason_co
         self.assertEqual(starters - {"_start_cmd", "start_tool"}, set(), "a tool process started outside start_tool")
         start = [f for f in case.body if isinstance(f, ast.FunctionDef) and f.name == "start_tool"][0]
         self.assertTrue(any(isinstance(n, ast.Name) and n.id == "TOOL" for n in ast.walk(start)))
+
+    # ── Phase 2 round 42 controls ──
+    def test_phase2_cleanup_is_registered_before_the_test_body(self):
+        """The tools' stop is registered with addCleanup in setUp, so it also runs when tearDown itself fails."""
+        self.assertTrue(any(getattr(f, "__func__", None) is Case._stop_all_tools for f, _a, _k in self._cleanups),
+                        "setUp must register _stop_all_tools with addCleanup")
+
+    def test_phase2_windows_branch_kills_through_the_handle(self):
+        """Synthetic, on every platform: with WINDOWS set, stop_tool calls the handle's kill() (TerminateProcess), never
+        send_signal; with it cleared, the POSIX order is SIGTERM, wait, kill, wait. No OS call (FakeTool)."""
+        g = globals(); saved = g["WINDOWS"]
+        try:
+            g["WINDOWS"] = True
+            t = self.add_fake_tool(ignore_term=True); self.stop_tool(t, grace=0)
+            self.assertEqual(t.calls, [("kill",), ("wait", 5)])
+            g["WINDOWS"] = False
+            u = self.add_fake_tool(ignore_term=True); self.stop_tool(u, grace=0)
+            self.assertEqual(u.calls, [("signal", int(signal.SIGTERM)), ("wait", 5), ("kill",), ("wait", 5)])
+        finally:
+            g["WINDOWS"] = saved
+
+    def test_phase2_case_dir_removal_is_bounded_and_reported(self):
+        """A folder that cannot be removed is reported with its path after bounded retries (never silently abandoned);
+        a transient failure is retried. Synthetic remover; only this test's own sub-folder is touched."""
+        saved = self.dir
+        sub = tempfile.mkdtemp(prefix="sub-", dir=saved)
+        try:
+            self.dir = sub
+            calls = []
+            def stuck(path): calls.append(path); raise PermissionError(errno.EACCES, "synthetic: file in use")
+            msg = self._remove_case_dir(rmtree=stuck, attempts=3, delay=0)
+            self.assertEqual(len(calls), 3); self.assertIn(sub, msg or ""); self.assertIn("PermissionError", msg or "")
+            once = []
+            def flaky(path):
+                if not once: once.append(1); raise PermissionError(errno.EACCES, "synthetic: transient")
+                shutil.rmtree(path)
+            self.assertIsNone(self._remove_case_dir(rmtree=flaky, attempts=3, delay=0)); self.assertFalse(os.path.exists(sub))
+        finally:
+            self.dir = saved
+
+    def test_static_teardown_stops_tools_before_pinned_cleanup(self):
+        """tearDown stops the tools first (run_owned stops its own tree on SIGTERM), then the case's pinned cleanup."""
+        with open(__file__, encoding="utf8") as fh: tree = ast.parse(fh.read())
+        case = [c for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "Case"][0]
+        td = [f for f in case.body if isinstance(f, ast.FunctionDef) and f.name == "tearDown"][0]
+        first = td.body[0]
+        self.assertTrue(isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)
+                        and getattr(first.value.func, "attr", None) == "_stop_all_tools", "tearDown's first statement")
+        calls = [n for n in ast.walk(td) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+        stop = min(c.lineno for c in calls if c.func.attr == "_stop_all_tools")
+        pinned = min(c.lineno for c in calls if c.func.attr == "cleanup")
+        self.assertLess(stop, pinned)
+
+    def test_static_untracked_interpreters_inventory(self):
+        """Every Case method that starts a process with subprocess directly (not a tracked tool) is listed in
+        UNTRACKED_STARTERS, so a new untracked start is a reviewed change, not an accident."""
+        with open(__file__, encoding="utf8") as fh: tree = ast.parse(fh.read())
+        case = [c for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "Case"][0]
+        found = set()
+        for fn in (f for f in case.body if isinstance(f, ast.FunctionDef)):
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and getattr(n.func.value, "id", None) == "subprocess" \
+                        and n.func.attr in ("Popen", "run", "call", "check_call", "check_output"):
+                    found.add(fn.name)
+        self.assertEqual(found - {"_start_cmd"}, UNTRACKED_STARTERS)
 
 if __name__ == "__main__":
     print(f"run_owned self-tests on {sys.platform}, Python {sys.version.split()[0]}", flush=True)
