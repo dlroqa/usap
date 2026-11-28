@@ -228,6 +228,11 @@ OWNED_TESTS = frozenset({
     "test_guard_owned_fixture_cleanup_works_without_the_guard",
     "test_limit_tool_sigkill_leaves_the_tree",
     "test_linux_adopted_orphans_are_reaped_while_running",
+    "test_f1_orphancheck_reports_an_unreaped_zombie",
+    "test_f1_dead_pidfd_never_reaches_another_process",
+    "test_f1_without_pidfd_open_the_fixture_skips_and_never_signals",
+    "test_f1_failing_pidfd_open_skips_and_never_signals",
+    "test_f1_stale_pidfd_fails_without_any_fallback",
     "test_linux_identity_mismatch_is_never_signalled",
     "test_mac_group_eperm_with_live_members_is_uncertain",
     "test_mac_group_inspection_error_is_uncertain",
@@ -267,6 +272,7 @@ PURE_TESTS = frozenset({
     "test_guard_no_cached_signal_references",
     "test_n2_classifier_requires_positive_lineage",
     "test_static_guard_plain_kill_only_where_proven_safe",
+    "test_static_fixture_signals_only_through_pidfd",
     "test_static_ident_admission_and_signal_paths",
     "test_ident_own_identity_matches_run_owned",
 })
@@ -486,6 +492,45 @@ def scan_pidfile(ident, path):
     return pids, notes, n
 
 
+# F1 (round 41): runs the real orphancheck fixture IN this process (runpy) with its pidfd capability altered. Plain
+# os.kill/os.killpg are replaced by recorders that write a note and raise BEFORE any OS call; every pidfd_send_signal
+# the fixture makes is noted, then passed on. HOW: "absent" (no os.pidfd_open), "oserror" (pidfd_open fails, e.g.
+# ENOSYS), "stale" (pidfd_open hands back a pidfd whose process is already gone: the pinned identity no longer exists,
+# as after a reap with the number possibly reused). The stale pidfd comes from this wrapper's OWN child, killed through
+# its own fresh pidfd and reaped by its own pid. The fixture's guard and engine run unmodified, under the tool.
+F1_WRAP = r'''
+import os, runpy, signal, subprocess, sys
+how, fix, pids = sys.argv[1], sys.argv[2], sys.argv[3]
+def note(t):
+    with open(pids, "a", encoding="utf8") as f: f.write(t + "\n")
+def plain(name):
+    def rec(*a, **k):
+        note("plainkill:" + name); raise RuntimeError("F1 wrapper: plain " + name + " blocked before any OS call")
+    return rec
+os.kill, os.killpg = plain("kill"), plain("killpg")
+real_open, real_send = os.pidfd_open, signal.pidfd_send_signal
+def send(fd, sig, *a):
+    note("pidfdsig:%d" % int(sig)); return real_send(fd, sig, *a)
+signal.pidfd_send_signal = send
+if how == "absent":
+    del os.pidfd_open
+elif how == "oserror":
+    def refuse(pid, *a): raise OSError(38, "simulated: pidfd_open not supported")
+    os.pidfd_open = refuse
+elif how == "stale":
+    def stale(pid, *a):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL)
+        fd = real_open(p.pid)  # our own unreaped child: pinned
+        real_send(fd, signal.SIGKILL); p.wait(10)  # reaped: fd now names a process that no longer exists
+        note("stalepidfd"); return fd
+    os.pidfd_open = stale
+else:
+    raise SystemExit("unknown HOW " + how)
+sys.path.insert(0, os.path.dirname(fix)); sys.argv = [fix, "orphancheck", pids]
+runpy.run_path(fix, run_name="__main__")
+'''
+
+
 class Case(unittest.TestCase):
     def setUp(self):
         n = self._testMethodName
@@ -610,10 +655,110 @@ class Case(unittest.TestCase):
         else:
             self.assertEqual(code, 0, err); self.assertEqual(rep["containment"], "full")
 
-    @unittest.skipUnless(LINUX, "Linux subreaper")
+    @unittest.skipUnless(LINUX and ro._pidfd_works(), "Linux subreaper and pidfd (the fixture signals only through a pidfd)")
     def test_linux_adopted_orphans_are_reaped_while_running(self):
         code, rep, err = self.tool("--timeout", "20", "--", *self.fixture("orphancheck"))
+        self.read_pids(2, wait=2)  # round 41: root and engine records, so tearDown verifies the engine is gone
+        if code == 4: self.skipTest("the fixture could not pin the engine with a pidfd (it never falls back to kill(pid))")
         self.assertEqual(code, 0, f"a killed orphan must not stay a zombie that looks alive: {err}")
+
+    @unittest.skipUnless(LINUX and ro._pidfd_works(), "Linux subreaper and pidfd")
+    def test_f1_orphancheck_reports_an_unreaped_zombie(self):
+        """F1 negative control: under a subreaper that never reaps the engine, the fixture's pidfd check must see the
+        killed engine as an unreaped zombie and exit 3 (the reap check is not vacuous). The helper is this test's own
+        child; it waits only for the fixture root while the fixture runs.
+        Round 41: after the root has exited (and reported), the helper stops and reaps what it adopted (the zombie
+        engine; or, if the fixture failed early, a live engine or a guard still exiting) through a pidfd taken while
+        that process is the helper's own unreaped child, so its pid is pinned (no one else may reap it), then reaps it
+        by that pid. It prints how many it reaped: a fixture that exits 4 or throws can no longer leave the engine."""
+        if not os.path.exists(f"/proc/{os.getpid()}/task/{os.getpid()}/children"):
+            self.skipTest("no /proc/<pid>/task/<tid>/children (the helper could not find what it adopted)")
+        helper = ("import ctypes, os, signal, subprocess, sys, time\n"
+                  "assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0\n"  # PR_SET_CHILD_SUBREAPER
+                  "print(subprocess.Popen(sys.argv[1:]).wait(), flush=True)\n"  # waitpid(root) only, never -1
+                  "me, n, end = os.getpid(), 0, time.time() + 10\n"
+                  "while time.time() < end:\n"
+                  "    kids = [int(k) for k in open(f'/proc/{me}/task/{me}/children').read().split()]\n"
+                  "    if not kids: break\n"
+                  "    for k in kids:\n"  # our own unreaped children only: pinned until we reap them ourselves
+                  "        fd = os.pidfd_open(k); signal.pidfd_send_signal(fd, signal.SIGKILL); os.close(fd)\n"
+                  "        os.waitpid(k, 0); n += 1\n"
+                  "print(n, flush=True)\n")
+        h = subprocess.run([sys.executable, "-c", helper, *self.fixture("orphancheck")], capture_output=True, text=True,
+                           timeout=60, env=self.env)
+        self.read_pids(2, wait=2)
+        out = h.stdout.split()
+        self.assertEqual(out[:1], ["3"], h.stderr)
+        self.assertEqual(h.returncode, 0, h.stderr)
+        self.assertGreaterEqual(int(out[1]) if len(out) > 1 else -1, 1, f"the zombie engine was not reaped by the helper: {h.stderr}")
+
+    @unittest.skipUnless(LINUX and ro._pidfd_works() and hasattr(signal, "pidfd_send_signal"), "Linux pidfd")
+    def test_f1_dead_pidfd_never_reaches_another_process(self):
+        """F1 pid-reuse property: once the pinned process is reaped, its pidfd refuses every signal (ESRCH), whatever
+        process later holds the number. Only this test's own child is involved."""
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        fd = os.pidfd_open(p.pid)
+        try:
+            p.kill(); p.wait(10)  # reaped: the number is free for reuse from here on
+            for sig in (0, signal.SIGKILL):
+                with self.assertRaises(ProcessLookupError): signal.pidfd_send_signal(fd, sig)
+        finally:
+            os.close(fd)
+            if p.poll() is None: p.kill(); p.wait(10)
+
+    def _f1_wrapped(self, how, records):
+        code, rep, err = self.tool("--timeout", "20", "--", sys.executable, "-B", "-c", F1_WRAP, how, FIX, self.pids)
+        pids, notes = self.read_pids(records, wait=2)
+        self.assertEqual(len(pids), records, notes)
+        self.assertNotIn(True, [n.startswith("plainkill") for n in notes], f"a plain kill/killpg was attempted: {notes}")
+        self.assertIsNotNone(rep, err); self.assertEqual(rep["survivors"], [], rep)
+        return code, notes, err
+
+    @unittest.skipUnless(LINUX and ro._pidfd_works() and hasattr(signal, "pidfd_send_signal"), "Linux pidfd")
+    def test_f1_without_pidfd_open_the_fixture_skips_and_never_signals(self):
+        """F1 unsupported pidfd (no os.pidfd_open): exit 4 and note it before starting anything; no signal of any kind."""
+        code, notes, err = self._f1_wrapped("absent", 1)
+        self.assertEqual(code, 4, err); self.assertIn("nopidfd", notes)
+        self.assertEqual([n for n in notes if n.startswith("pidfdsig")], [], notes)
+
+    @unittest.skipUnless(LINUX and ro._pidfd_works() and hasattr(signal, "pidfd_send_signal"), "Linux pidfd")
+    def test_f1_failing_pidfd_open_skips_and_never_signals(self):
+        """F1 unsupported pidfd (pidfd_open raises after the guard and engine exist): exit 4; the fixture signals
+        nothing, and the engine is left to the tool, which stops it as its own (no survivors)."""
+        code, notes, err = self._f1_wrapped("oserror", 2)
+        self.assertEqual(code, 4, err); self.assertIn("nopidfd", notes)
+        self.assertEqual([n for n in notes if n.startswith("pidfdsig")], [], notes)
+
+    @unittest.skipUnless(LINUX and ro._pidfd_works() and hasattr(signal, "pidfd_send_signal"), "Linux pidfd")
+    def test_f1_stale_pidfd_fails_without_any_fallback(self):
+        """F1 identity mismatch / simulated pid reuse: if the pinned identity is gone, the one SIGKILL through it is
+        refused (ESRCH) and the fixture fails (traceback, exit 1); it never retries by pid. No process is reused or
+        signalled for real: the stale pidfd belongs to the wrapper's own reaped child."""
+        code, notes, err = self._f1_wrapped("stale", 2)
+        self.assertEqual(code, 1, err); self.assertIn("stalepidfd", notes); self.assertNotIn("nopidfd", notes)
+        self.assertEqual([n for n in notes if n.startswith("pidfdsig")], ["pidfdsig:9"], notes)
+        self.assertIn("ProcessLookupError", err)
+
+    def test_static_fixture_signals_only_through_pidfd(self):
+        """F1: the fixture never calls os.kill/os.killpg; in orphancheck the pidfd is opened before the guard is released
+        or reaped, and the engine is signalled (and its reap checked) only through pidfd_send_signal."""
+        with open(FIX, encoding="utf8") as fh: src = fh.read()
+        tree = ast.parse(src)
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+        self.assertEqual([c.lineno for c in calls if c.func.attr in ("kill", "killpg") and getattr(c.func.value, "id", None) == "os"], [])
+        # round 41: no cached/aliased signal function, no signal through a Popen handle other than the Windows breakaway
+        # child's own p.kill(), and no external kill command
+        self.assertEqual(signal_cache_violations(src), [])
+        if hasattr(ast, "unparse"):
+            self.assertEqual([ast.unparse(c.func) for c in calls if c.func.attr in ("kill", "killpg", "send_signal", "terminate")], ["p.kill"])
+        self.assertEqual([n.lineno for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                          and n.value.split()[:1] in (["kill"], ["pkill"], ["killall"], ["taskkill"])], [])
+        line = lambda attr, owner=None: [c.lineno for c in calls if c.func.attr == attr and (owner is None or ast.unparse(c.func.value) == owner)] \
+            if hasattr(ast, "unparse") else [c.lineno for c in calls if c.func.attr == attr]
+        opened, released, reaped = line("pidfd_open"), line("close", "guard.stdin"), line("wait", "guard")
+        self.assertEqual(len(opened), 1); self.assertTrue(released and reaped)
+        self.assertLess(opened[0], min(released)); self.assertLess(opened[0], min(reaped))
+        self.assertGreaterEqual(len(line("pidfd_send_signal")), 2)
 
     @unittest.skipUnless(LINUX and hasattr(os, "pidfd_open"), "Linux pidfd")
     def test_linux_identity_mismatch_is_never_signalled(self):
