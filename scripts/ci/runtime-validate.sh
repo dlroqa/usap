@@ -43,13 +43,34 @@ check_binary() { # name path required(1/0)
 
 sha256_check() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 -c -; else sha256sum -c -; fi; }
 
+# fetch_verified: same download (curl -fsSL --retry 3), same pinned SHA-256 check and same result as before. On a
+# failure it also sets FETCH_DETAIL, which says which of the two failures it was (diagnostic only, never a verdict):
+#   "<file>: download failed: curl exit N, HTTP S"  (network or HTTP error after curl's retries; nothing is installed)
+#   "<file>: checksum mismatch: got <12 hex>, B bytes (pinned <12 hex>)"  (the bytes are not the pinned file; it fails)
+# No URL, header or token is printed.
+FETCH_DETAIL=""
+sha256_of() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi | cut -c1-12; }
 fetch_verified() { # url sha256 dest
-  local url="$1" sum="$2" dest="$3"
+  local url="$1" sum="$2" dest="$3" rc=0 http=""
+  FETCH_DETAIL=""
   mkdir -p "$(dirname "$dest")"
   if [[ ! -f "$dest" ]] || ! echo "$sum  $dest" | sha256_check >/dev/null 2>&1; then
-    curl -fsSL --retry 3 "$url" -o "$dest.part" && mv "$dest.part" "$dest"
+    if http="$(curl -fsSL --retry 3 -w '%{http_code}' "$url" -o "$dest.part")"; then
+      mv "$dest.part" "$dest"
+    else
+      rc=$?
+      FETCH_DETAIL="$(basename "$dest"): download failed: curl exit $rc, HTTP ${http:-none}"
+    fi
   fi
-  echo "$sum  $dest" | sha256_check >/dev/null 2>&1
+  if echo "$sum  $dest" | sha256_check >/dev/null 2>&1; then return 0; fi
+  if [[ -z "$FETCH_DETAIL" ]]; then
+    if [[ -f "$dest" ]]; then
+      FETCH_DETAIL="$(basename "$dest"): checksum mismatch: got $(sha256_of "$dest"), $(wc -c < "$dest" | tr -d ' ') bytes (pinned ${sum:0:12})"
+    else
+      FETCH_DETAIL="$(basename "$dest"): file missing after download"
+    fi
+  fi
+  return 1
 }
 
 api() { # method path [json-body]
@@ -212,7 +233,7 @@ if fetch_verified "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolv
   fi
   api POST /api/llm/stop '{}' >/dev/null
 else
-  record "LLM model download" FAIL "checksum mismatch or download failed"
+  record "LLM model download" FAIL "${FETCH_DETAIL:-checksum mismatch or download failed}"
 fi
 
 # Speech: whisper ggml-tiny.en (MIT) + JFK sample from whisper.cpp, pinned.
@@ -278,7 +299,7 @@ if fetch_verified "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c
   fi
   api POST /api/speech/stop '{}' >/dev/null
 else
-  record "Speech model download" FAIL "checksum mismatch or download failed"
+  record "Speech model download" FAIL "${FETCH_DETAIL:-checksum mismatch or download failed}"
 fi
 
 # Download integrity (Step 9.4): a catalog model downloaded *through the app* must stream, verify against
@@ -384,7 +405,7 @@ if fetch_verified "https://huggingface.co/second-state/stable-diffusion-v1-5-GGU
   cp "$CACHE/$SD_MODEL" "$APP/models/$SD_MODEL"
   for b in ${IMAGE_BACKENDS:-cpu}; do image_test "$b"; done
 else
-  record "Image model download" FAIL "checksum mismatch or download failed"
+  record "Image model download" FAIL "${FETCH_DETAIL:-checksum mismatch or download failed}"
 fi
 
 exit $FAILED
